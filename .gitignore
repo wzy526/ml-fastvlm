@@ -139,3 +139,9 @@ dmypy.json
 
 # FastVLM models
 app/FastVLM/model
+
+# data
+data/
+
+# check points
+checkpoints/
