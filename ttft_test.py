@@ -9,8 +9,7 @@
 # - #Visual Tokens: 256
 # - Vis. Enc. Size: 125M
 # - Model Size: 0.5B parameters
-# - Stage: 2 (base version)
-# - Performance: 85x faster TTFT vs LLaVA-OneVision-0.5B
+# - Stage: 2 
 #
 import os
 import time
@@ -266,8 +265,7 @@ def test_fastvlm_ttft(args):
         print("="*60)
     
     tokenizer, model, image_processor = load_model(args.model_path, device)
-    
-    # 创建数据集
+
     dataset = TestDataset(
         data_path=args.data_path,
         image_folder=args.image_folder,
@@ -276,14 +274,13 @@ def test_fastvlm_ttft(args):
         max_samples=args.max_samples
     )
     
-    # 创建数据加载器
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=False
     ) if world_size > 1 else None
     
     dataloader = DataLoader(
         dataset,
-        batch_size=1,  # 每个样本单独处理
+        batch_size=1,  #一个图片一个图片处理
         sampler=sampler,
         num_workers=4,
         pin_memory=True
@@ -298,7 +295,6 @@ def test_fastvlm_ttft(args):
         print("Using dist.all_reduce(sum) to calculate average TTFT")
     
     for i, sample in enumerate(tqdm(dataloader, disable=rank != 0)):
-        # 解包batch
         sample = {k: v[0] if isinstance(v, list) else v for k, v in sample.items()}
         
         try:
