@@ -26,7 +26,7 @@ from llava.utils import disable_torch_init
 from llava.conversation import conv_templates
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.model import LlavaLlamaForCausalLM
+from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
 import transformers
 
 
@@ -143,12 +143,21 @@ def load_model(model_path, device):
 
     compute_dtype = torch.float16 # according to llava training setting
     
-    # load LLaVA model with FastViTHD (Llama backbone)
-    model = LlavaLlamaForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=compute_dtype,
-        device_map={"": device}
-    )
+    config = transformers.AutoConfig.from_pretrained(model_path)
+    if config.model_type == "llava_qwen2":
+        print(f"Loading LlavaQwen2ForCausalLM model (Qwen2 backbone)")
+        model = LlavaQwen2ForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=compute_dtype,
+            device_map={"": device}
+        )
+    else:
+        print(f"Loading LlavaLlamaForCausalLM model (Llama backbone)")
+        model = LlavaLlamaForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=compute_dtype,
+            device_map={"": device}
+        )
     
     # load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -191,6 +200,7 @@ def load_model(model_path, device):
 def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="llava_v1"):
     """measure TTFT for LLaVA-FastViTHD-0.5B Stage 2"""
     
+    # 数据预处理不计入TTFT时间
     # prompt
     qs = sample['question']
     conv = conv_templates[conv_mode].copy()
@@ -226,9 +236,9 @@ def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="l
         image_size = None
     
     torch.cuda.empty_cache()
-    
-    # measure TTFT 
     torch.cuda.synchronize()
+    
+    # TTFT测量开始 - 只测量模型推理时间
     start_time = time.time()
     
     with torch.inference_mode():
@@ -257,6 +267,13 @@ def test_fastvlm_ttft(args):
     rank, world_size, local_rank = setup_distributed()
     device = f"cuda:{local_rank}" if local_rank is not None else "cuda:0"
     
+    if rank is None:
+        rank = 0
+    if world_size is None:
+        world_size = 1
+    if local_rank is None:
+        local_rank = 0
+    
     if rank == 0:
         print("="*60)
         print("LLaVA-FastViTHD-0.5B Stage 2 TTFT test")
@@ -278,12 +295,18 @@ def test_fastvlm_ttft(args):
         dataset, num_replicas=world_size, rank=rank, shuffle=False
     ) if world_size > 1 else None
     
+
+    def custom_collate_fn(batch):
+        # 由于batch_size=1，直接返回第一个元素
+        return batch[0]
+    
     dataloader = DataLoader(
         dataset,
         batch_size=1,  #一个图片一个图片处理
         sampler=sampler,
-        num_workers=4,
-        pin_memory=True
+        num_workers=0,  # 设置为0避免多进程问题
+        pin_memory=False, 
+        collate_fn=custom_collate_fn
     )
     
     # acculate latency
@@ -295,7 +318,7 @@ def test_fastvlm_ttft(args):
         print("Using dist.all_reduce(sum) to calculate average TTFT")
     
     for i, sample in enumerate(tqdm(dataloader, disable=rank != 0)):
-        sample = {k: v[0] if isinstance(v, list) else v for k, v in sample.items()}
+        # sample已经是单个样本，不需要进一步处理
         
         try:
             ttft = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode)

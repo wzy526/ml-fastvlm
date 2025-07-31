@@ -11,9 +11,9 @@
 # - Stage: 2 (base version)
 
 # 设置参数
-MODEL_PATH="./checkpoints/llava-fastvithd_7b_stage3"  # FastVLM模型路径
-DATA_PATH="/path/to/gqa/questions.json"              # GQA问题文件路径
-IMAGE_FOLDER="/path/to/gqa/images"                   # GQA图像文件夹路径
+MODEL_PATH="./checkpoints/llava-fastvithd_0.5b_stage2"  # FastVLM模型路径
+DATA_PATH="/cluster/home/data/gqa/questions/val_balanced_questions.json"              # GQA问题文件路径
+IMAGE_FOLDER="/cluster/home/data/gqa/images"                   # GQA图像文件夹路径
 MAX_SAMPLES=1000                                     # 最大测试样本数
 OUTPUT_FILE="ttft_test_results.json"                   # 输出结果文件
 
