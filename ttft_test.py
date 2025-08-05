@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 #
-# LLaVA-FastViTHD-0.5B Stage 2 TTFT 测试脚本
-# 基于LLaVA架构的FastVLM-0.5B Stage 2模型：
+# FastVLM TTFT 测试脚本 - 支持多种视觉编码器
+# 基于LLaVA架构的多视觉编码器模型：
 # - Architecture: LLaVA (Large Language and Vision Assistant)
-# - Vision Encoder: FastViTHD
+# - Vision Encoder: 支持 FastViTHD, CLIP-ViT-L/14-336px, CLIP-ViT-L/14-336px-S2, CLIP-ViT-L/14-336px-LLaVA16 等
 # - LLM: LLaVA (Llama-based)
-# - Input Res: 1024
-# - #Visual Tokens: 256
-# - Vis. Enc. Size: 125M
-# - Model Size: 0.5B parameters
-# - Stage: 2 
+# - Input Res: 可配置 (336, 512, 768, 1024, 1536, 2048)
+# - #Visual Tokens: 可配置 (根据编码器和分辨率自动计算或手动指定)
+# - Model Size: 可配置
+# - Stage: 可配置 
 #
 import os
 import time
@@ -30,10 +29,62 @@ from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
 import transformers
 
 
-class TestDataset(Dataset):
-    """TTFT test dataset for LLaVA-FastViTHD-0.5B Stage 2"""
+def calculate_visual_tokens(resolution, vision_encoder, patch_size=None):
+    """
+    根据分辨率和视觉编码器类型计算visual token数量
     
-    def __init__(self, data_path, image_folder, tokenizer, image_processor, max_samples=None):
+    Args:
+        resolution (int): 输入分辨率
+        vision_encoder (str): 视觉编码器类型
+        patch_size (int, optional): patch大小，如果为None则使用默认值
+    
+    Returns:
+        int: visual token数量
+    """
+    if vision_encoder == "fastvithd":
+        return 256
+    elif vision_encoder == "clip":
+        if patch_size is None:
+            patch_size = 14
+        num_patches = (resolution // patch_size) ** 2
+        return num_patches
+    elif vision_encoder == "clip_s2":
+        if patch_size is None:
+            patch_size = 14
+        num_patches = (resolution // patch_size) ** 2
+        return num_patches
+    elif vision_encoder == "clip_llava16":
+        # LLaVA-1.6分块方式：每个patch经过CLIP产生visual tokens
+        # 每个336x336的patch产生 (336/14)^2 = 576个tokens
+        if resolution == 1008:
+            # 1个全局patch + 9个局部patches = 10个patches
+            # 10 × 576 = 5760 tokens
+            return 10 * 576
+        elif resolution == 672:
+            # 1个全局patch + 4个局部patches = 5个patches  
+            # 5 × 576 = 2880 tokens
+            return 5 * 576
+        elif resolution == 336:
+            # 只有1个全局patch
+            # 1 × 576 = 576 tokens
+            return 1 * 576
+        else:
+            if patch_size is None:
+                patch_size = 336
+            grid_size = resolution // patch_size
+            num_patches = 1 + (grid_size ** 2)
+            return num_patches * 576
+    else:
+        if patch_size is None:
+            patch_size = 14
+        num_patches = (resolution // patch_size) ** 2
+        return num_patches
+
+
+class TestDataset(Dataset):
+    """TTFT test dataset for LLaVA models with different vision encoders"""
+    
+    def __init__(self, data_path, image_folder, tokenizer, image_processor, max_samples=None, resolution=1024):
         """
         Args:
             data_path: GQA数据文件路径 (.json)
@@ -41,10 +92,12 @@ class TestDataset(Dataset):
             tokenizer: 分词器
             image_processor: 图像处理器
             max_samples: 最大样本数
+            resolution: 目标分辨率 (默认1024)
         """
         self.image_folder = image_folder
         self.tokenizer = tokenizer
         self.image_processor = image_processor
+        self.resolution = resolution
         
         # load GQA data
         with open(data_path, 'r') as f:
@@ -76,7 +129,7 @@ class TestDataset(Dataset):
             image = self.resize_for_fastvlm(image)
         except Exception as e:
             print(f"Error loading image {image_path}: {e}")
-            image = Image.new('RGB', (1024, 1024), color='gray')
+            image = Image.new('RGB', (self.resolution, self.resolution), color='gray')
         
         return {
             'qid': sample['qid'],
@@ -87,8 +140,8 @@ class TestDataset(Dataset):
         }
     
     def resize_for_fastvlm(self, image):
-        """resize image to FastVLM target resolution (1024x1024)"""
-        target_size = 1024
+        """resize image to target resolution for vision encoder"""
+        target_size = self.resolution
         
         w, h = image.size
         if w > h:
@@ -131,33 +184,60 @@ def setup_distributed():
     return rank, world_size, local_rank
 
 
-def load_model(model_path, device):
-    """load LLaVA-FastViTHD-0.5B Stage 2 model"""
+def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
+    """load LLaVA model with specified vision encoder"""
     disable_torch_init()
     model_name = get_model_name_from_path(model_path)
     
-    print(f"Loading LLaVA-FastViTHD-0.5B Stage 2 model: {model_name}")
-    print(f"Architecture: LLaVA with FastViTHD + Llama")
-    print(f"Expected config: FastViTHD + Llama, 1024x1024 input, 256 visual tokens")
-    print(f"Model size: 0.5B parameters, Stage 2")
+    # 先加载模型以检测backbone类型，稍后更新打印信息
+    pass
+    
+    print(f"Resolution: {resolution}x{resolution}")
+    print(f"Vision Encoder: {vision_encoder}")
 
     compute_dtype = torch.float16 # according to llava training setting
     
     config = transformers.AutoConfig.from_pretrained(model_path)
+    
+    # check llm backbone type
     if config.model_type == "llava_qwen2":
+        llm_backbone = "Qwen2"
         print(f"Loading LlavaQwen2ForCausalLM model (Qwen2 backbone)")
         model = LlavaQwen2ForCausalLM.from_pretrained(
             model_path,
             torch_dtype=compute_dtype,
-            device_map={"": device}
+            device_map="auto"  
         )
     else:
+        llm_backbone = "Llama"
         print(f"Loading LlavaLlamaForCausalLM model (Llama backbone)")
         model = LlavaLlamaForCausalLM.from_pretrained(
             model_path,
             torch_dtype=compute_dtype,
-            device_map={"": device}
+            device_map="auto" 
         )
+    
+    # 根据vision_encoder类型更新打印信息
+    if vision_encoder == "fastvithd":
+        print(f"Loading LLaVA-FastViTHD model: {model_name}")
+        print(f"Architecture: LLaVA with FastViTHD + {llm_backbone}")
+        print(f"Expected config: FastViTHD + {llm_backbone}, {resolution}x{resolution} input, 256 visual tokens")
+    elif vision_encoder == "clip":
+        print(f"Loading LLaVA-CLIP model: {model_name}")
+        print(f"Architecture: LLaVA with CLIP-ViT-L/14-336px + {llm_backbone}")
+        print(f"Expected config: CLIP-ViT-L/14-336px + {llm_backbone}, {resolution}x{resolution} input")
+    elif vision_encoder == "clip_s2":
+        print(f"Loading LLaVA-CLIP-S2 model: {model_name}")
+        print(f"Architecture: LLaVA with CLIP-ViT-L/14-336px-S2 + {llm_backbone}")
+        print(f"Expected config: CLIP-ViT-L/14-336px-S2 + {llm_backbone}, {resolution}x{resolution} input (multi-scale)")
+    elif vision_encoder == "clip_llava16":
+        print(f"Loading LLaVA-CLIP-LLaVA16 model: {model_name}")
+        print(f"Architecture: LLaVA with CLIP-ViT-L/14-336px-LLaVA16 + {llm_backbone}")
+        print(f"Expected config: CLIP-ViT-L/14-336px-LLaVA16 + {llm_backbone}, {resolution}x{resolution} input (LLaVA-1.6 patching)")
+    else:
+        print(f"Loading LLaVA model with {vision_encoder}: {model_name}")
+        print(f"Architecture: LLaVA with {vision_encoder} + {llm_backbone}")
+        print(f"Expected config: {vision_encoder} + {llm_backbone}, {resolution}x{resolution} input")
     
     # load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -173,11 +253,25 @@ def load_model(model_path, device):
         else:
             tokenizer.legacy = False
     
-    # load FastViTHD vision tower
+        # load vision tower
     if hasattr(model, 'get_vision_tower'):
         vision_tower = model.get_vision_tower()
-        image_processor = vision_tower.image_processor
-        print(f"FastViTHD vision tower loaded: {type(vision_tower).__name__}")
+        print(f"Vision tower loaded: {type(vision_tower).__name__}")
+        
+        if not vision_tower.is_loaded:
+            print("Loading vision tower...")
+            vision_tower.load_model()
+        
+        if hasattr(vision_tower, 'vision_tower') and vision_tower.vision_tower.device != device:
+            print(f"Moving vision tower from {vision_tower.vision_tower.device} to {device}")
+            vision_tower.vision_tower = vision_tower.vision_tower.to(device)
+        
+        # 获取image_processor
+        if hasattr(vision_tower, 'image_processor'):
+            image_processor = vision_tower.image_processor
+        else:
+            print("Warning: Vision tower has no image_processor attribute")
+            image_processor = None
         
         # verify vision encoder config
         if hasattr(vision_tower, 'config'):
@@ -197,8 +291,8 @@ def load_model(model_path, device):
     return tokenizer, model, image_processor
 
 
-def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="llava_v1"):
-    """measure TTFT for LLaVA-FastViTHD-0.5B Stage 2"""
+def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="llava_v1", resolution=1024, vision_encoder="fastvithd"):
+    """measure TTFT for LLaVA model with specified vision encoder"""
     
     # 数据预处理不计入TTFT时间
     # prompt
@@ -225,12 +319,15 @@ def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="l
     # process image to target resolution
     if image_processor is not None:
         image = sample['image']
-        if image.size != (1024, 1024):
-            image = image.resize((1024, 1024), Image.Resampling.LANCZOS)
-        
+        if image.size != (resolution, resolution):
+            image = image.resize((resolution, resolution), Image.Resampling.LANCZOS)
+
         image_tensor = process_images([image], image_processor, model.config)[0]
         image_tensor = image_tensor.unsqueeze(0).half().to(model.device)
         image_size = image.size
+        
+        if image_tensor.device != model.device:
+            image_tensor = image_tensor.to(model.device)
     else:
         image_tensor = None
         image_size = None
@@ -242,6 +339,11 @@ def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="l
     start_time = time.time()
     
     with torch.inference_mode():
+        if image_tensor is not None and image_tensor.device != model.device:
+            image_tensor = image_tensor.to(model.device)
+        
+
+        
         output_ids = model.generate(
             input_ids,
             images=image_tensor,
@@ -261,7 +363,7 @@ def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="l
 
 
 def test_fastvlm_ttft(args):
-    """test TTFT performance for LLaVA-FastViTHD-0.5B Stage 2"""
+    """test TTFT performance for LLaVA model with specified vision encoder"""
     
     # setup distributed
     rank, world_size, local_rank = setup_distributed()
@@ -276,19 +378,32 @@ def test_fastvlm_ttft(args):
     
     if rank == 0:
         print("="*60)
-        print("LLaVA-FastViTHD-0.5B Stage 2 TTFT test")
-        print("Config: FastViTHD + Llama, 1024x1024, 256 visual tokens")
-        print("Model: 0.5B parameters, Stage 2")
+        if args.vision_encoder == "fastvithd":
+            print(f"LLaVA-FastViTHD TTFT test - {args.resolution}x{args.resolution}")
+            print(f"Config: FastViTHD + [LLM Backbone], {args.resolution}x{args.resolution}, 256 visual tokens")
+        elif args.vision_encoder == "clip":
+            print(f"LLaVA-CLIP TTFT test - {args.resolution}x{args.resolution}")
+            print(f"Config: CLIP-ViT-L/14-336px + [LLM Backbone], {args.resolution}x{args.resolution}")
+        elif args.vision_encoder == "clip_s2":
+            print(f"LLaVA-CLIP-S2 TTFT test - {args.resolution}x{args.resolution}")
+            print(f"Config: CLIP-ViT-L/14-336px-S2 + [LLM Backbone], {args.resolution}x{args.resolution} (multi-scale)")
+        elif args.vision_encoder == "clip_llava16":
+            print(f"LLaVA-CLIP-LLaVA16 TTFT test - {args.resolution}x{args.resolution}")
+            print(f"Config: CLIP-ViT-L/14-336px-LLaVA16 + [LLM Backbone], {args.resolution}x{args.resolution} (LLaVA-1.6 patching)")
+        else:
+            print(f"LLaVA-{args.vision_encoder.upper()} TTFT test - {args.resolution}x{args.resolution}")
+            print(f"Config: {args.vision_encoder.upper()} + [LLM Backbone], {args.resolution}x{args.resolution}")
         print("="*60)
     
-    tokenizer, model, image_processor = load_model(args.model_path, device)
+    tokenizer, model, image_processor = load_model(args.model_path, device, args.resolution, args.vision_encoder)
 
     dataset = TestDataset(
         data_path=args.data_path,
         image_folder=args.image_folder,
         tokenizer=tokenizer,
         image_processor=image_processor,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        resolution=args.resolution
     )
     
     sampler = torch.utils.data.distributed.DistributedSampler(
@@ -304,24 +419,29 @@ def test_fastvlm_ttft(args):
         dataset,
         batch_size=1,  #一个图片一个图片处理
         sampler=sampler,
-        num_workers=0,  # 设置为0避免多进程问题
+        num_workers=10, 
         pin_memory=False, 
         collate_fn=custom_collate_fn
     )
     
-    # acculate latency
+    # accumulated latency
     accumulated_latency = 0.0
     running_samples = 0
     
     if rank == 0:
-        print(f"Start LLaVA-FastViTHD-0.5B Stage 2 TTFT test, total {len(dataset)} samples")
+        if args.vision_encoder == "fastvithd":
+            print(f"Start LLaVA-FastViTHD TTFT test, total {len(dataset)} samples")
+        elif args.vision_encoder == "clip":
+            print(f"Start LLaVA-CLIP TTFT test, total {len(dataset)} samples")
+        else:
+            print(f"Start LLaVA-{args.vision_encoder.upper()} TTFT test, total {len(dataset)} samples")
         print("Using dist.all_reduce(sum) to calculate average TTFT")
     
     for i, sample in enumerate(tqdm(dataloader, disable=rank != 0)):
         # sample已经是单个样本，不需要进一步处理
         
         try:
-            ttft = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode)
+            ttft = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode, args.resolution, args.vision_encoder)
             accumulated_latency += ttft
             running_samples += 1
             
@@ -349,7 +469,16 @@ def test_fastvlm_ttft(args):
     
     if rank == 0:
         print("\n" + "="*60)
-        print("LLaVA-FastViTHD-0.5B Stage 2 TTFT test results")
+        if args.vision_encoder == "fastvithd":
+            print(f"LLaVA-FastViTHD TTFT test results - {args.resolution}x{args.resolution}")
+        elif args.vision_encoder == "clip":
+            print(f"LLaVA-CLIP TTFT test results - {args.resolution}x{args.resolution}")
+        elif args.vision_encoder == "clip_s2":
+            print(f"LLaVA-CLIP-S2 TTFT test results - {args.resolution}x{args.resolution}")
+        elif args.vision_encoder == "clip_llava16":
+            print(f"LLaVA-CLIP-LLaVA16 TTFT test results - {args.resolution}x{args.resolution}")
+        else:
+            print(f"LLaVA-{args.vision_encoder.upper()} TTFT test results - {args.resolution}x{args.resolution}")
         print("="*60)
         print(f"Global samples: {global_running_samples}")
         print(f"Global accumulated latency: {global_accumulated_latency:.2f}ms")
@@ -362,12 +491,35 @@ def test_fastvlm_ttft(args):
         print(f"- Global average = total accumulated latency / total samples")
 
         if args.output_file:
+            if args.visual_tokens is not None:
+                # 如果用户指定了visual token数量，直接使用
+                visual_tokens = args.visual_tokens
+            else:
+                # 否则根据分辨率和vision encoder自动计算
+                visual_tokens = calculate_visual_tokens(args.resolution, args.vision_encoder, args.patch_size)
+            
+            # 设置模型配置名称
+            if args.vision_encoder == "fastvithd":
+                model_config = 'LLaVA_FastViTHD_0.5B_Stage2'
+            elif args.vision_encoder == "clip":
+                model_config = 'LLaVA_CLIP_ViT_L_14_336px'
+            elif args.vision_encoder == "clip_s2":
+                model_config = 'LLaVA_CLIP_ViT_L_14_336px_S2'
+            elif args.vision_encoder == "clip_llava16":
+                model_config = 'LLaVA_CLIP_ViT_L_14_336px_LLaVA16'
+            else:
+                model_config = f'LLaVA_{args.vision_encoder.upper()}'
+            
+            # 用来保存
+            config = transformers.AutoConfig.from_pretrained(args.model_path)
+            llm_backbone = "Qwen2" if config.model_type == "llava_qwen2" else "Llama"
+            
             results = {
-                'model_config': 'LLaVA_FastViTHD_0.5B_Stage2',
-                'vision_encoder': 'FastViTHD',
-                'llm': 'Llama',
-                'input_resolution': '1024x1024',
-                'visual_tokens': 256,
+                'model_config': model_config,
+                'vision_encoder': args.vision_encoder,
+                'llm': llm_backbone,
+                'input_resolution': f'{args.resolution}x{args.resolution}',
+                'visual_tokens': visual_tokens,
                 'model_size': '0.5B',
                 'stage': 2,
                 'model_path': args.model_path,
@@ -393,8 +545,25 @@ if __name__ == "__main__":
     parser.add_argument("--image-folder", type=str, required=True, help="GQA image folder path")
     parser.add_argument("--conv-mode", type=str, default="llava_v1", help="Conversation mode")
     parser.add_argument("--max-samples", type=int, default=None, help="Max test samples")
-    parser.add_argument("--output-file", type=str, default="llava_fastvithd_0. 5b_stage2_ttft_results.json", help="Output results file")
+    parser.add_argument("--resolution", type=int, default=1024, choices=[224, 256, 336, 384, 448, 512, 672, 768, 1008, 1024, 1152, 1344, 1536], 
+                       help="Input resolution (224, 256, 336, 384, 448, 512, 672, 768, 1008, 1024, 1152, 1344, or 1536)")
+    parser.add_argument("--output-file", type=str, default=None, help="Output results file")
+    parser.add_argument("--vision-encoder", type=str, default="fastvithd", choices=["fastvithd", "clip", "clip_s2", "clip_llava16"],
+                       help="Vision encoder to use (fastvithd, clip, clip_s2, or clip_llava16)")
+    parser.add_argument("--visual-tokens", type=int, default=None, 
+                       help="Number of visual tokens (if None, will be calculated automatically based on resolution and vision encoder)")
+    parser.add_argument("--patch-size", type=int, default=None,
+                       help="Patch size for visual token calculation (if None, will use default values for each encoder)")
     
     args = parser.parse_args()
+    
+    if args.output_file is None:
+        if args.visual_tokens is not None:
+            visual_tokens_str = f"vt{args.visual_tokens}"
+        else:
+            visual_tokens = calculate_visual_tokens(args.resolution, args.vision_encoder, args.patch_size)
+            visual_tokens_str = f"vt{visual_tokens}"
+        
+        args.output_file = f"ttft_test_results_{args.vision_encoder}_{args.resolution}x{args.resolution}_{visual_tokens_str}.json"
     
     test_fastvlm_ttft(args) 
