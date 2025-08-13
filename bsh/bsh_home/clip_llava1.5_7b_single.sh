@@ -5,35 +5,12 @@
 # LLM: LLaVA-1.5-7B
 # 使用单卡测试
 
-# 指定GPU设备（可选）
-# 如果您想指定特定的GPU设备，请取消注释并修改下面的行
-# 例如：指定使用GPU 0
-# export CUDA_VISIBLE_DEVICES=0
-# 或者指定使用GPU 1
-# export CUDA_VISIBLE_DEVICES=1
-# 或者指定使用GPU 2
-# export CUDA_VISIBLE_DEVICES=2
-
-# 如果您想动态指定GPU，可以在运行脚本时设置环境变量：
-# CUDA_VISIBLE_DEVICES= bash clip_llava1.5_7b_single.sh
-
 echo "=========================================="
 echo "LLaVA-1.5-7B + CLIP 单卡TTFT 测试"
 echo "Vision Encoder: CLIP-ViT-L/14-336px"
 echo "LLM: LLaVA-1.5-7B"
 echo "单卡测试"
 echo "=========================================="
-
-# 显示GPU设备信息
-echo "GPU设备信息："
-if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
-    echo "指定使用的GPU: $CUDA_VISIBLE_DEVICES"
-else
-    echo "使用默认GPU设备"
-fi
-echo "当前可用的GPU数量: $(nvidia-smi --list-gpus | wc -l)"
-echo "当前节点: $(hostname)"
-echo ""
 
 # 模型路径 - LLaVA-1.5-7B模型
 MODEL_PATH="./checkpoints/llava-1.5-7b"
