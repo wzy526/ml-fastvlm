@@ -262,7 +262,7 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
             print("Loading vision tower...")
             vision_tower.load_model()
         
-        if hasattr(vision_tower, 'vision_tower') and vision_tower.vision_tower.device != device:
+        if hasattr(vision_tower, 'vision_tower') and hasattr(vision_tower.vision_tower, 'device') and vision_tower.vision_tower.device != device:
             print(f"Moving vision tower from {vision_tower.vision_tower.device} to {device}")
             vision_tower.vision_tower = vision_tower.vision_tower.to(device)
         
@@ -428,6 +428,9 @@ def test_fastvlm_ttft(args):
     accumulated_latency = 0.0
     running_samples = 0
     
+    # warm up samples
+    warmup_samples = 100
+    
     if rank == 0:
         if args.vision_encoder == "fastvithd":
             print(f"Start LLaVA-FastViTHD TTFT test, total {len(dataset)} samples")
@@ -436,23 +439,41 @@ def test_fastvlm_ttft(args):
         else:
             print(f"Start LLaVA-{args.vision_encoder.upper()} TTFT test, total {len(dataset)} samples")
         print("Using dist.all_reduce(sum) to calculate average TTFT")
+        print(f"Warmup phase: first {warmup_samples} samples will not be counted in TTFT measurement")
     
+    if rank == 0:
+        print(f"Starting warmup with {warmup_samples} samples...")
+    
+    warmup_count = 0
     for i, sample in enumerate(tqdm(dataloader, disable=rank != 0)):
-        # sample已经是单个样本，不需要进一步处理
-        
         try:
-            ttft = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode, args.resolution, args.vision_encoder)
-            accumulated_latency += ttft
-            running_samples += 1
-            
-            if rank == 0 and i % 50 == 0:
-                current_avg = accumulated_latency / running_samples
-                print(f"Sample {i}: current average TTFT = {current_avg:.2f}ms")
+            if i < warmup_samples:
+                # warm up phase - not count time
+                _ = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode, args.resolution, args.vision_encoder)
+                warmup_count += 1
+                if rank == 0 and i % 20 == 0:
+                    print(f"Warmup sample {i+1}/{warmup_samples}")
+            else:
+                # test phase - count time
+                ttft = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode, args.resolution, args.vision_encoder)
+                accumulated_latency += ttft
+                running_samples += 1
+                
+                if rank == 0 and (i - warmup_samples) % 50 == 0:
+                    current_avg = accumulated_latency / running_samples
+                    print(f"Test sample {i - warmup_samples}: current average TTFT = {current_avg:.2f}ms")
                 
         except Exception as e:
             if rank == 0:
-                print(f"Error processing sample {i}: {e}")
+                if i < warmup_samples:
+                    print(f"Error processing warmup sample {i}: {e}")
+                else:
+                    print(f"Error processing test sample {i - warmup_samples}: {e}")
             continue
+    
+    if rank == 0:
+        print(f"Warmup completed: {warmup_count} samples")
+        print(f"Actual TTFT measurement: {running_samples} samples")
     
     # use all_reduce to calculate global accumulated latency and samples
     accumulated_latency_tensor = torch.tensor(accumulated_latency, device=device)
@@ -480,11 +501,13 @@ def test_fastvlm_ttft(args):
         else:
             print(f"LLaVA-{args.vision_encoder.upper()} TTFT test results - {args.resolution}x{args.resolution}")
         print("="*60)
+        print(f"Warmup samples: {warmup_samples}")
         print(f"Global samples: {global_running_samples}")
         print(f"Global accumulated latency: {global_accumulated_latency:.2f}ms")
         print(f"Global average TTFT: {avg_ttft:.2f}ms")
         
         print(f"\nCalculation method:")
+        print(f"- Warmup samples: {warmup_samples} (not counted)")
         print(f"- Per card accumulated latency: {accumulated_latency:.2f}ms")
         print(f"- Per card samples: {running_samples}")
         print(f"- Using dist.all_reduce(sum) to sum")
@@ -524,6 +547,7 @@ def test_fastvlm_ttft(args):
                 'stage': 2,
                 'model_path': args.model_path,
                 'data_path': args.data_path,
+                'warmup_samples': warmup_samples,
                 'total_samples': global_running_samples,
                 'accumulated_latency_ms': global_accumulated_latency,
                 'avg_ttft_ms': avg_ttft,
