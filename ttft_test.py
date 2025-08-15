@@ -234,6 +234,12 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
         print(f"Loading LLaVA-CLIP-LLaVA16 model: {model_name}")
         print(f"Architecture: LLaVA with CLIP-ViT-L/14-336px-LLaVA16 + {llm_backbone}")
         print(f"Expected config: CLIP-ViT-L/14-336px-LLaVA16 + {llm_backbone}, {resolution}x{resolution} input (LLaVA-1.6 patching)")
+        
+        # llava16 anyres config修改
+        model.config.image_aspect_ratio = 'fixed_hr'
+        model.config.image_grid_pinpoints = None    
+        print(f"Updated config - image_aspect_ratio: {model.config.image_aspect_ratio}")
+        print(f"Updated config - image_grid_pinpoints: {model.config.image_grid_pinpoints}")
     else:
         print(f"Loading LLaVA model with {vision_encoder}: {model_name}")
         print(f"Architecture: LLaVA with {vision_encoder} + {llm_backbone}")
@@ -269,6 +275,12 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
         # 获取image_processor
         if hasattr(vision_tower, 'image_processor'):
             image_processor = vision_tower.image_processor
+            # 添加调试信息显示实际使用的分辨率
+            if vision_encoder == "fastvithd":
+                print(f"FastViTHD actual image size: {image_processor.size}")
+                print(f"FastViTHD actual crop size: {image_processor.crop_size}")
+                if hasattr(vision_tower, 'config'):
+                    print(f"FastViTHD config image_size: {vision_tower.config.get('image_cfg', {}).get('image_size', 'N/A')}")
         else:
             print("Warning: Vision tower has no image_processor attribute")
             image_processor = None
@@ -321,9 +333,8 @@ def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="l
         image = sample['image']
         if image.size != (resolution, resolution):
             image = image.resize((resolution, resolution), Image.Resampling.LANCZOS)
-
-        image_tensor = process_images([image], image_processor, model.config)[0]
-        image_tensor = image_tensor.unsqueeze(0).half().to(model.device)
+        image_tensor = process_images([image], image_processor, model.config)
+        image_tensor = image_tensor[None, ...].half().to(model.device)
         image_size = image.size
         
         if image_tensor.device != model.device:
@@ -341,10 +352,7 @@ def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="l
     with torch.inference_mode():
         if image_tensor is not None and image_tensor.device != model.device:
             image_tensor = image_tensor.to(model.device)
-        
-
-        
-        output_ids = model.generate(
+        model.generate(
             input_ids,
             images=image_tensor,
             image_sizes=[image_size] if image_size else None,
