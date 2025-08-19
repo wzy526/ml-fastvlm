@@ -10,9 +10,9 @@
   "data_path": "/root/gqa_opendatalab/testdev_balanced_questions.json",
   "warmup_samples": 100,
   "total_samples": 12478,
-  "accumulated_latency_ms": 1701019.125,
-  "avg_ttft_ms": 136.32145576214137,
+  "accumulated_latency_ms": 11448280.0,
+  "avg_ttft_ms": 917.4771598012502,
   "calculation_method": "dist.all_reduce(sum)",
   "world_size": 1,
-  "timestamp": "2025-08-14 19:34:42"
+  "timestamp": "2025-08-16 06:55:21"
 }
