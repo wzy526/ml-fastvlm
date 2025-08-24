@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# FastVLM FLOPs 计算脚本 - 支持多种视觉编码器
+# FastVLM FLOPs 计算脚本 - 使用fvcore
 # 基于LLaVA架构的多视觉编码器模型：
 # - Architecture: LLaVA (Large Language and Vision Assistant)
 # - Vision Encoder: 支持 FastViTHD, CLIP-ViT-L/14-336px, CLIP-ViT-L/14-336px-S2, CLIP-ViT-L/14-336px-LLaVA16 等
@@ -13,12 +13,20 @@
 import os
 import argparse
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 from PIL import Image
 import numpy as np
 import json
 import time
 from typing import Dict, Any, Optional
+
+try:
+    from fvcore.nn import FlopCountAnalysis, flop_count
+    FVCORE_AVAILABLE = True
+    print("✓ fvcore 已安装")
+except ImportError:
+    FVCORE_AVAILABLE = False
+    print("✗ fvcore 未安装，请安装: pip install fvcore")
 
 from llava.utils import disable_torch_init
 from llava.conversation import conv_templates
@@ -80,8 +88,8 @@ def calculate_visual_tokens(resolution, vision_encoder, patch_size=None):
         return num_patches
 
 
-class FLOPsCalculator:
-    """VLM模型FLOPs计算器"""
+class FVCoreFLOPsCalculator:
+    """使用fvcore计算VLM模型FLOPs"""
     
     def __init__(self, model, tokenizer, image_processor, vision_encoder="fastvithd"):
         self.model = model
@@ -89,142 +97,164 @@ class FLOPsCalculator:
         self.image_processor = image_processor
         self.vision_encoder = vision_encoder
         
-        # 注册FLOPs计算hooks
-        self.encoder_flops = 0
-        self.connector_flops = 0
-        self.tokenizer_flops = 0
-        self.llm_flops = 0
-        
-        self._register_hooks()
-    
-    def _register_hooks(self):
-        """注册FLOPs计算hooks"""
-        # 这里需要根据具体的模型架构来注册hooks
-        # 由于不同模型的内部结构可能不同，这里提供一个框架
-        pass
+        if not FVCORE_AVAILABLE:
+            raise ImportError("fvcore未安装，请安装: pip install fvcore")
     
     def calculate_encoder_flops(self, image_tensor):
-        """计算视觉编码器FLOPs"""
-        # 根据不同的视觉编码器计算FLOPs
-        if self.vision_encoder == "fastvithd":
-            # FastViTHD的FLOPs计算
-            # 假设输入为 [1, 3, H, W]
-            H, W = image_tensor.shape[2], image_tensor.shape[3]
+        """使用fvcore计算视觉编码器FLOPs"""
+        try:
+            vision_tower = self.model.get_vision_tower()
             
-            # FastViTHD的FLOPs估算
-            # 基于论文中的参数和架构
-            embed_dim = 3072  # FastViTHD的embedding维度
-            num_layers = 12   # 假设的层数
-            num_heads = 12    # 假设的注意力头数
+            print(f"计算视觉编码器FLOPs...")
+            print(f"输入张量形状: {image_tensor.shape}")
             
-            # 每个patch的FLOPs
-            patch_size = 64
-            num_patches = (H // patch_size) * (W // patch_size)
+            device = next(vision_tower.parameters()).device
+            dtype = next(vision_tower.parameters()).dtype
+            image_tensor = image_tensor.to(device=device, dtype=dtype)
             
-            # 自注意力的FLOPs: 4 * embed_dim * embed_dim * num_patches
-            attention_flops = 4 * embed_dim * embed_dim * num_patches
+            # 使用FlopCountAnalysis
+            flops_analyzer = FlopCountAnalysis(vision_tower, (image_tensor,))
+            flops = flops_analyzer.total()
             
-            # FFN的FLOPs: 8 * embed_dim * embed_dim * num_patches
-            ffn_flops = 8 * embed_dim * embed_dim * num_patches
+            print(f"视觉编码器FLOPs: {flops:,.0f}")
             
-            # 总FLOPs
-            total_flops = num_layers * (attention_flops + ffn_flops)
-            
-            return total_flops
-            
-        elif self.vision_encoder == "clip":
-            # CLIP的FLOPs计算
-            H, W = image_tensor.shape[2], image_tensor.shape[3]
-            
-            # CLIP ViT-L/14的参数
-            embed_dim = 1024
-            num_layers = 24
-            num_heads = 16
-            patch_size = 14
-            
-            num_patches = (H // patch_size) * (W // patch_size)
-            
-            # 自注意力的FLOPs
-            attention_flops = 4 * embed_dim * embed_dim * num_patches
-            
-            # FFN的FLOPs
-            ffn_flops = 8 * embed_dim * embed_dim * num_patches
-            
-            # 总FLOPs
-            total_flops = num_layers * (attention_flops + ffn_flops)
-            
-            return total_flops
-            
-        else:
-            # 默认估算
-            H, W = image_tensor.shape[2], image_tensor.shape[3]
-            return H * W * 3 * 1000  # 简单估算
+            return flops
+        except Exception as e:
+            print(f"视觉编码器FLOPs计算失败: {e}")
+            return 0
     
     def calculate_connector_flops(self, visual_features):
-        """计算连接器(投影层)FLOPs"""
-        # 多模态投影层的FLOPs
-        if hasattr(self.model, 'get_model') and hasattr(self.model.get_model(), 'mm_projector'):
-            projector = self.model.get_model().mm_projector
-            
-            # 获取投影层的参数
-            if hasattr(projector, 'weight'):
-                in_features = projector.weight.shape[1]
-                out_features = projector.weight.shape[0]
+        """使用fvcore计算连接器(投影层)FLOPs"""
+        try:
+            if hasattr(self.model, 'get_model') and hasattr(self.model.get_model(), 'mm_projector'):
+                projector = self.model.get_model().mm_projector
                 
-                # 线性层的FLOPs: input_features * output_features
-                flops = in_features * out_features * visual_features.shape[1]
+                print(f"计算连接器FLOPs...")
+                print(f"输入特征形状: {visual_features.shape}")
+
+                device = next(projector.parameters()).device
+                dtype = next(projector.parameters()).dtype
+                visual_features = visual_features.to(device=device, dtype=dtype)
+                
+                # 使用FlopCountAnalysis
+                flops_analyzer = FlopCountAnalysis(projector, (visual_features,))
+                flops = flops_analyzer.total()
+                
+                print(f"连接器FLOPs: {flops:,.0f}")
+                
                 return flops
-        
-        # 默认估算
-        return visual_features.shape[0] * visual_features.shape[1] * 1000
-    
-    def calculate_tokenizer_flops(self, text_input):
-        """计算分词器FLOPs"""
-        # 分词器的FLOPs相对较小，主要是字符串处理
-        # 这里提供一个简单的估算
-        return len(text_input) * 100  # 简单估算
+        except Exception as e:
+            print(f"连接器FLOPs计算失败: {e}")
+            return 0
     
     def calculate_llm_flops(self, input_ids, visual_tokens_count):
-        """计算LLM的FLOPs"""
-        # 获取模型配置
-        config = self.model.config
-        
-        # 获取模型参数
-        hidden_size = getattr(config, 'hidden_size', 4096)
-        num_layers = getattr(config, 'num_hidden_layers', 32)
-        num_attention_heads = getattr(config, 'num_attention_heads', 32)
-        intermediate_size = getattr(config, 'intermediate_size', 11008)
-        
-        # 计算序列长度
-        seq_len = input_ids.shape[1] + visual_tokens_count
-        
-        # 自注意力的FLOPs: 4 * hidden_size * hidden_size * seq_len
-        attention_flops = 4 * hidden_size * hidden_size * seq_len
-        
-        # FFN的FLOPs: 2 * hidden_size * intermediate_size * seq_len
-        ffn_flops = 2 * hidden_size * intermediate_size * seq_len
-        
-        # 总FLOPs
-        total_flops = num_layers * (attention_flops + ffn_flops)
-        
-        return total_flops
+        """使用自定义fvcore计算LLM的FLOPs"""
+        try:
+            # 创建完整的输入序列
+            seq_len = input_ids.shape[1] + visual_tokens_count
+            
+            print(f"计算LLM FLOPs...")
+            print(f"输入序列长度: {input_ids.shape[1]}")
+            print(f"Visual tokens数量: {visual_tokens_count}")
+            print(f"总序列长度: {seq_len}")
+            
+            # 确保输入张量在正确的设备和数据类型上
+            device = next(self.model.parameters()).device
+            dtype = next(self.model.parameters()).dtype
+            
+            # 创建正确的输入格式 - 使用input_ids而不是visual tokens
+            # 创建包含visual tokens和文本tokens的完整序列
+            total_seq_len = visual_tokens_count + input_ids.shape[1]
+            dummy_input_ids = torch.randint(0, 1000, (1, total_seq_len), device=device, dtype=torch.long)
+            
+            # 直接使用手动计算方法，因为fvcore对LLM的支持有限
+            config = self.model.config
+            hidden_size = getattr(config, 'hidden_size', 3584)  # Qwen2-7B的hidden_size
+            num_layers = getattr(config, 'num_hidden_layers', 28)  # Qwen2-7B的层数
+            intermediate_size = getattr(config, 'intermediate_size', 18944)  # Qwen2-7B的intermediate_size
+            num_attention_heads = getattr(config, 'num_attention_heads', 28)  # 注意力头数量
+            num_key_value_heads = getattr(config, 'num_key_value_heads', 4)  # KV头数量 (GQA)
+            
+            # head dim
+            head_dim = hidden_size // num_attention_heads  # 128
+            kv_head_dim = (hidden_size // num_attention_heads) * num_key_value_heads  # 512
+            
+            # GQA self attention flops calculation
+            # q_proj: hidden_size × hidden_size × seq_len
+            q_flops = hidden_size * hidden_size * total_seq_len
+            # k_proj: hidden_size × kv_head_dim × seq_len (GQA)
+            k_flops = hidden_size * kv_head_dim * total_seq_len
+            # v_proj: hidden_size × kv_head_dim × seq_len (GQA)
+            v_flops = hidden_size * kv_head_dim * total_seq_len
+            # attention: seq_len × seq_len × kv_head_dim
+            attn_flops = total_seq_len * total_seq_len * kv_head_dim
+            # o_proj: hidden_size × hidden_size × seq_len
+            o_flops = hidden_size * hidden_size * total_seq_len
+            
+            # 总注意力FLOPs
+            attention_flops = q_flops + k_flops + v_flops + attn_flops + o_flops
+            
+            # SwiGLU FFN
+            #gate_proj: hidden_size × intermediate_size × seq_len
+            gate_flops = hidden_size * intermediate_size * total_seq_len
+            #up_proj: hidden_size × intermediate_size × seq_len
+            up_flops = hidden_size * intermediate_size * total_seq_len
+            #down_proj: intermediate_size × hidden_size × seq_len
+            down_flops = intermediate_size * hidden_size * total_seq_len
+            # total ffn flops
+            ffn_flops = gate_flops + up_flops + down_flops
+            
+            # embedding flops: vocab_size × hidden_size × seq_len
+            vocab_size = getattr(config, 'vocab_size', 152064)
+            embedding_flops = vocab_size * hidden_size * total_seq_len
+            
+            # lm head flops: hidden_size × vocab_size × seq_len
+            lm_head_flops = hidden_size * vocab_size * total_seq_len
+            
+            # each layer flops
+            layer_flops = attention_flops + ffn_flops
+            
+            # total flops (all layers + embedding + lm_head)
+            flops = num_layers * layer_flops + embedding_flops + lm_head_flops
+            print(f"Using manual calculation method")
+            
+            print(f"LLM FLOPs: {flops:,.0f}")
+            
+            return flops
+        except Exception as e:
+            print(f"LLM FLOPs calculation failed: {e}")
+            return 0
     
-    def calculate_total_flops(self, image_tensor, text_input, visual_tokens_count):
+    def calculate_total_flops(self, image_tensor, text_input, visual_tokens_count, text_tokens_count, tokenizer):
         """计算总FLOPs"""
-        # 计算各部分FLOPs
-        self.encoder_flops = self.calculate_encoder_flops(image_tensor)
-        self.connector_flops = self.calculate_connector_flops(torch.randn(1, visual_tokens_count, 4096))  # 假设的visual features
-        self.tokenizer_flops = self.calculate_tokenizer_flops(text_input)
-        self.llm_flops = self.calculate_llm_flops(torch.randint(0, 1000, (1, 10)), visual_tokens_count)  # 假设的input_ids
+        print("="*60)
+        print("使用fvcore计算FLOPs")
+        print("="*60)
         
-        # 总FLOPs
-        total_flops = self.encoder_flops + self.connector_flops + self.tokenizer_flops + self.llm_flops
+        # 计算各部分FLOPs
+        encoder_flops = self.calculate_encoder_flops(image_tensor)
+        
+        print("获取真实视觉特征...")
+        with torch.no_grad():
+            vision_tower = self.model.get_vision_tower()
+            device = next(vision_tower.parameters()).device
+            dtype = next(vision_tower.parameters()).dtype
+            image_tensor_device = image_tensor.to(device=device, dtype=dtype)
+            visual_features = vision_tower(image_tensor_device)
+        
+        connector_flops = self.calculate_connector_flops(visual_features)
+        
+
+        input_ids = tokenizer(text_input, return_tensors='pt')['input_ids']
+        llm_flops = self.calculate_llm_flops(input_ids, visual_tokens_count)
+        
+        # 总FLOPs (不包含tokenizer)
+        total_flops = encoder_flops + connector_flops + llm_flops
         
         return {
-            'encoder_flops': self.encoder_flops,
-            'connector_flops': self.connector_flops,
-            'tokenizer_flops': self.tokenizer_flops,
-            'llm_flops': self.llm_flops,
+            'encoder_flops': encoder_flops,
+            'connector_flops': connector_flops,
+            'llm_flops': llm_flops,
             'total_flops': total_flops
         }
 
@@ -260,58 +290,99 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd"):
             torch_dtype=torch.float16,
             device_map="auto",
         )
-    
-    # 加载图像处理器
+
     image_processor = model.get_vision_tower().image_processor
     
     return model, tokenizer, image_processor
 
 
-def create_test_image(resolution=1024):
-    """创建测试图像"""
-    # 创建一个随机图像用于测试
-    image = Image.fromarray(np.random.randint(0, 255, (resolution, resolution, 3), dtype=np.uint8))
-    return image
+def load_gqa_sample(data_path, image_folder, resolution=1024):
+    """加载GQA数据集中的一个样本"""
+    import json
+
+    with open(data_path, 'r') as f:
+        data = json.load(f)
+
+    sample_id = list(data.keys())[0]
+    sample = data[sample_id]
+    
+    # load image
+    image_path = os.path.join(image_folder, f"{sample['imageId']}.jpg")
+    try:
+        image = Image.open(image_path).convert('RGB')
+        
+        # resize
+        w, h = image.size
+        if w > h:
+            new_w = resolution
+            new_h = int(h * resolution / w)
+        else:
+            new_h = resolution
+            new_w = int(w * resolution / h)
+        
+        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        # 如果图像不是正方形，进行填充
+        if new_w != resolution or new_h != resolution:
+            background = Image.new('RGB', (resolution, resolution), (255, 255, 255))
+            x = (resolution - new_w) // 2
+            y = (resolution - new_h) // 2
+            background.paste(image, (x, y))
+            image = background
+        
+        return image, sample['question']
+    except Exception as e:
+        print(f"加载GQA样本失败: {e}")
+        
+        image = Image.fromarray(np.random.randint(0, 255, (resolution, resolution, 3), dtype=np.uint8))
+        return image, "Describe this image in detail."
 
 
-def test_vlm_flops(args):
-    """测试VLM模型FLOPs"""
+def test_vlm_flops_fvcore(args):
+    """使用fvcore测试VLM模型FLOPs"""
     print("="*60)
-    print("FastVLM FLOPs 计算测试")
+    print("FastVLM FLOPs 计算测试 (使用fvcore)")
     print("="*60)
     
-    # 加载模型和分词器
+    if not FVCORE_AVAILABLE:
+        print("错误: fvcore未安装，请安装: pip install fvcore")
+        return
+    
+    # tokenizer
     print(f"加载模型: {args.model_path}")
     model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, args.vision_encoder)
     
-    # 创建FLOPs计算器
-    flops_calculator = FLOPsCalculator(model, tokenizer, image_processor, args.vision_encoder)
+    flops_calculator = FVCoreFLOPsCalculator(model, tokenizer, image_processor, args.vision_encoder)
     
-    # 创建测试图像
-    print(f"创建测试图像: {args.resolution}x{args.resolution}")
-    test_image = create_test_image(args.resolution)
+    # load gqa
+    data_path = "/root/gqa_opendatalab/testdev_balanced_questions.json"
+    image_folder = "/root/gqa_opendatalab/images"
     
-    # 处理图像
+    print(f"加载GQA数据样本...")
+    test_image, test_text = load_gqa_sample(data_path, image_folder, args.resolution)
+
     image_tensor = image_processor(test_image, return_tensors='pt')['pixel_values']
-    
-    # 计算visual tokens
+
     if args.visual_tokens is not None:
         visual_tokens_count = args.visual_tokens
     else:
         visual_tokens_count = calculate_visual_tokens(args.resolution, args.vision_encoder, args.patch_size)
     
-    # 创建测试文本
-    test_text = "Describe this image in detail."
+    # text tokens
+    text_tokens = tokenizer(test_text, return_tensors='pt')['input_ids']
+    text_tokens_count = text_tokens.shape[1]
+    print(f"实际文本token数量: {text_tokens_count}")
+    print(f"文本内容: {test_text}")
     
-    # 计算FLOPs
-    print("计算FLOPs...")
-    flops_results = flops_calculator.calculate_total_flops(image_tensor, test_text, visual_tokens_count)
+    # flops
+    print("开始计算FLOPs...")
+    flops_results = flops_calculator.calculate_total_flops(image_tensor, test_text, visual_tokens_count, text_tokens_count, tokenizer)
     
-    # 获取模型配置信息
+    # model config
     config = transformers.AutoConfig.from_pretrained(args.model_path)
     llm_backbone = "Qwen2" if config.model_type == "llava_qwen2" else "Llama"
     
-    # 设置模型配置名称
+    # 这我让gpt先给我补上了 不知道对不对
     if args.vision_encoder == "fastvithd":
         model_config = 'LLaVA_FastViTHD_7B_Stage2'
     elif args.vision_encoder == "clip":
@@ -322,10 +393,9 @@ def test_vlm_flops(args):
         model_config = 'LLaVA_CLIP_ViT_L_14_336px_LLaVA16'
     else:
         model_config = f'LLaVA_{args.vision_encoder.upper()}'
-    
-    # 打印结果
+
     print("\n" + "="*60)
-    print("FLOPs 计算结果")
+    print("FLOPs 计算结果 (fvcore)")
     print("="*60)
     print(f"模型配置: {model_config}")
     print(f"视觉编码器: {args.vision_encoder}")
@@ -336,14 +406,24 @@ def test_vlm_flops(args):
     print("-"*60)
     print(f"编码器FLOPs: {flops_results['encoder_flops']:,.0f}")
     print(f"连接器FLOPs: {flops_results['connector_flops']:,.0f}")
-    print(f"分词器FLOPs: {flops_results['tokenizer_flops']:,.0f}")
     print(f"LLM FLOPs: {flops_results['llm_flops']:,.0f}")
     print("-"*60)
     print(f"总FLOPs: {flops_results['total_flops']:,.0f}")
     print(f"总FLOPs (G): {flops_results['total_flops'] / 1e9:.2f}G")
+    print(f"总FLOPs (T): {flops_results['total_flops'] / 1e12:.3f}T")
     print("="*60)
     
-    # 保存结果
+    total = flops_results['total_flops']
+    if total > 0:
+        encoder_ratio = flops_results['encoder_flops'] / total * 100
+        connector_ratio = flops_results['connector_flops'] / total * 100
+        llm_ratio = flops_results['llm_flops'] / total * 100
+        
+        print(f"\n各部分FLOPs占比:")
+        print(f"编码器: {encoder_ratio:.1f}%")
+        print(f"连接器: {connector_ratio:.1f}%")
+        print(f"LLM: {llm_ratio:.1f}%")
+    
     if args.output_file:
         results = {
             'model_config': model_config,
@@ -354,10 +434,14 @@ def test_vlm_flops(args):
             'model_path': args.model_path,
             'encoder_flops': flops_results['encoder_flops'],
             'connector_flops': flops_results['connector_flops'],
-            'tokenizer_flops': flops_results['tokenizer_flops'],
             'llm_flops': flops_results['llm_flops'],
             'total_flops': flops_results['total_flops'],
             'total_flops_g': flops_results['total_flops'] / 1e9,
+            'total_flops_t': flops_results['total_flops'] / 1e12,
+            'encoder_ratio': encoder_ratio if total > 0 else 0,
+            'connector_ratio': connector_ratio if total > 0 else 0,
+            'llm_ratio': llm_ratio if total > 0 else 0,
+            'flops_library': 'fvcore',
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
         
@@ -368,7 +452,7 @@ def test_vlm_flops(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VLM模型FLOPs计算")
+    parser = argparse.ArgumentParser(description="VLM模型FLOPs计算 (使用fvcore)")
     parser.add_argument("--model-path", type=str, required=True, help="VLM模型路径")
     parser.add_argument("--resolution", type=int, default=1024, 
                        choices=[224, 256, 336, 384, 448, 512, 672, 768, 1008, 1024, 1152, 1344, 1536], 
@@ -391,6 +475,6 @@ if __name__ == "__main__":
             visual_tokens = calculate_visual_tokens(args.resolution, args.vision_encoder, args.patch_size)
             visual_tokens_str = f"vt{visual_tokens}"
         
-        args.output_file = f"flops_test_results_{args.vision_encoder}_{args.resolution}x{args.resolution}_{visual_tokens_str}.json"
+        args.output_file = f"flops_fvcore_results_{args.vision_encoder}_{args.resolution}x{args.resolution}_{visual_tokens_str}.json"
     
-    test_vlm_flops(args)
+    test_vlm_flops_fvcore(args)
