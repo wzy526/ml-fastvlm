@@ -188,8 +188,8 @@ class FVCoreFLOPsCalculator:
             v_flops = hidden_size * kv_head_dim * total_seq_len
             # attention: seq_len × seq_len × head_dim (per head) - QK + AV
             attn_flops = total_seq_len * total_seq_len * head_dim * num_attention_heads * 2
-            # o_proj: kv_head_dim × hidden_size × seq_len
-            o_flops = kv_head_dim * hidden_size * total_seq_len
+            # o_proj: hidden_size × hidden_size × seq_len
+            o_flops = hidden_size * hidden_size * total_seq_len
             
             # total attention flops
             attention_flops = q_flops + k_flops + v_flops + attn_flops + o_flops
@@ -217,7 +217,7 @@ class FVCoreFLOPsCalculator:
             
             # embedding flops: vocab_size × hidden_size × seq_len
             vocab_size = getattr(config, 'vocab_size', 152064) # gqa vocab size
-            embedding_flops = vocab_size * hidden_size * total_seq_len
+            # embedding_flops = vocab_size * hidden_size * total_seq_len
             
             # lm head flops: hidden_size × vocab_size × seq_len
             lm_head_flops = hidden_size * vocab_size * total_seq_len
@@ -226,7 +226,7 @@ class FVCoreFLOPsCalculator:
             final_norm_flops = hidden_size * total_seq_len
             
             # total flops (all layers + embedding + lm_head + final_norm)
-            flops = num_layers * layer_flops + embedding_flops + lm_head_flops + final_norm_flops
+            flops = num_layers * layer_flops + lm_head_flops + final_norm_flops
             print(f"Using manual calculation method")
             
             print(f"LLM FLOPs: {flops:,.0f}")
