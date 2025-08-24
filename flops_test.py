@@ -199,13 +199,15 @@ class FVCoreFLOPsCalculator:
             gate_flops = hidden_size * intermediate_size * total_seq_len
             #up_proj: hidden_size × intermediate_size × seq_len
             up_flops = hidden_size * intermediate_size * total_seq_len
+            # gate activation and gate multiplication: intermediate_size × seq_len
+            gate_activation_flops = intermediate_size * total_seq_len
             #down_proj: intermediate_size × hidden_size × seq_len
             down_flops = intermediate_size * hidden_size * total_seq_len
             # total ffn flops
-            ffn_flops = gate_flops + up_flops + down_flops
+            ffn_flops = gate_flops + up_flops + gate_activation_flops + down_flops
             
             # embedding flops: vocab_size × hidden_size × seq_len
-            vocab_size = getattr(config, 'vocab_size', 152064)
+            vocab_size = getattr(config, 'vocab_size', 152064) # gqa vocab size
             embedding_flops = vocab_size * hidden_size * total_seq_len
             
             # lm head flops: hidden_size × vocab_size × seq_len
