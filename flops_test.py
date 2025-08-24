@@ -186,12 +186,12 @@ class FVCoreFLOPsCalculator:
             k_flops = hidden_size * kv_head_dim * total_seq_len
             # v_proj: hidden_size × kv_head_dim × seq_len (GQA)
             v_flops = hidden_size * kv_head_dim * total_seq_len
-            # attention: seq_len × seq_len × kv_head_dim
-            attn_flops = total_seq_len * total_seq_len * kv_head_dim
-            # o_proj: hidden_size × hidden_size × seq_len
-            o_flops = hidden_size * hidden_size * total_seq_len
+            # attention: seq_len × seq_len × head_dim (per head) - QK + AV
+            attn_flops = total_seq_len * total_seq_len * head_dim * num_attention_heads * 2
+            # o_proj: kv_head_dim × hidden_size × seq_len
+            o_flops = kv_head_dim * hidden_size * total_seq_len
             
-            # 总注意力FLOPs
+            # total attention flops
             attention_flops = q_flops + k_flops + v_flops + attn_flops + o_flops
             
             # SwiGLU FFN
@@ -206,6 +206,15 @@ class FVCoreFLOPsCalculator:
             # total ffn flops
             ffn_flops = gate_flops + up_flops + gate_activation_flops + down_flops
             
+            # norm layer flops (RMSNorm)
+            # input_layernorm: hidden_size × seq_len
+            input_layernorm_flops = hidden_size * total_seq_len
+            # post_attention_layernorm: hidden_size × seq_len  
+            post_attention_layernorm_flops = hidden_size * total_seq_len
+            
+            # each layer flops (include norm layer)
+            layer_flops = attention_flops + ffn_flops + input_layernorm_flops + post_attention_layernorm_flops
+            
             # embedding flops: vocab_size × hidden_size × seq_len
             vocab_size = getattr(config, 'vocab_size', 152064) # gqa vocab size
             embedding_flops = vocab_size * hidden_size * total_seq_len
@@ -213,11 +222,11 @@ class FVCoreFLOPsCalculator:
             # lm head flops: hidden_size × vocab_size × seq_len
             lm_head_flops = hidden_size * vocab_size * total_seq_len
             
-            # each layer flops
-            layer_flops = attention_flops + ffn_flops
+            # norm layer flops (RMSNorm)
+            final_norm_flops = hidden_size * total_seq_len
             
-            # total flops (all layers + embedding + lm_head)
-            flops = num_layers * layer_flops + embedding_flops + lm_head_flops
+            # total flops (all layers + embedding + lm_head + final_norm)
+            flops = num_layers * layer_flops + embedding_flops + lm_head_flops + final_norm_flops
             print(f"Using manual calculation method")
             
             print(f"LLM FLOPs: {flops:,.0f}")
