@@ -167,7 +167,36 @@ class FVCoreFLOPsCalculator:
             total_seq_len = visual_tokens_count + input_ids.shape[1]
             dummy_input_ids = torch.randint(0, 1000, (1, total_seq_len), device=device, dtype=torch.long)
             
-            # 直接使用手动计算方法，因为fvcore对LLM的支持有限
+            # 方法1: 使用fvcore计算 (关闭dynamic cache)
+            print("="*40)
+            print("方法1: 使用fvcore计算LLM FLOPs")
+            print("="*40)
+            
+            # 关闭dynamic cache
+            original_use_cache = self.model.config.use_cache
+            self.model.config.use_cache = False
+            print(f"关闭dynamic cache: use_cache = {self.model.config.use_cache}")
+            
+            try:
+                # 使用FlopCountAnalysis计算LLM FLOPs
+                flops_analyzer = FlopCountAnalysis(self.model, (dummy_input_ids,))
+                fvcore_flops = flops_analyzer.total()
+                print(f"fvcore计算的LLM FLOPs: {fvcore_flops:,.0f}")
+                fvcore_success = True
+            except Exception as e:
+                print(f"fvcore计算LLM FLOPs失败: {e}")
+                fvcore_flops = 0
+                fvcore_success = False
+            finally:
+                # 恢复原始设置
+                self.model.config.use_cache = original_use_cache
+                print(f"恢复dynamic cache设置: use_cache = {self.model.config.use_cache}")
+            
+            # 方法2: 手动计算
+            print("="*40)
+            print("方法2: 手动计算LLM FLOPs")
+            print("="*40)
+            
             config = self.model.config
             hidden_size = getattr(config, 'hidden_size', 3584)  # Qwen2-7B的hidden_size
             num_layers = getattr(config, 'num_hidden_layers', 28)  # Qwen2-7B的层数
@@ -226,12 +255,34 @@ class FVCoreFLOPsCalculator:
             final_norm_flops = hidden_size * total_seq_len
             
             # total flops (all layers + embedding + lm_head + final_norm)
-            flops = num_layers * layer_flops + lm_head_flops + final_norm_flops
-            print(f"Using manual calculation method")
+            manual_flops = num_layers * layer_flops + lm_head_flops + final_norm_flops
             
-            print(f"LLM FLOPs: {flops:,.0f}")
+            print(f"手动计算的LLM FLOPs: {manual_flops:,.0f}")
             
-            return flops
+            # 比较结果
+            print("="*40)
+            print("FLOPs计算结果比较")
+            print("="*40)
+            print(f"fvcore计算: {fvcore_flops:,.0f}")
+            print(f"手动计算: {manual_flops:,.0f}")
+            
+            if fvcore_success and fvcore_flops > 0:
+                diff = abs(fvcore_flops - manual_flops)
+                diff_percent = (diff / manual_flops) * 100
+                print(f"差异: {diff:,.0f} ({diff_percent:.2f}%)")
+                
+                if diff_percent < 5:
+                    print("✅ 两种方法结果基本一致 (差异 < 5%)")
+                elif diff_percent < 20:
+                    print("⚠️ 两种方法结果有一定差异 (差异 < 20%)")
+                else:
+                    print("❌ 两种方法结果差异较大 (差异 >= 20%)")
+            else:
+                print("❌ fvcore计算失败，无法比较")
+            
+            # 返回手动计算结果作为最终结果
+            return manual_flops
+            
         except Exception as e:
             print(f"LLM FLOPs calculation failed: {e}")
             return 0

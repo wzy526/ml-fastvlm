@@ -145,3 +145,6 @@ data/
 
 # check points
 checkpoints/
+
+# jsons
+*.json
