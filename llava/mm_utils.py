@@ -6,6 +6,7 @@ import base64
 import torch
 import math
 import ast
+import numpy as np
 
 from transformers import StoppingCriteria
 from llava.constants import IMAGE_TOKEN_INDEX
@@ -177,6 +178,25 @@ def process_images(images, image_processor, model_cfg):
         for image in images:
             image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
             new_images.append(image)
+    elif image_aspect_ratio == "fixed_hr":
+        # 整
+        assert len(images) == 1
+        image_global = image_processor(images[0], return_tensors='pt')['pixel_values']
+        new_images.append(image_global)
+        image_total = np.asarray(images[0])
+        H_hr, W_hr = image_total.shape[0], image_total.shape[1]
+        H_lr, W_lr = image_processor.crop_size["height"], image_processor.crop_size["width"]
+        assert H_hr % H_lr == 0 and W_hr % W_lr == 0
+        r_h, r_w = H_hr // H_lr, W_hr // W_lr
+        shape = (r_h, r_w, H_lr, W_lr, 3)  # 3行3列，每个小块是 H * W
+        strides = (image_total.strides[0] * H_lr, image_total.strides[1] * W_lr, image_total.strides[0], image_total.strides[1], image_total.strides[2])
+        image_packs = np.lib.stride_tricks.as_strided(image_total, shape=shape, strides=strides)
+        image_packs = image_packs.reshape(r_h * r_w, H_lr, W_lr, 3)
+        processed_img_packs = image_processor(image_packs, return_tensors='pt')['pixel_values']
+        new_images.append(processed_img_packs)
+        new_images = torch.cat(new_images, dim=0)
+        return new_images
+        # 整完
     else:
         return image_processor(images, return_tensors='pt')['pixel_values']
     if all(x.shape == new_images[0].shape for x in new_images):

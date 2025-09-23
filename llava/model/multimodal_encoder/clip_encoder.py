@@ -164,3 +164,144 @@ class CLIPVisionTowerS2(CLIPVisionTower):
     @property
     def hidden_size(self):
         return self.config.hidden_size * len(self.s2_scales)
+
+
+class CLIPVisionTowerLLaVA16(CLIPVisionTower):
+    """
+    CLIP Vision Tower with LLaVA-1.6 style patching logic
+    Implements the same patching strategy as LLaVA-1.6 for high-resolution image processing
+    """
+    
+    def __init__(self, vision_tower, args, delay_load=False):
+        # LLaVA-1.6 style configuration
+        self.llava16_grid_pinpoints = getattr(args, 'llava16_grid_pinpoints', '[336, 672, 1008]')
+        self.llava16_patch_size = getattr(args, 'llava16_patch_size', 336)
+        self.llava16_image_size = getattr(args, 'llava16_image_size', 1008)
+        
+        # Parse grid pinpoints
+        if isinstance(self.llava16_grid_pinpoints, str):
+            import ast
+            self.llava16_grid_pinpoints = ast.literal_eval(self.llava16_grid_pinpoints)
+        
+        super().__init__(vision_tower, args, delay_load)
+        
+        # Import LLaVA-1.6 utilities
+        from llava.mm_utils import process_anyres_image, get_anyres_image_grid_shape
+        self.process_anyres_image = process_anyres_image
+        self.get_anyres_image_grid_shape = get_anyres_image_grid_shape
+        
+        # Update image processor settings
+        if not delay_load or getattr(args, 'unfreeze_mm_vision_tower', False):
+            self.image_processor.size['shortest_edge'] = self.llava16_image_size
+            self.image_processor.crop_size['height'] = self.image_processor.crop_size['width'] = self.llava16_image_size
+
+    def load_model(self, device_map=None):
+        if self.is_loaded:
+            print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
+            return
+
+        self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
+        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        if not self.tune_vision_tower:
+            self.vision_tower.requires_grad_(False)
+
+        # Update processor settings for LLaVA-1.6 style processing
+        self.image_processor.size['shortest_edge'] = self.llava16_image_size
+        self.image_processor.crop_size['height'] = self.image_processor.crop_size['width'] = self.llava16_image_size
+
+        self.is_loaded = True
+
+    @torch.no_grad()
+    def forward_feature(self, images):
+        """Standard CLIP forward for individual patches"""
+        image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
+        image_features = self.feature_select(image_forward_outs).to(images.dtype)
+        return image_features
+
+    @torch.no_grad()
+    def forward(self, images):
+        """
+        LLaVA-1.6 style forward with patching logic
+        Processes high-resolution images by dividing them into patches
+        """
+        if type(images) is list:
+            image_features = []
+            for image in images:
+                # Process single image with LLaVA-1.6 style patching
+                image_feature = self._process_single_image_llava16(image)
+                image_features.append(image_feature)
+        else:
+            # Process batch of images
+            if images.ndim == 4:  # Single image in batch
+                image_features = self._process_single_image_llava16(images)
+            else:  # Multiple images
+                image_features = []
+                for i in range(images.shape[0]):
+                    image_feature = self._process_single_image_llava16(images[i])
+                    image_features.append(image_feature)
+
+        return image_features
+
+    def _process_single_image_llava16(self, image):
+        """
+        Process a single image using LLaVA-1.6 style patching
+        """
+        # Convert tensor to PIL if needed
+        if isinstance(image, torch.Tensor):
+            from PIL import Image
+            import torchvision.transforms as transforms
+            
+            # Convert tensor to PIL image
+            if image.ndim == 3:
+                image = image.unsqueeze(0)
+            
+            # Assuming image is in format [C, H, W] or [B, C, H, W]
+            if image.shape[1] == 3:  # [B, C, H, W]
+                image = image.squeeze(0)  # Remove batch dimension
+            
+            # Convert to PIL
+            to_pil = transforms.ToPILImage()
+            image = to_pil(image)
+
+        image_patches = self.process_anyres_image(
+            image, 
+            self.image_processor, 
+            self.llava16_grid_pinpoints
+        )
+        
+        # Forward through CLIP for each patch
+        patch_features = []
+        for patch in image_patches:
+            if patch.ndim == 3:
+                patch = patch.unsqueeze(0)
+            patch_feature = self.forward_feature(patch)
+            patch_features.append(patch_feature)
+        
+        # Concatenate all patch features
+        # First patch is the original resized image, rest are patches
+        if patch_features:
+            # Concatenate along the patch dimension
+            image_features = torch.cat(patch_features, dim=0)
+            return image_features
+        else:
+            return torch.empty(0, self.hidden_size, device=self.device, dtype=self.dtype)
+
+    @property
+    def hidden_size(self):
+        """Return hidden size for LLaVA-1.6 style processing"""
+        # For LLaVA-1.6, we need to account for multiple patches
+        # Base hidden size plus patches
+        base_size = self.config.hidden_size
+        # Number of patches depends on the grid pinpoints configuration
+        # This is a simplified calculation
+        return base_size
+
+    @property
+    def num_patches_per_side(self):
+        """Number of patches per side for LLaVA-1.6 style processing"""
+        return self.llava16_image_size // self.llava16_patch_size
+
+    @property
+    def num_patches(self):
+        """Total number of patches for LLaVA-1.6 style processing"""
+        return (self.llava16_image_size // self.llava16_patch_size) ** 2

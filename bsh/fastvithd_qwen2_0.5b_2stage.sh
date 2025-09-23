@@ -11,11 +11,12 @@
 # - Stage: 2 (base version)
 
 # 设置参数
-MODEL_PATH="./checkpoints/llava-fastvithd_0.5b_stage2"  # FastVLM模型路径
-DATA_PATH="/cluster/home/data/gqa/questions/val_balanced_questions.json"              # GQA问题文件路径
-IMAGE_FOLDER="/cluster/home/data/gqa/images"                   # GQA图像文件夹路径
-MAX_SAMPLES=1000                                     # 最大测试样本数
-OUTPUT_FILE="ttft_test_results.json"                   # 输出结果文件
+MODEL_PATH="./checkpoints/llava-fastvithd_0.5b_stage2"  # FastVLM ckpt
+DATA_PATH="/cluster/nvme2/wzy/gqa/questions/val_balanced_questions.json"              # GQA问题文件路径
+IMAGE_FOLDER="/cluster/nvme2/wzy/gqa/images"              
+MAX_SAMPLES=""                                     # 最大测试样本数（空值表示测试全部样本）
+RESOLUTION=1024                                    # 输入分辨率 (1024, 1536, 2048)
+OUTPUT_FILE=""                                 
 
 # 可用的模型选项
 AVAILABLE_MODELS=(
@@ -50,6 +51,20 @@ fi
 
 if [ ! -f "$DATA_PATH" ]; then
     echo "错误: GQA数据文件不存在: $DATA_PATH"
+    echo "当前节点: $(hostname)"
+    echo "当前用户: $(whoami)"
+    echo "当前目录: $(pwd)"
+    echo ""
+    echo "调试信息:"
+    echo "检查父目录..."
+    if [ -d "/cluster/home/data/gqa/questions" ]; then
+        echo "✓ questions目录存在"
+        echo "  目录内容:"
+        ls -la /cluster/home/data/gqa/questions/ | head -5
+    else
+        echo "✗ questions目录不存在"
+    fi
+    echo ""
     echo "请下载GQA数据集或修改DATA_PATH变量"
     exit 1
 fi
@@ -69,7 +84,7 @@ echo "============================================================"
 echo "配置信息:"
 echo "  - Vision Encoder: FastViTHD"
 echo "  - LLM: Llama"
-echo "  - Input Resolution: 1024x1024"
+echo "  - Input Resolution: ${RESOLUTION}x${RESOLUTION}"
 echo "  - Visual Tokens: 256"
 echo "  - Vision Encoder Size: 125M"
 echo "  - Model Size: 0.5B parameters"
@@ -78,23 +93,46 @@ echo ""
 echo "模型路径: $MODEL_PATH"
 echo "数据文件: $DATA_PATH"
 echo "图像文件夹: $IMAGE_FOLDER"
-echo "最大样本数: $MAX_SAMPLES"
-echo "输出文件: $OUTPUT_FILE"
+if [ -n "$MAX_SAMPLES" ]; then
+    echo "最大样本数: $MAX_SAMPLES"
+else
+    echo "测试样本数: 全部样本"
+fi
+echo "分辨率: ${RESOLUTION}x${RESOLUTION}"
+if [ -n "$OUTPUT_FILE" ]; then
+    echo "输出文件: $OUTPUT_FILE"
+else
+    echo "输出文件: 自动生成 (ttft_test_results_${RESOLUTION}x${RESOLUTION}.json)"
+fi
 echo "============================================================"
 echo ""
 
 # 运行8卡分布式测试
 echo "开始FastVLM TTFT分布式测试..."
-torchrun \
-    --nproc_per_node=8 \
-    --master_port=29500 \
-    ttft_test.py \
-    --model-path "$MODEL_PATH" \
-    --data-path "$DATA_PATH" \
-    --image-folder "$IMAGE_FOLDER" \
-    --max-samples "$MAX_SAMPLES" \
-    --output-file "$OUTPUT_FILE" \
+
+# 构建命令参数
+CMD_ARGS=(
+    --nproc_per_node=8
+    --master_port=29500
+    ttft_test.py
+    --model-path "$MODEL_PATH"
+    --data-path "$DATA_PATH"
+    --image-folder "$IMAGE_FOLDER"
     --conv-mode "llava_v1"
+    --resolution "$RESOLUTION"
+)
+
+# 只有当MAX_SAMPLES不为空时才添加该参数
+if [ -n "$MAX_SAMPLES" ]; then
+    CMD_ARGS+=(--max-samples "$MAX_SAMPLES")
+fi
+
+# 只有当OUTPUT_FILE不为空时才添加该参数
+if [ -n "$OUTPUT_FILE" ]; then
+    CMD_ARGS+=(--output-file "$OUTPUT_FILE")
+fi
+
+torchrun "${CMD_ARGS[@]}"
 
 echo ""
 echo "============================================================"
