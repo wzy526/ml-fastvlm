@@ -19,7 +19,7 @@ source /home/zhuofan.xia/miniconda3/bin/activate pt260
 TOTAL_STEPS=2595
 EXP_NAME="tdat-7b-l0d32-s12g8z3"
 
-
+# 创建输出目录
 echo "Creating output directories..."
 mkdir -p /ephstorage/vlm_exps/textdat/$EXP_NAME
 mkdir -p /perception-hl/zhuofan.xia/vlm_exps/textdat/

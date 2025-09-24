@@ -217,6 +217,10 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             self.k_proj_hd = None
             self.v_proj_hd = None
         
+        # rotary_emb fix by wzy
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        
     @torch.no_grad()
     def _grid_generate(self, Hk, Wk, B, device, dtype):
         ref_y, ref_x = torch.meshgrid(
