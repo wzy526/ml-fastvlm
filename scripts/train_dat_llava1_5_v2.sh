@@ -18,9 +18,21 @@ export DS_SKIP_CUDA_CHECK=1
 source /home/zhuofan.xia/miniconda3/bin/activate pt260
 TOTAL_STEPS=2595
 EXP_NAME="tdat-7b-l0d32-s12g8z3"
+
+
+echo "Creating output directories..."
+mkdir -p /ephstorage/vlm_exps/textdat/$EXP_NAME
+mkdir -p /perception-hl/zhuofan.xia/vlm_exps/textdat/
+
+# 验证文件路径
+echo "Verifying file paths..."
+echo "DeepSpeed config: $(ls -la ./scripts/zero_configs/zero2.json)"
+echo "Model path: $(ls -la /home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b)"
+echo "Data path: $(ls -la /perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json)"
+echo "Vision tower: $(ls -la /home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336)"
 WANDB_PROJECT="DECOAT" \
 ds --master_port=$MASTER_PORT --master_addr=$MASTER_ADDR --hostfile "/etc/volcano/all.host" llava/train/train_dat.py \
-    --deepspeed ./scripts/zero2.json \
+    --deepspeed ./scripts/zero_configs/zero2.json \
     --model_name_or_path /home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b \
     --version v1 \
     --extra_yaml_path ./configs/llava1_5_v1.yaml \

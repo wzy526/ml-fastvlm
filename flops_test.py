@@ -81,7 +81,16 @@ def calculate_visual_tokens(resolution, vision_encoder, patch_size=None):
             grid_size = resolution // patch_size
             num_patches = 1 + (grid_size ** 2)
             return num_patches * 576
+    elif vision_encoder == "custom":
+        # 自定义编码器，需要用户指定visual token数量
+        print("警告: 使用自定义视觉编码器，无法自动计算visual token数量")
+        print("请使用 --visual-tokens 参数手动指定")
+        if patch_size is None:
+            patch_size = 14
+        num_patches = (resolution // patch_size) ** 2
+        return num_patches
     else:
+        # 默认使用CLIP的方式计算
         if patch_size is None:
             patch_size = 14
         num_patches = (resolution // patch_size) ** 2
@@ -91,11 +100,12 @@ def calculate_visual_tokens(resolution, vision_encoder, patch_size=None):
 class FVCoreFLOPsCalculator:
     """使用fvcore计算VLM模型FLOPs"""
     
-    def __init__(self, model, tokenizer, image_processor, vision_encoder="fastvithd"):
+    def __init__(self, model, tokenizer, image_processor, vision_encoder="fastvithd", llm_type="qwen2"):
         self.model = model
         self.tokenizer = tokenizer
         self.image_processor = image_processor
         self.vision_encoder = vision_encoder
+        self.llm_type = llm_type
         
         if not FVCORE_AVAILABLE:
             raise ImportError("fvcore未安装，请安装: pip install fvcore")
@@ -108,8 +118,18 @@ class FVCoreFLOPsCalculator:
             print(f"计算视觉编码器FLOPs...")
             print(f"输入张量形状: {image_tensor.shape}")
             
-            device = next(vision_tower.parameters()).device
-            dtype = next(vision_tower.parameters()).dtype
+            # 检查vision_tower是否已加载
+            if hasattr(vision_tower, 'is_loaded') and not vision_tower.is_loaded:
+                print("视觉编码器未加载，正在加载...")
+                vision_tower.load_model()
+            
+            try:
+                device = next(vision_tower.parameters()).device
+                dtype = next(vision_tower.parameters()).dtype
+            except StopIteration:
+                # 如果vision_tower没有参数，使用模型的设备和数据类型
+                device = next(self.model.parameters()).device
+                dtype = next(self.model.parameters()).dtype
             image_tensor = image_tensor.to(device=device, dtype=dtype)
             
             # 使用FlopCountAnalysis
@@ -150,7 +170,6 @@ class FVCoreFLOPsCalculator:
     def calculate_llm_flops(self, input_ids, visual_tokens_count):
         """使用自定义fvcore计算LLM的FLOPs"""
         try:
-            # 创建完整的输入序列
             seq_len = input_ids.shape[1] + visual_tokens_count
             
             print(f"计算LLM FLOPs...")
@@ -158,12 +177,10 @@ class FVCoreFLOPsCalculator:
             print(f"Visual tokens数量: {visual_tokens_count}")
             print(f"总序列长度: {seq_len}")
             
-            # 确保输入张量在正确的设备和数据类型上
+            # device and dtype
             device = next(self.model.parameters()).device
             dtype = next(self.model.parameters()).dtype
-            
-            # 创建正确的输入格式 - 使用input_ids而不是visual tokens
-            # 创建包含visual tokens和文本tokens的完整序列
+
             total_seq_len = visual_tokens_count + input_ids.shape[1]
             dummy_input_ids = torch.randint(0, 1000, (1, total_seq_len), device=device, dtype=torch.long)
             
@@ -172,7 +189,7 @@ class FVCoreFLOPsCalculator:
             print("方法1: 使用fvcore计算LLM FLOPs")
             print("="*40)
             
-            # 关闭dynamic cache
+            # dynamic cache
             original_use_cache = self.model.config.use_cache
             self.model.config.use_cache = False
             print(f"关闭dynamic cache: use_cache = {self.model.config.use_cache}")
@@ -188,7 +205,6 @@ class FVCoreFLOPsCalculator:
                 fvcore_flops = 0
                 fvcore_success = False
             finally:
-                # 恢复原始设置
                 self.model.config.use_cache = original_use_cache
                 print(f"恢复dynamic cache设置: use_cache = {self.model.config.use_cache}")
             
@@ -299,8 +315,16 @@ class FVCoreFLOPsCalculator:
         print("获取真实视觉特征...")
         with torch.no_grad():
             vision_tower = self.model.get_vision_tower()
-            device = next(vision_tower.parameters()).device
-            dtype = next(vision_tower.parameters()).dtype
+            if hasattr(vision_tower, 'is_loaded') and not vision_tower.is_loaded:
+                print("视觉编码器未加载，正在加载...")
+                vision_tower.load_model()
+            try:
+                device = next(vision_tower.parameters()).device
+                dtype = next(vision_tower.parameters()).dtype
+            except StopIteration:
+                # 如果vision_tower没有参数，使用模型的设备和数据类型
+                device = next(self.model.parameters()).device
+                dtype = next(self.model.parameters()).dtype
             image_tensor_device = image_tensor.to(device=device, dtype=dtype)
             visual_features = vision_tower(image_tensor_device)
         
@@ -321,14 +345,22 @@ class FVCoreFLOPsCalculator:
         }
 
 
-def load_model_and_tokenizer(model_path, vision_encoder="fastvithd"):
-    """加载模型和分词器"""
+def load_model_and_tokenizer(model_path, vision_encoder="fastvithd", llm_type="auto", 
+                           encoder_path=None, llm_path=None):
+    """加载模型和分词器
+    
+    Args:
+        model_path: 主模型路径
+        vision_encoder: 视觉编码器类型
+        llm_type: LLM类型 (auto/qwen2/llama/custom)
+        encoder_path: 自定义视觉编码器路径
+        llm_path: 自定义LLM路径
+    """
     disable_torch_init()
     
-    # 获取模型名称
     model_name = get_model_name_from_path(model_path)
     
-    # 加载tokenizer
+    # load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_path,
         model_max_length=2048,
@@ -339,23 +371,67 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd"):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # determine llm type
+    if llm_type == "auto":
+        if 'qwen' in model_name.lower():
+            actual_llm_type = "qwen2"
+        else:
+            actual_llm_type = "llama"
+    else:
+        actual_llm_type = llm_type
+    
+    print(f"使用LLM类型: {actual_llm_type}")
+    
     # 加载模型
-    if 'qwen' in model_name.lower():
+    if actual_llm_type == "qwen2":
         model = LlavaQwen2ForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.float16,
             device_map="auto",
         )
-    else:
+    elif actual_llm_type == "llama":
         model = LlavaLlamaForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.float16,
             device_map="auto",
         )
+    elif actual_llm_type == "custom":
+        if llm_path is None:
+            raise ValueError("当llm_type为custom时，必须提供llm_path参数")
 
-    image_processor = model.get_vision_tower().image_processor
+        model = LlavaQwen2ForCausalLM.from_pretrained(
+            llm_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+    else:
+        raise ValueError(f"不支持的LLM类型: {actual_llm_type}")
+
+    # 处理自定义视觉编码器
+    if vision_encoder == "custom":
+        if encoder_path is None:
+            raise ValueError("当vision_encoder为custom时，必须提供encoder_path参数")
+        print(f"使用自定义视觉编码器: {encoder_path}")
+
+        vision_tower = model.get_vision_tower()
+        if hasattr(vision_tower, 'image_processor'):
+            image_processor = vision_tower.image_processor
+        else:
+            # CLIPVisionTower，用自带的processor
+            image_processor = vision_tower.image_processor if hasattr(vision_tower, 'image_processor') else None
+    else:
+        print(f"使用视觉编码器: {vision_encoder}")
+        vision_tower = model.get_vision_tower()
+        if hasattr(vision_tower, 'image_processor'):
+            image_processor = vision_tower.image_processor
+        else:
+            try:
+                image_processor = vision_tower.image_processor
+            except AttributeError:
+                from transformers import CLIPImageProcessor
+                image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
     
-    return model, tokenizer, image_processor
+    return model, tokenizer, image_processor, actual_llm_type
 
 
 def load_gqa_sample(data_path, image_folder, resolution=1024):
@@ -410,11 +486,36 @@ def test_vlm_flops_fvcore(args):
         print("错误: fvcore未安装，请安装: pip install fvcore")
         return
     
-    # tokenizer
-    print(f"加载模型: {args.model_path}")
-    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, args.vision_encoder)
+    if args.vision_encoder == "custom" and args.encoder_path is None:
+        print("错误: 当vision_encoder为custom时，必须提供encoder_path参数")
+        return
     
-    flops_calculator = FVCoreFLOPsCalculator(model, tokenizer, image_processor, args.vision_encoder)
+    if args.llm_type == "custom" and args.llm_path is None:
+        print("错误: 当llm_type为custom时，必须提供llm_path参数")
+        return
+    
+    # load model
+    print(f"加载模型: {args.model_path}")
+    if args.vision_encoder == "custom":
+        print(f"自定义视觉编码器路径: {args.encoder_path}")
+    if args.llm_type == "custom":
+        print(f"自定义LLM路径: {args.llm_path}")
+    
+    model, tokenizer, image_processor, actual_llm_type = load_model_and_tokenizer(
+        args.model_path, 
+        args.vision_encoder, 
+        args.llm_type,
+        args.encoder_path,
+        args.llm_path
+    )
+    
+    flops_calculator = FVCoreFLOPsCalculator(
+        model, 
+        tokenizer, 
+        image_processor, 
+        args.vision_encoder,
+        actual_llm_type
+    )
     
     # load gqa
     data_path = "/root/gqa_opendatalab/testdev_balanced_questions.json"
@@ -442,19 +543,23 @@ def test_vlm_flops_fvcore(args):
     
     # model config
     config = transformers.AutoConfig.from_pretrained(args.model_path)
-    llm_backbone = "Qwen2" if config.model_type == "llava_qwen2" else "Llama"
+    llm_backbone = actual_llm_type.upper()
     
-    # 这我让gpt先给我补上了 不知道对不对
+    # 根据encoder和LLM类型生成模型配置名称
     if args.vision_encoder == "fastvithd":
-        model_config = 'LLaVA_FastViTHD_7B_Stage2'
+        encoder_name = "FastViTHD"
     elif args.vision_encoder == "clip":
-        model_config = 'LLaVA_CLIP_ViT_L_14_336px'
+        encoder_name = "CLIP_ViT_L_14_336px"
     elif args.vision_encoder == "clip_s2":
-        model_config = 'LLaVA_CLIP_ViT_L_14_336px_S2'
+        encoder_name = "CLIP_ViT_L_14_336px_S2"
     elif args.vision_encoder == "clip_llava16":
-        model_config = 'LLaVA_CLIP_ViT_L_14_336px_LLaVA16'
+        encoder_name = "CLIP_ViT_L_14_336px_LLaVA16"
+    elif args.vision_encoder == "custom":
+        encoder_name = "Custom"
     else:
-        model_config = f'LLaVA_{args.vision_encoder.upper()}'
+        encoder_name = args.vision_encoder.upper()
+    
+    model_config = f'LLaVA_{encoder_name}_{llm_backbone}'
 
     print("\n" + "="*60)
     print("FLOPs 计算结果 (fvcore)")
@@ -490,10 +595,13 @@ def test_vlm_flops_fvcore(args):
         results = {
             'model_config': model_config,
             'vision_encoder': args.vision_encoder,
+            'llm_type': actual_llm_type,
             'llm': llm_backbone,
             'input_resolution': f'{args.resolution}x{args.resolution}',
             'visual_tokens': visual_tokens_count,
             'model_path': args.model_path,
+            'encoder_path': args.encoder_path,
+            'llm_path': args.llm_path,
             'encoder_flops': flops_results['encoder_flops'],
             'connector_flops': flops_results['connector_flops'],
             'llm_flops': flops_results['llm_flops'],
@@ -521,8 +629,15 @@ if __name__ == "__main__":
                        help="输入分辨率")
     parser.add_argument("--output-file", type=str, default=None, help="输出结果文件")
     parser.add_argument("--vision-encoder", type=str, default="fastvithd", 
-                       choices=["fastvithd", "clip", "clip_s2", "clip_llava16"],
+                       choices=["fastvithd", "clip", "clip_s2", "clip_llava16", "custom"],
                        help="视觉编码器类型")
+    parser.add_argument("--llm-type", type=str, default="auto", 
+                       choices=["auto", "qwen2", "llama", "custom"],
+                       help="LLM类型 (auto: 自动检测, qwen2: Qwen2, llama: LLaMA, custom: 自定义)")
+    parser.add_argument("--encoder-path", type=str, default=None,
+                       help="自定义视觉编码器路径 (当vision-encoder为custom时使用)")
+    parser.add_argument("--llm-path", type=str, default=None,
+                       help="自定义LLM路径 (当llm-type为custom时使用)")
     parser.add_argument("--visual-tokens", type=int, default=None, 
                        help="Visual token数量 (如果为None，将根据分辨率和编码器自动计算)")
     parser.add_argument("--patch-size", type=int, default=None,
@@ -540,3 +655,4 @@ if __name__ == "__main__":
         args.output_file = f"flops_fvcore_results_{args.vision_encoder}_{args.resolution}x{args.resolution}_{visual_tokens_str}.json"
     
     test_vlm_flops_fvcore(args)
+ 
