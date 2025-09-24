@@ -322,14 +322,25 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             cos, sin = position_embeddings
         # add rope to q, k, v
         query_states = einops.rearrange(query_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        key_states = einops.rearrange(key_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        value_states = einops.rearrange(value_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
+        
+        # key_states = einops.rearrange(key_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
+        # value_states = einops.rearrange(value_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
+
+        # by wzy
+        key_states = einops.rearrange(key_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_key_value_groups, c=self.head_dim)
+        value_states = einops.rearrange(value_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_key_value_groups, c=self.head_dim) # end
+
         # Apply RoPE in a [B H N C] manner
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # This RoPE may need some modifications.
-        
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # by wzy
+        key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_groups) # end
+
         # Convert back to [B N (H C)] format
         query_states = einops.rearrange(query_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
         key_states = einops.rearrange(key_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
@@ -471,8 +482,10 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         # 9. Last step: compute vanilla attention or F.sdpa get output and done
         kv_len = key_states_plus_hd.size(1)
         query_bhnc = einops.rearrange(query_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        key_bhnc = einops.rearrange(key_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_key_value_groups, c=self.head_dim)
-        value_bhnc = einops.rearrange(value_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
+        # key_bhnc = einops.rearrange(key_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_key_value_groups, c=self.head_dim)
+        # by wzy
+        key_bhnc = einops.rearrange(key_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
+        value_bhnc = einops.rearrange(value_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim) # end
         # 10. Store bhnc version of K,V in the prefill of inference
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
