@@ -178,6 +178,11 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         self.hd_proj = config.dat_extra_args.hd_proj
 
         self.hidden_size = config.hidden_size
+        
+        # Add missing attributes that should be inherited from LlamaAttention by wzy
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_key_value_groups = getattr(config, 'num_key_value_heads', config.num_attention_heads)
 
         self.off_dim = self.hidden_size // self.off_grps
         self.conv_lr_dw = nn.Conv2d(
