@@ -343,14 +343,19 @@ class LlamaAttentionDAT(LlamaAttentionEx):
 
         # Convert back to [B N (H C)] format
         query_states = einops.rearrange(query_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
+        # key_states = einops.rearrange(key_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
+        # value_states = einops.rearrange(value_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
+        
+        # by wzy
         key_states = einops.rearrange(key_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        value_states = einops.rearrange(value_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
+        value_states = einops.rearrange(value_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim) # end
+       
         # We assume that each HD picture has the same spatial dimension, i.e., [L, C, H_hr, W_hr]
         # Convert image_range_list to index tensor
         # A new version for no image cases: for each sample in batch ... (parallel version has to deal with random batch index)
         keys_concat, values_concat, attns_concat = [], [], []
         for b_idx in range(B):
-            if len(image_range_list[b_idx]) == 0:
+            if len(image_range_list[b_idx]) == 0 or image_hd_features is None:
                 keys_concat.append(key_states[b_idx])
                 values_concat.append(value_states[b_idx])
                 attns_concat.append(attention_mask[b_idx].permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
@@ -426,6 +431,19 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             # each KV_hd has the shape [Lp, Ns, C]
             # 7.1. (Extra?) How to add RoPE to key_hd?
             # But I think it is not necessary.
+
+            # Apply repeat_kv to expand head dimensions to match key_states and value_states
+            # Reshape key_hd and value_hd to [Lp, num_key_value_groups, Ns, head_dim] for repeat_kv
+            # wzy
+            key_hd = key_hd.view(Lp, self.num_key_value_groups, -1, self.head_dim)
+            value_hd = value_hd.view(Lp, self.num_key_value_groups, -1, self.head_dim)
+            # Apply repeat_kv
+            key_hd = repeat_kv(key_hd, self.num_heads // self.num_key_value_groups) 
+            value_hd = repeat_kv(value_hd, self.num_heads // self.num_key_value_groups) 
+            # Reshape back to [Lp, Ns, num_heads * head_dim]
+            key_hd = key_hd.view(Lp, -1, self.num_heads * self.head_dim)
+            value_hd = value_hd.view(Lp, -1, self.num_heads * self.head_dim) # end
+            
             # 8. Let's pack each key_hd and value_hd into the key / value sequences! Let's make the causal / partial causal attention mask!
             # The format is [SYS] [IMG_I1_LR] ... [IMG_In_LR] [IQ] [IMG_I1_HR] ... [IMG_In_HR] [IA] ... [IMG_J1_LR] ... [IMG_Jn_LR] [JQ] [IMG_J1_HR] ... [IMG_Jn_HR] [JA]
             # TODO: Maybe we should unpad the tokens then pad them again.
