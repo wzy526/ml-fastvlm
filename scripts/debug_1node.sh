@@ -1,7 +1,7 @@
 export TRANSFORMERS_OFFLINE=1
 export DS_SKIP_CUDA_CHECK=1
 source /home/zhuofan.xia/miniconda3/bin/activate pt260
-TOTAL_STEPS=2595
+TOTAL_STEPS=1
 export EXP_NAME="tdat-7b-l0d32-s12g8z3"
 ds llava/train/train_dat.py \
     --deepspeed scripts/zero_configs/zero2.json \
@@ -28,7 +28,7 @@ ds llava/train/train_dat.py \
     --gradient_accumulation_steps 1 \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 50000 \
+    --save_steps 1 \
     --save_total_limit 1 \
     --learning_rate 5e-6 \
     --weight_decay 0. \
