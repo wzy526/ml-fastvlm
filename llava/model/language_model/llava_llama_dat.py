@@ -31,6 +31,7 @@ from .modeling_llava_dat import LlamaDATModel, LlamaDATForCausalLM
 class LlavaLlamaDATConfig(LlamaConfig):
     model_type = "llava_llama_dat"
     
+    # wzy
     def to_dict(self):
         """Override to_dict to handle dat_extra_args serialization."""
         config_dict = super().to_dict()
