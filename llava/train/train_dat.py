@@ -66,6 +66,7 @@ class ModelDATExtraArguments:
     layers: Optional[List[str]] = field(default_factory=lambda: ['D'] * 32)
     use_sdpa: Optional[bool] = field(default=False)
     
+    # wzy
     def to_dict(self):
         """Convert the dataclass to a dictionary for JSON serialization."""
         return {
