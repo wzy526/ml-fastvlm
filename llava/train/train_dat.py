@@ -65,6 +65,21 @@ class ModelDATExtraArguments:
     hd_proj: Optional[bool] = field(default=True)
     layers: Optional[List[str]] = field(default_factory=lambda: ['D'] * 32)
     use_sdpa: Optional[bool] = field(default=False)
+    
+    def to_dict(self):
+        """Convert the dataclass to a dictionary for JSON serialization."""
+        return {
+            'lr_image_size': self.lr_image_size,
+            'hr_image_size': self.hr_image_size,
+            'grid_size': self.grid_size,
+            'off_ksize': self.off_ksize,
+            'off_grps': self.off_grps,
+            'inter_size': self.inter_size,
+            'lr_size': self.lr_size,
+            'hd_proj': self.hd_proj,
+            'layers': self.layers,
+            'use_sdpa': self.use_sdpa
+        }
 
 @dataclass
 class ModelArguments:

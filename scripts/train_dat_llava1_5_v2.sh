@@ -1,4 +1,4 @@
-!/usr/bin/env bash
+#!/usr/bin/env bash
 
 if ! command -v pdsh >/dev/null 2>&1; then
   cd /home/zhuofan.xia/pdsh-2.29

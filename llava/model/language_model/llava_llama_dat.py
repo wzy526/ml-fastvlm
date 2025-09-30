@@ -30,6 +30,29 @@ from .modeling_llava_dat import LlamaDATModel, LlamaDATForCausalLM
 
 class LlavaLlamaDATConfig(LlamaConfig):
     model_type = "llava_llama_dat"
+    
+    def to_dict(self):
+        """Override to_dict to handle dat_extra_args serialization."""
+        config_dict = super().to_dict()
+        if hasattr(self, 'dat_extra_args') and self.dat_extra_args is not None:
+            # Convert dat_extra_args to a serializable dictionary
+            if hasattr(self.dat_extra_args, 'to_dict'):
+                config_dict['dat_extra_args'] = self.dat_extra_args.to_dict()
+            else:
+                # Fallback: convert to dict manually
+                config_dict['dat_extra_args'] = {
+                    'lr_image_size': getattr(self.dat_extra_args, 'lr_image_size', None),
+                    'hr_image_size': getattr(self.dat_extra_args, 'hr_image_size', None),
+                    'grid_size': getattr(self.dat_extra_args, 'grid_size', None),
+                    'off_ksize': getattr(self.dat_extra_args, 'off_ksize', None),
+                    'off_grps': getattr(self.dat_extra_args, 'off_grps', None),
+                    'inter_size': getattr(self.dat_extra_args, 'inter_size', None),
+                    'lr_size': getattr(self.dat_extra_args, 'lr_size', None),
+                    'hd_proj': getattr(self.dat_extra_args, 'hd_proj', None),
+                    'layers': getattr(self.dat_extra_args, 'layers', None),
+                    'use_sdpa': getattr(self.dat_extra_args, 'use_sdpa', None)
+                }
+        return config_dict
 
 
 class LlavaLlamaDATModel(LlavaDATMetaModel, LlamaDATModel):
