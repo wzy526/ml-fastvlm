@@ -90,6 +90,7 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    group_by_modality_length: bool = field(default=False) # wzy
 
 
 @dataclass
@@ -815,11 +816,15 @@ def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    #         (ModelArguments, DataArguments, TrainingArguments))
+    # model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    dat_extra_args_parser = transformers.HfArgumentParser(ModelDATExtraArguments)
-    model_dat_extra_args, = dat_extra_args_parser.parse_yaml_file(model_args.extra_yaml_path)
+    # dat_extra_args_parser = transformers.HfArgumentParser(ModelDATExtraArguments)
+    # model_dat_extra_args, = dat_extra_args_parser.parse_yaml_file(model_args.extra_yaml_path)  
+
+    #  wzy  
+        (ModelArguments, DataArguments, TrainingArguments, ModelDATExtraArguments))
+    model_args, data_args, training_args, model_dat_extra_args = parser.parse_args_into_dataclasses() # end
 
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
