@@ -28,7 +28,7 @@ ds llava/train/train_dat.py \
     --gradient_accumulation_steps 1 \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 1 \
+    --save_steps 50000 \
     --save_total_limit 1 \
     --learning_rate 5e-6 \
     --weight_decay 0. \

@@ -65,7 +65,7 @@ class LlamaAttentionEx(LlamaAttention):
 
     def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
         super().__init__(config, layer_idx)
-        self.use_sdpa = config.dat_extra_args.use_sdpa
+        self.use_sdpa = config.dat_extra_args['use_sdpa']
 
     def forward(
         self,
@@ -166,16 +166,16 @@ class LlamaAttentionDAT(LlamaAttentionEx):
 
     def __init__(self, config, layer_idx):
         super().__init__(config=config, layer_idx=layer_idx)
-        self.grid_size = config.dat_extra_args.grid_size
-        self.off_ksize = config.dat_extra_args.off_ksize
-        self.off_grps = config.dat_extra_args.off_grps
-        self.inter_size = config.dat_extra_args.inter_size
-        self.use_sdpa = config.dat_extra_args.use_sdpa
-        self.lr_size = config.dat_extra_args.lr_size
-        self.zoom_ratio = config.dat_extra_args.hr_image_size / config.dat_extra_args.lr_image_size
-        self.vit_enc_patchsize = config.dat_extra_args.lr_image_size // self.lr_size
-        self.hr_size = config.dat_extra_args.hr_image_size // self.vit_enc_patchsize
-        self.hd_proj = config.dat_extra_args.hd_proj
+        self.grid_size = config.dat_extra_args['grid_size']
+        self.off_ksize = config.dat_extra_args['off_ksize']
+        self.off_grps = config.dat_extra_args['off_grps']
+        self.inter_size = config.dat_extra_args['inter_size']
+        self.use_sdpa = config.dat_extra_args['use_sdpa']
+        self.lr_size = config.dat_extra_args['lr_size']
+        self.zoom_ratio = config.dat_extra_args['hr_image_size'] / config.dat_extra_args['lr_image_size']
+        self.vit_enc_patchsize = config.dat_extra_args['lr_image_size'] // self.lr_size
+        self.hr_size = config.dat_extra_args['hr_image_size'] // self.vit_enc_patchsize
+        self.hd_proj = config.dat_extra_args['hd_proj']
 
         self.hidden_size = config.hidden_size
         
@@ -556,7 +556,7 @@ class LlamaDecoderLayerDAT(nn.Module):
         self.config = config
         assert hasattr(self.config, 'dat_extra_args'), 'dat_extra_args must be in the config'
         self.hidden_size = config.hidden_size
-        this_layer_attn_type = self.config.dat_extra_args.layers[layer_idx]
+        this_layer_attn_type = self.config.dat_extra_args['layers'][layer_idx]
         self.self_attn = ATTN_TYPE_MAPPING[this_layer_attn_type](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
