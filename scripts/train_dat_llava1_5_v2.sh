@@ -60,7 +60,7 @@ ds --master_port=$MASTER_PORT --master_addr=$MASTER_ADDR --hostfile "/etc/volcan
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --seed 3463 \
-    --report_to none \ 
+    --report_to none \
     --run_name $EXP_NAME
 
 rm -rf /ephstorage/vlm_exps/textdat/$EXP_NAME/checkpoint-*
