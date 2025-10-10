@@ -3,8 +3,6 @@
 # DAT-LLaVA-1.5 综合测试脚本
 # 基于训练脚本 train_dat_llava1_5_v2.sh 的配置
 
-# 设置环境变量
-export TRANSFORMERS_OFFLINE=1
 export DS_SKIP_CUDA_CHECK=1
 
 # 激活conda环境
