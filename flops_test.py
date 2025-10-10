@@ -445,7 +445,8 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd", llm_type="a
                 image_processor = vision_tower.image_processor
             except AttributeError:
                 from transformers import CLIPImageProcessor
-                image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
+                # use local clip-vit-large-patch14-336
+                image_processor = CLIPImageProcessor.from_pretrained("/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336")
     
     return model, tokenizer, image_processor, actual_llm_type
 

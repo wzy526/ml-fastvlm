@@ -105,16 +105,34 @@ class TestDataset(Dataset):
         
         # convert to list format
         self.samples = []
-        for qid, item in self.data.items():
-            if max_samples and len(self.samples) >= max_samples:
-                break
-            self.samples.append({
-                'qid': qid,
-                'question': item['question'],
-                'imageId': item['imageId'],
-                'answer': item.get('answer', ''),
-                'fullAnswer': item.get('fullAnswer', '')
-            })
+        
+        # 处理不同的数据格式
+        if isinstance(self.data, dict):
+            # 字典格式：{qid: item}
+            for qid, item in self.data.items():
+                if max_samples and len(self.samples) >= max_samples:
+                    break
+                self.samples.append({
+                    'qid': qid,
+                    'question': item['question'],
+                    'imageId': item['imageId'],
+                    'answer': item.get('answer', ''),
+                    'fullAnswer': item.get('fullAnswer', '')
+                })
+        elif isinstance(self.data, list):
+            # 列表格式：[item1, item2, ...]
+            for i, item in enumerate(self.data):
+                if max_samples and len(self.samples) >= max_samples:
+                    break
+                self.samples.append({
+                    'qid': item.get('qid', f'qid_{i}'),
+                    'question': item['question'],
+                    'imageId': item['imageId'],
+                    'answer': item.get('answer', ''),
+                    'fullAnswer': item.get('fullAnswer', '')
+                })
+        else:
+            raise ValueError(f"不支持的数据格式: {type(self.data)}")
     
     def __len__(self):
         return len(self.samples)
