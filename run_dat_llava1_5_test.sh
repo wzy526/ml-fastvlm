@@ -12,8 +12,10 @@ source /home/zhuofan.xia/miniconda3/bin/activate pt260
 
 # 设置实验名称和路径
 EXP_NAME="tdat-7b-l0d32-s12g8z3"
-OUTPUT_DIR="/ephstorage/vlm_exps/textdat/$EXP_NAME"
-BACKUP_DIR="/perception-hl/zhuofan.xia/vlm_exps/textdat/$EXP_NAME"
+# 主要训练输出目录 (在另一个remote上)
+OUTPUT_DIR="/perception-hl/zhuofan.xia/vlm_exps/textdat/$EXP_NAME"
+# 本地备份目录 (如果存在)
+BACKUP_DIR="/root/vlm_exps/textdat/$EXP_NAME"
 
 # 检查checkpoint是否存在
 if [ -d "$OUTPUT_DIR" ]; then

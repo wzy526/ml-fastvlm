@@ -42,7 +42,7 @@ def get_training_config():
         'vision_tower': '/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336',
         'data_path': '/perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json',
         'image_folder': '/perception-hl/zhuofan.xia/data',
-        'output_dir': '/ephstorage/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3',
+        'output_dir': '/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3',  # 更新为实际路径
         'extra_yaml_path': './configs/llava1_5_v1.yaml',
         'mm_projector_type': 'mlp2x_gelu',
         'mm_vision_select_layer': -2,
