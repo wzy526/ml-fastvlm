@@ -534,9 +534,13 @@ def test_vlm_flops_fvcore(args):
         actual_llm_type
     )
     
-    # load gqa
-    data_path = "/root/gqa_opendatalab/testdev_balanced_questions.json"
-    image_folder = "/root/gqa_opendatalab/images"
+    # # load gqa
+    # data_path = "/root/gqa_opendatalab/testdev_balanced_questions.json"
+    # image_folder = "/root/gqa_opendatalab/images"
+
+    # load dataset
+    data_path = "/perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json"
+    image_folder = "/perception-hl/zhuofan.xia/data"
     
     print(f"加载GQA数据样本...")
     test_image, test_text = load_gqa_sample(data_path, image_folder, args.resolution)

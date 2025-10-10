@@ -114,8 +114,8 @@ class TestDataset(Dataset):
                     break
                 self.samples.append({
                     'qid': qid,
-                    'question': item['question'],
-                    'imageId': item['imageId'],
+                    'question': item.get('question', ''),
+                    'imageId': item.get('imageId', ''),
                     'answer': item.get('answer', ''),
                     'fullAnswer': item.get('fullAnswer', '')
                 })
@@ -126,8 +126,8 @@ class TestDataset(Dataset):
                     break
                 self.samples.append({
                     'qid': item.get('qid', f'qid_{i}'),
-                    'question': item['question'],
-                    'imageId': item['imageId'],
+                    'question': item.get('question', ''),
+                    'imageId': item.get('imageId', ''),
                     'answer': item.get('answer', ''),
                     'fullAnswer': item.get('fullAnswer', '')
                 })
