@@ -99,7 +99,9 @@ def run_ttft_test(model_path, data_path, image_folder, output_file=None,
     print(f"运行TTFT测试命令: {' '.join(cmd)}")
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # 设置正确的工作目录为脚本所在目录
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=script_dir)
         print("TTFT测试完成")
         print("STDOUT:", result.stdout)
         if result.stderr:
@@ -132,7 +134,9 @@ def run_flops_test(model_path, output_file=None, resolution=336, vision_encoder=
     print(f"运行FLOPs测试命令: {' '.join(cmd)}")
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # 设置正确的工作目录为脚本所在目录
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=script_dir)
         print("FLOPs测试完成")
         print("STDOUT:", result.stdout)
         if result.stderr:

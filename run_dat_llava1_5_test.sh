@@ -65,7 +65,7 @@ echo "结果将保存到: $(pwd)"
 echo "开始运行DAT-LLaVA-1.5综合测试..."
 echo "="*80
 
-python /root/ml-fastvlm/test_dat_llava1_5_ttft_flops.py \
+python /home/zhuofan.xia/ml-fastvlm/test_dat_llava1_5_ttft_flops.py \
     --checkpoint-path "$CHECKPOINT_PATH" \
     --resolution 336 \
     --max-samples 1000 \
