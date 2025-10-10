@@ -65,22 +65,91 @@ echo "结果将保存到: $(pwd)"
 echo "开始运行DAT-LLaVA-1.5综合测试..."
 echo "="*80
 
-python /home/zhuofan.xia/ml-fastvlm/test_dat_llava1_5_ttft_flops.py \
-    --checkpoint-path "$CHECKPOINT_PATH" \
+# 设置时间戳
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# 1. 运行TTFT测试
+echo "1. 运行TTFT测试"
+echo "="*60
+python /home/zhuofan.xia/ml-fastvlm/ttft_test.py \
+    --model-path "$CHECKPOINT_PATH" \
+    --data-path "$DATA_PATH" \
+    --image-folder "$IMAGE_FOLDER" \
     --resolution 336 \
+    --vision-encoder clip \
     --max-samples 1000 \
-    --output-dir "$(pwd)"
+    --output-file "ttft_results_dat_llava1_5_${TIMESTAMP}.json"
+
+TTFT_SUCCESS=$?
+
+# 2. 运行FLOPs测试
+echo ""
+echo "2. 运行FLOPs测试"
+echo "="*60
+python /home/zhuofan.xia/ml-fastvlm/flops_test.py \
+    --model-path "$CHECKPOINT_PATH" \
+    --resolution 336 \
+    --vision-encoder clip \
+    --output-file "flops_results_dat_llava1_5_${TIMESTAMP}.json"
+
+FLOPS_SUCCESS=$?
+
+# 3. 汇总结果
+echo ""
+echo "测试结果汇总"
+echo "="*60
+echo "模型路径: $CHECKPOINT_PATH"
+echo "分辨率: 336x336"
+echo "视觉编码器: clip"
+echo "LLM类型: llama"
+echo "-"*60
+if [ $TTFT_SUCCESS -eq 0 ]; then
+    echo "TTFT测试: ✅ 成功"
+else
+    echo "TTFT测试: ❌ 失败"
+fi
+
+if [ $FLOPS_SUCCESS -eq 0 ]; then
+    echo "FLOPs测试: ✅ 成功"
+else
+    echo "FLOPs测试: ❌ 失败"
+fi
+
+# 创建综合结果文件
+cat > "comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json" << EOF
+{
+  "model_path": "$CHECKPOINT_PATH",
+  "resolution": "336x336",
+  "vision_encoder": "clip",
+  "llm_type": "llama",
+  "test_results": {
+    "ttft_success": $([ $TTFT_SUCCESS -eq 0 ] && echo "true" || echo "false"),
+    "flops_success": $([ $FLOPS_SUCCESS -eq 0 ] && echo "true" || echo "false"),
+    "ttft_output_file": "ttft_results_dat_llava1_5_${TIMESTAMP}.json",
+    "flops_output_file": "flops_results_dat_llava1_5_${TIMESTAMP}.json"
+  },
+  "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+
+echo "综合结果文件: comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json"
 
 # 检查测试结果
-if [ $? -eq 0 ]; then
+if [ $TTFT_SUCCESS -eq 0 ] && [ $FLOPS_SUCCESS -eq 0 ]; then
     echo ""
-    echo "🎉 测试完成成功!"
+    echo "🎉 所有测试完成成功!"
     echo "结果文件保存在: $(pwd)"
     echo ""
     echo "生成的文件:"
     ls -la *.json
 else
     echo ""
-    echo "❌ 测试失败，请检查日志"
+    echo "❌ 部分测试失败，请检查日志"
+    if [ $TTFT_SUCCESS -ne 0 ]; then
+        echo "TTFT测试失败"
+    fi
+    if [ $FLOPS_SUCCESS -ne 0 ]; then
+        echo "FLOPs测试失败"
+    fi
     exit 1
 fi
