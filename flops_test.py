@@ -400,12 +400,14 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd", llm_type="a
     if actual_llm_type == "qwen2":
         model = LlavaQwen2ForCausalLM.from_pretrained(
             model_path,
+            config=config,  # 传递修复后的配置
             torch_dtype=torch.float16,
             device_map="auto",
         )
     elif actual_llm_type == "llama":
         model = LlavaLlamaForCausalLM.from_pretrained(
             model_path,
+            config=config,  # 传递修复后的配置
             torch_dtype=torch.float16,
             device_map="auto",
         )

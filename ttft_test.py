@@ -218,6 +218,7 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
         print(f"Loading LlavaQwen2ForCausalLM model (Qwen2 backbone)")
         model = LlavaQwen2ForCausalLM.from_pretrained(
             model_path,
+            config=config,  # 传递修复后的配置
             torch_dtype=compute_dtype,
             device_map="auto"  
         )
@@ -226,6 +227,7 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
         print(f"Loading LlavaLlamaForCausalLM model (Llama backbone)")
         model = LlavaLlamaForCausalLM.from_pretrained(
             model_path,
+            config=config,  # 传递修复后的配置
             torch_dtype=compute_dtype,
             device_map="auto" 
         )
