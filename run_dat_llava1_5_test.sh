@@ -57,9 +57,8 @@ echo "使用图像文件夹: $IMAGE_FOLDER"
 # 创建结果目录
 RESULTS_DIR="./test_results_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS_DIR"
-cd "$RESULTS_DIR"
 
-echo "结果将保存到: $(pwd)"
+echo "结果将保存到: $(pwd)/$RESULTS_DIR"
 
 # 运行综合测试
 echo "开始运行DAT-LLaVA-1.5综合测试..."
@@ -78,7 +77,7 @@ python /home/zhuofan.xia/ml-fastvlm/ttft_test.py \
     --resolution 336 \
     --vision-encoder clip \
     --max-samples 1000 \
-    --output-file "ttft_results_dat_llava1_5_${TIMESTAMP}.json"
+    --output-file "$RESULTS_DIR/ttft_results_dat_llava1_5_${TIMESTAMP}.json"
 
 TTFT_SUCCESS=$?
 
@@ -90,7 +89,7 @@ python /home/zhuofan.xia/ml-fastvlm/flops_test.py \
     --model-path "$CHECKPOINT_PATH" \
     --resolution 336 \
     --vision-encoder clip \
-    --output-file "flops_results_dat_llava1_5_${TIMESTAMP}.json"
+    --output-file "$RESULTS_DIR/flops_results_dat_llava1_5_${TIMESTAMP}.json"
 
 FLOPS_SUCCESS=$?
 
@@ -116,7 +115,7 @@ else
 fi
 
 # 创建综合结果文件
-cat > "comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json" << EOF
+cat > "$RESULTS_DIR/comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json" << EOF
 {
   "model_path": "$CHECKPOINT_PATH",
   "resolution": "336x336",
@@ -132,16 +131,16 @@ cat > "comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json" << EOF
 }
 EOF
 
-echo "综合结果文件: comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json"
+echo "综合结果文件: $RESULTS_DIR/comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json"
 
 # 检查测试结果
 if [ $TTFT_SUCCESS -eq 0 ] && [ $FLOPS_SUCCESS -eq 0 ]; then
     echo ""
     echo "🎉 所有测试完成成功!"
-    echo "结果文件保存在: $(pwd)"
+    echo "结果文件保存在: $(pwd)/$RESULTS_DIR"
     echo ""
     echo "生成的文件:"
-    ls -la *.json
+    ls -la "$RESULTS_DIR"/*.json
 else
     echo ""
     echo "❌ 部分测试失败，请检查日志"
