@@ -382,6 +382,20 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd", llm_type="a
     
     print(f"使用LLM类型: {actual_llm_type}")
     
+    # 修复配置中的 decoder_config 问题
+    config = transformers.AutoConfig.from_pretrained(model_path)
+    if hasattr(config, 'decoder_config') and isinstance(config.decoder_config, dict):
+        print("修复 decoder_config 配置...")
+        # 将字典转换为配置对象
+        if 'model_type' in config.decoder_config:
+            decoder_config = transformers.AutoConfig.from_dict(config.decoder_config)
+            config.decoder_config = decoder_config
+        else:
+            # 如果没有 model_type，创建一个基本的配置对象
+            from transformers import PretrainedConfig
+            decoder_config = PretrainedConfig.from_dict(config.decoder_config)
+            config.decoder_config = decoder_config
+    
     # 加载模型
     if actual_llm_type == "qwen2":
         model = LlavaQwen2ForCausalLM.from_pretrained(
