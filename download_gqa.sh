@@ -6,7 +6,7 @@
 set -e  # 遇到错误时退出
 
 # 设置路径
-DATA_DIR="/cluster/home/data"
+DATA_DIR="/perception-hl/zhuofan.xia/data"
 GQA_DIR="$DATA_DIR/gqa"
 
 # GQA数据集下载链接
