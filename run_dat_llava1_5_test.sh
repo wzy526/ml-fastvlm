@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# DAT-LLaVA-1.5 综合测试脚本
+# DAT-LLaVA-1.5 GQA数据集综合测试脚本
 # 基于训练脚本 train_dat_llava1_5_v2.sh 的配置
+# 使用GQA数据集进行TTFT和FLOPs测试
 
 export DS_SKIP_CUDA_CHECK=1
 
@@ -30,22 +31,23 @@ else
     exit 1
 fi
 
-# 检查数据路径
-DATA_PATH="/perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json"
-IMAGE_FOLDER="/perception-hl/zhuofan.xia/data"
+# 检查GQA数据集路径
+DATA_PATH="/perception-hl/zhuofan.xia/data/gqa/questions/val_all_questions.json"
+IMAGE_FOLDER="/perception-hl/zhuofan.xia/data/gqa/images"
 
 if [ ! -f "$DATA_PATH" ]; then
-    echo "警告: 数据文件不存在: $DATA_PATH"
-    echo "将使用GQA数据集进行测试"
-    DATA_PATH="/root/gqa_opendatalab/testdev_balanced_questions.json"
-    IMAGE_FOLDER="/root/gqa_opendatalab/images"
+    echo "错误: 未找到GQA数据集文件"
+    echo "请检查以下路径:"
+    echo "  - $DATA_PATH"
+    echo "  - $IMAGE_FOLDER"
+    echo ""
+    echo "请确保GQA数据集已正确下载并解压到指定位置"
+    exit 1
 fi
 
-if [ ! -f "$DATA_PATH" ]; then
-    echo "错误: 未找到测试数据文件"
-    echo "请检查以下路径:"
-    echo "  - /perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json"
-    echo "  - /root/gqa_opendatalab/testdev_balanced_questions.json"
+if [ ! -d "$IMAGE_FOLDER" ]; then
+    echo "错误: 未找到GQA图像文件夹"
+    echo "请检查路径: $IMAGE_FOLDER"
     exit 1
 fi
 
@@ -58,95 +60,60 @@ mkdir -p "$RESULTS_DIR"
 
 echo "结果将保存到: $(pwd)/$RESULTS_DIR"
 
-# 运行综合测试
-echo "开始运行DAT-LLaVA-1.5综合测试..."
+# 运行GQA数据集综合测试
+echo "开始运行DAT-LLaVA-1.5 GQA数据集综合测试..."
 echo "="*80
 
 # 设置时间戳
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-# 1. 运行TTFT测试
-echo "1. 运行TTFT测试"
+# 运行综合测试脚本
+echo "运行GQA数据集综合测试 (TTFT + FLOPs)"
 echo "="*60
-python /home/zhuofan.xia/ml-fastvlm/ttft_test.py \
-    --model-path "$CHECKPOINT_PATH" \
-    --data-path "$DATA_PATH" \
-    --image-folder "$IMAGE_FOLDER" \
+python /home/zhuofan.xia/ml-fastvlm/test_dat_llava1_5_ttft_flops.py \
+    --checkpoint-path "$CHECKPOINT_PATH" \
     --resolution 336 \
-    --vision-encoder clip \
     --max-samples 1000 \
-    --output-file "$RESULTS_DIR/ttft_results_dat_llava1_5_${TIMESTAMP}.json"
+    --output-dir "$RESULTS_DIR"
 
-TTFT_SUCCESS=$?
+TEST_SUCCESS=$?
 
-# 2. 运行FLOPs测试
+# 汇总结果
 echo ""
-echo "2. 运行FLOPs测试"
+echo "GQA数据集测试结果汇总"
 echo "="*60
-python /home/zhuofan.xia/ml-fastvlm/flops_test.py \
-    --model-path "$CHECKPOINT_PATH" \
-    --resolution 336 \
-    --vision-encoder clip \
-    --output-file "$RESULTS_DIR/flops_results_dat_llava1_5_${TIMESTAMP}.json"
-
-FLOPS_SUCCESS=$?
-
-# 3. 汇总结果
-echo ""
-echo "测试结果汇总"
-echo "="*60
+echo "数据集: GQA (Graph Question Answering)"
+echo "数据路径: $DATA_PATH"
+echo "图像文件夹: $IMAGE_FOLDER"
 echo "模型路径: $CHECKPOINT_PATH"
 echo "分辨率: 336x336"
 echo "视觉编码器: clip"
 echo "LLM类型: llama"
 echo "-"*60
-if [ $TTFT_SUCCESS -eq 0 ]; then
-    echo "TTFT测试: ✅ 成功"
+if [ $TEST_SUCCESS -eq 0 ]; then
+    echo "GQA综合测试: ✅ 成功"
 else
-    echo "TTFT测试: ❌ 失败"
+    echo "GQA综合测试: ❌ 失败"
 fi
-
-if [ $FLOPS_SUCCESS -eq 0 ]; then
-    echo "FLOPs测试: ✅ 成功"
-else
-    echo "FLOPs测试: ❌ 失败"
-fi
-
-# 创建综合结果文件
-cat > "$RESULTS_DIR/comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json" << EOF
-{
-  "model_path": "$CHECKPOINT_PATH",
-  "resolution": "336x336",
-  "vision_encoder": "clip",
-  "llm_type": "llama",
-  "test_results": {
-    "ttft_success": $([ $TTFT_SUCCESS -eq 0 ] && echo "true" || echo "false"),
-    "flops_success": $([ $FLOPS_SUCCESS -eq 0 ] && echo "true" || echo "false"),
-    "ttft_output_file": "ttft_results_dat_llava1_5_${TIMESTAMP}.json",
-    "flops_output_file": "flops_results_dat_llava1_5_${TIMESTAMP}.json"
-  },
-  "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
-}
-EOF
-
-echo "综合结果文件: $RESULTS_DIR/comprehensive_test_results_dat_llava1_5_${TIMESTAMP}.json"
 
 # 检查测试结果
-if [ $TTFT_SUCCESS -eq 0 ] && [ $FLOPS_SUCCESS -eq 0 ]; then
+echo ""
+echo "GQA数据集测试完成"
+echo "结果文件保存在: $(pwd)/$RESULTS_DIR"
+echo ""
+echo "生成的文件:"
+ls -la "$RESULTS_DIR"/*.json 2>/dev/null || echo "未找到结果文件"
+
+# 检查测试结果
+if [ $TEST_SUCCESS -eq 0 ]; then
     echo ""
-    echo "🎉 所有测试完成成功!"
+    echo "🎉 GQA数据集测试完成成功!"
     echo "结果文件保存在: $(pwd)/$RESULTS_DIR"
     echo ""
     echo "生成的文件:"
-    ls -la "$RESULTS_DIR"/*.json
+    ls -la "$RESULTS_DIR"/*.json 2>/dev/null || echo "未找到结果文件"
 else
     echo ""
-    echo "❌ 部分测试失败，请检查日志"
-    if [ $TTFT_SUCCESS -ne 0 ]; then
-        echo "TTFT测试失败"
-    fi
-    if [ $FLOPS_SUCCESS -ne 0 ]; then
-        echo "FLOPs测试失败"
-    fi
+    echo "❌ GQA数据集测试失败，请检查日志"
     exit 1
 fi
