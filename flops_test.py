@@ -535,8 +535,8 @@ def test_vlm_flops_fvcore(args):
     )
     
     # load gqa
-    data_path = "/root/gqa_opendatalab/testdev_balanced_questions.json"
-    image_folder = "/root/gqa_opendatalab/images"
+    data_path = "/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json"
+    image_folder = "/perception-hl/zhuofan.xia/data/gqa/images"
 
     # # load dataset
     # data_path = "/perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json"
