@@ -40,8 +40,8 @@ def get_training_config():
     config = {
         'model_name_or_path': '/home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b',
         'vision_tower': '/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336',
-        'data_path': '/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json',  # GQA验证集
-        'image_folder': '/perception-hl/zhuofan.xia/data/gqa/images',  # GQA图像文件夹
+        'data_path': '/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json',  # GQA test set
+        'image_folder': '/perception-hl/zhuofan.xia/data/gqa/images', 
         'output_dir': '/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3',  
         'extra_yaml_path': './configs/llava1_5_v1.yaml',
         'mm_projector_type': 'mlp2x_gelu',
@@ -50,9 +50,9 @@ def get_training_config():
         'mm_use_im_patch_token': False,
         'image_aspect_ratio': 'pad',
         'model_max_length': 2048,
-        'resolution': 336,  # 从yaml配置中获取
-        'vision_encoder': 'clip',  # 使用CLIP作为视觉编码器
-        'llm_type': 'llama'  # 使用LLaMA作为LLM backbone
+        'resolution': 336,  
+        'vision_encoder': 'clip',  
+        'llm_type': 'llama'  
     }
     return config
 
