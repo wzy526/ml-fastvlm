@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 #
-# DAT-LLaVA-1.5 TTFT和FLOPs综合测试脚本
+# DAT-LLaVA-1.5 TTFT和FLOPs综合测试脚本 (GQA数据集)
 # 基于训练脚本 train_dat_llava1_5_v2.sh 的配置
-# 使用训练好的checkpoint和config进行测试
+# 使用GQA数据集进行测试，使用训练好的checkpoint和config
 #
 import os
 import time
@@ -36,13 +36,13 @@ import transformers
 
 
 def get_training_config():
-    """从训练脚本中获取配置信息"""
+    """从训练脚本中获取配置信息 - 使用GQA数据集"""
     config = {
         'model_name_or_path': '/home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b',
         'vision_tower': '/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336',
-        'data_path': '/perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json',
-        'image_folder': '/perception-hl/zhuofan.xia/data',
-        'output_dir': '/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3',  # 更新为实际路径
+        'data_path': '/perception-hl/zhuofan.xia/data/gqa/questions/val_all_questions.json',  # GQA验证集
+        'image_folder': '/perception-hl/zhuofan.xia/data/gqa/images',  # GQA图像文件夹
+        'output_dir': '/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3',  
         'extra_yaml_path': './configs/llava1_5_v1.yaml',
         'mm_projector_type': 'mlp2x_gelu',
         'mm_vision_select_layer': -2,
@@ -152,7 +152,7 @@ def run_flops_test(model_path, output_file=None, resolution=336, vision_encoder=
 def run_comprehensive_test(args):
     """运行综合测试"""
     print("="*80)
-    print("DAT-LLaVA-1.5 综合测试 (TTFT + FLOPs)")
+    print("DAT-LLaVA-1.5 综合测试 (TTFT + FLOPs) - GQA数据集")
     print("="*80)
     
     # 获取训练配置
@@ -177,8 +177,8 @@ def run_comprehensive_test(args):
     
     # 设置输出文件
     timestamp = time.strftime('%Y%m%d_%H%M%S')
-    ttft_output = f"ttft_results_dat_llava1_5_{timestamp}.json"
-    flops_output = f"flops_results_dat_llava1_5_{timestamp}.json"
+    ttft_output = f"ttft_results_dat_llava1_5_gqa_{timestamp}.json"
+    flops_output = f"flops_results_dat_llava1_5_gqa_{timestamp}.json"
     
     # 运行TTFT测试
     print("\n" + "="*60)
@@ -209,8 +209,11 @@ def run_comprehensive_test(args):
     
     # 汇总结果
     print("\n" + "="*80)
-    print("测试结果汇总")
+    print("测试结果汇总 (GQA数据集)")
     print("="*80)
+    print(f"数据集: GQA (Graph Question Answering)")
+    print(f"数据路径: {config['data_path']}")
+    print(f"图像文件夹: {config['image_folder']}")
     print(f"模型路径: {model_path}")
     print(f"分辨率: {args.resolution}x{args.resolution}")
     print(f"视觉编码器: {config['vision_encoder']}")
@@ -242,6 +245,12 @@ def run_comprehensive_test(args):
     
     # 创建综合结果文件
     comprehensive_results = {
+        'dataset_info': {
+            'name': 'GQA (Graph Question Answering)',
+            'data_path': config['data_path'],
+            'image_folder': config['image_folder'],
+            'description': 'GQA数据集用于测试视觉问答性能'
+        },
         'model_path': model_path,
         'training_config': config,
         'test_config': {
@@ -259,7 +268,7 @@ def run_comprehensive_test(args):
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }
     
-    comprehensive_output = f"comprehensive_test_results_dat_llava1_5_{timestamp}.json"
+    comprehensive_output = f"comprehensive_test_results_dat_llava1_5_gqa_{timestamp}.json"
     with open(comprehensive_output, 'w') as f:
         json.dump(comprehensive_results, f, indent=2)
     
@@ -269,7 +278,7 @@ def run_comprehensive_test(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DAT-LLaVA-1.5 综合测试 (TTFT + FLOPs)")
+    parser = argparse.ArgumentParser(description="DAT-LLaVA-1.5 综合测试 (TTFT + FLOPs) - GQA数据集")
     parser.add_argument("--checkpoint-path", type=str, default=None,
                        help="训练好的checkpoint路径 (如果为None，将自动查找最新的checkpoint)")
     parser.add_argument("--resolution", type=int, default=336, 
