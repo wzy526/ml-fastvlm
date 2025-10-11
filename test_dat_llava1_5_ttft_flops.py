@@ -40,7 +40,7 @@ def get_training_config():
     config = {
         'model_name_or_path': '/home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b',
         'vision_tower': '/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336',
-        'data_path': '/perception-hl/zhuofan.xia/data/gqa/questions/val_all_questions.json',  # GQA验证集
+        'data_path': '/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json',  # GQA验证集
         'image_folder': '/perception-hl/zhuofan.xia/data/gqa/images',  # GQA图像文件夹
         'output_dir': '/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3',  
         'extra_yaml_path': './configs/llava1_5_v1.yaml',

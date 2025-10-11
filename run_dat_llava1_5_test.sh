@@ -32,7 +32,7 @@ else
 fi
 
 # 检查GQA数据集路径
-DATA_PATH="/perception-hl/zhuofan.xia/data/gqa/questions/val_all_questions.json"
+DATA_PATH="/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json"
 IMAGE_FOLDER="/perception-hl/zhuofan.xia/data/gqa/images"
 
 if [ ! -f "$DATA_PATH" ]; then
