@@ -31,7 +31,7 @@ else
 fi
 
 # 检查GQA数据集路径
-DATA_PATH="/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json"
+DATA_PATH="/perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json"
 IMAGE_FOLDER="/perception-hl/zhuofan.xia/data/gqa/images"
 
 if [ ! -f "$DATA_PATH" ]; then
@@ -53,7 +53,7 @@ fi
 echo "使用数据文件: $DATA_PATH"
 echo "使用图像文件夹: $IMAGE_FOLDER"
 echo "使用模型路径: $CHECKPOINT_PATH"
-echo "评估模式: 完整GQA测试集 (无样本数限制)"
+echo "评估模式: GQA标准平衡验证集 (val_balanced_questions.json)"
 
 # 创建结果目录
 RESULTS_DIR="./gqa_eval_results_$(date +%Y%m%d_%H%M%S)"
