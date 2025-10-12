@@ -28,33 +28,37 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
     # 加载tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
     
-    # 加载模型 - 添加错误处理
-    try:
-        if 'qwen' in model_path.lower():
-            model = LlavaQwen2ForCausalLM.from_pretrained(
-                model_path, 
-                torch_dtype=torch.float16, 
-                device_map=device_map,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
-            )
+    # 修复配置中的 decoder_config 问题 - 这是关键！
+    config = transformers.AutoConfig.from_pretrained(model_path)
+    if hasattr(config, 'decoder_config') and isinstance(config.decoder_config, dict):
+        print("修复 decoder_config 配置...")
+        # 将字典转换为配置对象
+        if 'model_type' in config.decoder_config:
+            decoder_config = transformers.AutoConfig.from_dict(config.decoder_config)
+            config.decoder_config = decoder_config
         else:
-            model = LlavaLlamaForCausalLM.from_pretrained(
-                model_path, 
-                torch_dtype=torch.float16, 
-                device_map=device_map,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
-            )
-    except Exception as e:
-        print(f"LLaVA模型加载失败，尝试使用AutoModel: {e}")
-        # 如果LLaVA模型加载失败，尝试使用AutoModel
-        model = transformers.AutoModelForCausalLM.from_pretrained(
+            # 如果没有 model_type，创建一个基本的配置对象
+            from transformers import PretrainedConfig
+            decoder_config = PretrainedConfig.from_dict(config.decoder_config)
+            config.decoder_config = decoder_config
+    
+    # 加载模型
+    model_name = get_model_name_from_path(model_path)
+    if 'qwen' in model_name.lower():
+        print("Loading LlavaQwen2ForCausalLM model (Qwen2 backbone)")
+        model = LlavaQwen2ForCausalLM.from_pretrained(
             model_path,
+            config=config,  # 传递修复后的配置
             torch_dtype=torch.float16,
-            device_map=device_map,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
+            device_map=device_map
+        )
+    else:
+        print("Loading LlavaLlamaForCausalLM model (Llama backbone)")
+        model = LlavaLlamaForCausalLM.from_pretrained(
+            model_path,
+            config=config,  # 传递修复后的配置
+            torch_dtype=torch.float16,
+            device_map=device_map
         )
     
     # 设置图像处理器
