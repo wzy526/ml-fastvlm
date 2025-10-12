@@ -28,18 +28,33 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
     # 加载tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
     
-    # 加载模型
-    if 'qwen' in model_path.lower():
-        model = LlavaQwen2ForCausalLM.from_pretrained(
-            model_path, 
-            torch_dtype=torch.float16, 
-            device_map=device_map
-        )
-    else:
-        model = LlavaLlamaForCausalLM.from_pretrained(
-            model_path, 
-            torch_dtype=torch.float16, 
-            device_map=device_map
+    # 加载模型 - 添加错误处理
+    try:
+        if 'qwen' in model_path.lower():
+            model = LlavaQwen2ForCausalLM.from_pretrained(
+                model_path, 
+                torch_dtype=torch.float16, 
+                device_map=device_map,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+        else:
+            model = LlavaLlamaForCausalLM.from_pretrained(
+                model_path, 
+                torch_dtype=torch.float16, 
+                device_map=device_map,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+    except Exception as e:
+        print(f"LLaVA模型加载失败，尝试使用AutoModel: {e}")
+        # 如果LLaVA模型加载失败，尝试使用AutoModel
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map=device_map,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
         )
     
     # 设置图像处理器
