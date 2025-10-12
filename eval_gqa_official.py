@@ -59,6 +59,15 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             device_map=device_map
         )
     
+    # 修复视觉编码器加载问题
+    print("初始化视觉编码器...")
+    if hasattr(model, 'get_vision_tower'):
+        vision_tower = model.get_vision_tower()
+        if vision_tower is not None and not vision_tower.is_loaded:
+            print("加载视觉编码器...")
+            vision_tower.load_model()
+            print("视觉编码器加载完成")
+    
     # 设置图像处理器
     try:
         image_processor = transformers.CLIPImageProcessor.from_pretrained(
