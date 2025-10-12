@@ -68,11 +68,28 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
         )
     except OSError as e:
         if "preprocessor_config.json" in str(e):
-            print("警告: 未找到preprocessor_config.json，使用默认CLIP处理器...")
-            # 使用默认的CLIP处理器
-            image_processor = transformers.CLIPImageProcessor.from_pretrained(
-                "openai/clip-vit-large-patch14-336"
-            )
+            print("警告: 未找到preprocessor_config.json，使用训练时的视觉编码器...")
+            # 使用训练时的视觉编码器路径
+            vision_tower_path = "/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336"
+            try:
+                image_processor = transformers.CLIPImageProcessor.from_pretrained(
+                    vision_tower_path, trust_remote_code=True
+                )
+                print(f"成功加载视觉编码器: {vision_tower_path}")
+            except Exception as vision_error:
+                print(f"视觉编码器加载失败: {vision_error}")
+                # # 最后的备选方案：创建基本的图像处理器
+                # from transformers import CLIPImageProcessor
+                # image_processor = CLIPImageProcessor(
+                #     size={"height": 336, "width": 336},
+                #     do_convert_rgb=True,
+                #     do_normalize=True,
+                #     do_rescale=True,
+                #     do_resize=True,
+                #     image_mean=[0.48145466, 0.4578275, 0.40821073],
+                #     image_std=[0.26862954, 0.26130258, 0.27577711]
+                # )
+                # print("使用基本图像处理器配置")
         else:
             raise e
     
