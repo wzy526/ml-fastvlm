@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-GQA准确率评估脚本
-基于训练好的DAT-LLaVA-1.5模型进行GQA数据集准确率评估
+基于LLaVA官方实现的GQA评估脚本
+适配您训练的DAT-LLaVA-1.5模型
 """
 
 import os
@@ -22,32 +22,31 @@ import transformers
 
 
 def load_model_and_tokenizer(model_path, device_map="auto"):
-    """加载模型和分词器"""
+    """加载模型和分词器 - 基于官方实现"""
     disable_torch_init()
     
     # 加载tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
-
+    
+    # 修复配置中的 decoder_config 问题
     config = transformers.AutoConfig.from_pretrained(model_path)
     if hasattr(config, 'decoder_config') and isinstance(config.decoder_config, dict):
         print("修复 decoder_config 配置...")
-        # convert dictionary to config object
         if 'model_type' in config.decoder_config:
             decoder_config = transformers.AutoConfig.from_dict(config.decoder_config)
             config.decoder_config = decoder_config
         else:
-            # if there is no model_type, create a basic config object
             from transformers import PretrainedConfig
             decoder_config = PretrainedConfig.from_dict(config.decoder_config)
             config.decoder_config = decoder_config
     
-    # load model
+    # 加载模型
     model_name = get_model_name_from_path(model_path)
     if 'qwen' in model_name.lower():
         print("Loading LlavaQwen2ForCausalLM model (Qwen2 backbone)")
         model = LlavaQwen2ForCausalLM.from_pretrained(
             model_path,
-            config=config,  # pass the repaired config
+            config=config,
             torch_dtype=torch.float16,
             device_map=device_map
         )
@@ -55,12 +54,12 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
         print("Loading LlavaLlamaForCausalLM model (Llama backbone)")
         model = LlavaLlamaForCausalLM.from_pretrained(
             model_path,
-            config=config, 
+            config=config,
             torch_dtype=torch.float16,
             device_map=device_map
         )
     
-    # 设置图像处理器 - 处理缺失的preprocessor_config.json
+    # 设置图像处理器
     try:
         image_processor = transformers.CLIPImageProcessor.from_pretrained(
             model_path, trust_remote_code=True
@@ -68,7 +67,6 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
     except OSError as e:
         if "preprocessor_config.json" in str(e):
             print("警告: 未找到preprocessor_config.json，使用训练时的视觉编码器...")
-            # 使用训练时的视觉编码器路径
             vision_tower_path = "/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336"
             try:
                 image_processor = transformers.CLIPImageProcessor.from_pretrained(
@@ -77,18 +75,18 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
                 print(f"成功加载视觉编码器: {vision_tower_path}")
             except Exception as vision_error:
                 print(f"视觉编码器加载失败: {vision_error}")
-                # # 最后的备选方案：创建基本的图像处理器
-                # from transformers import CLIPImageProcessor
-                # image_processor = CLIPImageProcessor(
-                #     size={"height": 336, "width": 336},
-                #     do_convert_rgb=True,
-                #     do_normalize=True,
-                #     do_rescale=True,
-                #     do_resize=True,
-                #     image_mean=[0.48145466, 0.4578275, 0.40821073],
-                #     image_std=[0.26862954, 0.26130258, 0.27577711]
-                # )
-                # print("使用基本图像处理器配置")
+                # 创建基本图像处理器
+                from transformers import CLIPImageProcessor
+                image_processor = CLIPImageProcessor(
+                    size={"height": 336, "width": 336},
+                    do_convert_rgb=True,
+                    do_normalize=True,
+                    do_rescale=True,
+                    do_resize=True,
+                    image_mean=[0.48145466, 0.4578275, 0.40821073],
+                    image_std=[0.26862954, 0.26130258, 0.27577711]
+                )
+                print("使用基本图像处理器配置")
         else:
             raise e
     
@@ -96,19 +94,21 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
 
 
 def load_gqa_data(data_path, max_samples=None):
-    """加载GQA数据"""
+    """加载GQA数据 - 转换为LLaVA格式"""
     with open(data_path, 'r') as f:
         data = json.load(f)
-
+    
+    # 转换为LLaVA格式的样本列表
     samples = []
     for qid, item in data.items():
-        samples.append({
+        sample = {
             'questionId': qid,
             'question': item['question'],
             'imageId': item['imageId'],
             'answer': item['answer'],
             'fullAnswer': item.get('fullAnswer', item['answer'])
-        })
+        }
+        samples.append(sample)
     
     if max_samples:
         samples = samples[:max_samples]
@@ -116,37 +116,43 @@ def load_gqa_data(data_path, max_samples=None):
     return samples
 
 
-def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1"):
-    """评估单个样本"""
+def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="vicuna_v1", temperature=0):
+    """评估单个样本 - 基于官方实现"""
     try:
+        # 加载图像
         image_path = os.path.join(image_folder, f"{sample['imageId']}.jpg")
         if not os.path.exists(image_path):
             return None, "Image not found"
         
         image = Image.open(image_path).convert('RGB')
-
+        
+        # 构建对话 - 使用vicuna_v1格式（与官方一致）
         conv = conv_templates[conv_mode].copy()
         conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{sample['question']}")
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
         
+        # 处理输入
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
         input_ids = input_ids.unsqueeze(0).cuda()
-
+        
+        # 处理图像
         image_tensor = process_images([image], image_processor, model.config)[0]
         
+        # 生成回答 - 使用官方参数
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
                 images=image_tensor.unsqueeze(0).half().cuda(),
-                do_sample=False,
-                temperature=0,
+                do_sample=temperature > 0,
+                temperature=temperature,
                 top_p=None,
                 num_beams=1,
                 max_new_tokens=32,
                 use_cache=True
             )
         
+        # 解码输出
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
         outputs = outputs[len(prompt):].strip()
         
@@ -157,17 +163,17 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
 
 
 def normalize_answer(answer):
-    """标准化答案用于比较"""
+    """标准化答案 - 与GQA官方评估一致"""
     if answer is None:
         return ""
-        
-        # 转换为小写
+    
+    # 转换为小写
     answer = answer.lower().strip()
     
-    # remove punctuation
+    # 移除标点符号
     answer = re.sub(r'[^\w\s]', '', answer)
     
-    # remove extra spaces
+    # 移除多余空格
     answer = ' '.join(answer.split())
     
     return answer
@@ -185,24 +191,44 @@ def calculate_accuracy(predictions, ground_truths):
     return correct / total if total > 0 else 0.0
 
 
+def save_results_jsonl(predictions, ground_truths, samples, output_file):
+    """保存为JSONL格式 - 兼容GQA官方评估"""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for i, (pred, gt, sample) in enumerate(zip(predictions, ground_truths, samples)):
+            result = {
+                'questionId': sample['questionId'],
+                'question': sample['question'],
+                'imageId': sample['imageId'],
+                'ground_truth': gt,
+                'prediction': pred,
+                'correct': normalize_answer(pred) == normalize_answer(gt)
+            }
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
+
+
 def main():
-    parser = argparse.ArgumentParser(description="GQA准确率评估")
+    parser = argparse.ArgumentParser(description="GQA官方风格评估")
     parser.add_argument("--model-path", type=str, required=True, help="模型路径")
     parser.add_argument("--data-path", type=str, required=True, help="GQA数据文件路径")
     parser.add_argument("--image-folder", type=str, required=True, help="图像文件夹路径")
-    parser.add_argument("--output-file", type=str, default="gqa_accuracy_results.json", help="输出文件")
-    parser.add_argument("--max-samples", type=int, default=None, help="最大样本数 (None表示使用全部测试集)")
-    parser.add_argument("--conv-mode", type=str, default="llava_v1", help="对话模式")
+    parser.add_argument("--output-file", type=str, default="gqa_results.jsonl", help="输出文件")
+    parser.add_argument("--max-samples", type=int, default=None, help="最大样本数")
+    parser.add_argument("--conv-mode", type=str, default="vicuna_v1", help="对话模式")
+    parser.add_argument("--temperature", type=float, default=0, help="生成温度")
+    parser.add_argument("--chunks", type=int, default=1, help="分块数（兼容官方接口）")
+    parser.add_argument("--chunk-idx", type=int, default=0, help="当前块索引（兼容官方接口）")
     
     args = parser.parse_args()
     
     print("="*80)
-    print("GQA准确率评估")
+    print("GQA官方风格评估")
     print("="*80)
     print(f"模型路径: {args.model_path}")
     print(f"数据路径: {args.data_path}")
     print(f"图像文件夹: {args.image_folder}")
     print(f"最大样本数: {args.max_samples or '完整测试集'}")
+    print(f"对话模式: {args.conv_mode}")
+    print(f"温度: {args.temperature}")
     print("="*80)
     
     # 加载模型
@@ -215,6 +241,14 @@ def main():
     samples = load_gqa_data(args.data_path, args.max_samples)
     print(f"加载了 {len(samples)} 个样本")
     
+    # 分块处理（兼容官方接口）
+    if args.chunks > 1:
+        chunk_size = len(samples) // args.chunks
+        start_idx = args.chunk_idx * chunk_size
+        end_idx = start_idx + chunk_size if args.chunk_idx < args.chunks - 1 else len(samples)
+        samples = samples[start_idx:end_idx]
+        print(f"处理块 {args.chunk_idx}/{args.chunks-1}: 样本 {start_idx}-{end_idx-1}")
+    
     # 评估
     print("开始评估...")
     predictions = []
@@ -223,7 +257,8 @@ def main():
     
     for i, sample in enumerate(tqdm(samples, desc="评估进度")):
         pred, error = evaluate_single_sample(
-            model, tokenizer, image_processor, sample, args.image_folder, args.conv_mode
+            model, tokenizer, image_processor, sample, args.image_folder, 
+            args.conv_mode, args.temperature
         )
         
         if error:
@@ -234,33 +269,39 @@ def main():
         
         ground_truths.append(sample['answer'])
     
-    # calculate accuracy
+    # 计算准确率
     accuracy = calculate_accuracy(predictions, ground_truths)
     
-    # save results
-    results = {
+    # 保存结果
+    save_results_jsonl(predictions, ground_truths, samples, args.output_file)
+    
+    # 保存汇总结果
+    summary_file = args.output_file.replace('.jsonl', '_summary.json')
+    summary_results = {
         'model_path': args.model_path,
         'data_path': args.data_path,
         'image_folder': args.image_folder,
         'total_samples': len(samples),
         'accuracy': accuracy,
-        'predictions': predictions,
-        'ground_truths': ground_truths,
-        'errors': errors,
-        'error_count': len(errors)
+        'error_count': len(errors),
+        'conv_mode': args.conv_mode,
+        'temperature': args.temperature,
+        'chunks': args.chunks,
+        'chunk_idx': args.chunk_idx
     }
     
-    with open(args.output_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        json.dump(summary_results, f, indent=2, ensure_ascii=False)
     
-    # print
+    # 打印结果
     print("\n" + "="*80)
     print("评估结果")
     print("="*80)
     print(f"总样本数: {len(samples)}")
     print(f"准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
     print(f"错误数: {len(errors)}")
-    print(f"结果已保存到: {args.output_file}")
+    print(f"结果文件: {args.output_file}")
+    print(f"汇总文件: {summary_file}")
     print("="*80)
 
 
