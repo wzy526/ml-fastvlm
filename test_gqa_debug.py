@@ -132,7 +132,7 @@ def main():
     image_folder = "/perception-hl/zhuofan.xia/data/gqa/images"
     
     # 测试图像和问题
-    test_image_id = "1216"  # 从您的结果文件中看到的图像ID
+    test_image_id = "107911"  # 从您的结果文件中看到的图像ID
     test_question = "What color is the object?"
     
     print("="*80)
