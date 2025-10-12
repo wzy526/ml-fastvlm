@@ -53,6 +53,7 @@ fi
 echo "使用数据文件: $DATA_PATH"
 echo "使用图像文件夹: $IMAGE_FOLDER"
 echo "使用模型路径: $CHECKPOINT_PATH"
+echo "评估模式: 完整GQA测试集 (无样本数限制)"
 
 # 创建结果目录
 RESULTS_DIR="./gqa_eval_results_$(date +%Y%m%d_%H%M%S)"
@@ -75,7 +76,6 @@ python eval_gqa_accuracy.py \
     --data-path "$DATA_PATH" \
     --image-folder "$IMAGE_FOLDER" \
     --output-file "$RESULTS_DIR/gqa_accuracy_${TIMESTAMP}.json" \
-    --max-samples 1000 \
     --conv-mode "llava_v1"
 
 EVAL_SUCCESS=$?

@@ -61,10 +61,20 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             device_map=device_map
         )
     
-    # 设置图像处理器
-    image_processor = transformers.CLIPImageProcessor.from_pretrained(
-        model_path, trust_remote_code=True
-    )
+    # 设置图像处理器 - 处理缺失的preprocessor_config.json
+    try:
+        image_processor = transformers.CLIPImageProcessor.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+    except OSError as e:
+        if "preprocessor_config.json" in str(e):
+            print("警告: 未找到preprocessor_config.json，使用默认CLIP处理器...")
+            # 使用默认的CLIP处理器
+            image_processor = transformers.CLIPImageProcessor.from_pretrained(
+                "openai/clip-vit-large-patch14-336"
+            )
+        else:
+            raise e
     
     return model, tokenizer, image_processor
 
@@ -172,7 +182,7 @@ def main():
     parser.add_argument("--data-path", type=str, required=True, help="GQA数据文件路径")
     parser.add_argument("--image-folder", type=str, required=True, help="图像文件夹路径")
     parser.add_argument("--output-file", type=str, default="gqa_accuracy_results.json", help="输出文件")
-    parser.add_argument("--max-samples", type=int, default=None, help="最大样本数")
+    parser.add_argument("--max-samples", type=int, default=None, help="最大样本数 (None表示使用全部测试集)")
     parser.add_argument("--conv-mode", type=str, default="llava_v1", help="对话模式")
     
     args = parser.parse_args()
@@ -183,7 +193,7 @@ def main():
     print(f"模型路径: {args.model_path}")
     print(f"数据路径: {args.data_path}")
     print(f"图像文件夹: {args.image_folder}")
-    print(f"最大样本数: {args.max_samples or '全部'}")
+    print(f"最大样本数: {args.max_samples or '完整测试集'}")
     print("="*80)
     
     # 加载模型
