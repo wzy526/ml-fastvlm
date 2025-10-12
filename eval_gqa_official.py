@@ -116,8 +116,8 @@ def load_gqa_data(data_path, max_samples=None):
     return samples
 
 
-def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="vicuna_v1", temperature=0):
-    """评估单个样本 - 基于官方实现"""
+def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1", temperature=0):
+    """评估单个样本 - 修复推理问题"""
     try:
         # 加载图像
         image_path = os.path.join(image_folder, f"{sample['imageId']}.jpg")
@@ -126,7 +126,7 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         
         image = Image.open(image_path).convert('RGB')
         
-        # 构建对话 - 使用vicuna_v1格式（与官方一致）
+        # 构建对话 - 使用llava_v1格式（与训练时一致）
         conv = conv_templates[conv_mode].copy()
         conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{sample['question']}")
         conv.append_message(conv.roles[1], None)
@@ -139,26 +139,41 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         # 处理图像
         image_tensor = process_images([image], image_processor, model.config)[0]
         
-        # 生成回答 - 使用官方参数
+        # 生成回答 - 修复推理参数
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
                 images=image_tensor.unsqueeze(0).half().cuda(),
-                do_sample=temperature > 0,
-                temperature=temperature,
+                do_sample=False,  # 固定为False，确保确定性
+                temperature=0,   # 固定为0
                 top_p=None,
                 num_beams=1,
                 max_new_tokens=32,
-                use_cache=True
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id  # 添加pad_token_id
             )
         
-        # 解码输出
+        # 解码输出 - 修复解码逻辑
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-        outputs = outputs[len(prompt):].strip()
+        
+        # 提取回答部分 - 更安全的提取方式
+        if prompt in outputs:
+            outputs = outputs.split(prompt)[-1].strip()
+        else:
+            # 如果找不到prompt，尝试其他方式
+            outputs = outputs.strip()
+        
+        # 清理输出
+        if outputs:
+            # 移除可能的重复内容
+            lines = outputs.split('\n')
+            if lines:
+                outputs = lines[0].strip()
         
         return outputs, None
         
     except Exception as e:
+        print(f"推理错误: {e}")
         return None, str(e)
 
 
@@ -213,7 +228,7 @@ def main():
     parser.add_argument("--image-folder", type=str, required=True, help="图像文件夹路径")
     parser.add_argument("--output-file", type=str, default="gqa_results.jsonl", help="输出文件")
     parser.add_argument("--max-samples", type=int, default=None, help="最大样本数")
-    parser.add_argument("--conv-mode", type=str, default="vicuna_v1", help="对话模式")
+    parser.add_argument("--conv-mode", type=str, default="llava_v1", help="对话模式")
     parser.add_argument("--temperature", type=float, default=0, help="生成温度")
     parser.add_argument("--chunks", type=int, default=1, help="分块数（兼容官方接口）")
     parser.add_argument("--chunk-idx", type=int, default=0, help="当前块索引（兼容官方接口）")

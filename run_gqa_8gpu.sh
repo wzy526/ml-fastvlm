@@ -84,7 +84,7 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
         --data-path "$DATA_PATH" \
         --image-folder "$IMAGE_FOLDER" \
         --output-file "$RESULTS_DIR/gqa_results_${TIMESTAMP}_${CHUNKS}_${IDX}.jsonl" \
-        --conv-mode "vicuna_v1" \
+        --conv-mode "llava_v1" \
         --temperature 0 \
         --chunks $CHUNKS \
         --chunk-idx $IDX &
