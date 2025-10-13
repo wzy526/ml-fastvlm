@@ -100,7 +100,11 @@ def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
         
         # 构建答案映射
         for item in annotation_data['annotations']:
-            answers[item['question_id']] = item['answers']
+            # 取第一个答案作为标准答案
+            if 'answers' in item and item['answers']:
+                answers[item['question_id']] = item['answers'][0]
+            else:
+                answers[item['question_id']] = ''
     
     samples = []
     # TextVQA格式：data['questions'] 是列表
@@ -110,7 +114,7 @@ def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
             'questionId': question_id,
             'imageId': item['image_id'],
             'question': item['question'],
-            'answer': answers.get(question_id, [''])[0] if question_id in answers else ''  # 取第一个答案
+            'answer': answers.get(question_id, '')  # 直接获取字符串答案
         }
         samples.append(sample)
     
@@ -207,6 +211,12 @@ def calculate_anls_score(predictions, ground_truths):
         if not pred or not gt:
             return 0.0
         
+        # 确保pred和gt都是字符串
+        if isinstance(pred, dict):
+            pred = str(pred)
+        if isinstance(gt, dict):
+            gt = str(gt)
+            
         pred = pred.lower().strip()
         gt = gt.lower().strip()
         
