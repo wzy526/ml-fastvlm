@@ -9,7 +9,7 @@ MODEL_PATH=${MODEL_PATH:-/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d
 QUESTION_FILE=${QUESTION_FILE:-/perception-hl/zhuofan.xia/data/textvqa/val_questions.json}
 ANNOTATION_FILE=${ANNOTATION_FILE:-/perception-hl/zhuofan.xia/data/textvqa/val_annotations.json}
 IMAGE_FOLDER=${IMAGE_FOLDER:-/perception-hl/zhuofan.xia/data/textvqa/train_images}
-OUT_DIR=${OUT_DIR:-/perception-hl/zhuofan.xia/vlm_exps/textdat/}
+OUT_DIR=${OUT_DIR:-/perception-hl/zhuofan.xia/vlm_exps/textdat}
 CONV_MODE=${CONV_MODE:-llava_v1}
 
 mkdir -p "$OUT_DIR"

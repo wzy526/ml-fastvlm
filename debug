@@ -1,0 +1,7 @@
+python -u llava/eval/evaluate_textvqa.py \
+  --model-path /perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3 \
+  --conv-mode llava_v1 \
+  --question-file /perception-hl/zhuofan.xia/data/textvqa/val_questions.json \
+  --image-folder /perception-hl/zhuofan.xia/data/textvqa/train_images \
+  --answers-file /perception-hl/zhuofan.xia/vlm_exps/textdat/test_single.jsonl \
+  --temperature 0 --num_beams 1 --max_new_tokens 16
