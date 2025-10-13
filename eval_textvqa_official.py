@@ -21,7 +21,7 @@ from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
 import transformers
 
 
-def load_model_and_tokenizer(model_path, device_map="auto"):
+def load_model_and_tokenizer(model_path, device_map="none"):
     """加载模型和分词器 - 基于官方实现"""
     disable_torch_init()
     
@@ -48,7 +48,7 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             model_path,
             config=config,
             torch_dtype=torch.float16,
-            device_map=device_map,
+            device_map=None,
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
@@ -58,10 +58,13 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             model_path,
             config=config,
             torch_dtype=torch.float16,
-            device_map=device_map,
+            device_map=None,
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
+    # 将整个模型放到当前可见GPU
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    model.to(device)
     
     # 初始化视觉编码器
     print("初始化视觉编码器...")
