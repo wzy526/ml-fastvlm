@@ -1,45 +1,22 @@
 python -c "
 import os
-import json
 
-# 检查GQA数据集中的Image ID是否真的存在于图像文件夹中
-with open('/perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json', 'r') as f:
-    data = json.load(f)
-
+# 检查图像文件夹中的实际文件
 image_folder = '/perception-hl/zhuofan.xia/data/gqa/images'
-actual_files = set(os.listdir(image_folder))
+files = os.listdir(image_folder)
 
-print(f'GQA数据集样本数量: {len(data)}')
-print(f'图像文件夹文件数量: {len(actual_files)}')
+print(f'图像文件夹总文件数: {len(files)}')
+print('前20个文件:')
+for i, f in enumerate(files[:20]):
+    print(f'{i+1}: {f}')
 
-# 检查前100个样本的匹配情况
-samples = list(data.items())[:100]
-matched = 0
-unmatched = 0
+# 检查是否有2405722相关的文件
+target_id = '2405722'
+matching_files = [f for f in files if target_id in f]
+print(f'包含{target_id}的文件: {matching_files}')
 
-for i, (qid, item) in enumerate(samples):
-    image_id = item['imageId']
-    
-    # 检查所有可能的文件名格式
-    possible_names = [
-        f'{image_id}.jpg',
-        f'n{image_id}.jpg', 
-        f'{image_id}.png',
-        f'n{image_id}.png'
-    ]
-    
-    found = False
-    for name in possible_names:
-        if name in actual_files:
-            matched += 1
-            found = True
-            break
-    
-    if not found:
-        unmatched += 1
-
-print(f'前100个样本匹配情况:')
-print(f'匹配: {matched}')
-print(f'不匹配: {unmatched}')
-print(f'匹配率: {matched/100*100:.1f}%')
+# 检查是否有n2405722
+n_files = [f for f in files if f.startswith('n')]
+print(f'以n开头的文件数量: {len(n_files)}')
+print(f'前10个n开头文件: {n_files[:10]}')
 "
