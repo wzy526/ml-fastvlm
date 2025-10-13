@@ -368,8 +368,8 @@ def main():
     parser.add_argument("--output-file", default="/perception-hl/zhuofan.xia/vlm_exps/textdat/textvqa_val_pred.jsonl")
     parser.add_argument("--conv-mode", default="llava_v1")
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--num-shards", type=int, default=1, help="总的分片数")
-    parser.add_argument("--shard-id", type=int, default=0, help="当前分片ID")
+    parser.add_argument("--chunks", type=int, default=1, help="总的分块数")
+    parser.add_argument("--chunk-idx", type=int, default=0, help="当前分块索引")
     parser.add_argument("--device", default="cuda")
     
     args = parser.parse_args()
@@ -380,18 +380,18 @@ def main():
     # 加载数据
     samples = load_textvqa_data(args.question_file, args.annotation_file, args.max_samples)
     
-    # 分片处理
-    if args.num_shards > 1:
-        print(f"分片处理: {args.shard_id}/{args.num_shards}")
-        shard_size = len(samples) // args.num_shards
-        start_idx = args.shard_id * shard_size
-        if args.shard_id == args.num_shards - 1:
-            # 最后一个分片处理剩余的所有样本
+    # 分块处理
+    if args.chunks > 1:
+        print(f"分块处理: {args.chunk_idx}/{args.chunks}")
+        chunk_size = len(samples) // args.chunks
+        start_idx = args.chunk_idx * chunk_size
+        if args.chunk_idx == args.chunks - 1:
+            # 最后一个分块处理剩余的所有样本
             end_idx = len(samples)
         else:
-            end_idx = start_idx + shard_size
+            end_idx = start_idx + chunk_size
         samples = samples[start_idx:end_idx]
-        print(f"分片 {args.shard_id} 处理样本 {start_idx}-{end_idx-1} (共 {len(samples)} 个样本)")
+        print(f"分块 {args.chunk_idx} 处理样本 {start_idx}-{end_idx-1} (共 {len(samples)} 个样本)")
     
     # 评估
     predictions = []

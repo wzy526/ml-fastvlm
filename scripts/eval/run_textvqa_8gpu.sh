@@ -47,8 +47,8 @@ for ((i=0; i<NUM_SHARDS; i++)); do
     --annotation-file "$ANNOTATION_FILE" \
     --image-folder "$IMAGE_FOLDER" \
     --output-file "$OUT_DIR/textvqa_val_pred.s${i}.jsonl" \
-    --num-shards $NUM_SHARDS \
-    --shard-id $i \
+    --chunks $NUM_SHARDS \
+    --chunk-idx $i \
     2>&1 | sed -u "s/^/[GPU ${i}] /" | tee "$OUT_DIR/textvqa_s${i}.log" &
 done
 
