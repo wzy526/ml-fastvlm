@@ -1,44 +1,24 @@
 python -c "
 import os
-import json
 
-# 检查GQA数据中的Image ID是否真的存在对应的文件
-with open('/perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json', 'r') as f:
-    data = json.load(f)
-
+# 检查图像文件夹中的实际文件名格式
 image_folder = '/perception-hl/zhuofan.xia/data/gqa/images'
-actual_files = set(os.listdir(image_folder))
+actual_files = os.listdir(image_folder)
 
 print(f'图像文件夹中的实际文件数量: {len(actual_files)}')
+print('前20个文件名:')
+for i, filename in enumerate(actual_files[:20]):
+    print(f'{i+1}: {filename}')
 
-# 检查前10个样本
-samples = list(data.items())[:10]
-print('详细检查前10个样本:')
+print('\n检查文件名格式:')
+jpg_files = [f for f in actual_files if f.endswith('.jpg')]
+png_files = [f for f in actual_files if f.endswith('.png')]
+print(f'JPG文件数量: {len(jpg_files)}')
+print(f'PNG文件数量: {len(png_files)}')
 
-for i, (qid, item) in enumerate(samples):
-    image_id = item['imageId']
-    
-    # 检查所有可能的文件名格式
-    possible_names = [
-        f'{image_id}.jpg',
-        f'n{image_id}.jpg', 
-        f'{image_id}.png',
-        f'n{image_id}.png'
-    ]
-    
-    found = False
-    for name in possible_names:
-        if name in actual_files:
-            print(f'样本 {i+1}: Image ID {image_id} -> 找到: {name}')
-            found = True
-            break
-    
-    if not found:
-        print(f'样本 {i+1}: Image ID {image_id} -> 未找到')
-        # 检查是否有相似的文件名
-        similar_files = [f for f in actual_files if image_id in f]
-        if similar_files:
-            print(f'  相似文件: {similar_files[:3]}')
-        else:
-            print(f'  无相似文件')
+# 检查是否有n前缀的文件
+n_prefix_files = [f for f in actual_files if f.startswith('n')]
+print(f'以n开头的文件数量: {len(n_prefix_files)}')
+if n_prefix_files:
+    print('前5个n前缀文件:', n_prefix_files[:5])
 "
