@@ -84,21 +84,33 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
     return model, tokenizer, image_processor
 
 
-def load_textvqa_data(data_path, max_samples=None):
+def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
     """加载TextVQA数据"""
-    print(f"加载TextVQA数据: {data_path}")
+    print(f"加载TextVQA问题: {question_path}")
     
-    with open(data_path, 'r') as f:
-        data = json.load(f)
+    with open(question_path, 'r') as f:
+        question_data = json.load(f)
+    
+    # 加载答案（如果有annotations文件）
+    answers = {}
+    if annotation_path and os.path.exists(annotation_path):
+        print(f"加载TextVQA答案: {annotation_path}")
+        with open(annotation_path, 'r') as f:
+            annotation_data = json.load(f)
+        
+        # 构建答案映射
+        for item in annotation_data['annotations']:
+            answers[item['question_id']] = item['answers']
     
     samples = []
     # TextVQA格式：data['questions'] 是列表
-    for item in data['questions']:
+    for item in question_data['questions']:
+        question_id = item['question_id']
         sample = {
-            'questionId': item['question_id'],
+            'questionId': question_id,
             'imageId': item['image_id'],
             'question': item['question'],
-            'answer': item.get('answer', '')  # 可能没有answer字段
+            'answer': answers.get(question_id, [''])[0] if question_id in answers else ''  # 取第一个答案
         }
         samples.append(sample)
     
@@ -241,6 +253,7 @@ def main():
     parser = argparse.ArgumentParser(description="TextVQA评估")
     parser.add_argument("--model-path", default="/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3")
     parser.add_argument("--question-file", default="/perception-hl/zhuofan.xia/data/textvqa/val_questions.json")
+    parser.add_argument("--annotation-file", default="/perception-hl/zhuofan.xia/data/textvqa/val_annotations.json")
     parser.add_argument("--image-folder", default="/perception-hl/zhuofan.xia/data/textvqa/train_images")
     parser.add_argument("--output-file", default="/perception-hl/zhuofan.xia/vlm_exps/textdat/textvqa_val_pred.jsonl")
     parser.add_argument("--conv-mode", default="llava_v1")
@@ -253,7 +266,7 @@ def main():
     model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path)
     
     # 加载数据
-    samples = load_textvqa_data(args.question_file, args.max_samples)
+    samples = load_textvqa_data(args.question_file, args.annotation_file, args.max_samples)
     
     # 评估
     predictions = []
