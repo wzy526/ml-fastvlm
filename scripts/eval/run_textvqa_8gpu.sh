@@ -40,7 +40,7 @@ echo "开始8卡并行预测..."
 for ((i=0; i<NUM_SHARDS; i++)); do
   echo "启动GPU $i..."
   CUDA_VISIBLE_DEVICES=$i \
-  python -u eval_textvqa_official.py \
+  stdbuf -oL -eL python -u eval_textvqa_official.py \
     --model-path "$MODEL_PATH" \
     --conv-mode "$CONV_MODE" \
     --question-file "$QUESTION_FILE" \
@@ -49,7 +49,7 @@ for ((i=0; i<NUM_SHARDS; i++)); do
     --output-file "$OUT_DIR/textvqa_val_pred.s${i}.jsonl" \
     --num-shards $NUM_SHARDS \
     --shard-id $i \
-    > "$OUT_DIR/textvqa_s${i}.log" 2>&1 &
+    2>&1 | sed -u "s/^/[GPU ${i}] /" | tee "$OUT_DIR/textvqa_s${i}.log" &
 done
 
 echo "等待所有GPU完成..."
