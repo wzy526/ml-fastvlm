@@ -190,12 +190,13 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         
         # 处理图像
         image_tensor = process_images([image], image_processor, model.config)[0]
+        image_tensor = image_tensor.half().cuda()
         
         # 生成回答
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor.unsqueeze(0).half().cuda(),
+                images=image_tensor.unsqueeze(0),
                 do_sample=False,
                 temperature=0,
                 top_p=None,
