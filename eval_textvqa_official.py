@@ -21,7 +21,7 @@ from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
 import transformers
 
 
-def load_model_and_tokenizer(model_path, device_map="none"):
+def load_model_and_tokenizer(model_path, device_map="auto"):
     """加载模型和分词器 - 基于官方实现"""
     disable_torch_init()
     
@@ -48,7 +48,7 @@ def load_model_and_tokenizer(model_path, device_map="none"):
             model_path,
             config=config,
             torch_dtype=torch.float16,
-            device_map=None,
+            device_map=device_map,
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
@@ -58,14 +58,10 @@ def load_model_and_tokenizer(model_path, device_map="none"):
             model_path,
             config=config,
             torch_dtype=torch.float16,
-            device_map=None,
+            device_map=device_map,
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
-    # 将整个模型放到当前可见GPU
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model.to(device)
-    
     # 初始化视觉编码器
     print("初始化视觉编码器...")
     if hasattr(model, 'get_vision_tower'):
@@ -189,7 +185,7 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         
         # 处理输入
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
-        input_ids = input_ids.unsqueeze(0).cuda()
+        input_ids = input_ids.unsqueeze(0).to('cuda')
         
         # 处理图像
         image_tensor = process_images([image], image_processor, model.config)[0]
@@ -198,7 +194,7 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor.unsqueeze(0).half().cuda(),
+                images=image_tensor.unsqueeze(0).to('cuda', dtype=torch.float16),
                 do_sample=False,
                 temperature=0,
                 top_p=None,
