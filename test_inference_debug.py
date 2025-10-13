@@ -7,7 +7,7 @@ import os
 import json
 import torch
 from PIL import Image
-from transformers import AutoTokenizer, LlavaLlamaForCausalLM, CLIPImageProcessor
+from transformers import AutoTokenizer, CLIPImageProcessor
 from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM as LlavaLlamaForCausalLM_LLaVA
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
 from llava.conversation import conv_templates
