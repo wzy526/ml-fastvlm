@@ -40,14 +40,43 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
             decoder_config = PretrainedConfig.from_dict(config.decoder_config)
             config.decoder_config = decoder_config
     
-    # 修复 LlavaConfig 缺少 attention_dropout 的问题
-    if not hasattr(config, 'attention_dropout'):
-        print("修复 attention_dropout 配置...")
-        config.attention_dropout = 0.0
-    if not hasattr(config, 'hidden_dropout'):
-        config.hidden_dropout = 0.0
-    if not hasattr(config, 'attention_probs_dropout_prob'):
-        config.attention_probs_dropout_prob = 0.0
+    # 修复 LlavaConfig 缺少必要属性的问题
+    missing_attrs = {
+        'attention_dropout': 0.0,
+        'hidden_dropout': 0.0,
+        'attention_probs_dropout_prob': 0.0,
+        'attention_bias': False,
+        'use_cache': True,
+        'rope_theta': 10000.0,
+        'rope_scaling': None,
+        'max_position_embeddings': 2048,
+        'rms_norm_eps': 1e-6,
+        'initializer_range': 0.02,
+        'use_sliding_window': False,
+        'sliding_window': None,
+        'max_window_layers': None,
+        'tie_word_embeddings': False,
+        'rope_theta': 10000.0,
+        'rope_scaling': None,
+        'attention_bias': False,
+        'attention_dropout': 0.0,
+        'hidden_dropout': 0.0,
+        'attention_probs_dropout_prob': 0.0,
+        'use_cache': True,
+        'max_position_embeddings': 2048,
+        'rms_norm_eps': 1e-6,
+        'initializer_range': 0.02,
+        'use_sliding_window': False,
+        'sliding_window': None,
+        'max_window_layers': None,
+        'tie_word_embeddings': False
+    }
+    
+    print("修复 LlavaConfig 缺失属性...")
+    for attr, default_value in missing_attrs.items():
+        if not hasattr(config, attr):
+            setattr(config, attr, default_value)
+            print(f"  添加 {attr} = {default_value}")
     
     # 加载模型
     model_name = get_model_name_from_path(model_path)
