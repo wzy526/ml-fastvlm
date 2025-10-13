@@ -346,14 +346,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# python -c "
-# import json
-# with open('/perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json', 'r') as f:
-#     data = json.load(f)
-    
-# # 查看前几个样本的图像ID
-# samples = list(data.items())[:5]
-# for qid, item in samples:
-#     print(f'Question ID: {qid}, Image ID: {item[\"imageId\"]}')
-# "
