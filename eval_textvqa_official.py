@@ -417,15 +417,6 @@ def main():
     
     print(f"结果已保存到: {args.output_file}")
     print(f"最终ANLS分数: {anls_score:.4f}")
-    
-    # 使用官方评估器重新计算
-    print("\n使用官方评估器重新计算...")
-    try:
-        from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
-        official_accuracy = eval_single_official(args.annotation_file, args.output_file)
-        print(f"官方评估器ANLS分数: {official_accuracy:.4f}")
-    except Exception as e:
-        print(f"官方评估器计算失败: {e}")
 
 
 if __name__ == "__main__":
