@@ -21,7 +21,7 @@ from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
 import transformers
 
 
-def load_model_and_tokenizer(model_path, device_map="auto"):
+def load_model_and_tokenizer(model_path, device: str = "cuda"):
     """加载模型和分词器 - 基于官方实现"""
     disable_torch_init()
     
@@ -48,7 +48,7 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             model_path,
             config=config,
             torch_dtype=torch.float16,
-            device_map=device_map,
+            device_map=None,
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
@@ -58,10 +58,13 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             model_path,
             config=config,
             torch_dtype=torch.float16,
-            device_map=device_map,
+            device_map=None,
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
+    # 将整个模型放到指定设备，避免模块被放在 CPU 上
+    model.to(device)
+    model.eval()
     # 初始化视觉编码器
     print("初始化视觉编码器...")
     if hasattr(model, 'get_vision_tower'):
@@ -373,7 +376,7 @@ def main():
     args = parser.parse_args()
     
     # 加载模型
-    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path)
+    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, device=args.device)
     
     # 加载数据
     samples = load_textvqa_data(args.question_file, args.annotation_file, args.max_samples)
