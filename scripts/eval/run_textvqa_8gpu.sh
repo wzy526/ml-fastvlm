@@ -40,14 +40,15 @@ echo "开始8卡并行预测..."
 for ((i=0; i<NUM_SHARDS; i++)); do
   echo "启动GPU $i..."
   CUDA_VISIBLE_DEVICES=$i \
-  python -u llava/eval/evaluate_textvqa.py \
+  python -u eval_textvqa_official.py \
     --model-path "$MODEL_PATH" \
     --conv-mode "$CONV_MODE" \
     --question-file "$QUESTION_FILE" \
+    --annotation-file "$ANNOTATION_FILE" \
     --image-folder "$IMAGE_FOLDER" \
-    --answers-file "$OUT_DIR/textvqa_val_pred.s${i}.jsonl" \
-    --temperature 0 --num_beams 1 --max_new_tokens 16 \
-    --num-shards $NUM_SHARDS --shard-id $i \
+    --output-file "$OUT_DIR/textvqa_val_pred.s${i}.jsonl" \
+    --num-shards $NUM_SHARDS \
+    --shard-id $i \
     > "$OUT_DIR/textvqa_s${i}.log" 2>&1 &
 done
 
@@ -60,10 +61,14 @@ ls -la "$OUT_DIR"/textvqa_val_pred.s*.jsonl || echo "警告: 没有找到预测�
 echo "[TextVQA-8GPU] 合并预测..."
 cat "$OUT_DIR"/textvqa_val_pred.s*.jsonl > "$OUT_DIR"/textvqa_val_pred.jsonl
 
-echo "[TextVQA-8GPU] 计算ANLS分数..."
-python -u llava/eval/textvqa_eval.py \
+echo "[TextVQA-8GPU] 计算最终ANLS分数..."
+python -u eval_textvqa_official.py \
+  --model-path "$MODEL_PATH" \
+  --question-file "$QUESTION_FILE" \
   --annotation-file "$ANNOTATION_FILE" \
-  --result-file "$OUT_DIR"/textvqa_val_pred.jsonl
+  --image-folder "$IMAGE_FOLDER" \
+  --output-file "$OUT_DIR"/textvqa_val_pred_final.jsonl \
+  --max-samples 0 2>&1 | grep "ANLS分数"
 
 echo "[TextVQA-8GPU] 完成"
 
