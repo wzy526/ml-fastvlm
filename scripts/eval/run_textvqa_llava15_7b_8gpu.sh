@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # 模型与数据路径（可通过环境变量覆盖）
-MODEL_PATH=${MODEL_PATH:-/root/ml-fastvlm/checkpoints/llava-v1_5-7b}
+MODEL_PATH=${MODEL_PATH:-/home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b}
 QUESTION_FILE=${QUESTION_FILE:-/perception-hl/zhuofan.xia/data/textvqa/val_questions.json}
 ANNOTATION_FILE=${ANNOTATION_FILE:-/perception-hl/zhuofan.xia/data/textvqa/val_annotations.json}
 IMAGE_FOLDER=${IMAGE_FOLDER:-/perception-hl/zhuofan.xia/data/textvqa/train_images}
