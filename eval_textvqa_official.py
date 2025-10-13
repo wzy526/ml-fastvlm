@@ -40,6 +40,15 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
             decoder_config = PretrainedConfig.from_dict(config.decoder_config)
             config.decoder_config = decoder_config
     
+    # 修复 LlavaConfig 缺少 attention_dropout 的问题
+    if not hasattr(config, 'attention_dropout'):
+        print("修复 attention_dropout 配置...")
+        config.attention_dropout = 0.0
+    if not hasattr(config, 'hidden_dropout'):
+        config.hidden_dropout = 0.0
+    if not hasattr(config, 'attention_probs_dropout_prob'):
+        config.attention_probs_dropout_prob = 0.0
+    
     # 加载模型
     model_name = get_model_name_from_path(model_path)
     if 'qwen' in model_name.lower():
