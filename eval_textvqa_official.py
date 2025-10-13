@@ -120,8 +120,9 @@ def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
         # 构建答案映射 - 获取完整的10个答案
         for item in annotation_data['annotations']:
             if 'answers' in item and item['answers']:
-                # 保存完整的答案列表（通常是10个）
-                answers[item['question_id']] = item['answers']
+                # 提取答案字符串列表（从字典格式中提取answer字段）
+                answer_strings = [ans['answer'] for ans in item['answers'] if 'answer' in ans]
+                answers[item['question_id']] = answer_strings
             else:
                 answers[item['question_id']] = []
     
