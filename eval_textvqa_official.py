@@ -330,21 +330,27 @@ def eval_single_official(annotation_file, result_file):
     
     # 加载annotations - 匹配实际JSON格式
     annotation_data = json.load(open(annotation_file))
-    annotations = annotation_data['annotations']  # 使用 'annotations' 而不是 'data'
-    annotations = {(annotation['image_id'], annotation['question'].lower()): annotation for annotation in annotations}
+    annotations = annotation_data['annotations']
+    
+    # 构建question_id到annotation的映射（更简单的方式）
+    annotation_dict = {ann['question_id']: ann for ann in annotations}
     
     # 加载结果
     results = [json.loads(line) for line in open(result_file)]
 
     pred_list = []
     for result in results:
-        annotation = annotations[(result['question_id'], prompt_processor(result['prompt']))]
-        # 提取答案字符串列表（从字典格式中提取answer字段）
-        gt_answers = [ans['answer'] for ans in annotation['answers'] if 'answer' in ans]
-        pred_list.append({
-            "pred_answer": result['text'],
-            "gt_answers": gt_answers,
-        })
+        question_id = result['question_id']
+        if question_id in annotation_dict:
+            annotation = annotation_dict[question_id]
+            # 提取答案字符串列表（从字典格式中提取answer字段）
+            gt_answers = [ans['answer'] for ans in annotation['answers'] if 'answer' in ans]
+            pred_list.append({
+                "pred_answer": result['text'],
+                "gt_answers": gt_answers,
+            })
+        else:
+            print(f"警告: 找不到question_id {question_id} 的annotation")
 
     evaluator = TextVQAAccuracyEvaluator()
     accuracy = evaluator.eval_pred_list(pred_list)
