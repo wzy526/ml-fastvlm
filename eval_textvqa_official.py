@@ -84,8 +84,27 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
     return model, tokenizer, image_processor
 
 
+def prompt_processor(prompt):
+    """官方LLaVA的prompt处理函数"""
+    if prompt.startswith('OCR tokens: '):
+        pattern = r"Question: (.*?) Short answer:"
+        match = re.search(pattern, prompt, re.DOTALL)
+        question = match.group(1)
+    elif 'Reference OCR token: ' in prompt and len(prompt.split('\n')) == 3:
+        if prompt.startswith('Reference OCR token:'):
+            question = prompt.split('\n')[1]
+        else:
+            question = prompt.split('\n')[0]
+    elif len(prompt.split('\n')) == 2:
+        question = prompt.split('\n')[0]
+    else:
+        assert False
+
+    return question.lower()
+
+
 def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
-    """加载TextVQA数据"""
+    """加载TextVQA数据 - 完全按照官方格式"""
     print(f"加载TextVQA问题: {question_path}")
     
     with open(question_path, 'r') as f:
@@ -98,13 +117,13 @@ def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
         with open(annotation_path, 'r') as f:
             annotation_data = json.load(f)
         
-        # 构建答案映射
+        # 构建答案映射 - 获取完整的10个答案
         for item in annotation_data['annotations']:
-            # 取第一个答案作为标准答案
             if 'answers' in item and item['answers']:
-                answers[item['question_id']] = item['answers'][0]
+                # 保存完整的答案列表（通常是10个）
+                answers[item['question_id']] = item['answers']
             else:
-                answers[item['question_id']] = ''
+                answers[item['question_id']] = []
     
     samples = []
     # TextVQA格式：data['questions'] 是列表
@@ -114,7 +133,7 @@ def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
             'questionId': question_id,
             'imageId': item['image_id'],
             'question': item['question'],
-            'answer': answers.get(question_id, '')  # 直接获取字符串答案
+            'answers': answers.get(question_id, [])  # 获取完整的答案列表
         }
         samples.append(sample)
     
@@ -149,11 +168,12 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         
         image = Image.open(image_path).convert('RGB')
         
-        # 构建对话
+        # 构建对话 - 使用官方TextVQA格式
         conv = conv_templates[conv_mode].copy()
         roles = conv.roles
         
-        inp = sample['question']
+        # 官方TextVQA prompt格式
+        inp = f"Question: {sample['question']} Short answer:"
         if model.config.mm_use_im_start_end:
             inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
         else:
@@ -224,16 +244,16 @@ def normalize_answer(answer):
 
 
 def calculate_anls_score(predictions, ground_truths):
-    """使用官方TextVQA评估器计算ANLS分数"""
+    """使用官方TextVQA评估器计算ANLS分数 - 完全按照官方脚本"""
     try:
         from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
         
-        # 构建官方评估器需要的格式
+        # 构建官方评估器需要的格式 - 完全按照官方脚本
         pred_list = []
         for pred, gt in zip(predictions, ground_truths):
             pred_list.append({
                 "pred_answer": pred,
-                "gt_answers": [gt] if isinstance(gt, str) else gt
+                "gt_answers": gt  # gt已经是完整的答案列表
             })
         
         evaluator = TextVQAAccuracyEvaluator()
@@ -300,6 +320,34 @@ def calculate_anls_score_simple(predictions, ground_truths):
     return total_score / len(predictions) if predictions else 0.0
 
 
+def eval_single_official(annotation_file, result_file):
+    """完全按照官方脚本的评估函数"""
+    from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
+    
+    experiment_name = os.path.splitext(os.path.basename(result_file))[0]
+    print(experiment_name)
+    
+    # 加载annotations - 按照官方格式
+    annotations = json.load(open(annotation_file))['data']
+    annotations = {(annotation['image_id'], annotation['question'].lower()): annotation for annotation in annotations}
+    
+    # 加载结果
+    results = [json.loads(line) for line in open(result_file)]
+
+    pred_list = []
+    for result in results:
+        annotation = annotations[(result['question_id'], prompt_processor(result['prompt']))]
+        pred_list.append({
+            "pred_answer": result['text'],
+            "gt_answers": annotation['answers'],
+        })
+
+    evaluator = TextVQAAccuracyEvaluator()
+    accuracy = evaluator.eval_pred_list(pred_list)
+    print('Samples: {}\nAccuracy: {:.2f}%\n'.format(len(pred_list), 100. * accuracy))
+    return accuracy
+
+
 def main():
     parser = argparse.ArgumentParser(description="TextVQA评估")
     parser.add_argument("--model-path", default="/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3")
@@ -334,7 +382,7 @@ def main():
             prediction = ""
         
         predictions.append(prediction)
-        ground_truths.append(sample['answer'])
+        ground_truths.append(sample['answers'])  # 使用完整的答案列表
         
         if (i + 1) % 100 == 0:
             print(f"已处理 {i + 1} 个样本")
@@ -343,7 +391,7 @@ def main():
     anls_score = calculate_anls_score(predictions, ground_truths)
     print(f"ANLS分数: {anls_score:.4f}")
     
-    # 保存结果
+    # 保存结果 - 使用官方格式
     with open(args.output_file, 'w') as f:
         for i, (pred, gt, sample) in enumerate(zip(predictions, ground_truths, samples)):
             result = {
@@ -353,12 +401,21 @@ def main():
                 'prompt': f"Question: {sample['question']} Short answer:",
                 'text': pred,
                 'ground_truth': gt,
-                'anls_score': calculate_anls_score_simple([pred], [gt])
+                'anls_score': calculate_anls_score_simple([pred], [gt[0]] if gt else [''])
             }
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
     
     print(f"结果已保存到: {args.output_file}")
     print(f"最终ANLS分数: {anls_score:.4f}")
+    
+    # 使用官方评估器重新计算
+    print("\n使用官方评估器重新计算...")
+    try:
+        from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
+        official_accuracy = eval_single_official(args.annotation_file, args.output_file)
+        print(f"官方评估器ANLS分数: {official_accuracy:.4f}")
+    except Exception as e:
+        print(f"官方评估器计算失败: {e}")
 
 
 if __name__ == "__main__":
