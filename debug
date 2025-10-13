@@ -2,42 +2,30 @@ cd /root/ml-fastvlm && python -c "
 import os
 import json
 
-# 加载GQA数据
+# 测试修复后的图像路径匹配
 with open('/perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json', 'r') as f:
     data = json.load(f)
 
-# 获取图像文件夹中的实际文件名
+samples = list(data.items())[:3]
 image_folder = '/perception-hl/zhuofan.xia/data/gqa/images'
-actual_files = set(os.listdir(image_folder))
 
-print(f'图像文件夹中的实际文件数量: {len(actual_files)}')
-
-# 检查GQA数据中的Image ID是否在实际文件中
-samples = list(data.items())[:10]
-print('检查前10个样本的Image ID匹配情况:')
-
-matched_count = 0
+print('测试修复后的图像路径匹配:')
 for i, (qid, item) in enumerate(samples):
     image_id = item['imageId']
     
-    # 检查不同的文件名格式
-    possible_names = [
-        f'{image_id}.jpg',
-        f'n{image_id}.jpg',
-        f'{image_id}.png',
-        f'n{image_id}.png'
+    # 尝试不同的文件名格式 - 优先尝试n前缀
+    possible_paths = [
+        os.path.join(image_folder, f'n{image_id}.jpg'),  # 优先尝试n前缀
+        os.path.join(image_folder, f'{image_id}.jpg'),
+        os.path.join(image_folder, f'n{image_id}.png'),
+        os.path.join(image_folder, f'{image_id}.png')
     ]
     
-    found = False
-    for name in possible_names:
-        if name in actual_files:
-            print(f'样本 {i+1}: Image ID {image_id} -> 找到: {name}')
-            found = True
-            matched_count += 1
+    found_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            found_path = path
             break
     
-    if not found:
-        print(f'样本 {i+1}: Image ID {image_id} -> 未找到匹配文件')
-
-print(f'匹配的样本数: {matched_count}/{len(samples)}')
+    print(f'样本 {i+1}: Image ID {image_id} -> 找到: {found_path}')
 "

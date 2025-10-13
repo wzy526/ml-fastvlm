@@ -131,12 +131,12 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         # 加载图像 - 修复图像路径匹配问题
         image_id = sample['imageId']
         
-        # 尝试不同的文件名格式
+        # 尝试不同的文件名格式 - 根据测试结果，优先尝试n前缀
         possible_paths = [
+            os.path.join(image_folder, f"n{image_id}.jpg"),  # 优先尝试n前缀
             os.path.join(image_folder, f"{image_id}.jpg"),
-            os.path.join(image_folder, f"n{image_id}.jpg"),
-            os.path.join(image_folder, f"{image_id}.png"),
-            os.path.join(image_folder, f"n{image_id}.png")
+            os.path.join(image_folder, f"n{image_id}.png"),
+            os.path.join(image_folder, f"{image_id}.png")
         ]
         
         image_path = None
