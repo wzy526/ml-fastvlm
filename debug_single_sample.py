@@ -155,7 +155,7 @@ def debug_single_sample():
     print("开始调试单个样本...")
     
     # 使用与eval_gqa_official.py相同的参数
-    model_path = "/ephstorage/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3"
+    model_path = "/perception-hl/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3"
     image_folder = "/perception-hl/zhuofan.xia/data/gqa/images"
     data_path = "/perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json"
     conv_mode = "llava_v1"
