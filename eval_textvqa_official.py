@@ -205,25 +205,60 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         return None, str(e)
 
 
+def normalize_answer(answer):
+    """官方TextVQA答案标准化处理"""
+    if not answer:
+        return ""
+    
+    # 转换为小写
+    answer = answer.lower()
+    
+    # 移除标点符号
+    import re
+    answer = re.sub(r'[^\w\s]', '', answer)
+    
+    # 移除多余空格
+    answer = ' '.join(answer.split())
+    
+    return answer
+
+
 def calculate_anls_score(predictions, ground_truths):
-    """计算ANLS分数"""
+    """使用官方TextVQA评估器计算ANLS分数"""
+    try:
+        from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
+        
+        # 构建官方评估器需要的格式
+        pred_list = []
+        for pred, gt in zip(predictions, ground_truths):
+            pred_list.append({
+                "pred_answer": pred,
+                "gt_answers": [gt] if isinstance(gt, str) else gt
+            })
+        
+        evaluator = TextVQAAccuracyEvaluator()
+        accuracy = evaluator.eval_pred_list(pred_list)
+        return accuracy
+        
+    except ImportError:
+        print("警告: 无法导入官方评估器，使用简化版本")
+        return calculate_anls_score_simple(predictions, ground_truths)
+
+
+def calculate_anls_score_simple(predictions, ground_truths):
+    """简化版ANLS计算（备用）"""
     def anls_score(pred, gt):
         if not pred or not gt:
             return 0.0
         
-        # 确保pred和gt都是字符串
-        if isinstance(pred, dict):
-            pred = str(pred)
-        if isinstance(gt, dict):
-            gt = str(gt)
-            
-        pred = pred.lower().strip()
-        gt = gt.lower().strip()
+        # 标准化答案
+        pred = normalize_answer(pred)
+        gt = normalize_answer(gt)
         
         if pred == gt:
             return 1.0
         
-        # 简单的编辑距离计算
+        # 计算编辑距离
         def levenshtein_distance(s1, s2):
             if len(s1) < len(s2):
                 return levenshtein_distance(s2, s1)
@@ -249,8 +284,14 @@ def calculate_anls_score(predictions, ground_truths):
         if max_len == 0:
             return 1.0
         
+        # ANLS计算：基于编辑距离的相似度
         similarity = 1.0 - (distance / max_len)
-        return max(0.0, similarity)
+        
+        # 如果相似度低于0.5，返回0（官方TextVQA阈值）
+        if similarity < 0.5:
+            return 0.0
+        
+        return similarity
     
     total_score = 0.0
     for pred, gt in zip(predictions, ground_truths):
@@ -306,12 +347,13 @@ def main():
     with open(args.output_file, 'w') as f:
         for i, (pred, gt, sample) in enumerate(zip(predictions, ground_truths, samples)):
             result = {
-                'questionId': sample['questionId'],
+                'question_id': sample['questionId'],
+                'image_id': sample['imageId'],
                 'question': sample['question'],
-                'imageId': sample['imageId'],
+                'prompt': f"Question: {sample['question']} Short answer:",
+                'text': pred,
                 'ground_truth': gt,
-                'prediction': pred,
-                'anls_score': calculate_anls_score([pred], [gt])
+                'anls_score': calculate_anls_score_simple([pred], [gt])
             }
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
     
