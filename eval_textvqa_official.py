@@ -92,12 +92,13 @@ def load_textvqa_data(data_path, max_samples=None):
         data = json.load(f)
     
     samples = []
-    for item in data:
+    # TextVQA格式：data['questions'] 是列表
+    for item in data['questions']:
         sample = {
-            'questionId': item['questionId'],
-            'imageId': item['imageId'],
+            'questionId': item['question_id'],
+            'imageId': item['image_id'],
             'question': item['question'],
-            'answer': item['answer']
+            'answer': item.get('answer', '')  # 可能没有answer字段
         }
         samples.append(sample)
     
@@ -113,10 +114,22 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
     try:
         # 加载图像
         image_id = sample['imageId']
-        image_path = os.path.join(image_folder, f"{image_id}.jpg")
+        # TextVQA图像文件名格式可能不同，尝试多种格式
+        possible_paths = [
+            os.path.join(image_folder, f"{image_id}.jpg"),
+            os.path.join(image_folder, f"{image_id}.png"),
+            os.path.join(image_folder, f"n{image_id}.jpg"),
+            os.path.join(image_folder, f"n{image_id}.png")
+        ]
         
-        if not os.path.exists(image_path):
-            return None, f"Image not found: {image_path}"
+        image_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                image_path = path
+                break
+        
+        if not image_path:
+            return None, f"Image not found for ID {image_id}. Tried: {possible_paths[:2]}"
         
         image = Image.open(image_path).convert('RGB')
         
