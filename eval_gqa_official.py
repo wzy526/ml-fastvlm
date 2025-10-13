@@ -128,10 +128,25 @@ def load_gqa_data(data_path, max_samples=None):
 def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1", temperature=0):
     """评估单个样本 - 修复推理问题"""
     try:
-        # 加载图像
-        image_path = os.path.join(image_folder, f"{sample['imageId']}.jpg")
-        if not os.path.exists(image_path):
-            return None, "Image not found"
+        # 加载图像 - 修复图像路径匹配问题
+        image_id = sample['imageId']
+        
+        # 尝试不同的文件名格式
+        possible_paths = [
+            os.path.join(image_folder, f"{image_id}.jpg"),
+            os.path.join(image_folder, f"n{image_id}.jpg"),
+            os.path.join(image_folder, f"{image_id}.png"),
+            os.path.join(image_folder, f"n{image_id}.png")
+        ]
+        
+        image_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                image_path = path
+                break
+        
+        if not image_path:
+            return None, f"Image not found for ID {image_id}. Tried: {possible_paths[:2]}"
         
         image = Image.open(image_path).convert('RGB')
         

@@ -1,27 +1,31 @@
 python -c "
-import json
 import os
+import json
 
-# 加载GQA数据
+# 测试修复后的图像路径逻辑
 with open('/perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json', 'r') as f:
     data = json.load(f)
 
-# 获取前几个样本
 samples = list(data.items())[:3]
 image_folder = '/perception-hl/zhuofan.xia/data/gqa/images'
 
-print('检查图像文件是否存在:')
+print('测试修复后的图像路径匹配:')
 for i, (qid, item) in enumerate(samples):
     image_id = item['imageId']
-    image_path = os.path.join(image_folder, f'{image_id}.jpg')
-    exists = os.path.exists(image_path)
-    print(f'样本 {i+1}: Image ID {image_id} -> {image_path} -> 存在: {exists}')
-
-print(f'\n图像文件夹内容 (前5个文件):')
-if os.path.exists(image_folder):
-    files = os.listdir(image_folder)[:5]
-    for f in files:
-        print(f'  {f}')
-else:
-    print(f'  图像文件夹不存在: {image_folder}')
+    
+    # 尝试不同的文件名格式
+    possible_paths = [
+        os.path.join(image_folder, f'{image_id}.jpg'),
+        os.path.join(image_folder, f'n{image_id}.jpg'),
+        os.path.join(image_folder, f'{image_id}.png'),
+        os.path.join(image_folder, f'n{image_id}.png')
+    ]
+    
+    found_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            found_path = path
+            break
+    
+    print(f'样本 {i+1}: Image ID {image_id} -> 找到: {found_path}')
 "
