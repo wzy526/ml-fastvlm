@@ -328,8 +328,9 @@ def eval_single_official(annotation_file, result_file):
     experiment_name = os.path.splitext(os.path.basename(result_file))[0]
     print(experiment_name)
     
-    # 加载annotations - 按照官方格式
-    annotations = json.load(open(annotation_file))['data']
+    # 加载annotations - 匹配实际JSON格式
+    annotation_data = json.load(open(annotation_file))
+    annotations = annotation_data['annotations']  # 使用 'annotations' 而不是 'data'
     annotations = {(annotation['image_id'], annotation['question'].lower()): annotation for annotation in annotations}
     
     # 加载结果
@@ -338,9 +339,11 @@ def eval_single_official(annotation_file, result_file):
     pred_list = []
     for result in results:
         annotation = annotations[(result['question_id'], prompt_processor(result['prompt']))]
+        # 提取答案字符串列表（从字典格式中提取answer字段）
+        gt_answers = [ans['answer'] for ans in annotation['answers'] if 'answer' in ans]
         pred_list.append({
             "pred_answer": result['text'],
-            "gt_answers": annotation['answers'],
+            "gt_answers": gt_answers,
         })
 
     evaluator = TextVQAAccuracyEvaluator()
