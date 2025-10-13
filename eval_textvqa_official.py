@@ -73,6 +73,18 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
             print("加载视觉编码器...")
             vision_tower.load_model()
             print("视觉编码器加载完成")
+        # 确保视觉编码器也在同一设备和精度
+        try:
+            if hasattr(vision_tower, 'to'):
+                vision_tower.to(device, dtype=torch.float16)
+        except Exception as _:
+            pass
+    # 确保多模态投影层在同一设备
+    if hasattr(model, 'mm_projector') and model.mm_projector is not None:
+        try:
+            model.mm_projector.to(device, dtype=torch.float16)
+        except Exception as _:
+            pass
     
     # 加载图像处理器
     try:
