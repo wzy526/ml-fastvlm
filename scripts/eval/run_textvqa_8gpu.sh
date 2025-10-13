@@ -18,8 +18,7 @@ NUM_SHARDS=${NUM_SHARDS:-8}
 
 echo "[TextVQA-8GPU] 生成分片预测 NUM_SHARDS=$NUM_SHARDS"
 
-# 检查输出目录
-if [ ! -d "$OUT_DIR" ]; then
+# 检查输出目录 
   echo "创建输出目录: $OUT_DIR"
   mkdir -p "$OUT_DIR"
 fi
@@ -40,7 +39,7 @@ echo "开始8卡并行预测..."
 for ((i=0; i<NUM_SHARDS; i++)); do
   echo "启动GPU $i..."
   CUDA_VISIBLE_DEVICES=$i \
-  python -u -m llava.eval.evaluate_textvqa \
+  python -u llava/eval/evaluate_textvqa.py \
     --model-path "$MODEL_PATH" \
     --conv-mode "$CONV_MODE" \
     --question-file "$QUESTION_FILE" \
@@ -61,7 +60,7 @@ echo "[TextVQA-8GPU] 合并预测..."
 cat "$OUT_DIR"/textvqa_val_pred.s*.jsonl > "$OUT_DIR"/textvqa_val_pred.jsonl
 
 echo "[TextVQA-8GPU] 计算ANLS分数..."
-python -u -m llava.eval.textvqa_eval \
+python -u llava/eval/textvqa_eval.py \
   --annotation-file "$ANNOTATION_FILE" \
   --result-file "$OUT_DIR"/textvqa_val_pred.jsonl
 
