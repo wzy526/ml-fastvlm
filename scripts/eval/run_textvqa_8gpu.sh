@@ -18,7 +18,8 @@ NUM_SHARDS=${NUM_SHARDS:-8}
 
 echo "[TextVQA-8GPU] 生成分片预测 NUM_SHARDS=$NUM_SHARDS"
 
-# 检查输出目录 
+# 检查输出目录
+if [ ! -d "$OUT_DIR" ]; then
   echo "创建输出目录: $OUT_DIR"
   mkdir -p "$OUT_DIR"
 fi
