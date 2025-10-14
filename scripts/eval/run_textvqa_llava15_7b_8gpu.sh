@@ -40,7 +40,6 @@ for ((i=0; i<NUM_SHARDS; i++)); do
     --question-file "$QUESTION_FILE" \
     --annotation-file "$ANNOTATION_FILE" \
     --image-folder "$IMAGE_FOLDER" \
-    --ocr-file "$OCR_FILE" \
     --output-file "$OUT_DIR/textvqa_val_pred.s${i}.jsonl" \
     --chunks $NUM_SHARDS \
     --chunk-idx $i \
