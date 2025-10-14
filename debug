@@ -1,8 +1,11 @@
-python eval_textvqa_official.py \
-  --model-path /perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3 \
-  --question-file /perception-hl/zhuofan.xia/data/textvqa/val_questions.json \
-  --annotation-file /perception-hl/zhuofan.xia/data/textvqa/val_annotations.json \
-  --image-folder /perception-hl/zhuofan.xia/data/textvqa/train_images \
-  --ocr-file /perception-hl/zhuofan.xia/data/textvqa/val_ocr_tokens.json \
-  --output-file /perception-hl/zhuofan.xia/vlm_exps/textdat/textvqa_val_pred.sample10.jsonl \
-  --max-samples 10
+python - << 'PY'
+import json
+from eval_textvqa_official import load_textvqa_data
+qs="/perception-hl/zhuofan.xia/data/textvqa/val_questions.json"
+as_="/perception-hl/zhuofan.xia/data/textvqa/val_annotations.json"
+oc="/perception-hl/zhuofan.xia/data/textvqa/val_ocr_tokens.json"
+samples=load_textvqa_data(qs, as_, max_samples=50, ocr_path=oc)[:3]
+for s in samples:
+    o=s.get("ocr_tokens","")
+    print(s["questionId"], "OCR非空" if o.strip() else "OCR空", (o[:120]+"...") if o else "")
+PY
