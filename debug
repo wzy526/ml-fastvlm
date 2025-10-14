@@ -1,1 +1,8 @@
-python -c "import json; data=json.load(open('/perception-hl/zhuofan.xia/data/textvqa/val_questions.json')); print(f'TextVQA验证集总样本数: {len(data[\"questions\"])}')"
+python eval_textvqa_official.py \
+  --model-path /perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3 \
+  --question-file /perception-hl/zhuofan.xia/data/textvqa/val_questions.json \
+  --annotation-file /perception-hl/zhuofan.xia/data/textvqa/val_annotations.json \
+  --image-folder /perception-hl/zhuofan.xia/data/textvqa/train_images \
+  --ocr-file /perception-hl/zhuofan.xia/data/textvqa/val_ocr_tokens.json \
+  --output-file /perception-hl/zhuofan.xia/vlm_exps/textdat/textvqa_val_pred.sample10.jsonl \
+  --max-samples 10
