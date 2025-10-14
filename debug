@@ -1,0 +1,1 @@
+python -c "import json; data=json.load(open('/perception-hl/zhuofan.xia/data/textvqa/val_questions.json')); print(f'TextVQA验证集总样本数: {len(data[\"questions\"])}')"

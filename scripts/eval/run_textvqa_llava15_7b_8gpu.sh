@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 8卡并行：复现 LLaVA-1.5 7B 在 TextVQA（目标≈58.2）
+# 8卡并行：复现 LLaVA-1.5 7B 在 TextVQA with OCR（目标≈58.2）
 # 用法：bash scripts/eval/run_textvqa_llava15_7b_8gpu.sh
 
 set -euo pipefail
@@ -10,7 +10,8 @@ MODEL_PATH=${MODEL_PATH:-/home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b}
 QUESTION_FILE=${QUESTION_FILE:-/perception-hl/zhuofan.xia/data/textvqa/val_questions.json}
 ANNOTATION_FILE=${ANNOTATION_FILE:-/perception-hl/zhuofan.xia/data/textvqa/val_annotations.json}
 IMAGE_FOLDER=${IMAGE_FOLDER:-/perception-hl/zhuofan.xia/data/textvqa/train_images}
-OUT_DIR=${OUT_DIR:-/perception-hl/zhuofan.xia/vlm_exps/textvqa_llava15_7b}
+OCR_FILE=${OCR_FILE:-/perception-hl/zhuofan.xia/data/textvqa/val_ocr_tokens.json}
+OUT_DIR=${OUT_DIR:-/perception-hl/zhuofan.xia/vlm_exps/textvqa_llava15_7b_ocr}
 
 # LLaVA-1.5 官方模板
 CONV_MODE=${CONV_MODE:-llava_v1}
