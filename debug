@@ -1,11 +1,10 @@
 python - << 'PY'
 import json
-from eval_textvqa_official import load_textvqa_data
 qs="/perception-hl/zhuofan.xia/data/textvqa/val_questions.json"
-as_="/perception-hl/zhuofan.xia/data/textvqa/val_annotations.json"
 oc="/perception-hl/zhuofan.xia/data/textvqa/val_ocr_tokens.json"
-samples=load_textvqa_data(qs, as_, max_samples=50, ocr_path=oc)[:3]
-for s in samples:
-    o=s.get("ocr_tokens","")
-    print(s["questionId"], "OCR非空" if o.strip() else "OCR空", (o[:120]+"...") if o else "")
+Q=json.load(open(qs))["questions"][:50]
+O={x["question_id"]:x["ocr_tokens"] for x in json.load(open(oc))}
+hit=sum(1 for q in Q if q["question_id"] in O)
+non_empty=sum(1 for q in Q if q["question_id"] in O and O[q["question_id"]].strip())
+print(f"前50命中: {hit}/50, 非空: {non_empty}/50 ({non_empty/50:.1%})")
 PY
