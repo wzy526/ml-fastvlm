@@ -124,7 +124,7 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
 
 
 def prompt_processor(prompt):
-    """官方LLaVA的prompt处理函数"""
+    """官方LLaVA的prompt处理函数 - 支持OCR tokens"""
     if prompt.startswith('OCR tokens: '):
         pattern = r"Question: (.*?) Short answer:"
         match = re.search(pattern, prompt, re.DOTALL)
@@ -137,13 +137,22 @@ def prompt_processor(prompt):
     elif len(prompt.split('\n')) == 2:
         question = prompt.split('\n')[0]
     else:
-        assert False
+        # 处理标准TextVQA格式
+        if 'Question:' in prompt and 'Short answer:' in prompt:
+            pattern = r"Question: (.*?) Short answer:"
+            match = re.search(pattern, prompt, re.DOTALL)
+            if match:
+                question = match.group(1)
+            else:
+                question = prompt.split('\n')[0]
+        else:
+            question = prompt.split('\n')[0]
 
     return question.lower()
 
 
-def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
-    """加载TextVQA数据 - 完全按照官方格式"""
+def load_textvqa_data(question_path, annotation_path=None, max_samples=None, ocr_path=None):
+    """加载TextVQA数据 - 完全按照官方格式，支持OCR tokens"""
     print(f"加载TextVQA问题: {question_path}")
     
     with open(question_path, 'r') as f:
@@ -165,6 +174,15 @@ def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
             else:
                 answers[item['question_id']] = []
     
+    # 加载OCR tokens（如果提供）
+    ocr_tokens = {}
+    if ocr_path and os.path.exists(ocr_path):
+        print(f"加载OCR tokens: {ocr_path}")
+        with open(ocr_path, 'r') as f:
+            ocr_data = json.load(f)
+        ocr_tokens = {item['question_id']: item['ocr_tokens'] for item in ocr_data}
+        print(f"加载了{len(ocr_tokens)}个OCR tokens")
+    
     samples = []
     # TextVQA格式：data['questions'] 是列表
     for item in question_data['questions']:
@@ -175,6 +193,11 @@ def load_textvqa_data(question_path, annotation_path=None, max_samples=None):
             'question': item['question'],
             'answers': answers.get(question_id, [])  # 获取完整的答案列表
         }
+        
+        # 添加OCR tokens（如果有）
+        if question_id in ocr_tokens:
+            sample['ocr_tokens'] = ocr_tokens[question_id]
+        
         samples.append(sample)
     
     if max_samples:
@@ -208,12 +231,19 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         
         image = Image.open(image_path).convert('RGB')
         
-        # 构建对话 - 使用官方TextVQA格式
+        # 构建对话 - 使用官方TextVQA格式，支持OCR
         conv = conv_templates[conv_mode].copy()
         roles = conv.roles
         
-        # 官方TextVQA prompt格式
-        inp = f"Question: {sample['question']} Short answer:"
+        # 检查是否有OCR tokens（基于官方LLaVA实现）
+        if 'ocr_tokens' in sample and sample['ocr_tokens']:
+            # 使用OCR tokens格式
+            ocr_tokens = sample['ocr_tokens']
+            inp = f"OCR tokens: {ocr_tokens}\nQuestion: {sample['question']} Short answer:"
+        else:
+            # 标准TextVQA格式
+            inp = f"Question: {sample['question']} Short answer:"
+        
         if model.config.mm_use_im_start_end:
             inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
         else:
@@ -404,6 +434,7 @@ def main():
     parser.add_argument("--annotation-file", default="/perception-hl/zhuofan.xia/data/textvqa/val_annotations.json")
     parser.add_argument("--image-folder", default="/perception-hl/zhuofan.xia/data/textvqa/train_images")
     parser.add_argument("--output-file", default="/perception-hl/zhuofan.xia/vlm_exps/textdat/textvqa_val_pred.jsonl")
+    parser.add_argument("--ocr-file", default=None, help="OCR tokens文件路径（可选）。格式: [{'question_id': 'xxx', 'ocr_tokens': 'text'}, ...]")
     parser.add_argument("--conv-mode", default="llava_v1")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--chunks", type=int, default=1, help="总的分块数")
@@ -416,7 +447,7 @@ def main():
     model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, device=args.device)
     
     # 加载数据
-    samples = load_textvqa_data(args.question_file, args.annotation_file, args.max_samples)
+    samples = load_textvqa_data(args.question_file, args.annotation_file, args.max_samples, args.ocr_file)
     
     # 分块处理
     if args.chunks > 1:
