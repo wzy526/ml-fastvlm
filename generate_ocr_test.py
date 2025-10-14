@@ -38,7 +38,7 @@ def extract_ocr_with_easyocr(image_path):
         print(f"OCR处理错误 {image_path}: {e}")
         return ""
 
-def generate_ocr_tokens(question_file, image_folder, output_file, max_samples=50, use_real_ocr=False):
+def generate_ocr_tokens(question_file, image_folder, output_file, max_samples=None, use_real_ocr=False):
     """生成OCR tokens - 支持真实OCR和模拟OCR"""
     print("生成OCR tokens...")
     
@@ -47,7 +47,9 @@ def generate_ocr_tokens(question_file, image_folder, output_file, max_samples=50
     with open(question_file, 'r') as f:
         question_data = json.load(f)
     
-    questions = question_data['questions'][:max_samples]
+    questions = question_data['questions']
+    if max_samples:
+        questions = questions[:max_samples]
     print(f"处理 {len(questions)} 个问题...")
     
     # 图像OCR缓存，避免重复处理
@@ -115,7 +117,7 @@ def main():
     parser.add_argument("--question-file", default="/perception-hl/zhuofan.xia/data/textvqa/val_questions.json")
     parser.add_argument("--image-folder", default="/perception-hl/zhuofan.xia/data/textvqa/train_images")
     parser.add_argument("--output-file", default="/perception-hl/zhuofan.xia/data/textvqa/ocr_tokens.json")
-    parser.add_argument("--max-samples", type=int, default=50, help="处理样本数量")
+    parser.add_argument("--max-samples", type=int, default=None, help="处理样本数量（None表示处理全部）")
     parser.add_argument("--use-real-ocr", action="store_true", help="使用真实OCR（需要安装EasyOCR）")
     
     args = parser.parse_args()
