@@ -141,7 +141,7 @@ summary = {
     'accuracy': accuracy,
     'correct_samples': correct,
     'error_samples': total - correct,
-    'conv_mode': 'vicuna_v1',
+    'conv_mode': 'llava_v1',
     'temperature': 0,
     'chunks': $CHUNKS,
     'gpu_list': '$GPU_LIST'
@@ -163,7 +163,7 @@ echo "图像文件夹: $IMAGE_FOLDER"
 echo "模型路径: $CHECKPOINT_PATH"
 echo "GPU配置: $GPU_LIST"
 echo "分块数: $CHUNKS"
-echo "对话模式: vicuna_v1"
+echo "对话模式: llava_v1"
 echo "温度: 0"
 echo "-"*60
 
