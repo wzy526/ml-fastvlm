@@ -245,21 +245,53 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         return None, str(e)
 
 
+def extract_answer_from_response(response):
+    """从模型响应中提取答案 - 完全按照LLaVA官方GQA评估逻辑"""
+    if not response:
+        return ""
+    
+    # LLaVA官方GQA评估逻辑：非常简单
+    # 1. 移除句末句号
+    response = response.rstrip('.')
+    
+    # 2. 转换为小写
+    response = response.lower().strip()
+    
+    # 3. 直接返回处理后的文本（不进行复杂的答案提取）
+    return response
+
+
 def normalize_answer(answer):
-    """标准化答案 - 与GQA官方评估一致"""
+    """标准化答案 - 完全按照LLaVA官方GQA评估逻辑"""
     if answer is None:
         return ""
     
-    # 转换为小写
+    # LLaVA官方GQA评估逻辑：非常简单
+    # 1. 移除句末句号
+    answer = answer.rstrip('.')
+    
+    # 2. 转换为小写
     answer = answer.lower().strip()
     
-    # 移除标点符号
-    answer = re.sub(r'[^\w\s]', '', answer)
-    
-    # 移除多余空格
-    answer = ' '.join(answer.split())
-    
+    # 3. 直接返回（不进行复杂的标准化处理）
     return answer
+
+
+def gqa_accuracy(predictions, ground_truths):
+    """GQA准确率计算 - 完全按照LLaVA官方评估逻辑"""
+    correct = 0
+    total = len(predictions)
+    
+    for pred, gt in zip(predictions, ground_truths):
+        # 标准化预测和真实答案
+        norm_pred = normalize_answer(pred)
+        norm_gt = normalize_answer(gt)
+        
+        # LLaVA官方匹配逻辑：简单的字符串匹配
+        if norm_pred == norm_gt:
+            correct += 1
+    
+    return correct / total if total > 0 else 0.0
 
 
 def calculate_accuracy(predictions, ground_truths):
@@ -352,8 +384,8 @@ def main():
         
         ground_truths.append(sample['answer'])
     
-    # 计算准确率
-    accuracy = calculate_accuracy(predictions, ground_truths)
+    # 计算准确率 - 使用GQA官方评估逻辑
+    accuracy = gqa_accuracy(predictions, ground_truths)
     
     # 保存结果
     save_results_jsonl(predictions, ground_truths, samples, args.output_file)
