@@ -48,7 +48,9 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             model_path,
             config=config,
             torch_dtype=torch.float16,
-            device_map=device_map
+            device_map=None,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
         )
     else:
         print("Loading LlavaLlamaForCausalLM model (Llama backbone)")
@@ -56,8 +58,14 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             model_path,
             config=config,
             torch_dtype=torch.float16,
-            device_map=device_map
+            device_map=None,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
         )
+    
+    # 将整个模型放到CUDA设备，避免模块被放在CPU上
+    model.to('cuda')
+    model.eval()
     
     # 修复视觉编码器加载问题
     print("初始化视觉编码器...")
@@ -158,7 +166,7 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         
         # 处理输入
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
-        input_ids = input_ids.unsqueeze(0).to(model.device)
+        input_ids = input_ids.unsqueeze(0).to('cuda')
         
         # 处理图像
         image_tensor = process_images([image], image_processor, model.config)[0]
@@ -167,7 +175,7 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor.unsqueeze(0).half().to(model.device),
+                images=image_tensor.unsqueeze(0).to('cuda', dtype=torch.float16),
                 do_sample=False,  # 固定为False，确保确定性
                 temperature=0,   # 固定为0
                 top_p=None,
