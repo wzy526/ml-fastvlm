@@ -17,20 +17,131 @@ from llava.utils import disable_torch_init
 from llava.conversation import conv_templates
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.model.builder import load_pretrained_model
+from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
 import transformers
 
 
-def load_model_and_tokenizer(model_path, model_base=None):
-    """加载模型和分词器 - 使用LLaVA官方方式"""
+def load_model_and_tokenizer(model_path, device: str = "cuda"):
+    """加载模型和分词器 - 基于官方实现"""
     disable_torch_init()
-    model_path = os.path.expanduser(model_path)
-    model_name = get_model_name_from_path(model_path)
     
-    # 使用LLaVA官方的模型加载函数
-    tokenizer, model, image_processor, context_len = load_pretrained_model(
-        model_path, model_base, model_name
-    )
+    # 加载tokenizer
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+    
+    # 修复配置中的 decoder_config 问题
+    config = transformers.AutoConfig.from_pretrained(model_path)
+    if hasattr(config, 'decoder_config') and isinstance(config.decoder_config, dict):
+        print("修复 decoder_config 配置...")
+        if 'model_type' in config.decoder_config:
+            decoder_config = transformers.AutoConfig.from_dict(config.decoder_config)
+            config.decoder_config = decoder_config
+        else:
+            from transformers import PretrainedConfig
+            decoder_config = PretrainedConfig.from_dict(config.decoder_config)
+            config.decoder_config = decoder_config
+    
+    # 修复 LlavaConfig 缺少必要属性的问题
+    missing_attrs = {
+        'attention_dropout': 0.0,
+        'hidden_dropout': 0.0,
+        'attention_probs_dropout_prob': 0.0,
+        'attention_bias': False,
+        'mlp_bias': False,
+        'use_cache': True,
+        'rope_theta': 10000.0,
+        'rope_scaling': None,
+        'max_position_embeddings': 2048,
+        'rms_norm_eps': 1e-6,
+        'initializer_range': 0.02,
+        'use_sliding_window': False,
+        'sliding_window': None,
+        'max_window_layers': None,
+        'tie_word_embeddings': False
+    }
+    
+    print("修复 LlavaConfig 缺失属性...")
+    for attr, default_value in missing_attrs.items():
+        if not hasattr(config, attr):
+            setattr(config, attr, default_value)
+            print(f"  添加 {attr} = {default_value}")
+    
+    # 加载模型
+    model_name = get_model_name_from_path(model_path)
+    if 'qwen' in model_name.lower():
+        print("Loading LlavaQwen2ForCausalLM model (Qwen2 backbone)")
+        model = LlavaQwen2ForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=torch.float16,
+            device_map=None,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+    else:
+        print("Loading LlavaLlamaForCausalLM model (Llama backbone)")
+        model = LlavaLlamaForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=torch.float16,
+            device_map=None,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+    
+    # 将整个模型放到指定设备，避免模块被放在 CPU 上
+    model.to(device)
+    model.eval()
+    # 初始化视觉编码器
+    print("初始化视觉编码器...")
+    if hasattr(model, 'get_vision_tower'):
+        vision_tower = model.get_vision_tower()
+        if vision_tower is not None and not vision_tower.is_loaded:
+            print("加载视觉编码器...")
+            vision_tower.load_model()
+            print("视觉编码器加载完成")
+        # 确保视觉编码器也在同一设备和精度
+        try:
+            if hasattr(vision_tower, 'to'):
+                vision_tower.to(device, dtype=torch.float16)
+        except Exception as _:
+            pass
+    # 确保多模态投影层在同一设备
+    if hasattr(model, 'mm_projector') and model.mm_projector is not None:
+        try:
+            model.mm_projector.to(device, dtype=torch.float16)
+        except Exception as _:
+            pass
+    
+    # 设置图像处理器
+    try:
+        image_processor = transformers.CLIPImageProcessor.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+    except OSError as e:
+        if "preprocessor_config.json" in str(e):
+            print("警告: 未找到preprocessor_config.json，使用训练时的视觉编码器...")
+            vision_tower_path = "/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336"
+            try:
+                image_processor = transformers.CLIPImageProcessor.from_pretrained(
+                    vision_tower_path, trust_remote_code=True
+                )
+                print(f"成功加载视觉编码器: {vision_tower_path}")
+            except Exception as vision_error:
+                print(f"视觉编码器加载失败: {vision_error}")
+                # 创建基本图像处理器
+                from transformers import CLIPImageProcessor
+                image_processor = CLIPImageProcessor(
+                    size={"height": 336, "width": 336},
+                    do_convert_rgb=True,
+                    do_normalize=True,
+                    do_rescale=True,
+                    do_resize=True,
+                    image_mean=[0.48145466, 0.4578275, 0.40821073],
+                    image_std=[0.26862954, 0.26130258, 0.27577711]
+                )
+                print("使用基本图像处理器配置")
+        else:
+            raise e
     
     return model, tokenizer, image_processor
 
@@ -225,7 +336,6 @@ def convert_gqa_for_eval(src_file, dst_file):
 def main():
     parser = argparse.ArgumentParser(description="GQA官方风格评估")
     parser.add_argument("--model-path", type=str, required=True, help="模型路径")
-    parser.add_argument("--model-base", type=str, default=None, help="模型基础路径")
     parser.add_argument("--data-path", type=str, required=True, help="GQA数据文件路径")
     parser.add_argument("--image-folder", type=str, required=True, help="图像文件夹路径")
     parser.add_argument("--output-file", type=str, default="gqa_results.jsonl", help="输出文件")
@@ -253,7 +363,7 @@ def main():
     
     # 加载模型
     print("加载模型...")
-    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, args.model_base)
+    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, device="cuda")
     print("模型加载完成")
     
     # 加载数据
