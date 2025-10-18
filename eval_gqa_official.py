@@ -158,7 +158,7 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         
         # 处理输入
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
-        input_ids = input_ids.unsqueeze(0).cuda()
+        input_ids = input_ids.unsqueeze(0).to(model.device)
         
         # 处理图像
         image_tensor = process_images([image], image_processor, model.config)[0]
@@ -167,7 +167,7 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor.unsqueeze(0).half().cuda(),
+                images=image_tensor.unsqueeze(0).half().to(model.device),
                 do_sample=False,  # 固定为False，确保确定性
                 temperature=0,   # 固定为0
                 top_p=None,
