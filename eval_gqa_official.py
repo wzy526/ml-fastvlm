@@ -21,7 +21,7 @@ from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
 import transformers
 
 
-def load_model_and_tokenizer(model_path, device_map="auto"):
+def load_model_and_tokenizer(model_path, device: str = "cuda"):
     """加载模型和分词器 - 基于官方实现"""
     disable_torch_init()
     
@@ -39,6 +39,31 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             from transformers import PretrainedConfig
             decoder_config = PretrainedConfig.from_dict(config.decoder_config)
             config.decoder_config = decoder_config
+    
+    # 修复 LlavaConfig 缺少必要属性的问题
+    missing_attrs = {
+        'attention_dropout': 0.0,
+        'hidden_dropout': 0.0,
+        'attention_probs_dropout_prob': 0.0,
+        'attention_bias': False,
+        'mlp_bias': False,
+        'use_cache': True,
+        'rope_theta': 10000.0,
+        'rope_scaling': None,
+        'max_position_embeddings': 2048,
+        'rms_norm_eps': 1e-6,
+        'initializer_range': 0.02,
+        'use_sliding_window': False,
+        'sliding_window': None,
+        'max_window_layers': None,
+        'tie_word_embeddings': False
+    }
+    
+    print("修复 LlavaConfig 缺失属性...")
+    for attr, default_value in missing_attrs.items():
+        if not hasattr(config, attr):
+            setattr(config, attr, default_value)
+            print(f"  添加 {attr} = {default_value}")
     
     # 加载模型
     model_name = get_model_name_from_path(model_path)
@@ -63,11 +88,10 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             low_cpu_mem_usage=True
         )
     
-    # 将整个模型放到CUDA设备，避免模块被放在CPU上
-    model.to('cuda')
+    # 将整个模型放到指定设备，避免模块被放在 CPU 上
+    model.to(device)
     model.eval()
-    
-    # 修复视觉编码器加载问题
+    # 初始化视觉编码器
     print("初始化视觉编码器...")
     if hasattr(model, 'get_vision_tower'):
         vision_tower = model.get_vision_tower()
@@ -75,6 +99,18 @@ def load_model_and_tokenizer(model_path, device_map="auto"):
             print("加载视觉编码器...")
             vision_tower.load_model()
             print("视觉编码器加载完成")
+        # 确保视觉编码器也在同一设备和精度
+        try:
+            if hasattr(vision_tower, 'to'):
+                vision_tower.to(device, dtype=torch.float16)
+        except Exception as _:
+            pass
+    # 确保多模态投影层在同一设备
+    if hasattr(model, 'mm_projector') and model.mm_projector is not None:
+        try:
+            model.mm_projector.to(device, dtype=torch.float16)
+        except Exception as _:
+            pass
     
     # 设置图像处理器
     try:
@@ -280,7 +316,7 @@ def main():
     
     # 加载模型
     print("加载模型...")
-    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path)
+    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, device="cuda")
     print("模型加载完成")
     
     # 加载数据
