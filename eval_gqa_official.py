@@ -17,131 +17,20 @@ from llava.utils import disable_torch_init
 from llava.conversation import conv_templates
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
+from llava.model.builder import load_pretrained_model
 import transformers
 
 
-def load_model_and_tokenizer(model_path, device: str = "cuda"):
-    """加载模型和分词器 - 基于官方实现"""
+def load_model_and_tokenizer(model_path, model_base=None):
+    """加载模型和分词器 - 使用LLaVA官方方式"""
     disable_torch_init()
-    
-    # 加载tokenizer
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
-    
-    # 修复配置中的 decoder_config 问题
-    config = transformers.AutoConfig.from_pretrained(model_path)
-    if hasattr(config, 'decoder_config') and isinstance(config.decoder_config, dict):
-        print("修复 decoder_config 配置...")
-        if 'model_type' in config.decoder_config:
-            decoder_config = transformers.AutoConfig.from_dict(config.decoder_config)
-            config.decoder_config = decoder_config
-        else:
-            from transformers import PretrainedConfig
-            decoder_config = PretrainedConfig.from_dict(config.decoder_config)
-            config.decoder_config = decoder_config
-    
-    # 修复 LlavaConfig 缺少必要属性的问题
-    missing_attrs = {
-        'attention_dropout': 0.0,
-        'hidden_dropout': 0.0,
-        'attention_probs_dropout_prob': 0.0,
-        'attention_bias': False,
-        'mlp_bias': False,
-        'use_cache': True,
-        'rope_theta': 10000.0,
-        'rope_scaling': None,
-        'max_position_embeddings': 2048,
-        'rms_norm_eps': 1e-6,
-        'initializer_range': 0.02,
-        'use_sliding_window': False,
-        'sliding_window': None,
-        'max_window_layers': None,
-        'tie_word_embeddings': False
-    }
-    
-    print("修复 LlavaConfig 缺失属性...")
-    for attr, default_value in missing_attrs.items():
-        if not hasattr(config, attr):
-            setattr(config, attr, default_value)
-            print(f"  添加 {attr} = {default_value}")
-    
-    # 加载模型
+    model_path = os.path.expanduser(model_path)
     model_name = get_model_name_from_path(model_path)
-    if 'qwen' in model_name.lower():
-        print("Loading LlavaQwen2ForCausalLM model (Qwen2 backbone)")
-        model = LlavaQwen2ForCausalLM.from_pretrained(
-            model_path,
-            config=config,
-            torch_dtype=torch.float16,
-            device_map=None,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
-    else:
-        print("Loading LlavaLlamaForCausalLM model (Llama backbone)")
-        model = LlavaLlamaForCausalLM.from_pretrained(
-            model_path,
-            config=config,
-            torch_dtype=torch.float16,
-            device_map=None,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
     
-    # 将整个模型放到指定设备，避免模块被放在 CPU 上
-    model.to(device)
-    model.eval()
-    # 初始化视觉编码器
-    print("初始化视觉编码器...")
-    if hasattr(model, 'get_vision_tower'):
-        vision_tower = model.get_vision_tower()
-        if vision_tower is not None and not vision_tower.is_loaded:
-            print("加载视觉编码器...")
-            vision_tower.load_model()
-            print("视觉编码器加载完成")
-        # 确保视觉编码器也在同一设备和精度
-        try:
-            if hasattr(vision_tower, 'to'):
-                vision_tower.to(device, dtype=torch.float16)
-        except Exception as _:
-            pass
-    # 确保多模态投影层在同一设备
-    if hasattr(model, 'mm_projector') and model.mm_projector is not None:
-        try:
-            model.mm_projector.to(device, dtype=torch.float16)
-        except Exception as _:
-            pass
-    
-    # 设置图像处理器
-    try:
-        image_processor = transformers.CLIPImageProcessor.from_pretrained(
-            model_path, trust_remote_code=True
-        )
-    except OSError as e:
-        if "preprocessor_config.json" in str(e):
-            print("警告: 未找到preprocessor_config.json，使用训练时的视觉编码器...")
-            vision_tower_path = "/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336"
-            try:
-                image_processor = transformers.CLIPImageProcessor.from_pretrained(
-                    vision_tower_path, trust_remote_code=True
-                )
-                print(f"成功加载视觉编码器: {vision_tower_path}")
-            except Exception as vision_error:
-                print(f"视觉编码器加载失败: {vision_error}")
-                # 创建基本图像处理器
-                from transformers import CLIPImageProcessor
-                image_processor = CLIPImageProcessor(
-                    size={"height": 336, "width": 336},
-                    do_convert_rgb=True,
-                    do_normalize=True,
-                    do_rescale=True,
-                    do_resize=True,
-                    image_mean=[0.48145466, 0.4578275, 0.40821073],
-                    image_std=[0.26862954, 0.26130258, 0.27577711]
-                )
-                print("使用基本图像处理器配置")
-        else:
-            raise e
+    # 使用LLaVA官方的模型加载函数
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        model_path, model_base, model_name
+    )
     
     return model, tokenizer, image_processor
 
@@ -169,7 +58,7 @@ def load_gqa_data(data_path, max_samples=None):
     return samples
 
 
-def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1", temperature=0):
+def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1", temperature=0, max_new_tokens=8):
     """评估单个样本 - 修复推理问题"""
     try:
         # 加载图像 - 修复图像路径匹配问题
@@ -207,18 +96,17 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         # 处理图像
         image_tensor = process_images([image], image_processor, model.config)[0]
         
-        # 生成回答 - 修复推理参数
+        # 生成回答 - 使用LLaVA官方生成参数
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
                 images=image_tensor.unsqueeze(0).to('cuda', dtype=torch.float16),
-                do_sample=False,  # 固定为False，确保确定性
-                temperature=0,   # 固定为0
+                do_sample=True if temperature > 0 else False,
+                temperature=temperature,
                 top_p=None,
                 num_beams=1,
-                max_new_tokens=32,
-                use_cache=True,
-                pad_token_id=tokenizer.eos_token_id  # 添加pad_token_id
+                max_new_tokens=max_new_tokens,
+                use_cache=True
             )
         
         # 解码输出 - 修复解码逻辑
@@ -307,31 +195,48 @@ def calculate_accuracy(predictions, ground_truths):
 
 
 def save_results_jsonl(predictions, ground_truths, samples, output_file):
-    """保存为JSONL格式 - 兼容GQA官方评估"""
+    """保存为JSONL格式 - 兼容LLaVA官方GQA评估格式"""
     with open(output_file, 'w', encoding='utf-8') as f:
         for i, (pred, gt, sample) in enumerate(zip(predictions, ground_truths, samples)):
+            # LLaVA官方格式：只包含question_id和text
             result = {
-                'questionId': sample['questionId'],
-                'question': sample['question'],
-                'imageId': sample['imageId'],
-                'ground_truth': gt,
-                'prediction': pred,
-                'correct': normalize_answer(pred) == normalize_answer(gt)
+                'question_id': sample['questionId'],
+                'text': pred
             }
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
+
+
+def convert_gqa_for_eval(src_file, dst_file):
+    """转换LLaVA格式为GQA官方评估格式 - 完全按照LLaVA官方脚本"""
+    all_answers = []
+    for line_idx, line in enumerate(open(src_file)):
+        res = json.loads(line)
+        question_id = res['question_id']
+        text = res['text'].rstrip('.').lower()
+        all_answers.append({"questionId": question_id, "prediction": text})
+
+    with open(dst_file, 'w') as f:
+        json.dump(all_answers, f)
+    
+    print(f"转换完成: {src_file} -> {dst_file}")
+    print(f"转换了 {len(all_answers)} 个答案")
 
 
 def main():
     parser = argparse.ArgumentParser(description="GQA官方风格评估")
     parser.add_argument("--model-path", type=str, required=True, help="模型路径")
+    parser.add_argument("--model-base", type=str, default=None, help="模型基础路径")
     parser.add_argument("--data-path", type=str, required=True, help="GQA数据文件路径")
     parser.add_argument("--image-folder", type=str, required=True, help="图像文件夹路径")
     parser.add_argument("--output-file", type=str, default="gqa_results.jsonl", help="输出文件")
     parser.add_argument("--max-samples", type=int, default=None, help="最大样本数")
     parser.add_argument("--conv-mode", type=str, default="llava_v1", help="对话模式")
     parser.add_argument("--temperature", type=float, default=0, help="生成温度")
+    parser.add_argument("--max-new-tokens", type=int, default=8, help="最大生成长度（建议8-16）")
     parser.add_argument("--chunks", type=int, default=1, help="分块数（兼容官方接口）")
     parser.add_argument("--chunk-idx", type=int, default=0, help="当前块索引（兼容官方接口）")
+    parser.add_argument("--convert-for-eval", action="store_true", help="转换输出为GQA官方评估格式")
+    parser.add_argument("--eval-file", type=str, default=None, help="GQA官方评估文件路径")
     
     args = parser.parse_args()
     
@@ -348,7 +253,7 @@ def main():
     
     # 加载模型
     print("加载模型...")
-    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, device="cuda")
+    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, args.model_base)
     print("模型加载完成")
     
     # 加载数据
@@ -373,7 +278,7 @@ def main():
     for i, sample in enumerate(tqdm(samples, desc="评估进度")):
         pred, error = evaluate_single_sample(
             model, tokenizer, image_processor, sample, args.image_folder, 
-            args.conv_mode, args.temperature
+            args.conv_mode, args.temperature, args.max_new_tokens
         )
         
         if error:
@@ -417,7 +322,18 @@ def main():
     print(f"错误数: {len(errors)}")
     print(f"结果文件: {args.output_file}")
     print(f"汇总文件: {summary_file}")
-    print("="*80)
+    
+    # 如果指定了转换，则进行格式转换
+    if args.convert_for_eval:
+        if args.eval_file is None:
+            eval_file = args.output_file.replace('.jsonl', '_for_eval.json')
+        else:
+            eval_file = args.eval_file
+        
+        print(f"\n转换输出为GQA官方评估格式...")
+        convert_gqa_for_eval(args.output_file, eval_file)
+        print(f"GQA官方评估文件: {eval_file}")
+        print("="*80)
 
 
 if __name__ == "__main__":
