@@ -305,15 +305,28 @@ def calculate_accuracy(predictions, ground_truths):
     return correct / total if total > 0 else 0.0
 
 
-def save_results_jsonl(predictions, ground_truths, samples, output_file):
-    """保存为JSONL格式 - 兼容LLaVA官方GQA评估格式"""
+def save_results_jsonl(predictions, ground_truths, samples, output_file, detailed=True):
+    """保存为JSONL格式 - 支持详细和LLaVA官方格式"""
     with open(output_file, 'w', encoding='utf-8') as f:
         for i, (pred, gt, sample) in enumerate(zip(predictions, ground_truths, samples)):
-            # LLaVA官方格式：只包含question_id和text
-            result = {
-                'question_id': sample['questionId'],
-                'text': pred
-            }
+            if detailed:
+                # 详细格式：包含所有信息用于调试和分析
+                result = {
+                    'questionId': sample['questionId'],
+                    'question': sample['question'],
+                    'imageId': sample['imageId'],
+                    'ground_truth': gt,
+                    'prediction': pred,
+                    'prediction_normalized': normalize_answer(pred),
+                    'ground_truth_normalized': normalize_answer(gt),
+                    'correct': normalize_answer(pred) == normalize_answer(gt)
+                }
+            else:
+                # LLaVA官方格式：只包含question_id和text
+                result = {
+                    'question_id': sample['questionId'],
+                    'text': pred
+                }
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
 
 
@@ -347,6 +360,7 @@ def main():
     parser.add_argument("--chunk-idx", type=int, default=0, help="当前块索引（兼容官方接口）")
     parser.add_argument("--convert-for-eval", action="store_true", help="转换输出为GQA官方评估格式")
     parser.add_argument("--eval-file", type=str, default=None, help="GQA官方评估文件路径")
+    parser.add_argument("--output-format", type=str, default="detailed", choices=["detailed", "llava"], help="输出格式：detailed(详细)或llava(官方格式)")
     
     args = parser.parse_args()
     
@@ -403,7 +417,8 @@ def main():
     accuracy = gqa_accuracy(predictions, ground_truths)
     
     # 保存结果
-    save_results_jsonl(predictions, ground_truths, samples, args.output_file)
+    detailed_format = (args.output_format == "detailed")
+    save_results_jsonl(predictions, ground_truths, samples, args.output_file, detailed=detailed_format)
     
     # 保存汇总结果
     summary_file = args.output_file.replace('.jsonl', '_summary.json')
