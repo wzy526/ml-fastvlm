@@ -179,7 +179,7 @@ def load_gqa_data(data_path, max_samples=None):
     return samples
 
 
-def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="vicuna_v1", temperature=0, max_new_tokens=16):
+def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1", temperature=0, max_new_tokens=16, brief_instruction: str = None):
     """评估单个样本 - 完全按照LLaVA官方逻辑"""
     try:
         # 加载图像 - 按照LLaVA官方逻辑
@@ -204,9 +204,12 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         
         image = Image.open(image_path).convert('RGB')
         
-        # 构建对话 - 使用llava_v1格式（与训练时一致）
+        # 构建对话 - 使用llava_v1/vicuna_v1格式
         conv = conv_templates[conv_mode].copy()
-        conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{sample['question']}")
+        question_text = sample['question']
+        if brief_instruction is not None and len(brief_instruction.strip()) > 0:
+            question_text = question_text + "\n" + brief_instruction.strip()
+        conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{question_text}")
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
         
@@ -344,7 +347,7 @@ def save_results_jsonl(predictions, ground_truths, samples, output_file, detaile
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
 
 
-def run_llava_gqa_evaluation(model_path, data_path, image_folder, output_dir, max_samples=None, conv_mode="llava_v1", temperature=0, max_new_tokens=16, chunks=1, chunk_idx=0):
+def run_llava_gqa_evaluation(model_path, data_path, image_folder, output_dir, max_samples=None, conv_mode="llava_v1", temperature=0, max_new_tokens=16, chunks=1, chunk_idx=0, brief_instruction: str = None):
     """运行LLaVA官方GQA评估 - 完全按照LLaVA原版逻辑"""
     print("="*80)
     print("LLaVA官方GQA评估")
@@ -385,7 +388,7 @@ def run_llava_gqa_evaluation(model_path, data_path, image_folder, output_dir, ma
     for i, sample in enumerate(tqdm(samples, desc="评估进度")):
         pred, error = evaluate_single_sample(
             model, tokenizer, image_processor, sample, image_folder, 
-            conv_mode, temperature, max_new_tokens
+            conv_mode, temperature, max_new_tokens, brief_instruction
         )
         
         if error:
@@ -475,6 +478,7 @@ def main():
     parser.add_argument("--convert-for-eval", action="store_true", help="转换输出为GQA官方评估格式")
     parser.add_argument("--eval-file", type=str, default=None, help="GQA官方评估文件路径")
     parser.add_argument("--llava-mode", action="store_true", help="使用LLaVA官方评估模式")
+    parser.add_argument("--brief-instruction", type=str, default=None, help="可选：在问题后追加的简答提示，例如 'Answer briefly with one or two words only.'")
     
     args = parser.parse_args()
     
@@ -490,7 +494,8 @@ def main():
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
             chunks=args.chunks,
-            chunk_idx=args.chunk_idx
+            chunk_idx=args.chunk_idx,
+            brief_instruction=args.brief_instruction
         )
         
         # 如果指定了转换，则进行格式转换
@@ -544,7 +549,7 @@ def main():
         for i, sample in enumerate(tqdm(samples, desc="评估进度")):
             pred, error = evaluate_single_sample(
                 model, tokenizer, image_processor, sample, args.image_folder, 
-                args.conv_mode, args.temperature, args.max_new_tokens
+                args.conv_mode, args.temperature, args.max_new_tokens, args.brief_instruction
             )
             
             if error:
