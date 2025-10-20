@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 基于LLaVA官方实现的GQA评估脚本
+完全匹配LLaVA原版GQA测试逻辑
 适配您训练的DAT-LLaVA-1.5模型
 """
 
@@ -147,21 +148,30 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
 
 
 def load_gqa_data(data_path, max_samples=None):
-    """加载GQA数据 - 转换为LLaVA格式"""
-    with open(data_path, 'r') as f:
-        data = json.load(f)
-    
-    # 转换为LLaVA格式的样本列表
+    """加载GQA数据 - 完全按照LLaVA格式"""
     samples = []
-    for qid, item in data.items():
-        sample = {
-            'questionId': qid,
-            'question': item['question'],
-            'imageId': item['imageId'],
-            'answer': item['answer'],
-            'fullAnswer': item.get('fullAnswer', item['answer'])
-        }
-        samples.append(sample)
+    
+    # 支持JSONL格式（LLaVA标准格式）
+    if data_path.endswith('.jsonl'):
+        with open(data_path, 'r') as f:
+            for line in f:
+                sample = json.loads(line.strip())
+                samples.append(sample)
+    else:
+        # 支持JSON格式（向后兼容）
+        with open(data_path, 'r') as f:
+            data = json.load(f)
+        
+        # 转换为LLaVA格式的样本列表
+        for qid, item in data.items():
+            sample = {
+                'questionId': qid,
+                'question': item['question'],
+                'imageId': item['imageId'],
+                'answer': item['answer'],
+                'fullAnswer': item.get('fullAnswer', item['answer'])
+            }
+            samples.append(sample)
     
     if max_samples:
         samples = samples[:max_samples]
@@ -169,13 +179,13 @@ def load_gqa_data(data_path, max_samples=None):
     return samples
 
 
-def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1", temperature=0, max_new_tokens=8):
-    """评估单个样本 - 修复推理问题"""
+def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="vicuna_v1", temperature=0, max_new_tokens=16):
+    """评估单个样本 - 完全按照LLaVA官方逻辑"""
     try:
-        # 加载图像 - 修复图像路径匹配问题
+        # 加载图像 - 按照LLaVA官方逻辑
         image_id = sample['imageId']
         
-        # 尝试不同的文件名格式 - 根据测试结果，优先尝试n前缀
+        # 尝试不同的文件名格式 - 按照LLaVA官方逻辑
         possible_paths = [
             os.path.join(image_folder, f"n{image_id}.jpg"),  # 优先尝试n前缀
             os.path.join(image_folder, f"{image_id}.jpg"),
@@ -200,18 +210,22 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
         
-        # 处理输入
+        # 处理输入 - 按照LLaVA官方逻辑
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
         input_ids = input_ids.unsqueeze(0).to('cuda')
         
-        # 处理图像
-        image_tensor = process_images([image], image_processor, model.config)[0]
+        # 处理图像 - 按照LLaVA官方逻辑
+        image_tensor = process_images([image], image_processor, model.config)
+        if type(image_tensor) is list:
+            image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
+        else:
+            image_tensor = image_tensor.to(model.device, dtype=torch.float16)
         
-        # 生成回答 - 使用LLaVA官方生成参数
+        # 生成回答 - 完全按照LLaVA官方生成参数
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor.unsqueeze(0).to('cuda', dtype=torch.float16),
+                images=image_tensor,
                 do_sample=True if temperature > 0 else False,
                 temperature=temperature,
                 top_p=None,
@@ -220,17 +234,17 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
                 use_cache=True
             )
         
-        # 解码输出 - 修复解码逻辑
+        # 解码输出 - 按照LLaVA官方逻辑
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
         
-        # 提取回答部分 - 更安全的提取方式
+        # 提取回答部分 - 完全按照LLaVA官方逻辑
         if prompt in outputs:
             outputs = outputs.split(prompt)[-1].strip()
         else:
             # 如果找不到prompt，尝试其他方式
             outputs = outputs.strip()
         
-        # 清理输出
+        # 清理输出 - 按照LLaVA官方逻辑
         if outputs:
             # 移除可能的重复内容
             lines = outputs.split('\n')
@@ -330,6 +344,106 @@ def save_results_jsonl(predictions, ground_truths, samples, output_file, detaile
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
 
 
+def run_llava_gqa_evaluation(model_path, data_path, image_folder, output_dir, max_samples=None, conv_mode="llava_v1", temperature=0, max_new_tokens=16, chunks=1, chunk_idx=0):
+    """运行LLaVA官方GQA评估 - 完全按照LLaVA原版逻辑"""
+    print("="*80)
+    print("LLaVA官方GQA评估")
+    print("="*80)
+    print(f"模型路径: {model_path}")
+    print(f"数据路径: {data_path}")
+    print(f"图像文件夹: {image_folder}")
+    print(f"最大样本数: {max_samples or '完整测试集'}")
+    print(f"对话模式: {conv_mode}")
+    print(f"温度: {temperature}")
+    print(f"分块: {chunks}/{chunk_idx}")
+    print("="*80)
+    
+    # 加载模型
+    print("加载模型...")
+    model, tokenizer, image_processor = load_model_and_tokenizer(model_path, device="cuda")
+    print("模型加载完成")
+    
+    # 加载数据
+    print("加载GQA数据...")
+    samples = load_gqa_data(data_path, max_samples)
+    print(f"加载了 {len(samples)} 个样本")
+    
+    # 分块处理（兼容LLaVA官方接口）
+    if chunks > 1:
+        chunk_size = len(samples) // chunks
+        start_idx = chunk_idx * chunk_size
+        end_idx = start_idx + chunk_size if chunk_idx < chunks - 1 else len(samples)
+        samples = samples[start_idx:end_idx]
+        print(f"处理块 {chunk_idx}/{chunks-1}: 样本 {start_idx}-{end_idx-1}")
+    
+    # 评估
+    print("开始评估...")
+    predictions = []
+    ground_truths = []
+    errors = []
+    
+    for i, sample in enumerate(tqdm(samples, desc="评估进度")):
+        pred, error = evaluate_single_sample(
+            model, tokenizer, image_processor, sample, image_folder, 
+            conv_mode, temperature, max_new_tokens
+        )
+        
+        if error:
+            errors.append(f"样本 {i}: {error}")
+            predictions.append("")
+        else:
+            predictions.append(pred)
+        
+        ground_truths.append(sample['answer'])
+    
+    # 计算准确率 - 使用GQA官方评估逻辑
+    accuracy = gqa_accuracy(predictions, ground_truths)
+    
+    # 保存结果 - LLaVA官方格式
+    output_file = os.path.join(output_dir, f"gqa_results_{chunks}_{chunk_idx}.jsonl")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 保存为LLaVA官方格式
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for i, (pred, sample) in enumerate(zip(predictions, samples)):
+            result = {
+                'question_id': sample['questionId'],
+                'text': pred
+            }
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
+    
+    # 保存汇总结果
+    summary_file = os.path.join(output_dir, f"gqa_summary_{chunks}_{chunk_idx}.json")
+    summary_results = {
+        'model_path': model_path,
+        'data_path': data_path,
+        'image_folder': image_folder,
+        'total_samples': len(samples),
+        'accuracy': accuracy,
+        'error_count': len(errors),
+        'conv_mode': conv_mode,
+        'temperature': temperature,
+        'chunks': chunks,
+        'chunk_idx': chunk_idx
+    }
+    
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        json.dump(summary_results, f, indent=2, ensure_ascii=False)
+    
+    # 打印结果
+    print("\n" + "="*80)
+    print("评估结果")
+    print("="*80)
+    print(f"总样本数: {len(samples)}")
+    print(f"准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"错误数: {len(errors)}")
+    print(f"结果文件: {output_file}")
+    print(f"汇总文件: {summary_file}")
+    print("="*80)
+    
+    return output_file, accuracy
+
+
 def convert_gqa_for_eval(src_file, dst_file):
     """转换LLaVA格式为GQA官方评估格式 - 完全按照LLaVA官方脚本"""
     all_answers = []
@@ -347,118 +461,147 @@ def convert_gqa_for_eval(src_file, dst_file):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GQA官方风格评估")
+    parser = argparse.ArgumentParser(description="LLaVA官方GQA评估")
     parser.add_argument("--model-path", type=str, required=True, help="模型路径")
     parser.add_argument("--data-path", type=str, required=True, help="GQA数据文件路径")
     parser.add_argument("--image-folder", type=str, required=True, help="图像文件夹路径")
-    parser.add_argument("--output-file", type=str, default="gqa_results.jsonl", help="输出文件")
+    parser.add_argument("--output-dir", type=str, default="./gqa_results", help="输出目录")
     parser.add_argument("--max-samples", type=int, default=None, help="最大样本数")
     parser.add_argument("--conv-mode", type=str, default="llava_v1", help="对话模式")
     parser.add_argument("--temperature", type=float, default=0, help="生成温度")
-    parser.add_argument("--max-new-tokens", type=int, default=8, help="最大生成长度（建议8-16）")
-    parser.add_argument("--chunks", type=int, default=1, help="分块数（兼容官方接口）")
-    parser.add_argument("--chunk-idx", type=int, default=0, help="当前块索引（兼容官方接口）")
+    parser.add_argument("--max-new-tokens", type=int, default=16, help="最大生成长度（GQA评估建议16）")
+    parser.add_argument("--chunks", type=int, default=1, help="分块数（兼容LLaVA官方接口）")
+    parser.add_argument("--chunk-idx", type=int, default=0, help="当前块索引（兼容LLaVA官方接口）")
     parser.add_argument("--convert-for-eval", action="store_true", help="转换输出为GQA官方评估格式")
     parser.add_argument("--eval-file", type=str, default=None, help="GQA官方评估文件路径")
-    parser.add_argument("--output-format", type=str, default="detailed", choices=["detailed", "llava"], help="输出格式：detailed(详细)或llava(官方格式)")
+    parser.add_argument("--llava-mode", action="store_true", help="使用LLaVA官方评估模式")
     
     args = parser.parse_args()
     
-    print("="*80)
-    print("GQA官方风格评估")
-    print("="*80)
-    print(f"模型路径: {args.model_path}")
-    print(f"数据路径: {args.data_path}")
-    print(f"图像文件夹: {args.image_folder}")
-    print(f"最大样本数: {args.max_samples or '完整测试集'}")
-    print(f"对话模式: {args.conv_mode}")
-    print(f"温度: {args.temperature}")
-    print("="*80)
-    
-    # 加载模型
-    print("加载模型...")
-    model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, device="cuda")
-    print("模型加载完成")
-    
-    # 加载数据
-    print("加载GQA数据...")
-    samples = load_gqa_data(args.data_path, args.max_samples)
-    print(f"加载了 {len(samples)} 个样本")
-    
-    # 分块处理（兼容官方接口）
-    if args.chunks > 1:
-        chunk_size = len(samples) // args.chunks
-        start_idx = args.chunk_idx * chunk_size
-        end_idx = start_idx + chunk_size if args.chunk_idx < args.chunks - 1 else len(samples)
-        samples = samples[start_idx:end_idx]
-        print(f"处理块 {args.chunk_idx}/{args.chunks-1}: 样本 {start_idx}-{end_idx-1}")
-    
-    # 评估
-    print("开始评估...")
-    predictions = []
-    ground_truths = []
-    errors = []
-    
-    for i, sample in enumerate(tqdm(samples, desc="评估进度")):
-        pred, error = evaluate_single_sample(
-            model, tokenizer, image_processor, sample, args.image_folder, 
-            args.conv_mode, args.temperature, args.max_new_tokens
+    if args.llava_mode:
+        # 使用LLaVA官方评估模式
+        output_file, accuracy = run_llava_gqa_evaluation(
+            model_path=args.model_path,
+            data_path=args.data_path,
+            image_folder=args.image_folder,
+            output_dir=args.output_dir,
+            max_samples=args.max_samples,
+            conv_mode=args.conv_mode,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
+            chunks=args.chunks,
+            chunk_idx=args.chunk_idx
         )
         
-        if error:
-            errors.append(f"样本 {i}: {error}")
-            predictions.append("")
-        else:
-            predictions.append(pred)
-        
-        ground_truths.append(sample['answer'])
-    
-    # 计算准确率 - 使用GQA官方评估逻辑
-    accuracy = gqa_accuracy(predictions, ground_truths)
-    
-    # 保存结果
-    detailed_format = (args.output_format == "detailed")
-    save_results_jsonl(predictions, ground_truths, samples, args.output_file, detailed=detailed_format)
-    
-    # 保存汇总结果
-    summary_file = args.output_file.replace('.jsonl', '_summary.json')
-    summary_results = {
-        'model_path': args.model_path,
-        'data_path': args.data_path,
-        'image_folder': args.image_folder,
-        'total_samples': len(samples),
-        'accuracy': accuracy,
-        'error_count': len(errors),
-        'conv_mode': args.conv_mode,
-        'temperature': args.temperature,
-        'chunks': args.chunks,
-        'chunk_idx': args.chunk_idx
-    }
-    
-    with open(summary_file, 'w', encoding='utf-8') as f:
-        json.dump(summary_results, f, indent=2, ensure_ascii=False)
-    
-    # 打印结果
-    print("\n" + "="*80)
-    print("评估结果")
-    print("="*80)
-    print(f"总样本数: {len(samples)}")
-    print(f"准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
-    print(f"错误数: {len(errors)}")
-    print(f"结果文件: {args.output_file}")
-    print(f"汇总文件: {summary_file}")
-    
-    # 如果指定了转换，则进行格式转换
-    if args.convert_for_eval:
-        if args.eval_file is None:
-            eval_file = args.output_file.replace('.jsonl', '_for_eval.json')
-        else:
-            eval_file = args.eval_file
-        
-        print(f"\n转换输出为GQA官方评估格式...")
-        convert_gqa_for_eval(args.output_file, eval_file)
-        print(f"GQA官方评估文件: {eval_file}")
+        # 如果指定了转换，则进行格式转换
+        if args.convert_for_eval:
+            if args.eval_file is None:
+                eval_file = os.path.join(args.output_dir, "testdev_balanced_predictions.json")
+            else:
+                eval_file = args.eval_file
+            
+            print(f"\n转换输出为GQA官方评估格式...")
+            convert_gqa_for_eval(output_file, eval_file)
+            print(f"GQA官方评估文件: {eval_file}")
+            print("="*80)
+    else:
+        # 使用传统评估模式（向后兼容）
         print("="*80)
+        print("GQA传统评估模式")
+        print("="*80)
+        print(f"模型路径: {args.model_path}")
+        print(f"数据路径: {args.data_path}")
+        print(f"图像文件夹: {args.image_folder}")
+        print(f"最大样本数: {args.max_samples or '完整测试集'}")
+        print(f"对话模式: {args.conv_mode}")
+        print(f"温度: {args.temperature}")
+        print("="*80)
+        
+        # 加载模型
+        print("加载模型...")
+        model, tokenizer, image_processor = load_model_and_tokenizer(args.model_path, device="cuda")
+        print("模型加载完成")
+        
+        # 加载数据
+        print("加载GQA数据...")
+        samples = load_gqa_data(args.data_path, args.max_samples)
+        print(f"加载了 {len(samples)} 个样本")
+        
+        # 分块处理（兼容官方接口）
+        if args.chunks > 1:
+            chunk_size = len(samples) // args.chunks
+            start_idx = args.chunk_idx * chunk_size
+            end_idx = start_idx + chunk_size if args.chunk_idx < args.chunks - 1 else len(samples)
+            samples = samples[start_idx:end_idx]
+            print(f"处理块 {args.chunk_idx}/{args.chunks-1}: 样本 {start_idx}-{end_idx-1}")
+        
+        # 评估
+        print("开始评估...")
+        predictions = []
+        ground_truths = []
+        errors = []
+        
+        for i, sample in enumerate(tqdm(samples, desc="评估进度")):
+            pred, error = evaluate_single_sample(
+                model, tokenizer, image_processor, sample, args.image_folder, 
+                args.conv_mode, args.temperature, args.max_new_tokens
+            )
+            
+            if error:
+                errors.append(f"样本 {i}: {error}")
+                predictions.append("")
+            else:
+                predictions.append(pred)
+            
+            ground_truths.append(sample['answer'])
+        
+        # 计算准确率 - 使用GQA官方评估逻辑
+        accuracy = gqa_accuracy(predictions, ground_truths)
+        
+        # 保存结果
+        os.makedirs(args.output_dir, exist_ok=True)
+        output_file = os.path.join(args.output_dir, f"gqa_results_{args.chunks}_{args.chunk_idx}.jsonl")
+        save_results_jsonl(predictions, ground_truths, samples, output_file, detailed=True)
+        
+        # 保存汇总结果
+        summary_file = os.path.join(args.output_dir, f"gqa_summary_{args.chunks}_{args.chunk_idx}.json")
+        summary_results = {
+            'model_path': args.model_path,
+            'data_path': args.data_path,
+            'image_folder': args.image_folder,
+            'total_samples': len(samples),
+            'accuracy': accuracy,
+            'error_count': len(errors),
+            'conv_mode': args.conv_mode,
+            'temperature': args.temperature,
+            'chunks': args.chunks,
+            'chunk_idx': args.chunk_idx
+        }
+        
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary_results, f, indent=2, ensure_ascii=False)
+        
+        # 打印结果
+        print("\n" + "="*80)
+        print("评估结果")
+        print("="*80)
+        print(f"总样本数: {len(samples)}")
+        print(f"准确率: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        print(f"错误数: {len(errors)}")
+        print(f"结果文件: {output_file}")
+        print(f"汇总文件: {summary_file}")
+        
+        # 如果指定了转换，则进行格式转换
+        if args.convert_for_eval:
+            if args.eval_file is None:
+                eval_file = os.path.join(args.output_dir, "testdev_balanced_predictions.json")
+            else:
+                eval_file = args.eval_file
+            
+            print(f"\n转换输出为GQA官方评估格式...")
+            convert_gqa_for_eval(output_file, eval_file)
+            print(f"GQA官方评估文件: {eval_file}")
+            print("="*80)
 
 
 if __name__ == "__main__":

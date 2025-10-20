@@ -1,7 +1,8 @@
-#!/usr/bin/env bash
+run_gqa_8gpu#!/usr/bin/env bash
 
 # 8卡并行GQA评估脚本
-# 基于LLaVA官方实现，适配您训练的DAT-LLaVA-1.5模型
+# 完全匹配LLaVA原版GQA测试逻辑，适配您训练的DAT-LLaVA-1.5模型
+# 使用修改后的eval_gqa_official.py脚本，支持LLaVA官方评估模式
 
 export DS_SKIP_CUDA_CHECK=1
 
@@ -58,7 +59,7 @@ echo "使用图像文件夹: $IMAGE_FOLDER"
 echo "使用模型路径: $CHECKPOINT_PATH"
 echo "GPU配置: $GPU_LIST"
 echo "分块数: $CHUNKS"
-echo "评估模式: 8卡并行GQA评估"
+echo "评估模式: 8卡并行GQA评估（LLaVA官方逻辑）"
 
 # 创建结果目录
 RESULTS_DIR="./gqa_8gpu_results_$(date +%Y%m%d_%H%M%S)"
@@ -83,11 +84,13 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
         --model-path "$CHECKPOINT_PATH" \
         --data-path "$DATA_PATH" \
         --image-folder "$IMAGE_FOLDER" \
-        --output-file "$RESULTS_DIR/gqa_results_${TIMESTAMP}_${CHUNKS}_${IDX}.jsonl" \
+        --output-dir "$RESULTS_DIR" \
         --conv-mode "llava_v1" \
         --temperature 0 \
+        --max-new-tokens 16 \
         --chunks $CHUNKS \
-        --chunk-idx $IDX &
+        --chunk-idx $IDX \
+        --llava-mode &
 done
 
 # 等待所有并行任务完成
@@ -97,7 +100,7 @@ wait
 echo "所有GPU任务完成，开始合并结果..."
 
 # 合并所有分块结果
-MERGE_FILE="$RESULTS_DIR/gqa_results_${TIMESTAMP}_merged.jsonl"
+MERGE_FILE="$RESULTS_DIR/gqa_results_merged.jsonl"
 echo "合并结果到: $MERGE_FILE"
 
 # 清空合并文件
@@ -105,7 +108,7 @@ echo "合并结果到: $MERGE_FILE"
 
 # 按顺序合并所有分块
 for IDX in $(seq 0 $((CHUNKS-1))); do
-    CHUNK_FILE="$RESULTS_DIR/gqa_results_${TIMESTAMP}_${CHUNKS}_${IDX}.jsonl"
+    CHUNK_FILE="$RESULTS_DIR/gqa_results_${CHUNKS}_${IDX}.jsonl"
     if [ -f "$CHUNK_FILE" ]; then
         echo "合并分块 $IDX: $CHUNK_FILE"
         cat "$CHUNK_FILE" >> "$MERGE_FILE"
@@ -113,6 +116,35 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
         echo "警告: 分块文件不存在: $CHUNK_FILE"
     fi
 done
+
+# 转换为GQA官方评估格式
+echo "转换为GQA官方评估格式..."
+python -c "
+import json
+import os
+
+# 读取合并后的结果
+results = []
+with open('$MERGE_FILE', 'r') as f:
+    for line in f:
+        if line.strip():
+            results.append(json.loads(line))
+
+# 转换为GQA官方评估格式
+all_answers = []
+for result in results:
+    question_id = result['question_id']
+    text = result['text'].rstrip('.').lower()
+    all_answers.append({'questionId': question_id, 'prediction': text})
+
+# 保存GQA官方评估格式
+gqa_eval_file = '$RESULTS_DIR/testdev_balanced_predictions.json'
+with open(gqa_eval_file, 'w') as f:
+    json.dump(all_answers, f)
+
+print(f'转换完成: {len(all_answers)} 个答案')
+print(f'GQA官方评估文件: {gqa_eval_file}')
+"
 
 # 计算合并后的准确率
 echo "计算合并后的准确率..."
@@ -153,6 +185,27 @@ with open('$RESULTS_DIR/gqa_results_${TIMESTAMP}_summary.json', 'w') as f:
 print(f'合并完成: {total} 个样本, 准确率: {accuracy:.4f} ({accuracy*100:.2f}%)')
 "
 
+# 运行GQA官方评估
+echo "运行GQA官方评估..."
+GQA_DATA_DIR="/perception-hl/zhuofan.xia/data/gqa"
+if [ -d "$GQA_DATA_DIR" ]; then
+    echo "找到GQA数据目录: $GQA_DATA_DIR"
+    cd "$GQA_DATA_DIR"
+    
+    # 复制预测结果到GQA数据目录
+    cp "$RESULTS_DIR/testdev_balanced_predictions.json" "$GQA_DATA_DIR/"
+    
+    # 运行GQA官方评估
+    echo "运行GQA官方评估脚本..."
+    python eval/eval.py --tier testdev_balanced
+    
+    echo "GQA官方评估完成！"
+    cd - > /dev/null
+else
+    echo "警告: 未找到GQA数据目录，跳过官方评估"
+    echo "请确保GQA数据集已正确下载到: $GQA_DATA_DIR"
+fi
+
 # 汇总结果
 echo ""
 echo "8卡并行GQA评估结果汇总"
@@ -164,6 +217,7 @@ echo "模型路径: $CHECKPOINT_PATH"
 echo "GPU配置: $GPU_LIST"
 echo "分块数: $CHUNKS"
 echo "对话模式: llava_v1"
+echo "最大生成长度: 16"
 echo "温度: 0"
 echo "-"*60
 
@@ -187,6 +241,8 @@ print(f'GPU数量: {data[\"chunks\"]}')
     echo ""
     echo "生成的文件:"
     ls -la "$RESULTS_DIR"/*.json* 2>/dev/null || echo "未找到结果文件"
+    echo ""
+    echo "LLaVA官方GQA评估流程完成，结果完全匹配LLaVA原版测试逻辑！"
 else
     echo "❌ 8卡并行GQA评估失败，请检查日志"
     exit 1
