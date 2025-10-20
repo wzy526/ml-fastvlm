@@ -1,8 +1,10 @@
-python eval_gqa_official.py \
-    --model-path "/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3" \
-    --data-path "/perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json" \
-    --image-folder "/perception-hl/zhuofan.xia/data/gqa/images" \
-    --output-file "gqa_test_10samples.jsonl" \
-    --max-samples 10 \
-    --conv-mode "llava_v1" \
-    --temperature 0
+CUDA_VISIBLE_DEVICES=0 python eval_gqa_official.py \
+  --model-path /perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3 \
+  --data-path /perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json \
+  --image-folder /perception-hl/zhuofan.xia/data/gqa/images \
+  --output-dir ./gqa_results_100 \
+  --llava-mode \
+  --conv-mode llava_v1 \
+  --temperature 0 \
+  --max-new-tokens 16 \
+  --max-samples 100
