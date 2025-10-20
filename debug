@@ -25,13 +25,13 @@ CUDA_VISIBLE_DEVICES=0 python eval_gqa_official.py \
 
 
 
-MODEL_PATH=${MODEL_PATH:-/home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b} \
 CUDA_VISIBLE_DEVICES=0 python eval_gqa_official.py \
-  --model-path "$MODEL_PATH" \
+  --model-path /home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b \
   --data-path /perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json \
   --image-folder /perception-hl/zhuofan.xia/data/gqa/images \
-  --output-dir ./gqa_debug_20 \
-  --conv-mode llava_v1 \
+  --output-dir ./gqa_debug_20_7b \
+  --conv-mode vicuna_v1 \
   --temperature 0 \
-  --max-new-tokens 16 \
-  --max-samples 20
+  --max-new-tokens 8 \
+  --max-samples 20 \
+  --brief-instruction "Answer briefly with one or two words only."
