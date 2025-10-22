@@ -4,10 +4,10 @@
   --data-path /perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json \
   --image-folder /perception-hl/zhuofan.xia/data/gqa/images \
   --output-dir ./gqa_debug_20 \
-  --conv-mode vicuna_v1 \
+  --conv-mode llava_v1 \
   --temperature 0 \
-  --max-new-tokens 8 \
-  --max-samples 20 \
+  --max-new-tokens 128 \
+  --max-samples 1000 \
   --brief-instruction "Answer briefly with one or two words only."
 
 
@@ -21,8 +21,8 @@ CUDA_VISIBLE_DEVICES=0 python eval_gqa_official.py \
   --data-path /perception-hl/zhuofan.xia/data/gqa/val_balanced_questions.json \
   --image-folder /perception-hl/zhuofan.xia/data/gqa/images \
   --output-dir ./gqa_debug_20_7b \
-  --conv-mode vicuna_v1 \
+  --conv-mode llava_v1 \
   --temperature 0 \
-  --max-new-tokens 8 \
-  --max-samples 20 \
+  --max-new-tokens 128 \
+  --max-samples 1000 \
   --brief-instruction "Answer briefly with one or two words only."
