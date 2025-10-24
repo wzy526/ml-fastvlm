@@ -148,6 +148,7 @@ checkpoints/
 
 # jsons
 *.json
+*.jsonl
 
 # wandb
 wandb/
