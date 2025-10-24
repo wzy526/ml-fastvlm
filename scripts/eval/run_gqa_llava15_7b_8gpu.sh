@@ -1,7 +1,7 @@
-run_gqa_8gpu#!/usr/bin/env bash
+#!/usr/bin/env bash
 
-# 8卡并行GQA评估脚本
-# 完全匹配LLaVA原版GQA测试逻辑，适配您训练的DAT-LLaVA-1.5模型
+# 8卡并行GQA评估脚本 - 使用预训练模型
+# 完全匹配LLaVA原版GQA测试逻辑，使用预训练的LLaVA模型
 # 使用修改后的eval_gqa_official.py脚本，支持LLaVA官方评估模式
 
 export DS_SKIP_CUDA_CHECK=1
@@ -10,14 +10,14 @@ export DS_SKIP_CUDA_CHECK=1
 source /root/miniconda3/bin/activate fastvlm
 
 # 设置实验名称和路径
-EXP_NAME="weilai"
-CHECKPOINT_PATH="/data/checkpoints/weilai/tdat-7b-l0d32-s12g8z3"
+EXP_NAME="llava-pretrained"
+CHECKPOINT_PATH="/data/gsva_pretrains/llava-v1_5-7b-hf"
 
 # 检查checkpoint是否存在
 if [ -d "$CHECKPOINT_PATH" ]; then
-    echo "找到检查点目录: $CHECKPOINT_PATH"
+    echo "找到预训练模型目录: $CHECKPOINT_PATH"
 else
-    echo "错误: 未找到检查点目录"
+    echo "错误: 未找到预训练模型目录"
     echo "请检查路径: $CHECKPOINT_PATH"
     exit 1
 fi
@@ -55,7 +55,7 @@ echo "分块数: $CHUNKS"
 echo "评估模式: 8卡并行GQA评估（LLaVA官方逻辑）"
 
 # 创建结果目录
-RESULTS_DIR="./gqa_8gpu_results_$(date +%Y%m%d_%H%M%S)"
+RESULTS_DIR="./gqa_llava15_7b_8gpu_results_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 
 echo "结果将保存到: $(pwd)/$RESULTS_DIR"

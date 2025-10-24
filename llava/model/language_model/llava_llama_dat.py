@@ -177,3 +177,5 @@ class LlavaLlamaDATForCausalLM(LlamaDATForCausalLM, LlavaDATMetaForCausalLM):
 
 AutoConfig.register("llava_llama_dat", LlavaLlamaDATConfig)
 AutoModelForCausalLM.register(LlavaLlamaDATConfig, LlavaLlamaDATForCausalLM)
+
+

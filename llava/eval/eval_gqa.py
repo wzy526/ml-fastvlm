@@ -121,7 +121,7 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
     except OSError as e:
         if "preprocessor_config.json" in str(e):
             print("警告: 未找到preprocessor_config.json，使用训练时的视觉编码器...")
-            vision_tower_path = "/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336"
+            vision_tower_path = "/data/gsva_pretrains/clip-vit-large-patch14-336"
             try:
                 image_processor = transformers.CLIPImageProcessor.from_pretrained(
                     vision_tower_path, trust_remote_code=True

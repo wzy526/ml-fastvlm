@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+cd /root/ml-fastvlm
 
 if ! command -v pdsh >/dev/null 2>&1; then
   cd /home/zhuofan.xia/pdsh-2.29
@@ -15,22 +16,21 @@ MASTER_PORT=25001
 
 export TRANSFORMERS_OFFLINE=1
 export DS_SKIP_CUDA_CHECK=1
-source /home/zhuofan.xia/miniconda3/bin/activate pt260
+source /root/miniconda3/bin/activate fastvlm
 TOTAL_STEPS=2595
-EXP_NAME="tdat-7b-l0d32-s12g8z3"
+EXP_NAME="tdat-7b-l0d32-s12g8z3_ep2"
 
-mkdir -p /ephstorage/vlm_exps/textdat/$EXP_NAME
-mkdir -p /perception-hl/zhuofan.xia/vlm_exps/textdat/
+mkdir -p /data/checkpoints/$EXP_NAME
 
 WANDB_PROJECT="DECOAT" \
 ds --master_port=$MASTER_PORT --master_addr=$MASTER_ADDR --hostfile "/etc/volcano/all.host" llava/train/train_dat.py \
     --deepspeed ./scripts/zero_configs/zero2.json \
-    --model_name_or_path /home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b \
+    --model_name_or_path /data/gsva_pretrains/llava-v1_5-7b-hf \
     --version v1 \
     --extra_yaml_path ./configs/llava1_5_v1.yaml \
-    --data_path /perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json \
-    --image_folder /perception-hl/zhuofan.xia/data \
-    --vision_tower /home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336 \
+    --data_path /data/llava_v1_5_mix665k.json \
+    --image_folder /data \
+    --vision_tower /data/gsva_pretrains/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
@@ -41,8 +41,8 @@ ds --master_port=$MASTER_PORT --master_addr=$MASTER_ADDR --hostfile "/etc/volcan
     --tf32 True \
     --max_grad_norm 1.0 \
     --ddp_find_unused_parameters True \
-    --output_dir /ephstorage/vlm_exps/textdat/$EXP_NAME \
-    --num_train_epochs 1 \
+    --output_dir /data/checkpoints/$EXP_NAME \
+    --num_train_epochs 2 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
@@ -63,5 +63,5 @@ ds --master_port=$MASTER_PORT --master_addr=$MASTER_ADDR --hostfile "/etc/volcan
     --report_to none \
     --run_name $EXP_NAME
 
-rm -rf /ephstorage/vlm_exps/textdat/$EXP_NAME/checkpoint-*
-cp -vr /ephstorage/vlm_exps/textdat/$EXP_NAME /perception-hl/zhuofan.xia/vlm_exps/textdat/
+# rm -rf /data/checkpoints/$EXP_NAME/checkpoint-*
+# cp -vr /data/checkpoints/$EXP_NAME /data/checkpoints/
