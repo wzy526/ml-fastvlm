@@ -5,7 +5,6 @@
 
 set -euo pipefail
 
-# 模型与数据路径（可通过环境变量覆盖）
 MODEL_PATH=${MODEL_PATH:-/data/checkpoints/weilai/tdat-7b-l0d32-s12g8z3}
 QUESTION_FILE=${QUESTION_FILE:-/data/textvqa/llava_textvqa_val_v051_ocr.jsonl}
 ANNOTATION_FILE=${ANNOTATION_FILE:-/data/textvqa/TextVQA_0.5.1_val.json}
