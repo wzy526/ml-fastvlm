@@ -12,6 +12,7 @@ source /root/miniconda3/bin/activate fastvlm
 # 设置实验名称和路径
 EXP_NAME="weilai"
 CHECKPOINT_PATH="/data/checkpoints/weilai/tdat-7b-l0d32-s12g8z3"
+IMAGE_ASPECT_RATIO=${IMAGE_ASPECT_RATIO:-anyres}
 
 # 检查checkpoint是否存在
 if [ -d "$CHECKPOINT_PATH" ]; then
@@ -73,12 +74,14 @@ echo "="*60
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     echo "启动GPU $IDX 处理分块 $IDX/$((CHUNKS-1))"
-    CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python eval_gqa_official.py \
+    CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python llava/eval/eval_gqa.py \
         --model-path "$CHECKPOINT_PATH" \
         --data-path "$DATA_PATH" \
         --image-folder "$IMAGE_FOLDER" \
         --output-dir "$RESULTS_DIR" \
         --conv-mode "llava_v1" \
+        --image-aspect-ratio "$IMAGE_ASPECT_RATIO" \
+        --use-raw-image \
         --temperature 0 \
         --max-new-tokens 16 \
         --chunks $CHUNKS \

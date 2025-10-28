@@ -388,7 +388,7 @@ def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="l
         model.generate(
             input_ids,
             images=image_tensor,
-            image_sizes=[image_size] if image_size else None,
+            image_sizes=[[image_size[0], image_size[1]]] if image_size else None,
             max_new_tokens=1,  # only generate first token
             use_cache=True,
             do_sample=False,  # greedy decoding for consistent TTFT

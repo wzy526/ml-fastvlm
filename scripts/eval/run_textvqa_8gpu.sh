@@ -2,7 +2,7 @@
 
 # 8卡并行：使用LLaVA官方流程生成 TextVQA 预测并计算分数
 # 用法：bash scripts/eval/run_textvqa_8gpu.sh
-
+source /root/miniconda3/bin/activate fastvlm
 set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:-/data/checkpoints/weilai/tdat-7b-l0d32-s12g8z3}
@@ -11,6 +11,7 @@ ANNOTATION_FILE=${ANNOTATION_FILE:-/data/textvqa/TextVQA_0.5.1_val.json}
 IMAGE_FOLDER=${IMAGE_FOLDER:-/data/textvqa/train_images}
 OUT_DIR=${OUT_DIR:-/root/ml-fastvlm/textvqa_results}
 CONV_MODE=${CONV_MODE:-vicuna_v1}
+IMAGE_ASPECT_RATIO=${IMAGE_ASPECT_RATIO:-anyres}
 
 mkdir -p "$OUT_DIR"
 
@@ -57,6 +58,8 @@ for ((i=0; i<NUM_SHARDS; i++)); do
     --answers-file "$OUT_DIR/tdat-7b.s${i}.jsonl" \
     --temperature 0 \
     --conv-mode "$CONV_MODE" \
+        --image-aspect-ratio "$IMAGE_ASPECT_RATIO" \
+        --use-raw-image \
     --num-chunks $NUM_SHARDS \
     --chunk-idx $i \
     2>&1 | sed -u "s/^/[GPU ${i}] /" | tee "$OUT_DIR/textvqa_s${i}.log" &
