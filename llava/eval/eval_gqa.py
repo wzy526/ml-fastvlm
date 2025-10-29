@@ -18,7 +18,7 @@ from llava.utils import disable_torch_init
 from llava.conversation import conv_templates
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
+from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM, LlavaLlamaDATForCausalLM, LlavaLlamaDATConfig
 import transformers
 
 
@@ -41,7 +41,7 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
             decoder_config = PretrainedConfig.from_dict(config.decoder_config)
             config.decoder_config = decoder_config
     
-    # 修复 LlavaConfig 缺少必要属性的问题
+    # LlavaConfig 
     missing_attrs = {
         'attention_dropout': 0.0,
         'hidden_dropout': 0.0,
@@ -78,6 +78,16 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
+    elif 'tdat' in model_name.lower():
+        print("Loading LlavaLlamaDATForCausalLM model (Llama backbone)")
+        model = LlavaLlamaDATForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=torch.float16,
+            device_map=None,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
     else:
         print("Loading LlavaLlamaForCausalLM model (Llama backbone)")
         model = LlavaLlamaForCausalLM.from_pretrained(
@@ -100,49 +110,24 @@ def load_model_and_tokenizer(model_path, device: str = "cuda"):
             print("加载视觉编码器...")
             vision_tower.load_model()
             print("视觉编码器加载完成")
-        # 确保视觉编码器也在同一设备和精度
-        try:
-            if hasattr(vision_tower, 'to'):
-                vision_tower.to(device, dtype=torch.float16)
-        except Exception as _:
-            pass
-    # 确保多模态投影层在同一设备
+
+        if hasattr(vision_tower, 'to'):
+            vision_tower.to(device, dtype=torch.float16)
+
+
     if hasattr(model, 'mm_projector') and model.mm_projector is not None:
-        try:
-            model.mm_projector.to(device, dtype=torch.float16)
-        except Exception as _:
-            pass
+        model.mm_projector.to(device, dtype=torch.float16)
     
-    # 设置图像处理器
-    try:
-        image_processor = transformers.CLIPImageProcessor.from_pretrained(
-            model_path, trust_remote_code=True
+        
+    image_processor = transformers.CLIPImageProcessor(
+            size={"height": 336, "width": 336},
+            do_convert_rgb=True,
+            do_normalize=True,
+            do_rescale=True,
+            do_resize=True,
+            image_mean=[0.48145466, 0.4578275, 0.40821073],
+            image_std=[0.26862954, 0.26130258, 0.27577711]
         )
-    except OSError as e:
-        if "preprocessor_config.json" in str(e):
-            print("警告: 未找到preprocessor_config.json，使用训练时的视觉编码器...")
-            vision_tower_path = "/data/gsva_pretrains/clip-vit-large-patch14-336"
-            try:
-                image_processor = transformers.CLIPImageProcessor.from_pretrained(
-                    vision_tower_path, trust_remote_code=True
-                )
-                print(f"成功加载视觉编码器: {vision_tower_path}")
-            except Exception as vision_error:
-                print(f"视觉编码器加载失败: {vision_error}")
-                # 创建基本图像处理器
-                from transformers import CLIPImageProcessor
-                image_processor = CLIPImageProcessor(
-                    size={"height": 336, "width": 336},
-                    do_convert_rgb=True,
-                    do_normalize=True,
-                    do_rescale=True,
-                    do_resize=True,
-                    image_mean=[0.48145466, 0.4578275, 0.40821073],
-                    image_std=[0.26862954, 0.26130258, 0.27577711]
-                )
-                print("使用基本图像处理器配置")
-        else:
-            raise e
     
     return model, tokenizer, image_processor
 
@@ -179,56 +164,55 @@ def load_gqa_data(data_path, max_samples=None):
     return samples
 
 
-def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1", temperature=0, max_new_tokens=16, brief_instruction: str = None):
+def evaluate_single_sample(model, tokenizer, image_processor, sample, image_folder, conv_mode="llava_v1", temperature=0, max_new_tokens=16, brief_instruction: str = None, use_raw_image=False):
     """评估单个样本 - 完全按照LLaVA官方逻辑"""
-    try:
         # 加载图像 - 按照LLaVA官方逻辑
-        image_id = sample['imageId']
+    image_id = sample['imageId']
+    
+    # 尝试不同的文件名格式 - 按照LLaVA官方逻辑
+    possible_paths = [
+        os.path.join(image_folder, f"n{image_id}.jpg"), 
+        os.path.join(image_folder, f"{image_id}.jpg"),
+        os.path.join(image_folder, f"n{image_id}.png"),
+        os.path.join(image_folder, f"{image_id}.png")
+    ]
+    
+    image_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            image_path = path
+            break
+    
+    if not image_path:
+        return None, f"Image not found for ID {image_id}. Tried: {possible_paths[:2]}"
+    
+    image = Image.open(image_path).convert('RGB')
+    orig_w, orig_h = image.size
+    
+    # 构建对话 - 使用llava_v1/vicuna_v1格式
+    conv = conv_templates[conv_mode].copy()
+    question_text = sample['question']
+    if brief_instruction is not None and len(brief_instruction.strip()) > 0:
+        question_text = question_text + "\n" + brief_instruction.strip()
+    conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{question_text}")
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+    
+    # 处理输入 - 按照LLaVA官方逻辑
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
+    input_ids = input_ids.unsqueeze(0).to('cuda')
+    
+    # 使用 1008 分辨率图像，让 DAT 模型进入 HR 路径
+    from torchvision import transforms
+    to_tensor = transforms.ToTensor()
+    hr_image = image.resize((1008, 1008), Image.Resampling.LANCZOS)
+    raw_image = to_tensor(hr_image).to(model.device, dtype=torch.float16)  # [3, 1008, 1008]
         
-        # 尝试不同的文件名格式 - 按照LLaVA官方逻辑
-        possible_paths = [
-            os.path.join(image_folder, f"n{image_id}.jpg"),  # 优先尝试n前缀
-            os.path.join(image_folder, f"{image_id}.jpg"),
-            os.path.join(image_folder, f"n{image_id}.png"),
-            os.path.join(image_folder, f"{image_id}.png")
-        ]
-        
-        image_path = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                image_path = path
-                break
-        
-        if not image_path:
-            return None, f"Image not found for ID {image_id}. Tried: {possible_paths[:2]}"
-        
-        image = Image.open(image_path).convert('RGB')
-        
-        # 构建对话 - 使用llava_v1/vicuna_v1格式
-        conv = conv_templates[conv_mode].copy()
-        question_text = sample['question']
-        if brief_instruction is not None and len(brief_instruction.strip()) > 0:
-            question_text = question_text + "\n" + brief_instruction.strip()
-        conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{question_text}")
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
-        
-        # 处理输入 - 按照LLaVA官方逻辑
-        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
-        input_ids = input_ids.unsqueeze(0).to('cuda')
-        
-        # 处理图像 - 按照LLaVA官方逻辑
-        image_tensor = process_images([image], image_processor, model.config)
-        if type(image_tensor) is list:
-            image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
-        else:
-            image_tensor = image_tensor.to(model.device, dtype=torch.float16)
-        
-        # 生成回答 - 完全按照LLaVA官方生成参数
-        with torch.inference_mode():
+    with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor,
+                images=raw_image[None, ...],  # [1, 3, 1008, 1008]
+                image_sizes=[(1008, 1008)],  # HR 分辨率
                 do_sample=True if temperature > 0 else False,
                 temperature=temperature,
                 top_p=None,
@@ -236,29 +220,23 @@ def evaluate_single_sample(model, tokenizer, image_processor, sample, image_fold
                 max_new_tokens=max_new_tokens,
                 use_cache=True
             )
+
+    outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+    
+
+    if prompt in outputs:
+        outputs = outputs.split(prompt)[-1].strip()
+    else:
+        # 如果找不到prompt，尝试其他方式
+        outputs = outputs.strip()
+    
+    # 清理输出 - 按照LLaVA官方逻辑
+    if outputs:
+        lines = outputs.split('\n')
+        if lines:
+            outputs = lines[0].strip()
         
-        # 解码输出 - 按照LLaVA官方逻辑
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-        
-        # 提取回答部分 - 完全按照LLaVA官方逻辑
-        if prompt in outputs:
-            outputs = outputs.split(prompt)[-1].strip()
-        else:
-            # 如果找不到prompt，尝试其他方式
-            outputs = outputs.strip()
-        
-        # 清理输出 - 按照LLaVA官方逻辑
-        if outputs:
-            # 移除可能的重复内容
-            lines = outputs.split('\n')
-            if lines:
-                outputs = lines[0].strip()
-        
-        return outputs, None
-        
-    except Exception as e:
-        print(f"推理错误: {e}")
-        return None, str(e)
+    return outputs, None
 
 
 def extract_answer_from_response(response):
@@ -347,7 +325,7 @@ def save_results_jsonl(predictions, ground_truths, samples, output_file, detaile
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
 
 
-def run_llava_gqa_evaluation(model_path, data_path, image_folder, output_dir, max_samples=None, conv_mode="llava_v1", temperature=0, max_new_tokens=16, chunks=1, chunk_idx=0, brief_instruction: str = None):
+def run_llava_gqa_evaluation(model_path, data_path, image_folder, output_dir, max_samples=None, conv_mode="llava_v1", temperature=0, max_new_tokens=16, chunks=1, chunk_idx=0, brief_instruction: str = None, use_raw_image=False):
     """运行LLaVA官方GQA评估 - 完全按照LLaVA原版逻辑"""
     print("="*80)
     print("LLaVA官方GQA评估")
@@ -388,7 +366,7 @@ def run_llava_gqa_evaluation(model_path, data_path, image_folder, output_dir, ma
     for i, sample in enumerate(tqdm(samples, desc="评估进度")):
         pred, error = evaluate_single_sample(
             model, tokenizer, image_processor, sample, image_folder, 
-            conv_mode, temperature, max_new_tokens, brief_instruction
+            conv_mode, temperature, max_new_tokens, brief_instruction, use_raw_image
         )
         
         if error:
@@ -471,6 +449,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./gqa_results", help="输出目录")
     parser.add_argument("--max-samples", type=int, default=None, help="最大样本数")
     parser.add_argument("--conv-mode", type=str, default="llava_v1", help="对话模式")
+    parser.add_argument("--image-aspect-ratio", type=str, default="pad", help="图像分辨率模式: pad, anyres, fixed_hr")
     parser.add_argument("--temperature", type=float, default=0, help="生成温度")
     parser.add_argument("--max-new-tokens", type=int, default=16, help="最大生成长度（GQA评估建议16）")
     parser.add_argument("--chunks", type=int, default=1, help="分块数（兼容LLaVA官方接口）")
@@ -479,6 +458,7 @@ def main():
     parser.add_argument("--eval-file", type=str, default=None, help="GQA官方评估文件路径")
     parser.add_argument("--llava-mode", action="store_true", help="使用LLaVA官方评估模式")
     parser.add_argument("--brief-instruction", type=str, default=None, help="可选：在问题后追加的简答提示，例如 'Answer briefly with one or two words only.'")
+    parser.add_argument("--use-raw-image", action="store_true", help="使用原始分辨率图像，让 DAT 模型自动判断 HR/LR 路径")
     
     args = parser.parse_args()
     
@@ -495,7 +475,8 @@ def main():
             max_new_tokens=args.max_new_tokens,
             chunks=args.chunks,
             chunk_idx=args.chunk_idx,
-            brief_instruction=args.brief_instruction
+            brief_instruction=args.brief_instruction,
+            use_raw_image=args.use_raw_image
         )
         
         # 如果指定了转换，则进行格式转换
@@ -549,7 +530,7 @@ def main():
         for i, sample in enumerate(tqdm(samples, desc="评估进度")):
             pred, error = evaluate_single_sample(
                 model, tokenizer, image_processor, sample, args.image_folder, 
-                args.conv_mode, args.temperature, args.max_new_tokens, args.brief_instruction
+                args.conv_mode, args.temperature, args.max_new_tokens, args.brief_instruction, args.use_raw_image
             )
             
             if error:

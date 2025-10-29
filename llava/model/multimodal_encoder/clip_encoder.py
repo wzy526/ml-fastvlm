@@ -9,7 +9,7 @@ class CLIPVisionTower(nn.Module):
         super().__init__()
 
         self.is_loaded = False
-
+        self.args = args
         self.vision_tower_name = vision_tower
         self.select_layer = args.mm_vision_select_layer
         self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
@@ -42,6 +42,14 @@ class CLIPVisionTower(nn.Module):
             print("Using input image size: {}".format(self.input_image_size))
             self.image_processor.size['shortest_edge'] = self.input_image_size
             self.image_processor.crop_size['height'] = self.image_processor.crop_size['width'] = self.input_image_size
+        
+        if hasattr(self.args, "dat_extra_args"):
+            hr_size = int(self.args.dat_extra_args['hr_image_size'])
+            self.image_processor.crop_size["height"] = hr_size
+            self.image_processor.crop_size["width"] = hr_size
+            self.image_processor.size["shortest_edge"] = hr_size
+            self.vision_tower.config.image_size = hr_size
+            print("use resolution:", hr_size)
 
         self.is_loaded = True
 

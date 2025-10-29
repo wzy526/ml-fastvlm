@@ -6,7 +6,7 @@ off_grps: 8
 inter_size: 256
 use_sdpa: True
 lr_size: 24
-hd_proj: F a l s
+hd_proj: False
 layers: [
   'D', 'D', 'D', 'D', 'D', 'D', 'D', 'D',
   'D', 'D', 'D', 'D', 'D', 'D', 'D', 'D',

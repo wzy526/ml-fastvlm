@@ -83,6 +83,9 @@ def eval_model(args):
     model_name = get_model_name_from_path(model_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
 
+    model.config.image_aspect_ratio = args.image_aspect_ratio
+    print(f"设置图像分辨率模式: {args.image_aspect_ratio}")
+
     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     answers_file = os.path.expanduser(args.answers_file)
@@ -102,16 +105,37 @@ def eval_model(args):
         input_ids = input_ids.to(device='cuda', non_blocking=True)
 
         with torch.inference_mode():
-            output_ids = model.generate(
-                input_ids,
-                images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
-                image_sizes=image_sizes,
-                do_sample=True if args.temperature > 0 else False,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                num_beams=args.num_beams,
-                max_new_tokens=args.max_new_tokens,
-                use_cache=True)
+            if args.use_raw_image:
+                # 使用 1008 分辨率图像，让 DAT 模型进入 HR 路径
+                from torchvision import transforms
+                to_tensor = transforms.ToTensor()
+                
+                # 将图像缩放到 1008x1008 以触发 HR 路径
+                hr_image = Image.open(os.path.join(args.image_folder, line["image"])).convert('RGB').resize((1008, 1008), Image.Resampling.LANCZOS)
+                raw_image = to_tensor(hr_image).to('cuda', dtype=torch.float16).unsqueeze(0)  # [1, 3, 1008, 1008]
+                
+                output_ids = model.generate(
+                    input_ids,
+                    images=raw_image,
+                    image_sizes=[(1008, 1008)],  # HR 分辨率
+                    do_sample=True if args.temperature > 0 else False,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    max_new_tokens=args.max_new_tokens,
+                    use_cache=True)
+            else:
+                # 使用 image_processor 预处理（传统 LLaVA 方式）
+                output_ids = model.generate(
+                    input_ids,
+                    images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
+                    image_sizes=image_sizes,
+                    do_sample=True if args.temperature > 0 else False,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    max_new_tokens=args.max_new_tokens,
+                    use_cache=True)
 
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
@@ -127,12 +151,14 @@ def eval_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-- model-path", type=str, default="facebook/opt-350m")
+    parser.add_argument("--model-path", type=str, default="facebook/opt-350m")
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--image-folder", type=str, default="")
     parser.add_argument("--question-file", type=str, default="tables/question.jsonl")
     parser.add_argument("--answers-file", type=str, default="answer.jsonl")
     parser.add_argument("--conv-mode", type=str, default="llava_v1")
+    parser.add_argument("--image-aspect-ratio", type=str, default="pad", help="Image aspect ratio: pad, anyres, or fixed_hr")
+    parser.add_argument("--use-raw-image", action="store_true", help="使用原始分辨率图像，让 DAT 模型自动判断 HR/LR 路径")
     parser.add_argument("--num-chunks", type=int, default=1)
     parser.add_argument("--chunk-idx", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.2)

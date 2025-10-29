@@ -292,35 +292,22 @@ class LlavaDATMetaForCausalLM(ABC):
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
             hd_features = None
-            if hasattr(self.model.config, "extra") and "zoom_ratio" in self.model.config.extra:
-                zoom_ratio = int(self.model.config.extra["zoom_ratio"])
+            if hasattr(self.model.config, "dat_extra_args"):
+                zoom_ratio = int(self.model.config.dat_extra_args['hr_image_size'] / self.model.config.dat_extra_args['lr_image_size'])
                 sub_image_size = images.shape[-1] // zoom_ratio
                 # Suppose images shape is B, C, H, W
                 with torch.no_grad():
                     if images.shape[-1] <= 336:
                         hd_features = self.encode_images(images)
                     else:
-                        # print(f'Input Image device: {images.device}')
-                        original_shape = (images.size(2), images.size(3))
-                        regular_shape = (math.ceil(original_shape[0] / 336) * 336, math.ceil(original_shape[1] / 336) * 336)
-                        pad_shape = (regular_shape[0] - original_shape[0], regular_shape[1] - original_shape[1])
-                        pad_shape = (int(pad_shape[0]), int(pad_shape[1]))
-                        encode_shape = (original_shape[0] // self.get_vision_tower().patch_size, original_shape[1] // self.get_vision_tower().patch_size)
-                        encode_reg_shape = (regular_shape[0] // self.get_vision_tower().patch_size, regular_shape[1] // self.get_vision_tower().patch_size)
-                        encode_reg_shape = (int(encode_reg_shape[0]), int(encode_reg_shape[1]))
-                        images_encoding = F.pad(images, pad=(0, pad_shape[1], 0, pad_shape[0]), mode='constant', value=0.0)
-                        images_list = crop_images_to_subimages(images_encoding, sub_image_size=336)
-                        images_list = self.encode_images(images_list) # B, Nsubs, C, 24, 24
+                        images_list = crop_images_to_subimages(images, sub_image_size=sub_image_size)
+                        images_list = self.encode_images(images_list)
                         size = int(images_list.shape[1] ** 0.5)
                         images_list = images_list.reshape(images_list.shape[0], size, size, images_list.shape[-1]).permute(0, 3, 1, 2)
-                        hd_features = combine_subimages_to_images(images_list, encode_reg_shape, sub_image_size=size).to(self.device)
-                        # B, C, e_reg, e_reg
-                        hd_features = hd_features[:, :, 0:encode_shape[0], 0:encode_shape[1]]
-                        
-                        hd_features = hd_features.flatten(2).permute(0, 2, 1)
-                        hd_features = hd_features.to(self.dtype)
-            if hasattr(self.model.config, "extra") and "lowres_size" in self.model.config.extra:
-                lowres_size = int(self.model.config.extra["lowres_size"])
+                        hd_features = combine_subimages_to_images(images_list, (size * zoom_ratio, size * zoom_ratio), sub_image_size=size).to(self.device)
+                        hd_features = hd_features.flatten(2).permute(0, 2, 1).to(self.dtype)
+            if hasattr(self.model.config, "dat_extra_args"):
+                lowres_size = int(self.model.config.dat_extra_args['lr_image_size'])
             else:
                 lowres_size = 336
             images = F.interpolate(images, size=lowres_size, mode="bilinear", antialias=True)

@@ -44,7 +44,6 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
-
     if 'llava' in model_name.lower():
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
@@ -153,7 +152,21 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+                # 检查模型类型，如果是 llava 类型，使用相应的模型类
+                config = AutoConfig.from_pretrained(model_path)
+                if config.model_type == "llava":
+                    if hasattr(config, 'architectures') and 'LlavaLlamaDATForCausalLM' in config.architectures:
+                        print("检测到 DAT 模型架构，使用 LlavaLlamaDATForCausalLM")
+                        from llava.model.language_model.llava_llama_dat import LlavaLlamaDATForCausalLM
+                        model = LlavaLlamaDATForCausalLM.from_pretrained(model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
+                    elif 'qwen' in model_name.lower():
+                        print("使用 LlavaQwen2ForCausalLM")
+                        model = LlavaQwen2ForCausalLM.from_pretrained(model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
+                    else:
+                        print("使用标准 LlavaLlamaForCausalLM")
+                        model = LlavaLlamaForCausalLM.from_pretrained(model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
+                else:
+                    model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
 
     image_processor = None
 
