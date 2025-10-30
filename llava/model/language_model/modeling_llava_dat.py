@@ -116,12 +116,11 @@ class LlamaAttentionEx(LlamaAttention):
                 # sin and cos are specific to RoPE models; cache_position needed for the static cache
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_groups)
             causal_mask = attention_mask
             if attention_mask is not None:
                 causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
-            # print(causal_mask.shape)
             # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
             # Reference: https://github.com/pytorch/pytorch/issues/112577.
             if query_states.device.type == "cuda" and causal_mask is not None:
@@ -331,7 +330,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         
         # key_states = einops.rearrange(key_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
         # value_states = einops.rearrange(value_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-
+        
         # by wzy
         key_states = einops.rearrange(key_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_key_value_groups, c=self.head_dim)
         value_states = einops.rearrange(value_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_key_value_groups, c=self.head_dim) # end
@@ -339,10 +338,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         # Apply RoPE in a [B H N C] manner
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # This RoPE may need some modifications.
-
-        # key_states = repeat_kv(key_states, self.num_key_value_groups)
-        # value_states = repeat_kv(value_states, self.num_key_value_groups)
-
         # by wzy
         key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_groups) # end
@@ -487,7 +482,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                     # This time, insert counter should always be zero.
             # We add the packed dst segments into the batch kvs
             if len(k_split) == 0 or len(v_split) == 0 or len(attn_split) == 0:
-                # print(f"We encounter k_split:{len(k_split)}, v_split:{len(v_split)}, attn_split:{len(attn_split)}, this image_range_list is {image_range_list[b_idx]}, we treat this sample with its original KV.")
                 keys_concat.append(key_states[b_idx])
                 values_concat.append(value_states[b_idx])
                 attns_concat.append(attention_mask[b_idx].permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
@@ -515,7 +509,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_bhnc, value_bhnc = past_key_value.update(key_bhnc, value_bhnc, self.layer_idx, cache_kwargs)
-            # print(f"LAYER {self.layer_idx}, kv_len: {kv_len}, k: {key_bhnc.shape}, v:{value_bhnc.shape}")
         if self.use_sdpa:
             # print(f"LAYER {self.layer_idx}, use_sdpa: {self.use_sdpa}, query_bhnc: {query_bhnc.shape}, key_bhnc: {key_bhnc.shape}, value_bhnc: {value_bhnc.shape}, attn_mask_4d: {attn_mask_4d.shape}")
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
