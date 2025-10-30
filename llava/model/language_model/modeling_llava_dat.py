@@ -72,6 +72,9 @@ class LlamaAttentionEx(LlamaAttention):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = getattr(config, 'num_key_value_heads', config.num_attention_heads)
+        # rotary_emb fix by wzy
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
 
     def forward(
