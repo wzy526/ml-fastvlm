@@ -25,7 +25,7 @@ from llava.utils import disable_torch_init
 from llava.conversation import conv_templates
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM
+from llava.model import LlavaLlamaForCausalLM, LlavaQwen2ForCausalLM, LlavaLlamaDATForCausalLM
 import transformers
 
 
@@ -44,10 +44,8 @@ def calculate_visual_tokens(resolution, vision_encoder, patch_size=None):
     if vision_encoder == "fastvithd":
         return 256
     elif vision_encoder == "clip":
-        if patch_size is None:
-            patch_size = 14
-        num_patches = (resolution // patch_size) ** 2
-        return num_patches
+        # Vanilla LLaVA 使用 CLIP-L/14，并将输入缩放到 336，视觉 token 固定为 576
+        return 576
     elif vision_encoder == "clip_s2":
         if patch_size is None:
             patch_size = 14
@@ -215,9 +213,9 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
 
     compute_dtype = torch.float16 # according to llava training setting
     
-    config = transformers.AutoConfig.from_pretrained(model_path)
+    config = transformers.AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     
-    # 修复配置中的 decoder_config 问题
+    # 修复配置中的 decoder/decoder_config/generation_config 问题
     if hasattr(config, 'decoder_config') and isinstance(config.decoder_config, dict):
         print("修复 decoder_config 配置...")
         # 将字典转换为配置对象
@@ -229,16 +227,58 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
             from transformers import PretrainedConfig
             decoder_config = PretrainedConfig.from_dict(config.decoder_config)
             config.decoder_config = decoder_config
+    # 最小修复到此：其余子配置保持原样
+
+    # 兼容: 有些权重的 decoder/text_config 仍是 dict，会在 GenerationConfig.from_model_config -> get_text_config(decoder=True)
+    # 里被取到并调用 to_dict() 导致报错，这里最小化修复这两个键
+    if hasattr(config, 'decoder') and isinstance(getattr(config, 'decoder'), dict):
+        from transformers import PretrainedConfig
+        print("修复 decoder 配置...")
+        cfg_dict = dict(getattr(config, 'decoder'))
+        config.decoder = PretrainedConfig.from_dict(cfg_dict)
+
+    if hasattr(config, 'text_config') and isinstance(getattr(config, 'text_config'), dict):
+        from transformers import PretrainedConfig
+        print("修复 text_config 配置...")
+        cfg_dict = dict(getattr(config, 'text_config'))
+        config.text_config = PretrainedConfig.from_dict(cfg_dict)
+
+    # 一些权重包含字典形式的 generation_config，需转为 GenerationConfig
+    if hasattr(config, 'generation_config') and isinstance(getattr(config, 'generation_config'), dict):
+        try:
+            print("修复 generation_config 配置...")
+            from transformers import GenerationConfig
+            config.generation_config = GenerationConfig.from_dict(config.generation_config)
+        except Exception as e:
+            print(f"警告: 修复 generation_config 失败，忽略。错误: {e}")
     
     # check llm backbone type
-    if config.model_type == "llava_qwen2":
+    # 识别 DAT-LLaVA（llava_llama_dat）优先
+    is_dat = False
+    if getattr(config, 'model_type', None) == 'llava_llama_dat':
+        is_dat = True
+    elif hasattr(config, 'architectures') and isinstance(config.architectures, (list, tuple)):
+        is_dat = any('DAT' in arch or 'LlavaLlamaDATForCausalLM' in arch for arch in config.architectures)
+
+    if is_dat:
+        llm_backbone = "Llama"
+        print(f"Loading LlavaLlamaDATForCausalLM model (Llama backbone, DAT)")
+        model = LlavaLlamaDATForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=compute_dtype,
+            device_map="auto",
+            trust_remote_code=True
+        )
+    elif config.model_type == "llava_qwen2":
         llm_backbone = "Qwen2"
         print(f"Loading LlavaQwen2ForCausalLM model (Qwen2 backbone)")
         model = LlavaQwen2ForCausalLM.from_pretrained(
             model_path,
             config=config,  # 传递修复后的配置
             torch_dtype=compute_dtype,
-            device_map="auto"  
+            device_map="auto",
+            trust_remote_code=True  
         )
     else:
         llm_backbone = "Llama"
@@ -247,7 +287,8 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
             model_path,
             config=config,  # 传递修复后的配置
             torch_dtype=compute_dtype,
-            device_map="auto" 
+            device_map="auto",
+            trust_remote_code=True 
         )
     
     # 根据vision_encoder类型更新打印信息
@@ -336,7 +377,7 @@ def load_model(model_path, device, resolution=1024, vision_encoder="fastvithd"):
     return tokenizer, model, image_processor
 
 
-def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="llava_v1", resolution=1024, vision_encoder="fastvithd"):
+def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="llava_v1", resolution=1024, vision_encoder="fastvithd", use_raw_image=False):
     """measure TTFT for LLaVA model with specified vision encoder"""
     
     # 数据预处理不计入TTFT时间
@@ -361,20 +402,28 @@ def measure_fastvlm_ttft(model, tokenizer, image_processor, sample, conv_mode="l
     input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0)
     input_ids = input_ids.to(model.device)
     
-    # process image to target resolution
-    if image_processor is not None:
-        image = sample['image']
-        if image.size != (resolution, resolution):
-            image = image.resize((resolution, resolution), Image.Resampling.LANCZOS)
-        image_tensor = process_images([image], image_processor, model.config)
-        image_tensor = image_tensor[None, ...].half().to(model.device)
+    # process image
+    image = sample['image']
+    if image.size != (resolution, resolution):
+        image = image.resize((resolution, resolution), Image.Resampling.LANCZOS)
+
+    if use_raw_image:
+        # 直接以分辨率分辨率的原图张量喂入，触发 DAT HR 路径
+        import torchvision.transforms as T
+        to_tensor = T.ToTensor()
+        raw = to_tensor(image).to(model.device, dtype=torch.float16)
+        image_tensor = raw[None, ...]
         image_size = image.size
-        
-        if image_tensor.device != model.device:
-            image_tensor = image_tensor.to(model.device)
     else:
-        image_tensor = None
-        image_size = None
+        if image_processor is not None:
+            image_tensor = process_images([image], image_processor, model.config)
+            image_tensor = image_tensor[None, ...].half().to(model.device)
+            image_size = image.size
+            if image_tensor.device != model.device:
+                image_tensor = image_tensor.to(model.device)
+        else:
+            image_tensor = None
+            image_size = None
     
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -490,13 +539,13 @@ def test_fastvlm_ttft(args):
         try:
             if i < warmup_samples:
                 # warm up phase - not count time
-                _ = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode, args.resolution, args.vision_encoder)
+                _ = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode, args.resolution, args.vision_encoder, args.use_raw_image)
                 warmup_count += 1
                 if rank == 0 and i % 20 == 0:
                     print(f"Warmup sample {i+1}/{warmup_samples}")
             else:
                 # test phase - count time
-                ttft = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode, args.resolution, args.vision_encoder)
+                ttft = measure_fastvlm_ttft(model, tokenizer, image_processor, sample, args.conv_mode, args.resolution, args.vision_encoder, args.use_raw_image)
                 accumulated_latency += ttft
                 running_samples += 1
                 
@@ -615,6 +664,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-file", type=str, default=None, help="Output results file")
     parser.add_argument("--vision-encoder", type=str, default="fastvithd", choices=["fastvithd", "clip", "clip_s2", "clip_llava16"],
                        help="Vision encoder to use (fastvithd, clip, clip_s2, or clip_llava16)")
+    parser.add_argument("--use-raw-image", action="store_true", help="以原始分辨率张量输入（如 1008x1008）触发 DAT HR，绕过336下采样")
     parser.add_argument("--visual-tokens", type=int, default=None, 
                        help="Number of visual tokens (if None, will be calculated automatically based on resolution and vision encoder)")
     parser.add_argument("--patch-size", type=int, default=None,

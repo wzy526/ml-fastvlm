@@ -19,6 +19,7 @@ import numpy as np
 import json
 import time
 from typing import Dict, Any, Optional
+from torchvision import transforms
 
 try:
     from fvcore.nn import FlopCountAnalysis, flop_count
@@ -51,10 +52,8 @@ def calculate_visual_tokens(resolution, vision_encoder, patch_size=None):
     if vision_encoder == "fastvithd":
         return 256
     elif vision_encoder == "clip":
-        if patch_size is None:
-            patch_size = 14
-        num_patches = (resolution // patch_size) ** 2
-        return num_patches
+        # Vanilla LLaVA 会将输入图像缩放到 336 后送入 CLIP-L/14，视觉 token 固定为 (336/14)^2=576
+        return 576
     elif vision_encoder == "clip_s2":
         if patch_size is None:
             patch_size = 14
@@ -303,7 +302,45 @@ class FVCoreFLOPsCalculator:
             print(f"LLM FLOPs calculation failed: {e}")
             return 0
     
-    def calculate_total_flops(self, image_tensor, text_input, visual_tokens_count, text_tokens_count, tokenizer):
+    def calculate_total_flops(self, image_tensor, text_input, visual_tokens_count, text_tokens_count, tokenizer, extra_hr_kv_flops: int = 0):
+        """计算整体 FLOPs（编码器 + 连接器 + LLM + 可选 DAT HR 额外 KV）"""
+        print("="*60)
+        print("使用fvcore计算FLOPs")
+        print("="*60)
+
+        encoder_flops = self.calculate_encoder_flops(image_tensor)
+
+        print("获取真实视觉特征...")
+        with torch.no_grad():
+            vision_tower = self.model.get_vision_tower()
+            if hasattr(vision_tower, 'is_loaded') and not vision_tower.is_loaded:
+                print("视觉编码器未加载，正在加载...")
+                vision_tower.load_model()
+            try:
+                device = next(vision_tower.parameters()).device
+                dtype = next(vision_tower.parameters()).dtype
+            except StopIteration:
+                device = next(self.model.parameters()).device
+                dtype = next(self.model.parameters()).dtype
+            image_tensor_device = image_tensor.to(device=device, dtype=dtype)
+            visual_features = vision_tower(image_tensor_device)
+
+        connector_flops = self.calculate_connector_flops(visual_features)
+
+        input_ids = tokenizer(text_input, return_tensors='pt')['input_ids']
+        llm_flops = self.calculate_llm_flops(input_ids, visual_tokens_count)
+
+        total_flops = encoder_flops + connector_flops + llm_flops + max(0, int(extra_hr_kv_flops))
+
+        return {
+            'encoder_flops': encoder_flops,
+            'connector_flops': connector_flops,
+            'llm_flops': llm_flops,
+            'dat_hr_kv_extra_flops': int(extra_hr_kv_flops),
+            'total_flops': total_flops
+        }
+    
+def calculate_total_flops(self, image_tensor, text_input, visual_tokens_count, text_tokens_count, tokenizer, extra_hr_kv_flops: int = 0):
         """计算总FLOPs"""
         print("="*60)
         print("使用fvcore计算FLOPs")
@@ -335,12 +372,13 @@ class FVCoreFLOPsCalculator:
         llm_flops = self.calculate_llm_flops(input_ids, visual_tokens_count)
         
         # 总FLOPs (不包含tokenizer)
-        total_flops = encoder_flops + connector_flops + llm_flops
+        total_flops = encoder_flops + connector_flops + llm_flops + max(0, int(extra_hr_kv_flops))
         
         return {
             'encoder_flops': encoder_flops,
             'connector_flops': connector_flops,
             'llm_flops': llm_flops,
+            'dat_hr_kv_extra_flops': int(extra_hr_kv_flops),
             'total_flops': total_flops
         }
 
@@ -382,19 +420,48 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd", llm_type="a
     
     print(f"使用LLM类型: {actual_llm_type}")
     
-    # 修复配置中的 decoder_config 问题
-    config = transformers.AutoConfig.from_pretrained(model_path)
-    if hasattr(config, 'decoder_config') and isinstance(config.decoder_config, dict):
+    # 修复配置中的子配置（与 ttft_test 保持一致，安全 no-op）
+    config = transformers.AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    from transformers import PretrainedConfig
+    # decoder_config
+    if hasattr(config, 'decoder_config') and isinstance(getattr(config, 'decoder_config'), dict):
         print("修复 decoder_config 配置...")
-        # 将字典转换为配置对象
-        if 'model_type' in config.decoder_config:
-            decoder_config = transformers.AutoConfig.from_dict(config.decoder_config)
-            config.decoder_config = decoder_config
-        else:
-            # 如果没有 model_type，创建一个基本的配置对象
-            from transformers import PretrainedConfig
-            decoder_config = PretrainedConfig.from_dict(config.decoder_config)
-            config.decoder_config = decoder_config
+        config.decoder_config = PretrainedConfig.from_dict(config.decoder_config)
+    # text_config（在你的权重里是 dict）
+    if hasattr(config, 'text_config') and isinstance(getattr(config, 'text_config'), dict):
+        print("修复 text_config 配置...")
+        config.text_config = PretrainedConfig.from_dict(config.text_config)
+    # vision_config（防御性）
+    if hasattr(config, 'vision_config') and isinstance(getattr(config, 'vision_config'), dict):
+        print("修复 vision_config 配置...")
+        config.vision_config = PretrainedConfig.from_dict(config.vision_config)
+    # generation_config
+    if hasattr(config, 'generation_config') and isinstance(getattr(config, 'generation_config'), dict):
+        from transformers import GenerationConfig
+        print("修复 generation_config 配置...")
+        config.generation_config = GenerationConfig.from_dict(config.generation_config)
+
+    # 旧版 LLaVA 缺失的新字段，补默认值以兼容 transformers>=4.45
+    missing_defaults = {
+        'attention_dropout': 0.0,
+        'hidden_dropout': 0.0,
+        'attention_probs_dropout_prob': 0.0,
+        'attention_bias': False,
+        'mlp_bias': False,
+        'use_cache': True,
+        'rope_theta': 10000.0,
+        'rope_scaling': None,
+        'max_position_embeddings': getattr(config, 'max_position_embeddings', 4096),
+        'rms_norm_eps': 1e-6,
+        'initializer_range': 0.02,
+        'use_sliding_window': False,
+        'sliding_window': None,
+        'max_window_layers': None,
+        'tie_word_embeddings': False
+    }
+    for k, v in missing_defaults.items():
+        if not hasattr(config, k):
+            setattr(config, k, v)
     
     # 加载模型
     if actual_llm_type == "qwen2":
@@ -403,6 +470,7 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd", llm_type="a
             config=config,  # 传递修复后的配置
             torch_dtype=torch.float16,
             device_map="auto",
+            trust_remote_code=True
         )
     elif actual_llm_type == "llama":
         model = LlavaLlamaForCausalLM.from_pretrained(
@@ -410,6 +478,7 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd", llm_type="a
             config=config,  # 传递修复后的配置
             torch_dtype=torch.float16,
             device_map="auto",
+            trust_remote_code=True
         )
     elif actual_llm_type == "custom":
         if llm_path is None:
@@ -446,7 +515,7 @@ def load_model_and_tokenizer(model_path, vision_encoder="fastvithd", llm_type="a
             except AttributeError:
                 from transformers import CLIPImageProcessor
                 # use local clip-vit-large-patch14-336
-                image_processor = CLIPImageProcessor.from_pretrained("/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336")
+                image_processor = CLIPImageProcessor.from_pretrained("/data/gsva_pretrains/clip-vit-large-patch14-336")
     
     return model, tokenizer, image_processor, actual_llm_type
 
@@ -490,7 +559,7 @@ def load_gqa_sample(data_path, image_folder, resolution=1024):
         print(f"加载GQA样本失败: {e}")
         
         image = Image.fromarray(np.random.randint(0, 255, (resolution, resolution, 3), dtype=np.uint8))
-        return image, "Describe this image in detail."
+    return image, "Describe this image in detail."
 
 
 def test_vlm_flops_fvcore(args):
@@ -535,22 +604,51 @@ def test_vlm_flops_fvcore(args):
     )
     
     # load gqa
-    data_path = "/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json"
-    image_folder = "/perception-hl/zhuofan.xia/data/gqa/images"
+    data_path = "/data/gqa/testdev_balanced_questions.json"
+    image_folder = "/data/gqa/images"
 
-    # # load dataset
-    # data_path = "/perception-hl/zhuofan.xia/data/llava_v1_5_mix665k.json"
-    # image_folder = "/perception-hl/zhuofan.xia/data"
     
     print(f"加载GQA数据样本...")
     test_image, test_text = load_gqa_sample(data_path, image_folder, args.resolution)
 
-    image_tensor = image_processor(test_image, return_tensors='pt')['pixel_values']
-
-    if args.visual_tokens is not None:
-        visual_tokens_count = args.visual_tokens
+    use_hr = getattr(args, 'use_raw_image', False) and args.resolution > 336
+    dat_cfg = getattr(model.config, 'dat_extra_args', None)
+    dat_hr_kv_extra_flops = 0
+    if use_hr and dat_cfg is not None:
+        # 将 PIL 图像转 tensor 并裁切为 zoom_ratio^2 个 336 子图
+        to_tensor = transforms.ToTensor()
+        raw = to_tensor(test_image).unsqueeze(0)  # [1,3,H,W] in [0,1]
+        hr_image_size = int(dat_cfg['hr_image_size'])
+        lr_image_size = int(dat_cfg['lr_image_size'])
+        zoom_ratio = int(hr_image_size // lr_image_size)
+        sub_size = lr_image_size
+        # 保证尺寸匹配
+        if raw.shape[-1] != hr_image_size:
+            raw = torch.nn.functional.interpolate(raw, size=(hr_image_size, hr_image_size), mode='bilinear', align_corners=False)
+        # 切分为子图
+        patches = []
+        for i in range(0, hr_image_size, sub_size):
+            for j in range(0, hr_image_size, sub_size):
+                patches.append(raw[:, :, i:i+sub_size, j:j+sub_size])
+        image_tensor = torch.cat(patches, dim=0).half()  # [zoom^2,3,336,336]
+        # HR额外开销单独算，LR还是走336
+        visual_tokens_count = 576
+        try:
+            grid_size = int(dat_cfg.get('grid_size', 12))
+            S = grid_size * grid_size
+            hidden_size = int(getattr(model.config, 'hidden_size', 4096))
+            num_layers = int(getattr(model.config, 'num_hidden_layers', 32))
+            # 每层对 S 个 HR 采样 token 做 K/V 投影（2 * hidden_size^2 * S）
+            dat_hr_kv_extra_flops = 2 * (hidden_size * hidden_size) * S * num_layers
+        except Exception:
+            dat_hr_kv_extra_flops = 0
     else:
-        visual_tokens_count = calculate_visual_tokens(args.resolution, args.vision_encoder, args.patch_size)
+        # 常规路径：单图由 processor 处理
+        image_tensor = image_processor(test_image, return_tensors='pt')['pixel_values']
+        if args.visual_tokens is not None:
+            visual_tokens_count = args.visual_tokens
+        else:
+            visual_tokens_count = calculate_visual_tokens(args.resolution, args.vision_encoder, args.patch_size)
     
     # text tokens
     text_tokens = tokenizer(test_text, return_tensors='pt')['input_ids']
@@ -558,9 +656,27 @@ def test_vlm_flops_fvcore(args):
     print(f"实际文本token数量: {text_tokens_count}")
     print(f"文本内容: {test_text}")
     
+    # 若 DAT HR 生效，则把注意力对新增 HR-KV 的交互成本合入（prefill 口径：Nq×(Nkv+Nkv_hd)）
+    if use_hr and dat_cfg is not None:
+        try:
+            grid_size = int(dat_cfg.get('grid_size', 12))
+            S = grid_size * grid_size  # N_kv_hd
+            hidden_size = int(getattr(model.config, 'hidden_size', 4096))
+            num_layers = int(getattr(model.config, 'num_hidden_layers', 32))
+            num_heads = int(getattr(model.config, 'num_attention_heads', 32))
+            head_dim = hidden_size // max(1, num_heads)
+            Nq_full = 576 + int(text_tokens_count)
+            delta_attn = 2 * Nq_full * S * head_dim * num_heads * num_layers
+            dat_hr_kv_extra_flops += int(delta_attn)
+        except Exception:
+            pass
+    
     # flops
     print("开始计算FLOPs...")
-    flops_results = flops_calculator.calculate_total_flops(image_tensor, test_text, visual_tokens_count, text_tokens_count, tokenizer)
+    flops_results = flops_calculator.calculate_total_flops(
+        image_tensor, test_text, visual_tokens_count, text_tokens_count, tokenizer,
+        extra_hr_kv_flops=dat_hr_kv_extra_flops
+    )
     
     # model config
     config = transformers.AutoConfig.from_pretrained(args.model_path)
@@ -626,6 +742,7 @@ def test_vlm_flops_fvcore(args):
             'encoder_flops': flops_results['encoder_flops'],
             'connector_flops': flops_results['connector_flops'],
             'llm_flops': flops_results['llm_flops'],
+            'dat_hr_kv_extra_flops': flops_results.get('dat_hr_kv_extra_flops', 0),
             'total_flops': flops_results['total_flops'],
             'total_flops_g': flops_results['total_flops'] / 1e9,
             'total_flops_t': flops_results['total_flops'] / 1e12,
@@ -663,6 +780,7 @@ if __name__ == "__main__":
                        help="Visual token数量 (如果为None，将根据分辨率和编码器自动计算)")
     parser.add_argument("--patch-size", type=int, default=None,
                        help="Patch大小 (如果为None，将使用每个编码器的默认值)")
+    parser.add_argument("--use-raw-image", action="store_true", help="以原图张量切分子图进入 DAT HR 路径，计算 HR 下 FLOPs")
     
     args = parser.parse_args()
     

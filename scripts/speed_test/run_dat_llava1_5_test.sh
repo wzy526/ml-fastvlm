@@ -7,14 +7,13 @@
 export DS_SKIP_CUDA_CHECK=1
 
 # 激活conda环境
-source /home/zhuofan.xia/miniconda3/bin/activate pt260
+source /root/miniconda3/bin/activate ml-fastvlm
 
 # 设置实验名称和路径
 EXP_NAME="tdat-7b-l0d32-s12g8z3"
-# 主要训练输出目录 (在另一个remote上)
-OUTPUT_DIR="/perception-hl/zhuofan.xia/vlm_exps/textdat/$EXP_NAME"
-# 本地备份目录 (如果存在)
-BACKUP_DIR="/root/vlm_exps/textdat/$EXP_NAME"
+OUTPUT_DIR="/data/checkpoints/weilai/$EXP_NAME"
+
+
 
 # 检查checkpoint是否存在
 if [ -d "$OUTPUT_DIR" ]; then
@@ -32,8 +31,8 @@ else
 fi
 
 # 检查GQA数据集路径
-DATA_PATH="/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json"
-IMAGE_FOLDER="/perception-hl/zhuofan.xia/data/gqa/images"
+DATA_PATH="/data/gqa/testdev_balanced_questions.json"
+IMAGE_FOLDER="/data/gqa/images"
 
 if [ ! -f "$DATA_PATH" ]; then
     echo "错误: 未找到GQA数据集文件"
