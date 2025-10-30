@@ -66,7 +66,7 @@ class LlamaAttentionEx(LlamaAttention):
 
     def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
         super().__init__(config, layer_idx)
-        self.use_sdpa = config.dat_extra_args['use_sdpa']
+        self.use_sdpa = False
 
     def forward(
         self,
