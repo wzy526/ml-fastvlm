@@ -154,10 +154,7 @@ class LlamaAttentionEx(LlamaAttention):
             return super().forward(
                 hidden_states,
                 attention_mask,
-                position_ids,
                 past_key_value,
-                output_attentions,
-                use_cache,
                 cache_position,
                 position_embeddings,
                 **kwargs
