@@ -38,11 +38,11 @@ import transformers
 def get_training_config():
     """从训练脚本中获取配置信息 - 使用GQA数据集"""
     config = {
-        'model_name_or_path': '/home/zhuofan.xia/gsva_pretrains/llava-v1_5-7b',
-        'vision_tower': '/home/zhuofan.xia/gsva_pretrains/clip-vit-large-patch14-336',
-        'data_path': '/perception-hl/zhuofan.xia/data/gqa/val_all_questions.json',  # GQA test set
-        'image_folder': '/perception-hl/zhuofan.xia/data/gqa/images', 
-        'output_dir': '/perception-hl/zhuofan.xia/vlm_exps/textdat/tdat-7b-l0d32-s12g8z3',  
+        'model_name_or_path': '/data/checkpoints/tdat-7b-l0d32-s12g8z3_ep2',
+        'vision_tower': '/data/checkpoints/tdat-7b-l0d32-s12g8z3_ep2/clip-vit-large-patch14-336',
+        'data_path': '/data/gqa/testdev_balanced_questions.json',  # GQA test set
+        'image_folder': '/data/gqa/images', 
+        'output_dir': './test_results_20251030_144000',  
         'extra_yaml_path': './configs/llava1_5_v1.yaml',
         'mm_projector_type': 'mlp2x_gelu',
         'mm_vision_select_layer': -2,
@@ -76,7 +76,7 @@ def find_latest_checkpoint(output_dir):
 
 
 def run_ttft_test(model_path, data_path, image_folder, output_file=None, 
-                  resolution=336, max_samples=1000, vision_encoder="clip"):
+                  resolution=336, max_samples=1000, vision_encoder="clip", use_raw_image=False):
     """运行TTFT测试"""
     print("="*60)
     print("开始TTFT测试")
@@ -92,6 +92,8 @@ def run_ttft_test(model_path, data_path, image_folder, output_file=None,
         '--vision-encoder', vision_encoder,
         '--max-samples', str(max_samples)
     ]
+    if use_raw_image:
+        cmd.append('--use-raw-image')
     
     if output_file:
         cmd.extend(['--output-file', output_file])
@@ -99,9 +101,11 @@ def run_ttft_test(model_path, data_path, image_folder, output_file=None,
     print(f"运行TTFT测试命令: {' '.join(cmd)}")
     
     try:
-        # 设置正确的工作目录为用户的工作目录
-        work_dir = "/home/zhuofan.xia/ml-fastvlm"
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=work_dir)
+        # 设置工作目录与单卡环境
+        work_dir = "/root/ml-fastvlm"
+        env = os.environ.copy()
+        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=work_dir, env=env)
         print("TTFT测试完成")
         print("STDOUT:", result.stdout)
         if result.stderr:
@@ -134,9 +138,10 @@ def run_flops_test(model_path, output_file=None, resolution=336, vision_encoder=
     print(f"运行FLOPs测试命令: {' '.join(cmd)}")
     
     try:
-        # 设置正确的工作目录为用户的工作目录
-        work_dir = "/home/zhuofan.xia/ml-fastvlm"
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=work_dir)
+        work_dir = "/root/ml-fastvlm"
+        env = os.environ.copy()
+        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=work_dir, env=env)
         print("FLOPs测试完成")
         print("STDOUT:", result.stdout)
         if result.stderr:
@@ -192,7 +197,8 @@ def run_comprehensive_test(args):
         output_file=ttft_output,
         resolution=args.resolution,
         max_samples=args.max_samples,
-        vision_encoder=config['vision_encoder']
+        vision_encoder=config['vision_encoder'],
+        use_raw_image=args.use_raw_image
     )
     
     # 运行FLOPs测试
@@ -288,6 +294,7 @@ def main():
                        help="TTFT测试的最大样本数")
     parser.add_argument("--output-dir", type=str, default=None,
                        help="输出目录 (如果为None，将使用当前目录)")
+    parser.add_argument("--use-raw-image", action="store_true", help="以原始分辨率张量输入（如1008x1008）触发 DAT HR")
     
     args = parser.parse_args()
     
