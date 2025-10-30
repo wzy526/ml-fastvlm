@@ -131,28 +131,27 @@ class LlamaAttentionEx(LlamaAttention):
             # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
             # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
             is_causal = True if causal_mask is None and q_len > 1 else False
-            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-                if use_cache:
-                    if causal_mask.shape[3] < key_states.shape[2]: 
-                        n_pad = key_states.shape[2] - causal_mask.shape[3]
-                        causal_mask = F.pad(causal_mask, (0, n_pad), mode="constant", value=0.0)
-                    attn_output = F.scaled_dot_product_attention(
-                        query_states,
-                        key_states,
-                        value_states,
-                        attn_mask=causal_mask,
-                        dropout_p=self.attention_dropout if self.training else 0.0,
-                        is_causal=False
-                    )
-                else:
-                    attn_output = F.scaled_dot_product_attention(
-                        query_states,
-                        key_states,
-                        value_states,
-                        attn_mask=causal_mask,
-                        dropout_p=self.attention_dropout if self.training else 0.0,
-                        is_causal=is_causal
-                    )
+            if use_cache:
+                if causal_mask.shape[3] < key_states.shape[2]: 
+                    n_pad = key_states.shape[2] - causal_mask.shape[3]
+                    causal_mask = F.pad(causal_mask, (0, n_pad), mode="constant", value=0.0)
+                attn_output = F.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=causal_mask,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    is_causal=False
+                )
+            else:
+                attn_output = F.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=causal_mask,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    is_causal=is_causal
+                )
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.view(bsz, q_len, -1)
             attn_output = self.o_proj(attn_output)
