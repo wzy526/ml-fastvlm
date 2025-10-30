@@ -3,7 +3,7 @@
 source /home/coder/miniforge3/bin/activate fastvlm
 
 CKPT_ROOT=/mnt/ephemeral/exps/
-EXP_NAME="tdat-llava1_5-7b-3l1d-s12g8z3-hdproj-ep1"
+EXP_NAME="tdat-llava1_5-7b-all_d-s12g8z3-hdproj-ep1"
 export WANDB_PROJECT="MMDAT-2025"
 mkdir -p $CKPT_ROOT/$EXP_NAME
 
@@ -11,7 +11,7 @@ ds llava/train/train_dat.py \
     --deepspeed ./scripts/zero_configs/zero2.json \
     --model_name_or_path /home/coder/work/llava-v1.5-7b \
     --version v1 \
-    --extra_yaml_path ./configs/llava1_5_v3.yaml \
+    --extra_yaml_path ./configs/llava1_5_v1.yaml \
     --data_path  /home/coder/work/llava-665k/llava_v1_5_mix665k.json \
     --image_folder /home/coder/work/llava-665k/train_split \
     --vision_tower /home/coder/work/clip-vit-large-patch14-336 \

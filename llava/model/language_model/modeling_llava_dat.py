@@ -512,6 +512,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             key_bhnc, value_bhnc = past_key_value.update(key_bhnc, value_bhnc, self.layer_idx, cache_kwargs)
             # print(f"LAYER {self.layer_idx}, kv_len: {kv_len}, k: {key_bhnc.shape}, v:{value_bhnc.shape}")
         if self.use_sdpa:
+            # print(f"LAYER {self.layer_idx}, use_sdpa: {self.use_sdpa}, query_bhnc: {query_bhnc.shape}, key_bhnc: {key_bhnc.shape}, value_bhnc: {value_bhnc.shape}, attn_mask_4d: {attn_mask_4d.shape}")
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                 attn_out = F.scaled_dot_product_attention(
                     query_bhnc, key_bhnc, value_bhnc, attn_mask_4d,

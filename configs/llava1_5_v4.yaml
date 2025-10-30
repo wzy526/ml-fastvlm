@@ -1,0 +1,15 @@
+lr_image_size: 336
+hr_image_size: 1008
+grid_size: 12
+off_ksize: 3
+off_grps: 8
+inter_size: 256
+use_sdpa: True
+lr_size: 24
+hd_proj: True
+layers: [
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+]
