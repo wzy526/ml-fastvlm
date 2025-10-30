@@ -66,7 +66,13 @@ class LlamaAttentionEx(LlamaAttention):
 
     def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
         super().__init__(config, layer_idx)
-        self.use_sdpa = False
+        self.use_sdpa = config.dat_extra_args['use_sdpa']
+
+        # Add missing attributes that should be inherited from LlamaAttention by wzy
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_key_value_groups = getattr(config, 'num_key_value_heads', config.num_attention_heads)
+
 
     def forward(
         self,
