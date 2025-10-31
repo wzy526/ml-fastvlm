@@ -31,7 +31,8 @@ ds llava/train/train_dat.py \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --eval_strategy "no" \
-    --save_strategy "epoch" \
+    --save_strategy "steps" \
+    --save_steps 2000 \
     --learning_rate 2e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.01 \
