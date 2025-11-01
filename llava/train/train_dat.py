@@ -885,7 +885,7 @@ def train(attn_implementation=None):
                     **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
     trainer.save_state()
