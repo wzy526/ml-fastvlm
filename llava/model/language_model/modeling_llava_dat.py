@@ -436,14 +436,15 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             # Apply repeat_kv to expand head dimensions to match key_states and value_states
             # Reshape key_hd and value_hd to [Lp, num_key_value_groups, Ns, head_dim] for repeat_kv
             # wzy
-            key_hd = key_hd.view(Lp, self.num_key_value_groups, -1, self.head_dim)
-            value_hd = value_hd.view(Lp, self.num_key_value_groups, -1, self.head_dim)
+            Ns = self.grid_size * self.grid_size
+            key_hd = key_hd.view(Lp, self.num_key_value_groups, Ns, self.head_dim)
+            value_hd = value_hd.view(Lp, self.num_key_value_groups, Ns, self.head_dim)
             # Apply repeat_kv
-            key_hd = repeat_kv(key_hd, self.num_heads // self.num_key_value_groups) 
-            value_hd = repeat_kv(value_hd, self.num_heads // self.num_key_value_groups) 
+            key_hd = repeat_kv(key_hd, self.num_heads // self.num_key_value_groups)
+            value_hd = repeat_kv(value_hd, self.num_heads // self.num_key_value_groups)
             # Reshape back to [Lp, Ns, num_heads * head_dim]
-            key_hd = key_hd.view(Lp, -1, self.num_heads * self.head_dim)
-            value_hd = value_hd.view(Lp, -1, self.num_heads * self.head_dim) # end
+            key_hd = key_hd.view(Lp, Ns, self.num_heads * self.head_dim)
+            value_hd = value_hd.view(Lp, Ns, self.num_heads * self.head_dim) # end
             
             # 8. Let's pack each key_hd and value_hd into the key / value sequences! Let's make the causal / partial causal attention mask!
             # The format is [SYS] [IMG_I1_LR] ... [IMG_In_LR] [IQ] [IMG_I1_HR] ... [IMG_In_HR] [IA] ... [IMG_J1_LR] ... [IMG_Jn_LR] [JQ] [IMG_J1_HR] ... [IMG_Jn_HR] [JA]

@@ -44,4 +44,5 @@ ds llava/train/train_dat.py \
     --lazy_preprocess True \
     --seed 42 \
     --report_to "wandb" \
-    --run_name $EXP_NAME
+    --run_name $EXP_NAME \
+    --resume_from_checkpoint True
