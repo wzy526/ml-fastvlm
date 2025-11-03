@@ -24,7 +24,7 @@ ds llava/train/train_dat.py \
     --bf16 True \
     --tf32 True \
     --max_grad_norm 1.0 \
-    --ddp_find_unused_parameters True \
+    --ddp_find_unused_parameters False \
     --output_dir $CKPT_ROOT/$EXP_NAME \
     --num_train_epochs 1 \
     --per_device_train_batch_size 4 \
@@ -41,8 +41,12 @@ ds llava/train/train_dat.py \
     --model_max_length 4096 \
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
+    --dataloader_pin_memory True \
+    --dataloader_prefetch_factor 3 \
+    --dataloader_persistent_workers True \
+    --dataloader_drop_last True \
     --lazy_preprocess True \
     --seed 42 \
     --report_to "wandb" \
     --run_name $EXP_NAME \
-    --resume_from_checkpoint True
+    --resume_from_checkpoint True \
