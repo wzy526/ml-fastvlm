@@ -3,7 +3,7 @@
 source /home/coder/miniforge3/bin/activate fastvlm
 
 CKPT_ROOT=/mnt/ephemeral/exps/
-EXP_NAME="tdat-llava1_5-7b-all_d-s12g8z3-hdproj-ep1"
+EXP_NAME="tdat-llava1_5-7b-3l1d-s12g8z3-cat-hdproj-ep1"
 export WANDB_PROJECT="MMDAT-2025"
 mkdir -p $CKPT_ROOT/$EXP_NAME
 
