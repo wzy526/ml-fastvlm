@@ -23,7 +23,7 @@ ds llava/train/train_dat.py \
     --group_by_modality_length True \
     --bf16 True \
     --tf32 True \
-    --max_grad_norm 1.0 \
+    --max_grad_norm 10 \
     --ddp_find_unused_parameters False \
     --output_dir $CKPT_ROOT/$EXP_NAME \
     --num_train_epochs 1 \

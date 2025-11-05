@@ -76,6 +76,9 @@ class LlamaAttentionEx(LlamaAttention):
         from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
+    @torch.no_grad()
+    def init_conv_weights(self):
+        pass
 
     def forward(
         self,
