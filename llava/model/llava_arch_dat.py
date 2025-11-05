@@ -455,7 +455,6 @@ class LlavaDATMetaForCausalLM(ABC):
                 start_ids += [len(ids)]
                 for start_id, end_id_plus_one in zip(start_ids[:-1], start_ids[1:]):
                     image_range_list[i].append([ids[start_id].item(), ids[end_id_plus_one - 1].item()])
-                # Since each answer has been marked in image_range_list[1:], we directly use the last token before start_id as the intention ones
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, hd_features, image_range_list
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):

@@ -6,10 +6,11 @@ off_grps: 8
 inter_size: 256
 use_sdpa: True
 lr_size: 24
-hd_proj: False
+hd_proj: True
 layers: [
-  'D', 'D', 'D', 'D', 'D', 'D', 'D', 'D',
-  'D', 'D', 'D', 'D', 'D', 'D', 'D', 'D',
-  'D', 'D', 'D', 'D', 'D', 'D', 'D', 'D',
-  'D', 'D', 'D', 'D', 'D', 'D', 'D', 'D'
+  'L', 'L', 'L', 'D', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'D', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'D', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'D', 'L', 'L', 'L', 'D',
 ]
+intention_as_gate: True

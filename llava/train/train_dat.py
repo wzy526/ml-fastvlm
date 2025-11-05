@@ -23,6 +23,7 @@ import pathlib
 from typing import Dict, Optional, Sequence, List
 
 import torch
+from torch.nn.init import kaiming_normal_
 
 import transformers
 import tokenizers
@@ -65,6 +66,7 @@ class ModelDATExtraArguments:
     hd_proj: Optional[bool] = field(default=True)
     layers: Optional[List[str]] = field(default_factory=lambda: ['D'] * 32)
     use_sdpa: Optional[bool] = field(default=False)
+    intention_as_gate: Optional[bool] = field(default=False)
 
 @dataclass
 class ModelArguments:
@@ -563,7 +565,7 @@ def preprocess(
     # tokenize conversations
     def get_tokenize_len(prompts):
         return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
-
+    
     if has_image:
         input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
     else:
@@ -863,6 +865,7 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+        model.get_model().init_conv_weights() # Important! Otherwise the convolution layers are zeros, very weird!
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

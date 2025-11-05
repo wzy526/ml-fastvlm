@@ -38,6 +38,11 @@ class LlavaLlamaDATModel(LlavaDATMetaModel, LlamaDATModel):
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
 
+    @torch.no_grad()
+    def init_conv_weights(self):
+        for layer in self.layers:
+            layer.self_attn.init_conv_weights()
+
 
 class LlavaLlamaDATForCausalLM(LlamaDATForCausalLM, LlavaDATMetaForCausalLM):
     config_class = LlavaLlamaDATConfig

@@ -181,6 +181,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         self.vit_enc_patchsize = config.dat_extra_args['lr_image_size'] // self.lr_size
         self.hr_size = config.dat_extra_args['hr_image_size'] // self.vit_enc_patchsize
         self.hd_proj = config.dat_extra_args['hd_proj']
+        self.intention_as_gate = config.dat_extra_args['intention_as_gate']
 
         self.hidden_size = config.hidden_size
         
@@ -196,40 +197,63 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             kernel_size=self.off_ksize,
             stride=1,
             padding=self.off_ksize // 2,
-            groups=self.off_dim
+            groups=self.off_dim,
+            bias=False
         )
-        self.act = get_activation('quick_gelu')
-        self.ln_1 = LayerNorm2d(self.off_dim)
+        self.act = get_activation('silu')
+        self.ln_1 = LayerNorm2d(self.off_dim, eps=1e-5)
         self.conv_lr_proj = nn.Conv2d(
             in_channels=self.off_dim,
             out_channels=self.inter_size,
             kernel_size=1,
             stride=1,
-            padding=0
-        )
-        self.proj_intention = nn.Linear(
-            in_features=self.hidden_size,
-            out_features=self.inter_size
-        )
-        self.ln_2 = LayerNorm2d(self.inter_size * 2)
-        self.conv_off_proj = nn.Conv2d(
-            in_channels=self.inter_size * 2,
-            out_channels=2,
-            kernel_size=1,
-            stride=1,
             padding=0,
             bias=False
         )
-        if self.hd_proj:
-            self.k_proj_hd = nn.Linear(self.hidden_size, self.num_key_value_groups * self.head_dim, bias=config.attention_bias if hasattr(config, "attention_bias") else False)
-            self.v_proj_hd = nn.Linear(self.hidden_size, self.num_key_value_groups * self.head_dim, bias=config.attention_bias if hasattr(config, "attention_bias") else False)
+        self.proj_intention = nn.Linear(
+            in_features=self.off_dim,
+            out_features=self.inter_size
+        )
+        if self.intention_as_gate:
+            self.ln_2 = LayerNorm2d(self.inter_size, eps=1e-5)
+            self.conv_off_proj = nn.Conv2d(
+                in_channels=self.inter_size,
+                out_channels=2,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            )
         else:
-            self.k_proj_hd = None
-            self.v_proj_hd = None
+            self.ln_2 = LayerNorm2d(self.inter_size * 2, eps=1e-5)
+            self.conv_off_proj = nn.Conv2d(
+                in_channels=self.inter_size * 2,
+                out_channels=2,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            )
+        if self.hd_proj:
+            self.k_proj_hd = nn.Linear(self.hidden_size, self.num_key_value_groups * self.head_dim)
+            self.v_proj_hd = nn.Linear(self.hidden_size, self.num_key_value_groups * self.head_dim)
+        else:
+            self.k_proj_hd = nn.Identity()
+            self.v_proj_hd = nn.Identity()
         
         # rotary_emb fix by wzy
         from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.insert_kvhd_offset = 6
+
+        self.init_conv_weights() # Explicitly initialize the weights of the conv layers, no zero!
+
+
+    @torch.no_grad()
+    def init_conv_weights(self): 
+        nn.init.kaiming_normal_(self.conv_lr_dw.weight, mode='fan_in', nonlinearity='linear')
+        nn.init.kaiming_normal_(self.conv_lr_proj.weight)
+        nn.init.kaiming_normal_(self.conv_off_proj.weight)
         
     @torch.no_grad()
     def _grid_generate(self, Hk, Wk, B, device, dtype):
@@ -327,10 +351,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             cos, sin = position_embeddings
         # add rope to q, k, v
         query_states = einops.rearrange(query_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        
-        # key_states = einops.rearrange(key_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        # value_states = einops.rearrange(value_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        
         # by wzy
         key_states = einops.rearrange(key_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_key_value_groups, c=self.head_dim)
         value_states = einops.rearrange(value_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_key_value_groups, c=self.head_dim) # end
@@ -341,13 +361,8 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         # by wzy
         key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_groups) # end
-
         # Convert back to [B N (H C)] format
         query_states = einops.rearrange(query_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        # key_states = einops.rearrange(key_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        # value_states = einops.rearrange(value_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        
-        # by wzy
         key_states = einops.rearrange(key_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
         value_states = einops.rearrange(value_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim) # end
        
@@ -360,9 +375,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 keys_concat.append(key_states[b_idx])
                 values_concat.append(value_states[b_idx])
                 attns_concat.append(attention_mask[b_idx].permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
-                # no_imgs_in_sample.append(True)
                 continue
-            # no_imgs_in_sample.append(False)
             # 1. We take the low-res image query features out.
             image_range_index = torch.arange(image_range_list[b_idx][0][0], image_range_list[b_idx][0][1], device=device, dtype=torch.int64)
             img_lr = einops.rearrange(
@@ -371,15 +384,23 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 g=self.off_grps, c=self.off_dim, h=self.lr_size, w=self.lr_size
             )
             embed_lr = self.conv_lr_proj(self.act(self.ln_1(self.conv_lr_dw(img_lr)))) # g, C_inter, H_lr, W_lr
+            if embed_lr.abs().max() < 1e-6:
+                print("Warning, LN instability causes embed_lr to all 0.")
             embed_lr = F.adaptive_avg_pool2d(embed_lr, (self.grid_size, self.grid_size))  # g, C_inter, H_grid, W_grid
             # 2. For each image, we mark the intention token for each question
-            intention_index = [answer_range[0] - 1 for answer_range in image_range_list[b_idx][1:]]
+            intention_index = [answer_range[0] - self.insert_kvhd_offset for answer_range in image_range_list[b_idx][1:]]
             Lp = len(intention_index)
-            embed_intention = self.proj_intention(query_states[b_idx, intention_index]) # Lp, C_inter
-            # 3. We combine them to guide offset generation
+            intention_tokens = query_states[b_idx, intention_index]
+            intention_tokens_per_off_group = einops.rearrange(
+                intention_tokens,
+                'l (g c) -> l g c',
+                l=Lp, g=self.off_grps, c=self.off_dim
+            )
+            embed_intention = self.proj_intention(intention_tokens_per_off_group) # Lp, group, C_off -> C_inter
+            # 3. We combine them to guide offset generation as per channel gate
             embed_intention = einops.repeat(
                 embed_intention,
-                'l c -> l g c h w',
+                'l g c -> l g c h w',
                 l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
             )
             embed_intention = einops.rearrange(
@@ -397,7 +418,17 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 'l g c h w -> (l g) c h w',
                 l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
             )
-            off_guide = torch.cat([embed_lr, embed_intention], dim=1) # Lp * g, 2C_inter, Hg, Wg
+            # gated_embed_lr = embed_lr.mul(embed_intention_gate[..., None, None])
+            # l g c h w * l g c -> l g c h w, h, w are broadcasted
+            # off_guide = einops.rearrange(
+            #     gated_embed_lr,
+            #     'l g c h w -> (l g) c h w',
+            #     l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
+            # )
+            if self.intention_as_gate:
+                off_guide = embed_lr.mul(embed_intention.sigmoid().mul(2.0))
+            else:
+                off_guide = torch.cat([embed_lr, embed_intention], dim=1) # Lp * g, 2C_inter, Hg, Wg
             # 4. We predict offsets
             offsets = self.conv_off_proj(self.act(self.ln_2(off_guide))) # Lp * g, 2, Hg, Wg
             # 5. We generate a grid then add offsets to them
@@ -414,11 +445,17 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 l=Lp, h=self.hr_size, w=self.hr_size, g=self.off_grps, c=self.off_dim
             )
             # 6. We sample tokens from the hr image features and then 
+            # Fix sampling to fp32
+            dtype = img_hr.dtype
+            img_hr = img_hr.to(torch.float32)
+            sample_locs = sample_locs.to(torch.float32)
             sampled_hr = F.grid_sample(
                 img_hr, 
                 sample_locs[..., (1, 0)],
                 mode='bilinear', align_corners=True
             ) # (Lp * g), Cg, H_grid, W_grid
+            sampled_hr = sampled_hr.to(dtype)
+            # end of precision fix
             sampled_hr = einops.rearrange(
                 sampled_hr,
                 '(l g) c h w -> l (h w) (g c)',
@@ -430,13 +467,10 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             else:
                 key_hd, value_hd = self.k_proj(sampled_hr), self.v_proj(sampled_hr)
             # each KV_hd has the shape [Lp, Ns, C]
-            # 7.1. (Extra?) How to add RoPE to key_hd?
-            # But I think it is not necessary.
-
+            Ns = self.grid_size * self.grid_size
             # Apply repeat_kv to expand head dimensions to match key_states and value_states
             # Reshape key_hd and value_hd to [Lp, num_key_value_groups, Ns, head_dim] for repeat_kv
             # wzy
-            Ns = self.grid_size * self.grid_size
             key_hd = key_hd.view(Lp, self.num_key_value_groups, Ns, self.head_dim)
             value_hd = value_hd.view(Lp, self.num_key_value_groups, Ns, self.head_dim)
             # Apply repeat_kv
@@ -447,52 +481,61 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             value_hd = value_hd.view(Lp, Ns, self.num_heads * self.head_dim) # end
             
             # 8. Let's pack each key_hd and value_hd into the key / value sequences! Let's make the causal / partial causal attention mask!
-            # The format is [SYS] [IMG_I1_LR] ... [IMG_In_LR] [IQ] [IMG_I1_HR] ... [IMG_In_HR] [IA] ... [IMG_J1_LR] ... [IMG_Jn_LR] [JQ] [IMG_J1_HR] ... [IMG_Jn_HR] [JA]
+            # For one image case, the format is [SYS] [IMG_I_LR] [Q1] [IMG_I_HR1] [P1] [A1] [Q2] [IMG_I_HR2] [P2] [A2] ...
+            # Q = question, SYS = system prompt, P = small tokens before answer, A = answer tokens
             # TODO: Maybe we should unpad the tokens then pad them again.
             key_b, value_b, attn_b = key_states[b_idx], value_states[b_idx], attention_mask[b_idx]
             k_split, v_split, attn_split = [], [], []
             # We split the original kv, attn; then add the hd parts into them
             insert_counter = 0
             for l_idx, (this_answer_start, this_answer_end) in enumerate(image_range_list[b_idx][1:]):
+                cur_intention_idx = this_answer_start - self.insert_kvhd_offset
                 if this_answer_end > 0:
-                    k_split.append(key_b[insert_counter:this_answer_start])
-                    v_split.append(value_b[insert_counter:this_answer_start])
+                    # Training mode, we split the input embeddings into three parts: before insert point, KV-hd, and after insert point
+                    k_split.append(key_b[insert_counter:cur_intention_idx + 1])
+                    v_split.append(value_b[insert_counter:cur_intention_idx + 1])
                     k_split.append(key_hd[l_idx])
                     v_split.append(value_hd[l_idx])
-                    k_split.append(key_b[this_answer_start:this_answer_end])
-                    v_split.append(value_b[this_answer_start:this_answer_end])
+                    k_split.append(key_b[cur_intention_idx + 1:this_answer_end + 1])
+                    v_split.append(value_b[cur_intention_idx + 1:this_answer_end + 1])
                     # before insert point, no attention; after insert point, full attention, but before next question starts
+                    attn_split.append(attn_b[:,:,insert_counter:cur_intention_idx + 1]) # [head, Nq, last_end to current insert point (inclusive)]
                     add_hd_attn_mask = torch.cat([
-                        torch.zeros(1, this_answer_start, self.grid_size * self.grid_size, device=device, dtype=attn_b.dtype),
-                        torch.ones(1, this_answer_end - this_answer_start, self.grid_size * self.grid_size, device=device, dtype=attn_b.dtype),
-                        torch.zeros(1, Nq - this_answer_end, self.grid_size * self.grid_size, device=device, dtype=attn_b.dtype)
+                        torch.zeros(1, cur_intention_idx + 1, Ns, device=device, dtype=attn_b.dtype), # Before the insert point, no tokens can see the hd features to avoid leakage
+                        torch.ones(1, Nq - cur_intention_idx - 1, Ns, device=device, dtype=attn_b.dtype), # After the insert point, all successive tokens can see the hd features
+                        # torch.zeros(1, Nq - this_answer_end, Ns, device=device, dtype=attn_b.dtype)
                     ], dim=1)
-                    attn_split.append(attn_b[:,:,insert_counter:this_answer_start]) # [head, Nq, last_end to this_start]
                     attn_split.append(self._flip_and_fill(add_hd_attn_mask)) # 0 -> -inf, 1 -> 0, in shape [head, Nq, n_kv_hd]
-                    attn_split.append(attn_b[:,:,this_answer_start:this_answer_end]) # [head, Nq, this_start to this_end]
+                    attn_split.append(attn_b[:,:,cur_intention_idx + 1:this_answer_end + 1]) # [head, Nq, this_start to this_end]
                     insert_counter = this_answer_end + 1 # From the last answer end point to the next answer start point
                 else:
                     # Inference mode, no answer end actually, we pack the input embeddings with hd features
-                    k_split.append(key_b[insert_counter:this_answer_start])
-                    v_split.append(value_b[insert_counter:this_answer_start])
+                    k_split.append(key_b[insert_counter:cur_intention_idx + 1])
+                    v_split.append(value_b[insert_counter:cur_intention_idx + 1])
                     k_split.append(key_hd[l_idx])
                     v_split.append(value_hd[l_idx])
-                    add_hd_attn_mask = torch.zeros(1, this_answer_start, self.grid_size * self.grid_size, device=device, dtype=attn_b.dtype)
-                    attn_split.append(attn_b[:,:,insert_counter:this_answer_start]) # [head, Nq, last_end to this_start]
+                    k_split.append(key_b[cur_intention_idx + 1:this_answer_start])
+                    v_split.append(value_b[cur_intention_idx + 1:this_answer_start])
+                    attn_split.append(attn_b[:,:,insert_counter:cur_intention_idx + 1]) # [head, Nq, last_end to current insert point (inclusive)]
+                    add_hd_attn_mask = torch.cat([
+                        torch.zeros(1, cur_intention_idx + 1, Ns, device=device, dtype=attn_b.dtype), # Before the insert point, no tokens can see the hd features to avoid leakage
+                        torch.ones(1, Nq - cur_intention_idx - 1, Ns, device=device, dtype=attn_b.dtype), # After the insert point, all successive tokens can see the hd features
+                    ], dim=1)
                     attn_split.append(self._flip_and_fill(add_hd_attn_mask)) # 0 -> -inf, 1 -> 0, in shape [head, Nq, n_kv_hd]
+                    attn_split.append(attn_b[:,:,cur_intention_idx + 1:this_answer_start]) # [head, Nq, after insert point to output start (exclusive)]
+                    # We need confirm this_answer_start is just Nq, since Nq is the length of the question tokens and cannot be indexed in tokens
+                    assert this_answer_start == Nq, "this_answer_start should be just Nq, since Nq is the length of the question tokens and cannot be indexed in tokens"
                     # This time, insert counter should always be zero.
             # We add the packed dst segments into the batch kvs
             if len(k_split) == 0 or len(v_split) == 0 or len(attn_split) == 0:
-                keys_concat.append(key_states[b_idx])
-                values_concat.append(value_states[b_idx])
-                attns_concat.append(attention_mask[b_idx].permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
+                keys_concat.append(key_b)
+                values_concat.append(value_b)
+                attns_concat.append(attn_b.permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
             else:
                 keys_concat.append(torch.cat(k_split, dim=0))
                 values_concat.append(torch.cat(v_split, dim=0))
                 attns_concat.append(torch.cat(attn_split, dim=2).permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
         # When no inputs are forwarded by offset_gen modules, or there are no questions
-        # We only use find_unused_parameters in Zero-2, we do not involve Zero-3
-
         # We pad each key, value, attn_mask with different lengths
         key_states_plus_hd = nn.utils.rnn.pad_sequence(keys_concat, batch_first=True, padding_value=0) # [B L_padded C]
         value_states_plus_hd = nn.utils.rnn.pad_sequence(values_concat, batch_first=True, padding_value=0) # [B L_padded C]

@@ -13,3 +13,4 @@ layers: [
   'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
   'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
 ]
+intention_as_gate: True
