@@ -9,9 +9,9 @@ lr_size: 24
 hd_proj: False
 
 layers: [
-  'L', 'L', 'L', 'D', 'L', 'L', 'L', 'D',
-  'L', 'L', 'L', 'D', 'L', 'L', 'L', 'D',
-  'L', 'L', 'L', 'D', 'L', 'L', 'L', 'D',
-  'L', 'L', 'L', 'D', 'L', 'L', 'L', 'D',
+  'L', 'D', 'L', 'D', 'L', 'D', 'L', 'D',
+  'L', 'D', 'L', 'D', 'L', 'D', 'L', 'D',
+  'L', 'D', 'L', 'D', 'L', 'D', 'L', 'D',
+  'L', 'D', 'L', 'D', 'L', 'D', 'L', 'D',
 ]
 intention_as_gate: True
