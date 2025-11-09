@@ -1,0 +1,16 @@
+lr_image_size: 336
+hr_image_size: 1008
+grid_size: 16
+off_ksize: 3
+off_grps: 8
+inter_size: 256
+use_sdpa: True
+lr_size: 24
+hd_proj: False
+layers: [
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+]
+intention_as_gate: True
