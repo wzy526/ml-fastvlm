@@ -1,13 +1,11 @@
-from sys import exec_prefix
 from typing import List, Optional, Tuple, Union
 import einops
-
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from torch.backends.cuda import enable_cudnn_sdp
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from timm.layers import LayerNorm2d
 from transformers.activations import get_activation
@@ -18,11 +16,11 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.models.llama.modeling_llama import (
     LlamaAttention, LlamaMLP, LlamaRMSNorm, LlamaRotaryEmbedding,
-    LlamaPreTrainedModel, apply_rotary_pos_emb, repeat_kv,
-    AttentionMaskConverter
+    LlamaPreTrainedModel, repeat_kv, apply_rotary_pos_emb,
+    AttentionMaskConverter, rotate_half
 )
 
-logger = logging.get_logger(__name__)
+logger = logging.get_logger(__name__) 
 
 def str2bool(v):
     return v.lower() in ('true', '1')
@@ -62,6 +60,15 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
 
     return causal_mask
 
+@dataclass
+class DATModelOutput(BaseModelOutputWithPast):
+    sampling_locs: Optional[List[torch.Tensor]] = None
+
+@dataclass
+class DATCausalLMOutput(CausalLMOutputWithPast):
+    sampling_locs: Optional[List[torch.Tensor]] = None
+
+
 class LlamaAttentionEx(LlamaAttention):
 
     def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
@@ -85,7 +92,7 @@ class LlamaAttentionEx(LlamaAttention):
         hidden_states,
         attention_mask=None, # we assume this attention mask is 4D-padded, no KV-hd added in 
         position_ids=None,
-        past_key_value=None,
+        past_key_values=None,
         output_attentions=False,
         use_cache=False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -115,10 +122,10 @@ class LlamaAttentionEx(LlamaAttention):
             else:
                 cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            if past_key_value is not None:
+            if past_key_values is not None:
                 # sin and cos are specific to RoPE models; cache_position needed for the static cache
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
             key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_groups)
             causal_mask = attention_mask
@@ -157,14 +164,14 @@ class LlamaAttentionEx(LlamaAttention):
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.view(bsz, q_len, -1)
             attn_output = self.o_proj(attn_output)
-            return attn_output, None, past_key_value
+            return attn_output, None, past_key_values, None
             # End of copy
         else:
             # directly pass the args
             return super().forward(
                 hidden_states,
                 attention_mask,
-                past_key_value,
+                past_key_values,
                 cache_position,
                 position_embeddings,
                 **kwargs
@@ -185,13 +192,13 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         self.hr_size = config.dat_extra_args['hr_image_size'] // self.vit_enc_patchsize
         self.hd_proj = config.dat_extra_args['hd_proj']
         self.intention_as_gate = config.dat_extra_args['intention_as_gate']
-
+        # self.max_kv_len = config.dat_extra_args.get('max_kv_len', 4096)
         self.hidden_size = config.hidden_size
         
         # Add missing attributes that should be inherited from LlamaAttention by wzy
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.num_key_value_groups = getattr(config, 'num_key_value_heads', config.num_attention_heads)
+        self.num_key_value_heads = getattr(config, 'num_key_value_heads', config.num_attention_heads)
 
         self.off_dim = self.hidden_size // self.off_grps
         self.conv_lr_dw = nn.Conv2d(
@@ -238,8 +245,8 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 bias=False
             )
         if self.hd_proj:
-            self.k_proj_hd = nn.Linear(self.hidden_size, self.num_key_value_groups * self.head_dim)
-            self.v_proj_hd = nn.Linear(self.hidden_size, self.num_key_value_groups * self.head_dim)
+            self.k_proj_hd = nn.Linear(self.hidden_size, self.hidden_size)
+            self.v_proj_hd = nn.Linear(self.hidden_size, self.hidden_size)
         else:
             self.k_proj_hd = nn.Identity()
             self.v_proj_hd = nn.Identity()
@@ -283,7 +290,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         hidden_states,
         attention_mask=None, # we assume this attention mask is 4D-padded, no KV-hd added in 
         position_ids=None,
-        past_key_value=None,
+        past_key_values=None,
         output_attentions=False,
         use_cache=False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -297,7 +304,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         B, Nq, C = hidden_states.size()
         dtype, device = hidden_states.dtype, hidden_states.device
         assert C == self.off_grps * self.off_dim
-        if use_cache and past_key_value.get_seq_length(self.layer_idx) == 0:
+        if use_cache and past_key_values.get_seq_length(self.layer_idx) == 0:
             # Here we manually add an extra intetion mark to the last token
             for b in range(B):
                 if len(image_range_list[b]) <= 1:
@@ -305,74 +312,29 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             # assert b == B - 1 and B == 1, f"b={b},B={B},rng_list={image_range_list}"
         # 0. Upon inference, if no cache, we run a prefill to cache the corresponding high-resolution features to the question, 
         # and then do a regular inference which is same as the Llama.
-        if use_cache and past_key_value.get_seq_length(self.layer_idx) > 0:
+        if use_cache and past_key_values.get_seq_length(self.layer_idx) > 0:
             # HD features are already processed during prefill, so they are not forwarded here.
             return super().forward(
                 hidden_states,
                 attention_mask,
                 position_ids,
-                past_key_value,
+                past_key_values,
                 output_attentions,
                 use_cache,
                 cache_position,
                 position_embeddings
             )
-
-        if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_groups * self.head_dim) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
-            )
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
-
-            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
-            query_states = torch.cat(query_states, dim=-1)
-
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
-        
-        # If we already packed the keys and values in inference (bs=1, no padding will do its job),
-        # we directly perform a standard attention (vanilla or sdpa) of this token, we do not support prefill with kv caches
-        # kv_seq_len = key_states.shape[-2]
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
-        # add rope to q, k, v
-        query_states = einops.rearrange(query_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        # by wzy
-        key_states = einops.rearrange(key_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_key_value_groups, c=self.head_dim)
-        value_states = einops.rearrange(value_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_key_value_groups, c=self.head_dim) # end
-
-        # Apply RoPE in a [B H N C] manner
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        # This RoPE may need some modifications.
-        # by wzy
-        key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_groups) # end
-        # Convert back to [B N (H C)] format
-        query_states = einops.rearrange(query_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        key_states = einops.rearrange(key_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        value_states = einops.rearrange(value_states, 'b h n c -> b n (h c)', b=B, n=Nq, h=self.num_heads, c=self.head_dim) # end
+        # Encode the hidden states to original q, k, v
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
        
         # We assume that each HD picture has the same spatial dimension, i.e., [L, C, H_hr, W_hr]
         # Convert image_range_list to index tensor
         # A new version for no image cases: for each sample in batch ... (parallel version has to deal with random batch index)
         keys_concat, values_concat, attns_concat = [], [], []
+        sampling_locs = []
+        pos_q_concat = []
         for b_idx in range(B):
             if len(image_range_list[b_idx]) == 0 or image_hd_features is None:
                 keys_concat.append(key_states[b_idx])
@@ -386,9 +348,18 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 '(h w) (g c)  -> g c h w',
                 g=self.off_grps, c=self.off_dim, h=self.lr_size, w=self.lr_size
             )
-            embed_lr = self.conv_lr_proj(self.act(self.ln_1(self.conv_lr_dw(img_lr)))) # g, C_inter, H_lr, W_lr
+            local_embed_lr = self.conv_lr_dw(img_lr)
+            if local_embed_lr.abs().max() < 1e-6:
+                logger.warning("Warning, conv_embed_lr instability causes local_embed_lr to all 0.")
+            normed_local_lr = self.ln_1(local_embed_lr)
+            if normed_local_lr.abs().max() < 1e-6:
+                logger.warning("Warning, ln_1 instability causes normed_local_lr to all 0.")
+            local_embed_lr = self.act(normed_local_lr)
+            if local_embed_lr.abs().max() < 1e-6:
+                logger.warning("Warning, act instability causes local_embed_lr to all 0.")
+            embed_lr = self.conv_lr_proj(local_embed_lr) # g, C_inter, H_lr, W_lr
             if embed_lr.abs().max() < 1e-6:
-                print("Warning, LN instability causes embed_lr to all 0.")
+                logger.warning("Warning, conv_lr_proj instability causes embed_lr to all 0.")
             embed_lr = F.adaptive_avg_pool2d(embed_lr, (self.grid_size, self.grid_size))  # g, C_inter, H_grid, W_grid
             # 2. For each image, we mark the intention token for each question
             intention_index = [answer_range[0] - self.insert_kvhd_offset for answer_range in image_range_list[b_idx][1:]]
@@ -421,13 +392,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 'l g c h w -> (l g) c h w',
                 l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
             )
-            # gated_embed_lr = embed_lr.mul(embed_intention_gate[..., None, None])
-            # l g c h w * l g c -> l g c h w, h, w are broadcasted
-            # off_guide = einops.rearrange(
-            #     gated_embed_lr,
-            #     'l g c h w -> (l g) c h w',
-            #     l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
-            # )
             if self.intention_as_gate:
                 off_guide = embed_lr.mul(embed_intention.sigmoid().mul(2.0))
             else:
@@ -469,38 +433,38 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 key_hd, value_hd = self.k_proj_hd(sampled_hr), self.v_proj_hd(sampled_hr)
             else:
                 key_hd, value_hd = self.k_proj(sampled_hr), self.v_proj(sampled_hr)
-            # each KV_hd has the shape [Lp, Ns, C]
             Ns = self.grid_size * self.grid_size
-            # Apply repeat_kv to expand head dimensions to match key_states and value_states
-            # Reshape key_hd and value_hd to [Lp, num_key_value_groups, Ns, head_dim] for repeat_kv
-            # wzy
-            key_hd = key_hd.view(Lp, self.num_key_value_groups, Ns, self.head_dim)
-            value_hd = value_hd.view(Lp, self.num_key_value_groups, Ns, self.head_dim)
-            # Apply repeat_kv
-            key_hd = repeat_kv(key_hd, self.num_heads // self.num_key_value_groups)
-            value_hd = repeat_kv(value_hd, self.num_heads // self.num_key_value_groups)
-            # Reshape back to [Lp, Ns, num_heads * head_dim]
-            key_hd = key_hd.view(Lp, Ns, self.num_heads * self.head_dim)
-            value_hd = value_hd.view(Lp, Ns, self.num_heads * self.head_dim) # end
-            
             # 8. Let's pack each key_hd and value_hd into the key / value sequences! Let's make the causal / partial causal attention mask!
             # For one image case, the format is [SYS] [IMG_I_LR] [Q1] [IMG_I_HR1] [P1] [A1] [Q2] [IMG_I_HR2] [P2] [A2] ...
             # Q = question, SYS = system prompt, P = small tokens before answer, A = answer tokens
-            # TODO: Maybe we should unpad the tokens then pad them again.
+            sampling_locs.append(sample_locs.reshape(Lp, self.off_grps, self.grid_size, self.grid_size, 2).clone().detach())
+            pos_q = []
             key_b, value_b, attn_b = key_states[b_idx], value_states[b_idx], attention_mask[b_idx]
             k_split, v_split, attn_split = [], [], []
             # We split the original kv, attn; then add the hd parts into them
-            insert_counter = 0
+            insert_counter, pos_counter, next_pos_counter = 0, 0, 0
             for l_idx, (this_answer_start, this_answer_end) in enumerate(image_range_list[b_idx][1:]):
                 cur_intention_idx = this_answer_start - self.insert_kvhd_offset
                 if this_answer_end > 0:
                     # Training mode, we split the input embeddings into three parts: before insert point, KV-hd, and after insert point
+                    # Part 1: before insert point
                     k_split.append(key_b[insert_counter:cur_intention_idx + 1])
                     v_split.append(value_b[insert_counter:cur_intention_idx + 1])
+                    next_pos_counter = pos_counter + k_split[-1].size(0)
+                    pos_q.append(torch.arange(pos_counter, next_pos_counter, device=device, dtype=torch.int64))
+                    pos_counter = next_pos_counter
+                    # Part 2: KV-hd
                     k_split.append(key_hd[l_idx])
                     v_split.append(value_hd[l_idx])
+                    next_pos_counter = pos_counter + k_split[-1].size(0)
+                    pos_counter = next_pos_counter
+                    # Part 3: after insert point
                     k_split.append(key_b[cur_intention_idx + 1:this_answer_end + 1])
                     v_split.append(value_b[cur_intention_idx + 1:this_answer_end + 1])
+                    next_pos_counter = pos_counter + k_split[-1].size(0)
+                    pos_q.append(torch.arange(pos_counter, next_pos_counter, device=device, dtype=torch.int64))
+                    pos_counter = next_pos_counter
+                    # Part 4: attention mask
                     # before insert point, no attention; after insert point, full attention, but before next question starts
                     attn_split.append(attn_b[:,:,insert_counter:cur_intention_idx + 1]) # [head, Nq, last_end to current insert point (inclusive)]
                     add_hd_attn_mask = torch.cat([
@@ -513,12 +477,24 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                     insert_counter = this_answer_end + 1 # From the last answer end point to the next answer start point
                 else:
                     # Inference mode, no answer end actually, we pack the input embeddings with hd features
+                    # Part 1: before insert point
                     k_split.append(key_b[insert_counter:cur_intention_idx + 1])
                     v_split.append(value_b[insert_counter:cur_intention_idx + 1])
+                    next_pos_counter = pos_counter + k_split[-1].size(0)
+                    pos_q.append(torch.arange(pos_counter, next_pos_counter, device=device, dtype=torch.int64))
+                    pos_counter = next_pos_counter
+                    # Part 2: KV-hd
                     k_split.append(key_hd[l_idx])
                     v_split.append(value_hd[l_idx])
+                    next_pos_counter = pos_counter + k_split[-1].size(0)
+                    pos_counter = next_pos_counter
+                    # Part 3: after insert point
                     k_split.append(key_b[cur_intention_idx + 1:this_answer_start])
                     v_split.append(value_b[cur_intention_idx + 1:this_answer_start])
+                    next_pos_counter = pos_counter + k_split[-1].size(0)
+                    pos_q.append(torch.arange(pos_counter, next_pos_counter, device=device, dtype=torch.int64))
+                    pos_counter = next_pos_counter
+                    # Part 4: 
                     attn_split.append(attn_b[:,:,insert_counter:cur_intention_idx + 1]) # [head, Nq, last_end to current insert point (inclusive)]
                     add_hd_attn_mask = torch.cat([
                         torch.zeros(1, cur_intention_idx + 1, Ns, device=device, dtype=attn_b.dtype), # Before the insert point, no tokens can see the hd features to avoid leakage
@@ -538,6 +514,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 keys_concat.append(torch.cat(k_split, dim=0))
                 values_concat.append(torch.cat(v_split, dim=0))
                 attns_concat.append(torch.cat(attn_split, dim=2).permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
+                pos_q_concat.append(torch.cat(pos_q, dim=0))
         # When no inputs are forwarded by offset_gen modules, or there are no questions
         # We pad each key, value, attn_mask with different lengths
         key_states_plus_hd = nn.utils.rnn.pad_sequence(keys_concat, batch_first=True, padding_value=0) # [B L_padded C]
@@ -546,18 +523,38 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         attn_mask_4d = attn_concat.permute(0, 2, 3, 1).contiguous() # [B h N L_padded]
         # 9. Last step: compute vanilla attention or F.sdpa get output and done
         kv_len = key_states_plus_hd.size(1)
+        # if kv_len > self.max_kv_len:
+        #     logger.warning(f"Warning, kv_len {kv_len} is greater than max_kv_len {self.max_kv_len}, truncating to {self.max_kv_len}")
+        #     kv_len = self.max_kv_len
+        #     key_states_plus_hd = key_states_plus_hd[:, :self.max_kv_len, :]
+        #     value_states_plus_hd = value_states_plus_hd[:, :self.max_kv_len, :]
+        #     attn_mask_4d = attn_mask_4d[:, :, :, :self.max_kv_len]
+        #     kv_len = self.max_kv_len
+            
         query_bhnc = einops.rearrange(query_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        # key_bhnc = einops.rearrange(key_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_key_value_groups, c=self.head_dim)
-        # by wzy
         key_bhnc = einops.rearrange(key_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
-        value_bhnc = einops.rearrange(value_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim) # end
+        value_bhnc = einops.rearrange(value_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
+
+        if Nq < kv_len:
+            kv_position_ids = torch.arange(kv_len, device=device, dtype=torch.int64)[None, :]
+            cos, sin = self.rotary_emb(value_bhnc, kv_position_ids)
+            position_ids_q = nn.utils.rnn.pad_sequence(pos_q_concat, batch_first=True, padding_value=0)
+            position_ids_q_index = position_ids_q[..., None].expand(-1, -1, self.head_dim)
+            cos_q = cos.expand(B, -1, -1).gather(1, position_ids_q_index)
+            sin_q = sin.expand(B, -1, -1).gather(1, position_ids_q_index)
+            query_bhnc = (query_bhnc * cos_q[:, None, ...]) + (rotate_half(query_bhnc) * sin_q[:, None, ...])
+            key_bhnc = (key_bhnc * cos[:, None, ...]) + (rotate_half(key_bhnc) * sin[:, None, ...])
+        else:
+            assert Nq == kv_len, "Nq should be the same as kv_len"
+            cos, sin = self.rotary_emb(value_states_plus_hd, position_ids)
+            query_bhnc, key_bhnc = apply_rotary_pos_emb(query_bhnc, key_bhnc, cos, sin)
+
         # 10. Store bhnc version of K,V in the prefill of inference
-        if past_key_value is not None:
+        if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_bhnc, value_bhnc = past_key_value.update(key_bhnc, value_bhnc, self.layer_idx, cache_kwargs)
+            key_bhnc, value_bhnc = past_key_values.update(key_bhnc, value_bhnc, self.layer_idx, cache_kwargs)
         if self.use_sdpa:
-            # print(f"LAYER {self.layer_idx}, use_sdpa: {self.use_sdpa}, query_bhnc: {query_bhnc.shape}, key_bhnc: {key_bhnc.shape}, value_bhnc: {value_bhnc.shape}, attn_mask_4d: {attn_mask_4d.shape}")
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                 attn_out = F.scaled_dot_product_attention(
                     query_bhnc, key_bhnc, value_bhnc, attn_mask_4d,
@@ -571,17 +568,11 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             attn_out = torch.einsum('b h q k, b h k c -> b h q c', attn_weights, value_bhnc)
         attn_output = einops.rearrange(attn_out, 'b h n c -> b n (h c)', b=B, h=self.num_heads, n=Nq, c=self.head_dim)
         # Output projection
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
-        else:
-            attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output)            
 
         if not output_attentions:
             attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_values, sampling_locs
 
 ATTN_TYPE_MAPPING = {
     'L': LlamaAttentionEx,
@@ -615,7 +606,7 @@ class LlamaDecoderLayerDAT(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -630,11 +621,11 @@ class LlamaDecoderLayerDAT(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         # assert image_range_list is not None
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value, sampling_locs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
             image_hd_features=image_hd_features,
@@ -656,6 +647,8 @@ class LlamaDecoderLayerDAT(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+
+        outputs += (sampling_locs,)
 
         return outputs
 
@@ -820,7 +813,7 @@ class LlamaDATModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for index, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -843,7 +836,7 @@ class LlamaDATModel(LlamaPreTrainedModel):
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
-                    past_key_value=past_key_values,
+                    past_key_values=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -853,6 +846,7 @@ class LlamaDATModel(LlamaPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+            sampling_locs = layer_outputs[-1]
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -872,11 +866,12 @@ class LlamaDATModel(LlamaPreTrainedModel):
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-        return BaseModelOutputWithPast(
+        return DATModelOutput(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            sampling_locs=sampling_locs,
         )
 
 class LlamaDATForCausalLM(LlamaPreTrainedModel):
@@ -982,12 +977,13 @@ class LlamaDATForCausalLM(LlamaPreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
         
-        return CausalLMOutputWithPast(
+        return DATCausalLMOutput(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            sampling_locs=outputs.sampling_locs,
         )
 
     def prepare_inputs_for_generation(

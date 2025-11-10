@@ -14,11 +14,9 @@
 
 
 from typing import List, Optional, Tuple, Union
-from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from transformers.models.auto import AutoConfig, AutoModelForCausalLM
 from transformers.models.llama import LlamaConfig

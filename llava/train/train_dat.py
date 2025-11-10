@@ -23,7 +23,6 @@ import pathlib
 from typing import Dict, Optional, Sequence, List
 
 import torch
-from torch.nn.init import kaiming_normal_
 
 import transformers
 import tokenizers
@@ -67,6 +66,7 @@ class ModelDATExtraArguments:
     layers: Optional[List[str]] = field(default_factory=lambda: ['D'] * 32)
     use_sdpa: Optional[bool] = field(default=False)
     intention_as_gate: Optional[bool] = field(default=False)
+    max_kv_len: Optional[int] = field(default=4096)
 
 @dataclass
 class ModelArguments:
@@ -92,7 +92,6 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
-    # group_by_modality_length: bool = field(default=False) # wzy
 
 
 @dataclass
@@ -435,27 +434,25 @@ def preprocess_llama_2(
 def preprocess_v1(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-
     # Apply prompt templates
     conversations = []
     for i, source in enumerate(sources):
         if roles[source[0]["from"]] != conv.roles[0]:
             # Skip the first one if it is not from human
             source = source[1:]
-
+        n_round = 0
         conv.messages = []
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
             assert role == conv.roles[j % 2], f"{i}"
             conv.append_message(role, sentence["value"])
+            n_round += 1
         conversations.append(conv.get_prompt())
-
     # Tokenize conversations
-
     if has_image:
         input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     else:
@@ -541,7 +538,7 @@ def preprocess_plain(
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -555,7 +552,7 @@ def preprocess(
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
-        return preprocess_v1(sources, tokenizer, has_image=has_image)
+        return preprocess_v1(sources, tokenizer, has_image=has_image,)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -657,7 +654,8 @@ class LazySupervisedDataset(Dataset):
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in self.list_data_dict[i]),
+            )
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])

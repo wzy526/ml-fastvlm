@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-
 export TRANSFORMERS_OFFLINE=1
 export DS_SKIP_CUDA_CHECK=1
 source /home/coder/miniforge3/bin/activate fastvlm
 CKPT_ROOT=/mnt/ephemeral/exps/
-EXP_NAME="tdat-llava1_5-7b-all_d-s16g8z3-hdproj-ep1-debug"
+EXP_NAME="txx-ep1-debug"
 mkdir -p $CKPT_ROOT/$EXP_NAME
 
 ds llava/train/train_dat.py \
     --deepspeed ./scripts/zero_configs/zero2.json \
     --model_name_or_path /home/coder/work/llava-v1.5-7b \
     --version v1 \
-    --extra_yaml_path ./configs/llava1_5_v5.yaml \
+    --extra_yaml_path ./configs/llava1_5_v9.yaml \
     --data_path  /home/coder/work/llava-665k/llava_v1_5_mix665k.json \
     --image_folder /home/coder/work/llava-665k/train_split \
     --vision_tower /home/coder/work/clip-vit-large-patch14-336 \
@@ -39,12 +38,12 @@ ds llava/train/train_dat.py \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --model_max_length 4096 \
-    --gradient_checkpointing True \
-    --dataloader_prefetch_factor 3 \
+    --gradient_checkpointing False \
     --dataloader_num_workers 4 \
-    --dataloader_pin_memory True \
-    --dataloader_persistent_workers True \
+    --dataloader_prefetch_factor 3 \
     --dataloader_drop_last True \
+    --dataloader_persistent_workers True \
+    --dataloader_pin_memory True \
     --lazy_preprocess True \
     --seed 42 \
     --report_to "none" 
