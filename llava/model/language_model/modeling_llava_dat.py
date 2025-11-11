@@ -196,6 +196,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         self.hr_size = config.dat_extra_args['hr_image_size'] // self.vit_enc_patchsize
         self.hd_proj = config.dat_extra_args['hd_proj']
         self.intention_as_gate = config.dat_extra_args['intention_as_gate']
+        self.use_intention_branch = config.dat_extra_args['use_intention_branch']
         self.hidden_size = config.hidden_size
         
         # Add missing attributes that should be inherited from LlamaAttention by wzy
