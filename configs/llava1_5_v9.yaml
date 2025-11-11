@@ -14,4 +14,3 @@ layers: [
   'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
 ]
 intention_as_gate: True
-max_kv_len: 4096

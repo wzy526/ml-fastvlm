@@ -3,7 +3,7 @@
 source /home/coder/miniforge3/bin/activate fastvlm
 
 CKPT_ROOT=/mnt/ephemeral/exps/
-EXP_NAME="tdat-llava1_5-7b-7l1d-s12g8z3-cat-hdproj-ep1"
+EXP_NAME="tdat-llava1_5-7b-V3"
 export WANDB_PROJECT="MMDAT-2025"
 mkdir -p $CKPT_ROOT/$EXP_NAME
 
@@ -24,7 +24,6 @@ ds llava/train/train_dat.py \
     --bf16 True \
     --tf32 True \
     --max_grad_norm 10 \
-    --ddp_find_unused_parameters False \
     --output_dir $CKPT_ROOT/$EXP_NAME \
     --num_train_epochs 1 \
     --per_device_train_batch_size 4 \
@@ -33,9 +32,9 @@ ds llava/train/train_dat.py \
     --eval_strategy "no" \
     --save_strategy "steps" \
     --save_steps 2000 \
-    --learning_rate 2e-5 \
+    --learning_rate 1e-5 \
     --weight_decay 0. \
-    --warmup_ratio 0.01 \
+    --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --model_max_length 4096 \

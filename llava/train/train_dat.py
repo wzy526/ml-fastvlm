@@ -66,7 +66,7 @@ class ModelDATExtraArguments:
     layers: Optional[List[str]] = field(default_factory=lambda: ['D'] * 32)
     use_sdpa: Optional[bool] = field(default=False)
     intention_as_gate: Optional[bool] = field(default=False)
-    max_kv_len: Optional[int] = field(default=4096)
+    use_intention_branch: Optional[bool] = field(default=True)
 
 @dataclass
 class ModelArguments:

@@ -196,7 +196,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         self.hr_size = config.dat_extra_args['hr_image_size'] // self.vit_enc_patchsize
         self.hd_proj = config.dat_extra_args['hd_proj']
         self.intention_as_gate = config.dat_extra_args['intention_as_gate']
-        # self.max_kv_len = config.dat_extra_args.get('max_kv_len', 4096)
         self.hidden_size = config.hidden_size
         
         # Add missing attributes that should be inherited from LlamaAttention by wzy
@@ -224,10 +223,13 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             padding=0,
             bias=False
         )
-        self.proj_intention = nn.Linear(
-            in_features=self.off_dim,
-            out_features=self.inter_size
-        )
+        if self.use_intention_branch:
+            self.proj_intention = nn.Linear(
+                in_features=self.off_dim,
+                out_features=self.inter_size
+            )
+        else:
+            self.proj_intention = nn.Identity()
         if self.intention_as_gate:
             self.ln_2 = LayerNorm2d(self.inter_size, eps=1e-5)
             self.conv_off_proj = nn.Conv2d(
@@ -367,26 +369,27 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 logger.warning("Warning, conv_lr_proj instability causes embed_lr to all 0.")
             embed_lr = F.adaptive_avg_pool2d(embed_lr, (self.grid_size, self.grid_size))  # g, C_inter, H_grid, W_grid
             # 2. For each image, we mark the intention token for each question
-            intention_index = [answer_range[0] - self.insert_kvhd_offset for answer_range in image_range_list[b_idx][1:]]
-            Lp = len(intention_index)
-            intention_tokens = query_states[b_idx, intention_index]
-            intention_tokens_per_off_group = einops.rearrange(
-                intention_tokens,
-                'l (g c) -> l g c',
-                l=Lp, g=self.off_grps, c=self.off_dim
-            )
-            embed_intention = self.proj_intention(intention_tokens_per_off_group) # Lp, group, C_off -> C_inter
-            # 3. We combine them to guide offset generation as per channel gate
-            embed_intention = einops.repeat(
-                embed_intention,
-                'l g c -> l g c h w',
-                l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
-            )
-            embed_intention = einops.rearrange(
-                embed_intention,
-                'l g c h w -> (l g) c h w',
-                l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
-            )
+            if self.use_intention_branch:
+                intention_index = [answer_range[0] - self.insert_kvhd_offset for answer_range in image_range_list[b_idx][1:]]
+                Lp = len(intention_index)
+                intention_tokens = query_states[b_idx, intention_index]
+                intention_tokens_per_off_group = einops.rearrange(
+                    intention_tokens,
+                    'l (g c) -> l g c',
+                    l=Lp, g=self.off_grps, c=self.off_dim
+                )
+                embed_intention = self.proj_intention(intention_tokens_per_off_group) # Lp, group, C_off -> C_inter
+                # 3. We combine them to guide offset generation as per channel gate
+                embed_intention = einops.repeat(
+                    embed_intention,
+                    'l g c -> l g c h w',
+                    l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
+                )
+                embed_intention = einops.rearrange(
+                    embed_intention,
+                    'l g c h w -> (l g) c h w',
+                    l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
+                )
             embed_lr = einops.repeat(
                 embed_lr,
                 'g c h w -> l g c h w',
@@ -397,10 +400,13 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 'l g c h w -> (l g) c h w',
                 l=Lp, c=self.inter_size, g=self.off_grps, h=self.grid_size, w=self.grid_size
             )
-            if self.intention_as_gate:
-                off_guide = embed_lr.mul(embed_intention.sigmoid().mul(2.0))
+            if self.use_intention_branch:
+                if self.intention_as_gate:
+                    off_guide = embed_lr.mul(embed_intention.sigmoid().mul(2.0)) # Lp * g, C_inter, Hg, Wg
+                else:
+                    off_guide = torch.cat([embed_lr, embed_intention], dim=1) # Lp * g, 2C_inter, Hg, Wg
             else:
-                off_guide = torch.cat([embed_lr, embed_intention], dim=1) # Lp * g, 2C_inter, Hg, Wg
+                off_guide = embed_lr # Lp * g, C_inter, Hg, Wg
             # 4. We predict offsets
             offsets = self.conv_off_proj(self.act(self.ln_2(off_guide))) # Lp * g, 2, Hg, Wg
             # 5. We generate a grid then add offsets to them
@@ -528,13 +534,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         attn_mask_4d = attn_concat.permute(0, 2, 3, 1).contiguous() # [B h N L_padded]
         # 9. Last step: compute vanilla attention or F.sdpa get output and done
         kv_len = key_states_plus_hd.size(1)
-        # if kv_len > self.max_kv_len:
-        #     logger.warning(f"Warning, kv_len {kv_len} is greater than max_kv_len {self.max_kv_len}, truncating to {self.max_kv_len}")
-        #     kv_len = self.max_kv_len
-        #     key_states_plus_hd = key_states_plus_hd[:, :self.max_kv_len, :]
-        #     value_states_plus_hd = value_states_plus_hd[:, :self.max_kv_len, :]
-        #     attn_mask_4d = attn_mask_4d[:, :, :, :self.max_kv_len]
-        #     kv_len = self.max_kv_len
         query_bhnc = einops.rearrange(query_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
         key_bhnc = einops.rearrange(key_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
         value_bhnc = einops.rearrange(value_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
