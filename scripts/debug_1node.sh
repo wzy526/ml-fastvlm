@@ -32,13 +32,13 @@ ds llava/train/train_dat.py \
     --eval_strategy "no" \
     --save_strategy "steps" \
     --save_steps 2000 \
-    --learning_rate 2e-5 \
+    --learning_rate 1e-5 \
     --weight_decay 0. \
-    --warmup_ratio 0.01 \
+    --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --model_max_length 4096 \
-    --gradient_checkpointing False \
+    --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --dataloader_prefetch_factor 3 \
     --dataloader_drop_last True \

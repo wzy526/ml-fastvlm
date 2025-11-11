@@ -542,8 +542,9 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             position_ids_q_index = position_ids_q[..., None].expand(-1, -1, self.head_dim)
             cos_q = cos.expand(B, -1, -1).gather(1, position_ids_q_index)
             sin_q = sin.expand(B, -1, -1).gather(1, position_ids_q_index)
-            query_bhnc = (query_bhnc * cos_q[:, None, ...]) + (rotate_half(query_bhnc) * sin_q[:, None, ...])
-            key_bhnc = (key_bhnc * cos[:, None, ...]) + (rotate_half(key_bhnc) * sin[:, None, ...])
+            query_bhnc = query_bhnc * cos_q[:, None, :, :] + rotate_half(query_bhnc) * sin_q[:, None, :, :]
+            key_bhnc = key_bhnc * cos[:, None, :, :] + rotate_half(key_bhnc) * sin[:, None, :, :]
+            torch.cuda.empty_cache()
         else:
             assert Nq == kv_len, "Nq should be the same as kv_len"
             cos, sin = self.rotary_emb(value_states_plus_hd, position_ids)
@@ -817,7 +818,7 @@ class LlamaDATModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training and (index + 1) % 4 == 0:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
