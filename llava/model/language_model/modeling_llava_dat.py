@@ -111,6 +111,9 @@ class LlamaAttentionEx(LlamaAttention):
             query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = key_states.view(bsz, q_len, self.num_key_value_groups, self.head_dim).transpose(1, 2)
             value_states = value_states.view(bsz, q_len, self.num_key_value_groups, self.head_dim).transpose(1, 2)
+            if past_key_values is not None and past_key_values.get_seq_length(self.layer_idx) > 0 and image_range_list is not None:
+                current_key_length = past_key_values.get_seq_length(self.layer_idx)
+                position_ids[0, 0].fill_(current_key_length)
             if position_embeddings is None:
                 logger.warning_once(
                     "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
@@ -122,6 +125,7 @@ class LlamaAttentionEx(LlamaAttention):
             else:
                 cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            
             if past_key_values is not None:
                 # sin and cos are specific to RoPE models; cache_position needed for the static cache
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -322,7 +326,8 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 output_attentions,
                 use_cache,
                 cache_position,
-                position_embeddings
+                position_embeddings,
+                image_range_list=[[0, Nq]]
             )
         # Encode the hidden states to original q, k, v
         query_states = self.q_proj(hidden_states)
@@ -530,7 +535,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         #     value_states_plus_hd = value_states_plus_hd[:, :self.max_kv_len, :]
         #     attn_mask_4d = attn_mask_4d[:, :, :, :self.max_kv_len]
         #     kv_len = self.max_kv_len
-            
         query_bhnc = einops.rearrange(query_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
         key_bhnc = einops.rearrange(key_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
         value_bhnc = einops.rearrange(value_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
@@ -818,7 +822,7 @@ class LlamaDATModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training and (index + 1) % 4 == 0:
+            if self.gradient_checkpointing and self.training and (index + 1) % 2 == 0:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,

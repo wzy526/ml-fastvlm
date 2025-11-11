@@ -450,11 +450,16 @@ def preprocess_v1(
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
             assert role == conv.roles[j % 2], f"{i}"
+            if role == conv.roles[1]:
+                # 检查作答者的回答是否以标点符号结尾，如果不是则添加句点
+                value = sentence["value"].rstrip()
+                if value and not value[-1] in '.!?。！？':
+                    sentence["value"] = value + '.'
+                else:
+                    sentence["value"] = value
             conv.append_message(role, sentence["value"])
-            # if j >= max_rounds * 2:
-            #     break
+            
         conversations.append(conv.get_prompt())
-    # breakpoint()
     # Tokenize conversations
     if has_image:
         input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
@@ -511,6 +516,7 @@ def preprocess_v1(
                     f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
                     f" (ignored)"
                 )
+
     return dict(
         input_ids=input_ids,
         labels=targets,
@@ -821,12 +827,17 @@ def train(attn_implementation=None):
     elif model_args.version == "v0.5":
         tokenizer.pad_token = tokenizer.unk_token
     else:
-        tokenizer.pad_token = tokenizer.unk_token
+        # tokenizer.pad_token = tokenizer.unk_token
+        # if tokenizer.pad_token == tokenizer.unk_token:
+        #     rank0_print("WARNING: Tokenizer pad_token == unk_token. We need a new pad_token...")
+        #     tokenizer.pad_token = None
+        #     tokenizer.pad_token_id = None
+        #     smart_tokenizer_and_embedding_resize(special_tokens_dict=dict(pad_token="[PAD]"), tokenizer=tokenizer, model=model)
+        #     model.config.pad_token_id = tokenizer.pad_token_id
         if model_args.version in conversation_lib.conv_templates:
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
-
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
             model_args=model_args,

@@ -3,7 +3,7 @@ export TRANSFORMERS_OFFLINE=1
 export DS_SKIP_CUDA_CHECK=1
 source /home/coder/miniforge3/bin/activate fastvlm
 CKPT_ROOT=/mnt/ephemeral/exps/
-EXP_NAME="txx-ep1-debug"
+EXP_NAME="txx-ep1-debug2"
 mkdir -p $CKPT_ROOT/$EXP_NAME
 
 ds llava/train/train_dat.py \
@@ -31,7 +31,7 @@ ds llava/train/train_dat.py \
     --gradient_accumulation_steps 1 \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 2000 \
+    --save_steps 1000 \
     --learning_rate 1e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
@@ -40,10 +40,11 @@ ds llava/train/train_dat.py \
     --model_max_length 4096 \
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
-    --dataloader_prefetch_factor 3 \
     --dataloader_drop_last True \
-    --dataloader_persistent_workers True \
     --dataloader_pin_memory True \
+    --dataloader_prefetch_factor 3 \
+    --dataloader_persistent_workers True \
     --lazy_preprocess True \
     --seed 42 \
-    --report_to "none" 
+    --report_to "none" \
+    --resume_from_checkpoint True
