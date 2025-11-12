@@ -348,6 +348,8 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 keys_concat.append(key_states[b_idx])
                 values_concat.append(value_states[b_idx])
                 attns_concat.append(attention_mask[b_idx].permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
+                # Ensure pos_q_concat has an entry for every batch element to keep batch dims aligned
+                pos_q_concat.append(torch.arange(Nq, device=device, dtype=torch.int64))
                 continue
             # 1. We take the low-res image query features out.
             image_range_index = torch.arange(image_range_list[b_idx][0][0], image_range_list[b_idx][0][1], device=device, dtype=torch.int64)
@@ -522,6 +524,8 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 keys_concat.append(key_b)
                 values_concat.append(value_b)
                 attns_concat.append(attn_b.permute(2, 0, 1).contiguous()) # head, Nq, Nkv -> Nkv, head, Nq
+                # No HD insertion for this sample; use identity mapping for query positions
+                pos_q_concat.append(torch.arange(key_b.size(0), device=device, dtype=torch.int64))
             else:
                 keys_concat.append(torch.cat(k_split, dim=0))
                 values_concat.append(torch.cat(v_split, dim=0))
@@ -546,8 +550,21 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             position_ids_q_index = position_ids_q[..., None].expand(-1, -1, self.head_dim)
             cos_q = cos.expand(B, -1, -1).gather(1, position_ids_q_index)
             sin_q = sin.expand(B, -1, -1).gather(1, position_ids_q_index)
-            query_bhnc = query_bhnc * cos_q[:, None, :, :] + rotate_half(query_bhnc) * sin_q[:, None, :, :]
-            key_bhnc = key_bhnc * cos[:, None, :, :] + rotate_half(key_bhnc) * sin[:, None, :, :]
+            try:
+                query_bhnc = query_bhnc * cos_q[:, None, :, :] + rotate_half(query_bhnc) * sin_q[:, None, :, :]
+                key_bhnc = key_bhnc * cos[:, None, :, :] + rotate_half(key_bhnc) * sin[:, None, :, :]
+            except Exception as e:
+                logger.error(f"Error in applying rotary embeddings: {e}")
+                logger.error(f"query_bhnc shape: {query_bhnc.shape}")
+                logger.error(f"key_bhnc shape: {key_bhnc.shape}")
+                logger.error(f"cos_q shape: {cos_q.shape}")
+                logger.error(f"sin_q shape: {sin_q.shape}")
+                logger.error(f"cos shape: {cos.shape}")
+                logger.error(f"sin shape: {sin.shape}")
+                logger.error(f"position_ids_q_index shape: {position_ids_q_index.shape}")
+                logger.error(f"position_ids_q max: {position_ids_q.max()}, min: {position_ids_q.min()}")
+                logger.error(f"We died here.")
+                raise e
             torch.cuda.empty_cache()
         else:
             assert Nq == kv_len, "Nq should be the same as kv_len"
