@@ -11,24 +11,31 @@ from timm.layers import LayerNorm2d
 from transformers.activations import get_activation
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.utils import logging, is_torchdynamo_compiling
-from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.models.llama.modeling_llama import (
-    LlamaAttention, LlamaMLP, LlamaRMSNorm, LlamaRotaryEmbedding,
-    LlamaPreTrainedModel, repeat_kv, apply_rotary_pos_emb,
+from transformers.models.qwen2.modeling_qwen2 import (
+    Qwen2Attention, Qwen2MLP, Qwen2RMSNorm, Qwen2RotaryEmbedding,
+    Qwen2PreTrainedModel, repeat_kv, apply_rotary_pos_emb,
     AttentionMaskConverter, rotate_half
 )
 
 logger = logging.get_logger(__name__)
 
-# Import mRoPE utilities
+try:
+    from transformers.models.qwen2.modeling_qwen2 import ROPE_INIT_FUNCTIONS
+    if 'mrope' not in ROPE_INIT_FUNCTIONS:
+        ROPE_INIT_FUNCTIONS['mrope'] = ROPE_INIT_FUNCTIONS['default']
+        logger.info("Registered 'mrope' support for transformers")
+except Exception as e:
+    logger.warning(f"Could not register mrope: {e}")
+
 try:
     from .mrope_utils import generate_3d_positions_for_dat
     MROPE_AVAILABLE = True
 except ImportError:
     MROPE_AVAILABLE = False
-    logger.warning("mRoPE utils not available, falling back to 1D RoPE") 
+    logger.warning("mrope_utils not available, mRoPE will be disabled") 
 
 def str2bool(v):
     return v.lower() in ('true', '1')
@@ -77,19 +84,20 @@ class DATCausalLMOutput(CausalLMOutputWithPast):
     sampling_locs: Optional[List[torch.Tensor]] = None
 
 
-class LlamaAttentionEx(LlamaAttention):
+class Qwen2AttentionEx(Qwen2Attention):
 
-    def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
+    def __init__(self, config: Qwen2Config, layer_idx: int | None = None):
         super().__init__(config, layer_idx)
         self.use_sdpa = config.dat_extra_args['use_sdpa']
 
-        # Add missing attributes that should be inherited from LlamaAttention by wzy
+        # Add missing attributes that should be inherited from Qwen2Attention by wzy
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = getattr(config, 'num_key_value_heads', config.num_attention_heads)
-        # rotary_emb fix by wzy
-        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        
+        if not hasattr(self, 'rotary_emb'):
+            from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+            self.rotary_emb = Qwen2RotaryEmbedding(config=config) 
 
     @torch.no_grad()
     def init_conv_weights(self):
@@ -111,7 +119,7 @@ class LlamaAttentionEx(LlamaAttention):
         **kwargs
     ):
         if self.use_sdpa:
-            # Copy from LlamaSdpaAttention
+            # Copy from Qwen2SdpaAttention
             bsz, q_len, _ = hidden_states.size()
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
@@ -189,7 +197,7 @@ class LlamaAttentionEx(LlamaAttention):
                 **kwargs
             )
     
-class LlamaAttentionDAT(LlamaAttentionEx):
+class Qwen2AttentionDAT(Qwen2AttentionEx):
 
     def __init__(self, config, layer_idx):
         super().__init__(config=config, layer_idx=layer_idx)
@@ -208,11 +216,14 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         self.hidden_size = config.hidden_size
         
         # mRoPE support
+        self.config = config  # 保存 config 引用以访问 rope_scaling 和 mrope_section
         self.use_mrope = config.dat_extra_args.get('use_mrope', False) and MROPE_AVAILABLE
         if self.use_mrope:
-            logger.info(f"Layer {layer_idx}: Using mRoPE (3D position encoding)")
+            rope_scaling = getattr(config, 'rope_scaling', None)
+            mrope_section = rope_scaling.get('mrope_section') if rope_scaling else None
+            logger.info(f"Layer {layer_idx}: Using mRoPE (3D position encoding), mrope_section={mrope_section}")
         
-        # Add missing attributes that should be inherited from LlamaAttention by wzy
+        # Add missing attributes that should be inherited from Qwen2Attention by wzy
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_heads = getattr(config, 'num_key_value_heads', config.num_attention_heads)
@@ -265,15 +276,14 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 bias=False
             )
         if self.hd_proj:
-            self.k_proj_hd = nn.Linear(self.hidden_size, self.hidden_size)
-            self.v_proj_hd = nn.Linear(self.hidden_size, self.hidden_size)
+            # GQA: k_proj and v_proj output dimension should be num_key_value_heads * head_dim, not hidden_size
+            kv_dim = self.num_key_value_heads * self.head_dim
+            self.k_proj_hd = nn.Linear(self.hidden_size, kv_dim)
+            self.v_proj_hd = nn.Linear(self.hidden_size, kv_dim)
         else:
             self.k_proj_hd = nn.Identity()
             self.v_proj_hd = nn.Identity()
         
-        # rotary_emb fix by wzy
-        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.insert_kvhd_offset = 6
 
         self.init_conv_weights() # Explicitly initialize the weights of the conv layers, no zero!
@@ -284,6 +294,131 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         nn.init.kaiming_normal_(self.conv_lr_dw.weight, mode='fan_in', nonlinearity='linear')
         nn.init.kaiming_normal_(self.conv_lr_proj.weight)
         nn.init.kaiming_normal_(self.conv_off_proj.weight)
+    
+    def _apply_mrope(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor,
+        position_ids_q_3d: torch.Tensor,        position_ids_kv_3d: torch.Tensor
+    ):
+        """
+        应用 mRoPE (3D rotary position embedding) - 对齐 Qwen2-VL 实现
+        
+        Qwen2-VL 的 mRoPE 规则：
+        - head_dim = 128，但只有前 64 维用于 RoPE
+        - mrope_section = [16, 24, 24] 定义 (temporal, height, width) 的维度分配
+        - 后 64 维保持不变（不做旋转）
+        
+        Args:
+            query: [B, H, Nq, D]
+            key: [B, H_kv, Nkv, D]
+            position_ids_q_3d: [B, Nq, 3] - Query 的 3D 位置
+            position_ids_kv_3d: [B, Nkv, 3] - KV 的 3D 位置
+        
+        Returns:
+            (query_rotated, key_rotated)
+        """
+        B, H, Nq, D = query.shape
+        H_kv, Nkv = key.shape[1], key.shape[2]
+        
+        # 获取 mrope_section 配置
+        rope_scaling = getattr(self.config, 'rope_scaling', None)
+        if rope_scaling and rope_scaling.get('type') == 'mrope':
+            mrope_section = rope_scaling.get('mrope_section', None)
+            if mrope_section:
+                # 使用 Qwen2-VL 的配置
+                dim_t, dim_h, dim_w = mrope_section
+                total_rope_dim = dim_t + dim_h + dim_w
+                
+                if total_rope_dim > D:
+                    logger.warning(f"mrope_section 总和 {total_rope_dim} > head_dim {D}，使用 1D RoPE fallback")
+                    pos_1d_q = position_ids_q_3d[:, :, 2]
+                    pos_1d_kv = position_ids_kv_3d[:, :, 2]
+                    cos_q, sin_q = self.rotary_emb(query, pos_1d_q)
+                    cos_kv, sin_kv = self.rotary_emb(key, pos_1d_kv)
+                    query_rot = query * cos_q[:, None, :, :] + rotate_half(query) * sin_q[:, None, :, :]
+                    key_rot = key * cos_kv[:, None, :, :] + rotate_half(key) * sin_kv[:, None, :, :]
+                    return query_rot, key_rot
+                
+                # 按照 mrope_section 分割维度
+                query_parts = [
+                    query[:, :, :, :dim_t],                      # temporal
+                    query[:, :, :, dim_t:dim_t+dim_h],           # height
+                    query[:, :, :, dim_t+dim_h:total_rope_dim],  # width
+                    query[:, :, :, total_rope_dim:]              # 不旋转的部分
+                ]
+                
+                key_parts = [
+                    key[:, :, :, :dim_t],
+                    key[:, :, :, dim_t:dim_t+dim_h],
+                    key[:, :, :, dim_t+dim_h:total_rope_dim],
+                    key[:, :, :, total_rope_dim:]
+                ]
+                
+                query_rot_list = []
+                key_rot_list = []
+                
+                # 对前 3 个部分（temporal, height, width）应用旋转
+                for axis_idx in range(3):
+                    # 获取当前部分的维度
+                    # cos_q, sin_q = self.rotary_emb(query_parts[axis_idx], position_ids_q_3d[:, :, axis_idx])
+                    # cos_kv, sin_kv = self.rotary_emb(key_parts[axis_idx], position_ids_kv_3d[:, :, axis_idx])
+                    part_dim = query_parts[axis_idx].shape[-1]
+                    
+                    # rotary_emb 返回完整 head_dim 的 cos/sin，我们只需要前 part_dim 个
+                    cos_q_full, sin_q_full = self.rotary_emb(query_parts[axis_idx], position_ids_q_3d[:, :, axis_idx])
+                    cos_kv_full, sin_kv_full = self.rotary_emb(key_parts[axis_idx], position_ids_kv_3d[:, :, axis_idx])
+                    
+                    # 只取前 part_dim 维度
+                    cos_q = cos_q_full[..., :part_dim]
+                    sin_q = sin_q_full[..., :part_dim]
+                    cos_kv = cos_kv_full[..., :part_dim]
+                    sin_kv = sin_kv_full[..., :part_dim]
+                    
+                    q_rot = query_parts[axis_idx] * cos_q[:, None, :, :] + \
+                            rotate_half(query_parts[axis_idx]) * sin_q[:, None, :, :]
+                    k_rot = key_parts[axis_idx] * cos_kv[:, None, :, :] + \
+                            rotate_half(key_parts[axis_idx]) * sin_kv[:, None, :, :]
+                    
+                    query_rot_list.append(q_rot)
+                    key_rot_list.append(k_rot)
+                
+                # 第 4 部分（如果存在）保持不变
+                if total_rope_dim < D:
+                    query_rot_list.append(query_parts[3])
+                    key_rot_list.append(key_parts[3])
+                
+                query_rotated = torch.cat(query_rot_list, dim=-1)
+                key_rotated = torch.cat(key_rot_list, dim=-1)
+                
+                return query_rotated, key_rotated
+        
+        # Fallback: 如果没有 mrope_section 配置，使用简单的三等分
+        logger.warning(f"未找到 mrope_section 配置，使用简单的 D//3 分割方法")
+        if D % 3 != 0:
+            logger.warning(f"head_dim {D} 不能被 3 整除，使用 1D RoPE fallback")
+            pos_1d_q = position_ids_q_3d[:, :, 2]
+            pos_1d_kv = position_ids_kv_3d[:, :, 2]
+            cos_q, sin_q = self.rotary_emb(query, pos_1d_q)
+            cos_kv, sin_kv = self.rotary_emb(key, pos_1d_kv)
+            query_rot = query * cos_q[:, None, :, :] + rotate_half(query) * sin_q[:, None, :, :]
+            key_rot = key * cos_kv[:, None, :, :] + rotate_half(key) * sin_kv[:, None, :, :]
+            return query_rot, key_rot
+        
+        dim_per_axis = D // 3
+        query_splits = [query[:, :, :, i*dim_per_axis:(i+1)*dim_per_axis] for i in range(3)]
+        key_splits = [key[:, :, :, i*dim_per_axis:(i+1)*dim_per_axis] for i in range(3)]
+        
+        query_rot_list, key_rot_list = [], []
+        for axis_idx in range(3):
+            cos_q, sin_q = self.rotary_emb(query_splits[axis_idx], position_ids_q_3d[:, :, axis_idx])
+            cos_kv, sin_kv = self.rotary_emb(key_splits[axis_idx], position_ids_kv_3d[:, :, axis_idx])
+            q_rot = query_splits[axis_idx] * cos_q[:, None, :, :] + rotate_half(query_splits[axis_idx]) * sin_q[:, None, :, :]
+            k_rot = key_splits[axis_idx] * cos_kv[:, None, :, :] + rotate_half(key_splits[axis_idx]) * sin_kv[:, None, :, :]
+            query_rot_list.append(q_rot)
+            key_rot_list.append(k_rot)
+        
+        return torch.cat(query_rot_list, dim=-1), torch.cat(key_rot_list, dim=-1)
         
     @torch.no_grad()
     def _grid_generate(self, Hk, Wk, B, device, dtype):
@@ -304,78 +439,6 @@ class LlamaAttentionDAT(LlamaAttentionEx):
             inverted_mask.to(torch.bool), torch.finfo(inverted_mask.dtype).min
         )
         return attention_mask
-    
-    def _apply_mrope(
-        self, 
-        query: torch.Tensor, 
-        key: torch.Tensor,
-        position_ids_q_3d: torch.Tensor,
-        position_ids_kv_3d: torch.Tensor
-    ):
-        """
-        应用 mRoPE (3D rotary position embedding)
-        
-        Args:
-            query: [B, H, Nq, D]
-            key: [B, H, Nkv, D]
-            position_ids_q_3d: [B, Nq, 3] - Query 的 3D 位置
-            position_ids_kv_3d: [B, Nkv, 3] - KV 的 3D 位置
-        
-        Returns:
-            (query_rotated, key_rotated)
-        """
-        B, H, Nq, D = query.shape
-        Nkv = key.shape[2]
-        
-        # 将 head_dim 分成 3 部分用于 temporal, height, width
-        if D % 3 != 0:
-            logger.warning(f"head_dim {D} 不能被 3 整除，使用 1D RoPE fallback")
-            # Fallback: 使用 width 维度
-            pos_1d_q = position_ids_q_3d[:, :, 2]
-            pos_1d_kv = position_ids_kv_3d[:, :, 2]
-            cos_q, sin_q = self.rotary_emb(query, pos_1d_q)
-            cos_kv, sin_kv = self.rotary_emb(key, pos_1d_kv)
-            query_rot = query * cos_q[:, None, :, :] + rotate_half(query) * sin_q[:, None, :, :]
-            key_rot = key * cos_kv[:, None, :, :] + rotate_half(key) * sin_kv[:, None, :, :]
-            return query_rot, key_rot
-        
-        dim_per_axis = D // 3
-        
-        # 分别处理 3 个维度
-        query_splits = [
-            query[:, :, :, :dim_per_axis],           # temporal
-            query[:, :, :, dim_per_axis:2*dim_per_axis],  # height
-            query[:, :, :, 2*dim_per_axis:]          # width
-        ]
-        
-        key_splits = [
-            key[:, :, :, :dim_per_axis],
-            key[:, :, :, dim_per_axis:2*dim_per_axis],
-            key[:, :, :, 2*dim_per_axis:]
-        ]
-        
-        query_rot_list = []
-        key_rot_list = []
-        
-        for axis_idx in range(3):  # temporal, height, width
-            # 为当前维度生成 cos/sin
-            cos_q, sin_q = self.rotary_emb(query_splits[axis_idx], position_ids_q_3d[:, :, axis_idx])
-            cos_kv, sin_kv = self.rotary_emb(key_splits[axis_idx], position_ids_kv_3d[:, :, axis_idx])
-            
-            # 应用旋转
-            q_rot = query_splits[axis_idx] * cos_q[:, None, :, :] + \
-                    rotate_half(query_splits[axis_idx]) * sin_q[:, None, :, :]
-            k_rot = key_splits[axis_idx] * cos_kv[:, None, :, :] + \
-                    rotate_half(key_splits[axis_idx]) * sin_kv[:, None, :, :]
-            
-            query_rot_list.append(q_rot)
-            key_rot_list.append(k_rot)
-        
-        # 拼接回完整的 head_dim
-        query_rotated = torch.cat(query_rot_list, dim=-1)
-        key_rotated = torch.cat(key_rot_list, dim=-1)
-        
-        return query_rotated, key_rotated
 
     def forward(
         self,
@@ -392,7 +455,19 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         image_range_list:List[List[int]]=None, # [Batch: (), (), [], [], []]
         **kwargs
     ):
-        # assert image_range_list is not None
+        if image_range_list is None or image_hd_features is None:
+            return super().forward(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_values,
+                output_attentions,
+                use_cache,
+                cache_position,
+                position_embeddings,
+                **kwargs
+            )
+        
         B, Nq, C = hidden_states.size()
         dtype, device = hidden_states.dtype, hidden_states.device
         assert C == self.off_grps * self.off_dim
@@ -403,7 +478,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                     image_range_list[b].append([Nq, -1])
             # assert b == B - 1 and B == 1, f"b={b},B={B},rng_list={image_range_list}"
         # 0. Upon inference, if no cache, we run a prefill to cache the corresponding high-resolution features to the question, 
-        # and then do a regular inference which is same as the Llama.
+        # and then do a regular inference which is same as the Qwen2.
         if use_cache and past_key_values.get_seq_length(self.layer_idx) > 0:
             # HD features are already processed during prefill, so they are not forwarded here.
             return super().forward(
@@ -457,9 +532,9 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 logger.warning("Warning, conv_lr_proj instability causes embed_lr to all 0.")
             embed_lr = F.adaptive_avg_pool2d(embed_lr, (self.grid_size, self.grid_size))  # g, C_inter, H_grid, W_grid
             # 2. For each image, we mark the intention token for each question
+            Lp = len(image_range_list[b_idx][1:])  # Number of answer ranges
             if self.use_intention_branch:
                 intention_index = [answer_range[0] - self.insert_kvhd_offset for answer_range in image_range_list[b_idx][1:]]
-                Lp = len(intention_index)
                 intention_tokens = query_states[b_idx, intention_index]
                 intention_tokens_per_off_group = einops.rearrange(
                     intention_tokens,
@@ -527,7 +602,7 @@ class LlamaAttentionDAT(LlamaAttentionEx):
                 '(l g) c h w -> l (h w) (g c)',
                 l=Lp, g=self.off_grps, c=self.off_dim, h=self.grid_size, w=self.grid_size
             )
-            # 7. Since we have obtained the sampled features, we use either the original Llama projection or a new set of projection to get key / value
+            # 7. Since we have obtained the sampled features, we use either the original Qwen2 projection or a new set of projection to get key / value
             if self.hd_proj:
                 key_hd, value_hd = self.k_proj_hd(sampled_hr), self.v_proj_hd(sampled_hr)
             else:
@@ -625,77 +700,121 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         # 9. Last step: compute vanilla attention or F.sdpa get output and done
         kv_len = key_states_plus_hd.size(1)
         query_bhnc = einops.rearrange(query_states, 'b n (h c) -> b h n c', b=B, n=Nq, h=self.num_heads, c=self.head_dim)
-        key_bhnc = einops.rearrange(key_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
-        value_bhnc = einops.rearrange(value_states_plus_hd, 'b n (h c) -> b h n c', b=B, n=kv_len, h=self.num_heads, c=self.head_dim)
+        # GQA: K and V should be reshaped to num_key_value_heads first, then repeated to num_heads
+        # This follows the official Qwen2 GQA implementation where num_key_value_heads <= num_heads
+        key_bhnc_kv = einops.rearrange(key_states_plus_hd, 'b n (kv_h c) -> b kv_h n c', b=B, n=kv_len, kv_h=self.num_key_value_heads, c=self.head_dim)
+        value_bhnc_kv = einops.rearrange(value_states_plus_hd, 'b n (kv_h c) -> b kv_h n c', b=B, n=kv_len, kv_h=self.num_key_value_heads, c=self.head_dim)
 
-        # 应用位置编码：根据 use_mrope 选择 1D RoPE 或 3D mRoPE
-        if self.use_mrope and Nq < kv_len:
-            # ===== 3D mRoPE 路径 =====
-            # 1. 生成 KV 序列的 3D 位置
-            kv_position_ids_3d = generate_3d_positions_for_dat(
-                batch_size=B,
-                seq_len=kv_len,
-                image_range_list=image_range_list,
-                sampling_locs=sampling_locs if len(sampling_locs) > 0 else None,
-                lr_size=self.lr_size,
-                hr_size=self.hr_size,
-                device=device,
-                dtype=torch.long
-            )
-            
-            # 2. Query 通过 pos_q_concat 从 KV 的 3D 位置中索引
-            position_ids_q = nn.utils.rnn.pad_sequence(pos_q_concat, batch_first=True, padding_value=0)
-            position_ids_q_index = position_ids_q.unsqueeze(-1).expand(-1, -1, 3)  # [B, Nq, 3]
-            position_ids_q_3d = torch.gather(kv_position_ids_3d, 1, position_ids_q_index)  # [B, Nq, 3]
-            
-            # 3. 应用 mRoPE
-            query_bhnc, key_bhnc = self._apply_mrope(
-                query_bhnc, key_bhnc, 
-                position_ids_q_3d,  # Query 的 3D 位置
-                kv_position_ids_3d   # KV 的 3D 位置
-            )
-            
-        elif Nq < kv_len:
-            # ===== 1D RoPE 路径 (默认) =====
-            kv_position_ids = torch.arange(kv_len, device=device, dtype=torch.int64)[None, :]
-            cos, sin = self.rotary_emb(value_bhnc, kv_position_ids)
-            position_ids_q = nn.utils.rnn.pad_sequence(pos_q_concat, batch_first=True, padding_value=0)
-            position_ids_q_index = position_ids_q[..., None].expand(-1, -1, self.head_dim)
-            cos_q = cos.expand(B, -1, -1).gather(1, position_ids_q_index)
-            sin_q = sin.expand(B, -1, -1).gather(1, position_ids_q_index)
-            try:
-                query_bhnc = query_bhnc * cos_q[:, None, :, :] + rotate_half(query_bhnc) * sin_q[:, None, :, :]
-                key_bhnc = key_bhnc * cos[:, None, :, :] + rotate_half(key_bhnc) * sin[:, None, :, :]
-            except Exception as e:
-                logger.error(f"Error in applying rotary embeddings: {e}")
-                logger.error(f"query_bhnc shape: {query_bhnc.shape}")
-                logger.error(f"key_bhnc shape: {key_bhnc.shape}")
-                logger.error(f"cos_q shape: {cos_q.shape}")
-                logger.error(f"sin_q shape: {sin_q.shape}")
-                logger.error(f"cos shape: {cos.shape}")
-                logger.error(f"sin shape: {sin.shape}")
-                logger.error(f"position_ids_q_index shape: {position_ids_q_index.shape}")
-                logger.error(f"position_ids_q max: {position_ids_q.max()}, min: {position_ids_q.min()}")
-                logger.error(f"We died here.")
-                raise e
-            torch.cuda.empty_cache()
+        has_image_tokens = image_range_list is not None and len(image_range_list[0]) > 0
+        use_mrope_now = self.use_mrope and has_image_tokens
+        
+        if use_mrope_now or position_embeddings is None:
+            if use_mrope_now:
+                kv_position_ids_3d = generate_3d_positions_for_dat(
+                    batch_size=B,
+                    seq_len=kv_len,
+                    image_range_list=image_range_list,
+                    sampling_locs=sampling_locs if len(sampling_locs) > 0 else None,
+                    lr_size=self.lr_size,
+                    hr_size=self.hr_size,
+                    device=device,
+                    dtype=torch.long
+                )
+                
+                position_ids_q = nn.utils.rnn.pad_sequence(pos_q_concat, batch_first=True, padding_value=0)
+                position_ids_q_index = position_ids_q.unsqueeze(-1).expand(-1, -1, 3) # [B, Nq, 3]  
+                position_ids_q_3d = torch.gather(kv_position_ids_3d, 1, position_ids_q_index) # [B, Nq, 3]
+                
+                query_bhnc, key_bhnc_kv = self._apply_mrope(
+                    query_bhnc, key_bhnc_kv, 
+                    position_ids_q_3d,  # Query 的 3D 位置
+                    kv_position_ids_3d   # KV 的 3D 位置
+                )
+                # 训练模式不需要 cos/sin（没有 cache）
+                cos, sin = None, None
+                
+            elif Nq < kv_len:
+                kv_position_ids = torch.arange(kv_len, device=device, dtype=torch.int64)[None, :]
+                # Apply rotary embedding to K and V with num_key_value_heads before repeating
+                cos, sin = self.rotary_emb(value_bhnc_kv, kv_position_ids)
+                position_ids_q = nn.utils.rnn.pad_sequence(pos_q_concat, batch_first=True, padding_value=0)
+                position_ids_q_index = position_ids_q[..., None].expand(-1, -1, self.head_dim)
+                cos_q = cos.expand(B, -1, -1).gather(1, position_ids_q_index)
+                sin_q = sin.expand(B, -1, -1).gather(1, position_ids_q_index)
+                try:
+                    query_bhnc = query_bhnc * cos_q[:, None, :, :] + rotate_half(query_bhnc) * sin_q[:, None, :, :]
+                    key_bhnc_kv = key_bhnc_kv * cos[:, None, :, :] + rotate_half(key_bhnc_kv) * sin[:, None, :, :]
+                except Exception as e:
+                    logger.error(f"Error in applying rotary embeddings: {e}")
+                    logger.error(f"query_bhnc shape: {query_bhnc.shape}")
+                    logger.error(f"key_bhnc_kv shape: {key_bhnc_kv.shape}")
+                    logger.error(f"cos_q shape: {cos_q.shape}")
+                    logger.error(f"sin_q shape: {sin_q.shape}")
+                    logger.error(f"cos shape: {cos.shape}")
+                    logger.error(f"sin shape: {sin.shape}")
+                    logger.error(f"position_ids_q_index shape: {position_ids_q_index.shape}")
+                    logger.error(f"position_ids_q max: {position_ids_q.max()}, min: {position_ids_q.min()}")
+                    logger.error(f"We died here.")
+                    raise e
+                torch.cuda.empty_cache()
+            else:
+                assert Nq == kv_len, "Nq should be the same as kv_len"
+                # Apply rotary embedding to K and V with num_key_value_heads before repeating
+                cos, sin = self.rotary_emb(value_bhnc_kv, position_ids)
+                query_bhnc, key_bhnc_kv = apply_rotary_pos_emb(query_bhnc, key_bhnc_kv, cos, sin)
         else:
-            # ===== Nq == kv_len 情况 =====
-            assert Nq == kv_len, "Nq should be the same as kv_len"
-            cos, sin = self.rotary_emb(value_states_plus_hd, position_ids)
-            query_bhnc, key_bhnc = apply_rotary_pos_emb(query_bhnc, key_bhnc, cos, sin)
-
-        # 10. Store bhnc version of K,V in the prefill of inference
+            # Use provided position_embeddings (cos, sin) - official Qwen2 way
+            cos, sin = position_embeddings
+            # For DAT with different Q and KV lengths, we need to handle position_embeddings carefully
+            if Nq < kv_len:
+                # When Q and KV have different lengths, position_embeddings from model level only covers Nq positions
+                # But KV needs kv_len positions (including inserted HD features)
+                # We need to recompute rotary embeddings for the full KV sequence
+                kv_position_ids = torch.arange(kv_len, device=device, dtype=torch.int64)[None, :]
+                # Recompute cos/sin for KV sequence (which includes HD features)
+                cos_kv, sin_kv = self.rotary_emb(value_bhnc_kv, kv_position_ids)
+                # For Q, we need to extract the correct positions from pos_q_concat
+                position_ids_q = nn.utils.rnn.pad_sequence(pos_q_concat, batch_first=True, padding_value=0)
+                position_ids_q_index = position_ids_q[..., None].expand(-1, -1, self.head_dim)
+                # Extract cos/sin for Q positions from the KV embeddings
+                cos_q = cos_kv.expand(B, -1, -1).gather(1, position_ids_q_index)
+                sin_q = sin_kv.expand(B, -1, -1).gather(1, position_ids_q_index)
+                # Apply rotary embeddings
+                query_bhnc = query_bhnc * cos_q[:, None, :, :] + rotate_half(query_bhnc) * sin_q[:, None, :, :]
+                key_bhnc_kv = key_bhnc_kv * cos_kv[:, None, :, :] + rotate_half(key_bhnc_kv) * sin_kv[:, None, :, :]
+                cos, sin = cos_kv, sin_kv  # Update cos/sin for cache
+            else:
+                # When Nq == kv_len, we can use position_embeddings directly
+                assert Nq == kv_len, "Nq should be the same as kv_len"
+                query_bhnc, key_bhnc_kv = apply_rotary_pos_emb(query_bhnc, key_bhnc_kv, cos, sin)
+        
+        # 10. Store bhnc version of K,V in the prefill of inference (before repeat_kv for GQA)
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_bhnc, value_bhnc = past_key_values.update(key_bhnc, value_bhnc, self.layer_idx, cache_kwargs)
-        if self.use_sdpa:
+            # Cache should store num_key_value_heads shape, not num_heads shape
+            if cos is not None and sin is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            else:
+                cache_kwargs = {"cache_position": cache_position}
+            key_bhnc_kv, value_bhnc_kv = past_key_values.update(key_bhnc_kv, value_bhnc_kv, self.layer_idx, cache_kwargs)
+        
+        # Repeat K and V to match Q's number of heads (GQA) - after rotary embedding and caching
+        key_bhnc = repeat_kv(key_bhnc_kv, self.num_heads // self.num_key_value_heads)
+        value_bhnc = repeat_kv(value_bhnc_kv, self.num_heads // self.num_key_value_heads)
+        if self.use_sdpa and query_bhnc.is_cuda:
+            # Only use SDPA with specific backend on CUDA devices
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                 attn_out = F.scaled_dot_product_attention(
                     query_bhnc, key_bhnc, value_bhnc, attn_mask_4d,
                     dropout_p=0.0, is_causal=False, scale=None
                 )
+            attn_weights = None
+        elif self.use_sdpa:
+            # Use SDPA without backend specification on CPU
+            attn_out = F.scaled_dot_product_attention(
+                query_bhnc, key_bhnc, value_bhnc, attn_mask_4d,
+                dropout_p=0.0, is_causal=False, scale=None
+            )
             attn_weights = None
         else:
             attn_pre_act = torch.einsum('b h q c, b h k c -> b h q k', query_bhnc * (self.head_dim ** -0.5), key_bhnc)
@@ -711,19 +830,19 @@ class LlamaAttentionDAT(LlamaAttentionEx):
         return attn_output, attn_weights, past_key_values, sampling_locs
 
 ATTN_TYPE_MAPPING = {
-    'L': LlamaAttentionEx,
-    'D': LlamaAttentionDAT,
+    'L': Qwen2AttentionEx,
+    'D': Qwen2AttentionDAT,
 }
 
-class LlamaDecoderLayerDAT(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+class Qwen2DecoderLayerDAT(nn.Module):
+    def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__()
 
         # Manually fix the args mismatch during different transformers versions
         if not hasattr(config, 'attention_dropout'):
             setattr(config, 'attention_dropout', 0.0)
         if not hasattr(config, 'rope_theta'):
-            setattr(config, 'rope_theta', 10000.0)
+            setattr(config, 'rope_theta', 1000000.0)
         if not hasattr(config, 'attention_bias'):
             setattr(config, 'attention_bias', False)
 
@@ -733,9 +852,9 @@ class LlamaDecoderLayerDAT(nn.Module):
         this_layer_attn_type = self.config.dat_extra_args['layers'][layer_idx]
         self.self_attn = ATTN_TYPE_MAPPING[this_layer_attn_type](config=config, layer_idx=layer_idx)
 
-        self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = Qwen2MLP(config)
+        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -788,20 +907,20 @@ class LlamaDecoderLayerDAT(nn.Module):
 
         return outputs
 
-class LlamaDATModel(LlamaPreTrainedModel):
-    def __init__(self, config: LlamaConfig):
+class Qwen2DATModel(Qwen2PreTrainedModel):
+    def __init__(self, config: Qwen2Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayerDAT(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen2DecoderLayerDAT(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -1010,14 +1129,14 @@ class LlamaDATModel(LlamaPreTrainedModel):
             sampling_locs=sampling_locs,
         )
 
-class LlamaDATForCausalLM(LlamaPreTrainedModel):
+class Qwen2DATForCausalLM(Qwen2PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         # Suppress attn impl to eager.
         config._attn_implementation = 'eager'
         super().__init__(config)
-        self.model = LlamaDATModel(config)
+        self.model = Qwen2DATModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

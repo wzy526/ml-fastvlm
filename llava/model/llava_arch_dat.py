@@ -38,6 +38,13 @@ def crop_images_to_subimages(images_tensor, sub_image_size=336):
         torch.Tensor: Tensor containing all sub-images with shape (N * 9, C, sub_image_size, sub_image_size).
     """
     # Get the batch size and input image dimensions
+    # 检查输入维度
+    if images_tensor.ndim != 4:
+        raise ValueError(
+            f"crop_images_to_subimages expects 4D tensor [B, C, H, W], "
+            f"but got shape {images_tensor.shape} with {images_tensor.ndim} dimensions. "
+            f"This might be because Qwen2-VL encoder returns pre-processed features instead of raw images."
+        )
     batch_size, channels, input_height, input_width = images_tensor.shape
 
     # Initialize an empty list to store the sub-images for all images in the batch
@@ -95,11 +102,8 @@ def combine_subimages_to_images(sub_images_tensor, input_shape=(72, 72), sub_ima
         row_idx = 0
         col_idx = 0
         for j in range(zoom_ratio**2):
-            # Extract the sub-image from the tensor
             sub_image = sub_images_tensor[i * (zoom_ratio**2) + j]
 
-            # print(i, i * 9 + j, row_idx, col_idx)
-            # Copy the sub-image into the original image at the appropriate location
             original_images[i, :, row_idx:row_idx+sub_image_size, col_idx:col_idx+sub_image_size] = sub_image
 
             # Update column index
@@ -162,7 +166,19 @@ class LlavaDATMetaModel:
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
+        # 检查 mm_projector 是否存在且维度匹配
+        need_rebuild = False
         if getattr(self, 'mm_projector', None) is None:
+            need_rebuild = True
+        else:
+            # 检查维度是否匹配
+            if hasattr(self.mm_projector, 'weight'):
+                expected_in_features = self.config.mm_hidden_size
+                actual_in_features = self.mm_projector.weight.shape[1]
+                if expected_in_features != actual_in_features:
+                    need_rebuild = True
+        
+        if need_rebuild:
             self.mm_projector = build_vision_projector(self.config)
 
             if 'unpad' in mm_patch_merge_type:
@@ -232,12 +248,9 @@ class LlavaDATMetaForCausalLM(ABC):
         self, input_ids, position_ids, attention_mask, past_key_values, labels, images, image_sizes=None
     ):
         vision_tower = self.get_vision_tower()
+        
+        # 调试：打印 images 的维度信息
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            # Inference
-            # When hd images are encoded, we need to pad the attention mask to the correct length
-            # if past_key_values:
-            #     n_pad = past_key_values.get_seq_length() - attention_mask.shape[1]
-            #     attention_mask = F.pad(attention_mask, (0, n_pad + 1, 0, 0), mode='constant', value=1.0)
             return input_ids, position_ids, attention_mask, past_key_values, None, labels, None, None
 
         if type(images) is list or images.ndim == 5:
@@ -291,19 +304,48 @@ class LlavaDATMetaForCausalLM(ABC):
         else:
             hd_features = None
             if hasattr(self.model.config, "dat_extra_args"):
-                zoom_ratio = int(self.model.config.dat_extra_args['hr_image_size'] / self.model.config.dat_extra_args['lr_image_size'])
-                sub_image_size = images.shape[-1] // zoom_ratio
-                # Suppose images shape is B, C, H, W
-                with torch.no_grad():
-                    if images.shape[-1] <= 336:
-                        hd_features = self.encode_images(images)
+                # 检查 images 的维度
+                if images.ndim != 4:
+                    hd_features = None
+                else:
+                    lr_image_size = self.model.config.dat_extra_args['lr_image_size']
+                    hr_image_size = self.model.config.dat_extra_args['hr_image_size']
+                    
+                    # ===== 关键修复：主动放大图像到高分辨率 =====
+                    # 如果图像是 336，先放大到 1008 用于生成 hd_features
+                    if images.shape[-1] == lr_image_size:
+                        # 放大图像到高分辨率
+                        images_hr = F.interpolate(
+                            images, 
+                            size=hr_image_size, 
+                            mode="bilinear", 
+                            antialias=True
+                        )
+                        zoom_ratio = int(hr_image_size / lr_image_size)
+                        sub_image_size = lr_image_size
+                        
+                        with torch.no_grad():
+                            images_list = crop_images_to_subimages(images_hr, sub_image_size=sub_image_size)
+                            images_list = self.encode_images(images_list)
+                            size = int(images_list.shape[1] ** 0.5)
+                            images_list = images_list.reshape(images_list.shape[0], size, size, images_list.shape[-1]).permute(0, 3, 1, 2)
+                            hd_features = combine_subimages_to_images(images_list, (size * zoom_ratio, size * zoom_ratio), sub_image_size=size).to(self.device)
+                            hd_features = hd_features.flatten(2).permute(0, 2, 1).to(self.dtype)
+                        
+                    elif images.shape[-1] < lr_image_size:
+                        hd_features = None
                     else:
-                        images_list = crop_images_to_subimages(images, sub_image_size=sub_image_size)
-                        images_list = self.encode_images(images_list)
-                        size = int(images_list.shape[1] ** 0.5)
-                        images_list = images_list.reshape(images_list.shape[0], size, size, images_list.shape[-1]).permute(0, 3, 1, 2)
-                        hd_features = combine_subimages_to_images(images_list, (size * zoom_ratio, size * zoom_ratio), sub_image_size=size).to(self.device)
-                        hd_features = hd_features.flatten(2).permute(0, 2, 1).to(self.dtype)
+                        zoom_ratio = int(hr_image_size / lr_image_size)
+                        sub_image_size = images.shape[-1] // zoom_ratio
+                        
+                        with torch.no_grad():
+                            images_list = crop_images_to_subimages(images, sub_image_size=sub_image_size)
+                            images_list = self.encode_images(images_list)
+                            size = int(images_list.shape[1] ** 0.5)
+                            images_list = images_list.reshape(images_list.shape[0], size, size, images_list.shape[-1]).permute(0, 3, 1, 2)
+                            hd_features = combine_subimages_to_images(images_list, (size * zoom_ratio, size * zoom_ratio), sub_image_size=size).to(self.device)
+                            hd_features = hd_features.flatten(2).permute(0, 2, 1).to(self.dtype)
+            
             if hasattr(self.model.config, "dat_extra_args"):
                 lowres_size = int(self.model.config.dat_extra_args['lr_image_size'])
             else:
@@ -311,7 +353,6 @@ class LlavaDATMetaForCausalLM(ABC):
             images = F.interpolate(images, size=lowres_size, mode="bilinear", antialias=True)
             image_features = self.encode_images(images)
 
-        # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
             raise NotImplementedError
 

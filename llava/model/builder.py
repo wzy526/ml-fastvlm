@@ -17,7 +17,7 @@ import os
 import warnings
 import shutil
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig, AutoProcessor
 import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -153,10 +153,10 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
                 # 检查模型类型，如果是 llava 类型，使用相应的模型类
-                config = AutoConfig.from_pretrained(model_path)
+                config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
                 if config.model_type == "llava":
                     if hasattr(config, 'architectures') and 'LlavaLlamaDATForCausalLM' in config.architectures:
-                        print("检测到 DAT 模型架构，使用 LlavaLlamaDATForCausalLM")
+                        print("检测到 Llama DAT 模型架构，使用 LlavaLlamaDATForCausalLM")
                         from llava.model.language_model.llava_llama_dat import LlavaLlamaDATForCausalLM
                         model = LlavaLlamaDATForCausalLM.from_pretrained(model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
                     elif 'qwen' in model_name.lower():
@@ -165,8 +165,34 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     else:
                         print("使用标准 LlavaLlamaForCausalLM")
                         model = LlavaLlamaForCausalLM.from_pretrained(model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
+                elif config.model_type == "llava_qwen2_dat":
+                    print("检测到 Qwen2 DAT 模型架构，使用 LlavaQwen2DATForCausalLM")
+                    from llava.model.language_model.llava_qwen_dat import LlavaQwen2DATForCausalLM
+                    model = LlavaQwen2DATForCausalLM.from_pretrained(model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
+                elif config.model_type == "qwen2_vl":
+                    print("检测到 Qwen2-VL 模型，优先使用带生成头的类加载")
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+                    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+                    # 先尝试官方的生成模型类，确保拥有语言模型头以支持 generate
+                    try:
+                        from transformers import Qwen2VLForConditionalGeneration
+                        model = Qwen2VLForConditionalGeneration.from_pretrained(
+                            model_path,
+                            low_cpu_mem_usage=True,
+                            trust_remote_code=True,
+                            **kwargs
+                        )
+                    except Exception as first_err:
+                        print(f"Qwen2VLForConditionalGeneration 加载失败，尝试 AutoModelForCausalLM: {first_err}")
+                        model = AutoModelForCausalLM.from_pretrained(
+                            model_path,
+                            low_cpu_mem_usage=True,
+                            trust_remote_code=True,
+                            **kwargs
+                        )
+                    image_processor = processor
                 else:
-                    model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+                    model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
 
     image_processor = None
 
@@ -188,6 +214,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length
+    elif hasattr(model.config, "max_position_embeddings"):
+        context_len = model.config.max_position_embeddings
     else:
         context_len = 2048
 

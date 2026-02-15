@@ -1,0 +1,18 @@
+lr_image_size: 336
+hr_image_size: 1008
+grid_size: 6   # 采样网格 (lr_size 的一半)
+off_ksize: 3
+off_grps: 8
+inter_size: 256
+use_sdpa: True
+lr_size: 12    # Qwen2-VL 使用 merger: 12×12 patches (336/(14×2))
+hd_proj: False
+layers: [
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+  'L', 'L', 'L', 'L', 'L', 'L', 'L', 'D',
+]
+intention_as_gate: True
+use_intention_branch: True
+use_mrope: True

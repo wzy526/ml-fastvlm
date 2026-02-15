@@ -67,6 +67,7 @@ class ModelDATExtraArguments:
     use_sdpa: Optional[bool] = field(default=False)
     intention_as_gate: Optional[bool] = field(default=False)
     use_intention_branch: Optional[bool] = field(default=True)
+    use_mrope: Optional[bool] = field(default=False)  # mrope 3d position encoding
 
 @dataclass
 class ModelArguments:
@@ -500,7 +501,8 @@ def preprocess_v1(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-            if i != 0 and not tokenizer.legacy and IS_TOKENIZER_GREATER_THAN_0_14:
+            # 检查 tokenizer 是否有 legacy 属性（Qwen2Tokenizer 没有此属性）
+            if i != 0 and not getattr(tokenizer, 'legacy', True) and IS_TOKENIZER_GREATER_THAN_0_14:
                 round_len -= 1
                 instruction_len -= 1
 
@@ -763,15 +765,105 @@ def train(attn_implementation=None):
 
     assert model_args.vision_tower is not None, "It must be a multimodal model"
     config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
-    config.update({'dat_extra_args': model_dat_extra_args.__dict__})
-    model = LlavaLlamaDATForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        config=config,
-        cache_dir=training_args.cache_dir,
-        attn_implementation=attn_implementation,
-        torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-        **bnb_model_from_pretrained_args
-    )
+    
+    # choose dat model
+    model_type = config.model_type if hasattr(config, 'model_type') else None
+    if model_type == "qwen2_vl" or (hasattr(config, 'architectures') and any('Qwen2VL' in arch for arch in config.architectures)):
+        # we want to finetune Qwen2-VL model with DAT
+        rank0_print("检测到 Qwen2-VL 模型，转换为 LlavaQwen2DATForCausalLM")
+        
+        # 检查是否使用 Qwen2-VL 自己的 encoder
+        use_qwen2vl_encoder = (
+            model_args.vision_tower and 
+            ('qwen2-vl' in model_args.vision_tower.lower() or 'qwen2vl' in model_args.vision_tower.lower())
+        )
+        
+        if use_qwen2vl_encoder:
+            rank0_print("✓ 使用 Qwen2-VL 原生 vision encoder")
+        else:
+            rank0_print("✗ 将使用外部 vision encoder (如 CLIP)")
+        
+        # we need to convert Qwen2-VL config to LlavaQwen2DATConfig
+        from llava.model.language_model.llava_qwen_dat import LlavaQwen2DATConfig, LlavaQwen2DATForCausalLM
+        
+        # 从 Qwen2-VL config 中提取语言模型部分的参数
+        config_dict = config.to_dict()
+        
+        # 调试：打印 DAT extra args 和 rope_scaling
+        rank0_print(f"DAT Extra Args - use_mrope: {getattr(model_dat_extra_args, 'use_mrope', False)}")
+        rank0_print(f"原始 rope_scaling: {config_dict.get('rope_scaling', 'NOT FOUND')}")
+        rank0_print(f"原始 rope_type: {config_dict.get('rope_type', 'NOT FOUND')}")
+        
+        # 处理 rope_scaling - Qwen2-VL 使用 mrope
+        # 如果使用 Qwen2-VL encoder，保留 vision_config；否则移除
+        if use_qwen2vl_encoder:
+            rank0_print("保留 Qwen2-VL vision_config")
+            # 保留 vision_config 和相关 token ids
+        else:
+            # 移除 Qwen2-VL 特有的配置，避免冲突
+            qwen2vl_only_keys = ['vision_config', 'vision_start_token_id', 'vision_end_token_id', 
+                                 'vision_token_id', 'image_token_id', 'video_token_id']
+            for key in qwen2vl_only_keys:
+                config_dict.pop(key, None)
+        
+        # 处理 rope_scaling - 根据 use_mrope 决定是否保留
+        # 检查 use_mrope 参数（从 model_dat_extra_args）
+        use_mrope = getattr(model_dat_extra_args, 'use_mrope', False)
+        
+        # Qwen2-VL 的 rope_type 可能是 'mrope' 或者 'default'，需要检查 rope_scaling 中的配置
+        if 'rope_scaling' in config_dict and config_dict['rope_scaling']:
+            rope_scaling = config_dict['rope_scaling']
+            # 检查是否有 mrope_section（这是 mRoPE 的标志）
+            has_mrope = 'mrope_section' in rope_scaling or rope_scaling.get('type') == 'mrope'
+            
+            if has_mrope and use_mrope:
+                rank0_print("✓ 启用 mRoPE (3D 位置编码)")
+                # 设置 rope_type 为 'mrope'（已在 modeling_qwen_dat.py 中注册支持）
+                config_dict['rope_type'] = 'mrope'
+                # 确保 rope_scaling 正确配置
+                if 'rope_scaling' not in config_dict:
+                    config_dict['rope_scaling'] = {}
+                config_dict['rope_scaling']['type'] = 'mrope'
+                config_dict['rope_scaling']['mrope_section'] = rope_scaling.get('mrope_section', [16, 24, 24])
+                rank0_print(f"  mrope_section: {config_dict['rope_scaling']['mrope_section']}")
+                rank0_print(f"  rope_type: {config_dict['rope_type']}")
+            elif has_mrope and not use_mrope:
+                rank0_print("⚠ 检测到 Qwen2-VL 的 mRoPE 配置，但 use_mrope=False，移除 mRoPE")
+                config_dict.pop('rope_scaling', None)
+                config_dict.pop('rope_type', None)
+            else:
+                rank0_print("ℹ 使用标准 RoPE 配置")
+        else:
+            rank0_print("ℹ 未检测到 rope_scaling 配置")
+        
+        # 创建新的配置
+        dat_config = LlavaQwen2DATConfig.from_dict(config_dict)
+        dat_config.dat_extra_args = model_dat_extra_args.__dict__
+        
+        # 从语言模型权重初始化
+        rank0_print("从 Qwen2-VL 加载语言模型权重...")
+        model = LlavaQwen2DATForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            config=dat_config,
+            cache_dir=training_args.cache_dir,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            ignore_mismatched_sizes=True,  # 忽略 vision 部分的大小不匹配
+            **bnb_model_from_pretrained_args
+        )
+        rank0_print("语言模型权重加载完成")
+    else:
+        # we want to finetune Llama model with DAT
+        rank0_print("We want to finetune Llama model with DAT")
+        config.update({'dat_extra_args': model_dat_extra_args.__dict__})
+        model = LlavaLlamaDATForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            cache_dir=training_args.cache_dir,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            **bnb_model_from_pretrained_args
+        )
    
     model.config.use_cache = False
 

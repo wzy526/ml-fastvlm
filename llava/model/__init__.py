@@ -4,6 +4,7 @@ from .language_model.llava_mpt import LlavaMptForCausalLM, LlavaMptConfig
 from .language_model.llava_mistral import LlavaMistralForCausalLM, LlavaMistralConfig
 from .language_model.llava_qwen import LlavaQwen2ForCausalLM, LlavaConfig
 from .language_model.llava_llama_dat import LlavaLlamaDATForCausalLM, LlavaLlamaDATConfig
+from .language_model.llava_qwen_dat import LlavaQwen2DATForCausalLM, LlavaQwen2DATConfig
 # except:
 #     pass
 
