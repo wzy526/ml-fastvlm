@@ -159,5 +159,15 @@ bsh/
 # qwen2vl models
 Qwen2-VL-2B/
 
+# HuggingFace cache
+hf_cache/
+
+# plan notes
+PLAN.md
+
+# IDE / editor settings
+.vscode/
+.claude/
+
 # test outputs
 test_output/
