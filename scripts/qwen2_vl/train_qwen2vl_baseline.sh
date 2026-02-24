@@ -7,6 +7,7 @@ mkdir -p $CKPT_ROOT/$EXP_NAME
 ds llava/train/train_qwen_dat.py \
     --deepspeed ./scripts/zero_configs/zero3.json \
     --model_name_or_path /mnt/ephemeral/base_models/Qwen2-VL-2B-Instruct \
+    --model_family qwen2_vl \
     --data_path /mnt/ephemeral/sft_data/llava_v1_5_mix665k_shuffled_full.json \
     --image_folder /mnt/ephemeral/sft_data/train_split \
     --freeze_vision False \

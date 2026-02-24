@@ -1,21 +1,24 @@
 """
-Qwen2VL-DAT: Dynamic Attention Token extension for Qwen2VL.
+Qwen2.5VL-DAT: Dynamic Attention Token extension for Qwen2.5VL.
 
-Extends official Qwen2VLForConditionalGeneration with DAT mechanism:
+Extends official Qwen2_5_VLForConditionalGeneration with DAT mechanism:
 - Offset-based sampling from high-resolution vision features
 - Per-layer HD feature injection via modified attention
-- Native mRoPE (3D position encoding) support
+- Proper 3D mRoPE position encoding for extended KV sequences
 
 Architecture (transformers >= 5.2.0):
-    Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration)
-    ├── model: Qwen2VLModel
-    │   ├── visual: Qwen2VisionTransformerPretrainedModel  (shared for LR & HR)
-    │   └── language_model: Qwen2VLTextModel
+    Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
+    ├── model: Qwen2_5_VLModel (unmodified — kwargs flow natively)
+    │   ├── visual: Qwen2_5_VisionTransformerPretrainedModel  (shared for LR & HR)
+    │   └── language_model: Qwen2_5_VLTextModel (unmodified)
     │       └── layers: mixed 'L' (standard) + 'D' (DAT) decoder layers
     └── lm_head: nn.Linear
 
 HD kwargs flow: ForConditionalGeneration → Model(**kwargs) → TextModel(**kwargs)
-    → DecoderLayerDAT(explicit HD args) → AttentionDAT(explicit HD args)
+    → DecoderLayer(**kwargs) → AttentionDAT(**kwargs)
+
+Key difference from Qwen2-VL DAT: uses proper 3D mRoPE coordinates for HD tokens
+instead of simplified sequential 1D indices.
 """
 
 import math
@@ -27,42 +30,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 import einops
 
-from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-    Qwen2VLForConditionalGeneration,
-    Qwen2VLModel,
-    Qwen2VLDecoderLayer,
-    Qwen2VLAttention,
-    Qwen2VLRotaryEmbedding,
-    Qwen2VLCausalLMOutputWithPast,
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen2_5_VLModel,
+    Qwen2_5_VLDecoderLayer,
+    Qwen2_5_VLAttention,
+    Qwen2_5_VLRotaryEmbedding,
+    Qwen2_5_VLCausalLMOutputWithPast,
     apply_multimodal_rotary_pos_emb,
     rotate_half,
     repeat_kv,
 )
-from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig
+from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import BaseModelOutputWithPast
 
 
 logger = logging.getLogger(__name__)
 
-# Qwen2-VL special token IDs
+# Qwen2.5-VL special token IDs (same as Qwen2-VL)
 IM_START_TOKEN_ID = 151644   # <|im_start|>
 
 
 def _find_im_start_backward(ids, ans_start, im_start_token_id=IM_START_TOKEN_ID):
-    """Scan backward from ans_start to find the nearest <|im_start|> token.
-
-    Args:
-        ids: 1D tensor of token IDs for one batch element
-        ans_start: position to scan backward from (exclusive)
-        im_start_token_id: token ID for <|im_start|>
-
-    Returns:
-        int: position of the <|im_start|> token
-
-    Raises:
-        ValueError: if no <|im_start|> found before ans_start
-    """
+    """Scan backward from ans_start to find the nearest <|im_start|> token."""
     for pos in range(ans_start - 1, -1, -1):
         if ids[pos].item() == im_start_token_id:
             return pos
@@ -76,9 +66,9 @@ def _find_im_start_backward(ids, ans_start, im_start_token_id=IM_START_TOKEN_ID)
 # Config
 # ============================================================================
 
-class Qwen2VLDATConfig(Qwen2VLConfig):
-    """Qwen2VL config extended with DAT parameters."""
-    model_type = "qwen2vl_dat"
+class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
+    """Qwen2.5VL config extended with DAT parameters."""
+    model_type = "qwen2_5_vl_dat"
 
     def __init__(self, dat_extra_args=None, **kwargs):
         super().__init__(**kwargs)
@@ -92,7 +82,6 @@ class Qwen2VLDATConfig(Qwen2VLConfig):
             'layers': '',              # Layer type string, e.g. "LLLDLLLD..."
             'use_intention_branch': True,
             'intention_as_gate': True,
-            'insert_kvhd_offset': 6,   # DEPRECATED: intention_idx is now computed dynamically
         }
 
 
@@ -124,7 +113,7 @@ def apply_multimodal_rotary_pos_emb_single(x, cos, sin, mrope_section, unsqueeze
 
     Args:
         x: [batch, heads, seq_len, head_dim]
-        cos: [3, batch, seq_len, head_dim]  (from Qwen2VLRotaryEmbedding)
+        cos: [3, batch, seq_len, head_dim]
         sin: [3, batch, seq_len, head_dim]
         mrope_section: list of ints, e.g. [16, 24, 24]
     """
@@ -143,17 +132,17 @@ def apply_multimodal_rotary_pos_emb_single(x, cos, sin, mrope_section, unsqueeze
 def compute_image_range_list(input_ids, labels, image_token_id,
                               im_start_token_id=IM_START_TOKEN_ID,
                               image_grid_thw=None, spatial_merge_size=2):
-    """Compute image_range_list from Qwen2VL-format inputs.
+    """Compute image_range_list from Qwen2.5VL-format inputs.
 
     Scans input_ids for image token regions and labels for answer regions.
     For each answer range, dynamically locates the preceding <|im_start|>
-    token as the intention_idx (replaces the old hardcoded insert_kvhd_offset).
+    token as the intention_idx.
 
     Args:
         input_ids: [B, seq_len]
         labels: [B, seq_len] or None (inference mode)
         image_token_id: int
-        im_start_token_id: int, token ID for <|im_start|> (default 151644)
+        im_start_token_id: int, token ID for <|im_start|>
         image_grid_thw: [num_images, 3] grid dimensions (t, h, w) per image
         spatial_merge_size: spatial merge factor (default 2)
 
@@ -164,13 +153,12 @@ def compute_image_range_list(input_ids, labels, image_token_id,
     """
     batch_size = input_ids.shape[0]
     result = []
-    img_idx = 0  # index into image_grid_thw (tracks which image we're at)
+    img_idx = 0
 
     for b in range(batch_size):
         ids = input_ids[b]
         ranges = []
 
-        # Find contiguous image token region
         image_mask = (ids == image_token_id)
         if not image_mask.any():
             result.append(ranges)
@@ -180,7 +168,6 @@ def compute_image_range_list(input_ids, labels, image_token_id,
         lr_start = image_indices[0].item()
         lr_end = image_indices[-1].item() + 1
 
-        # Get spatial dimensions from image_grid_thw
         if image_grid_thw is not None and img_idx < len(image_grid_thw):
             thw = image_grid_thw[img_idx]
             t, h, w = thw[0].item(), thw[1].item(), thw[2].item()
@@ -188,19 +175,16 @@ def compute_image_range_list(input_ids, labels, image_token_id,
             lr_w = w // spatial_merge_size
             img_idx += 1
         else:
-            # Fallback: assume square
             lr_len = lr_end - lr_start
             lr_h = lr_w = int(lr_len ** 0.5)
 
         ranges.append((lr_start, lr_end, lr_h, lr_w))
 
-        # Find answer ranges from labels
         if labels is not None:
             lab = labels[b]
             ans_mask = (lab != -100)
             if ans_mask.any():
                 ans_indices = torch.where(ans_mask)[0]
-                # Split into contiguous segments
                 seg_start = ans_indices[0].item()
                 for i in range(1, len(ans_indices)):
                     if ans_indices[i] - ans_indices[i - 1] > 1:
@@ -211,7 +195,6 @@ def compute_image_range_list(input_ids, labels, image_token_id,
                 intention_idx = _find_im_start_backward(ids, seg_start, im_start_token_id)
                 ranges.append([seg_start, ans_indices[-1].item(), intention_idx])
         else:
-            # Inference: answer starts at end of sequence
             seq_len = ids.shape[0]
             intention_idx = _find_im_start_backward(ids, seq_len, im_start_token_id)
             ranges.append([seq_len, -1, intention_idx])
@@ -234,13 +217,14 @@ def _build_causal_mask(seq_len, device, dtype):
 # DAT Attention
 # ============================================================================
 
-class Qwen2VLAttentionDAT(Qwen2VLAttention):
+class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
     """
-    Core DAT mechanism:
+    Core DAT mechanism for Qwen2.5-VL with proper 3D mRoPE:
     1. Extract LR features from query -> generate sampling offsets
     2. Grid sample from HD features -> project to KV
     3. Insert HD KV into the sequence with custom attention mask
-    4. Apply mRoPE with separate Q/KV position embeddings
+    4. Build proper 3D position IDs for extended KV (using original coordinate system)
+    5. Apply mRoPE with separate Q/KV position embeddings
     """
 
     def __init__(self, config, layer_idx: int, dat_extra_args: dict):
@@ -296,8 +280,8 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
             self.k_proj_hd = None
             self.v_proj_hd = None
 
-        # Rotary embedding for extended KV (separate Q/KV position encoding)
-        self._dat_rotary_emb = Qwen2VLRotaryEmbedding(config=config)
+        # Rotary embedding for extended KV (Qwen2.5-VL Attention doesn't have one)
+        self._dat_rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
 
         self._init_dat_weights()
 
@@ -328,19 +312,68 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         """Convert binary mask (0/1) to attention mask (0 -> -inf, 1 -> 0)."""
         return mask.masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, 0.0)
 
+    def _construct_hd_position_ids(self, pos_3d_b, lr_start, lr_end, lr_h, lr_w, device):
+        """Construct proper 3D mRoPE position IDs for HD tokens.
+
+        Maps HD sampling grid positions into the original coordinate system
+        used by get_rope_index. This ensures HD tokens have positions that are
+        consistent with the LR image tokens' coordinate system.
+
+        Args:
+            pos_3d_b: [3, Nq] — original 3D mRoPE positions for this batch element
+            lr_start: start index of LR image tokens in the sequence
+            lr_end: end index of LR image tokens in the sequence
+            lr_h: LR image height in merged patches
+            lr_w: LR image width in merged patches
+            device: torch device
+
+        Returns:
+            hd_pos: [3, Ns] — 3D position IDs for HD tokens (grid_size * grid_size)
+        """
+        Ns = self.grid_size * self.grid_size
+
+        # Extract LR image position IDs
+        lr_pos = pos_3d_b[:, lr_start:lr_end]  # [3, lr_h * lr_w]
+
+        # Temporal: constant (same as LR image tokens)
+        t_val = lr_pos[0, 0]
+
+        # Height: get range from LR positions
+        h_min = lr_pos[1].min()
+        h_max = lr_pos[1].max()
+
+        # Width: get range from LR positions
+        w_min = lr_pos[2].min()
+        w_max = lr_pos[2].max()
+
+        # Map grid coordinates to position ID space
+        # Use linspace [0, 1] then scale to [min, max]
+        grid_y = torch.linspace(0, 1, self.grid_size, device=device)
+        grid_x = torch.linspace(0, 1, self.grid_size, device=device)
+
+        h_hd = (grid_y * (h_max - h_min) + h_min).long()
+        w_hd = (grid_x * (w_max - w_min) + w_min).long()
+
+        # Expand to full grid [grid_size, grid_size] -> flatten to [Ns]
+        h_grid = h_hd.unsqueeze(1).expand(-1, self.grid_size).flatten()
+        w_grid = w_hd.unsqueeze(0).expand(self.grid_size, -1).flatten()
+        t_grid = t_val.expand(Ns).long()
+
+        return torch.stack([t_grid, h_grid, w_grid])  # [3, Ns]
+
     def _generate_offsets_and_sample(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx):
         """Generate sampling offsets from LR queries and sample from HD features.
 
         Args:
             query_states: [B, Nq, hidden_size]
-            image_hd_features: list of [H_hr, W_hr, C] per image (only images present)
+            image_hd_features: list of [H_hr, W_hr, C] per image
             image_range_list: per-batch range info
             b_idx: batch index
-            hd_feat_idx: index into image_hd_features for this batch element
+            hd_feat_idx: index into image_hd_features
 
         Returns:
-            key_hd: [Lp, Ns, kv_dim]  - HD keys per answer
-            value_hd: [Lp, Ns, kv_dim]  - HD values per answer
+            key_hd: [Lp, Ns, kv_dim]
+            value_hd: [Lp, Ns, kv_dim]
             sampling_locs: [Lp, off_grps, grid_h, grid_w, 2]
         """
         device = query_states.device
@@ -370,7 +403,6 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         answer_ranges = image_range_list[b_idx][1:]
         Lp = len(answer_ranges)
 
-        # Intention branch
         if self.use_intention_branch:
             intention_indices = [ar[2] for ar in answer_ranges]
             intention_tokens = query_states[b_idx, intention_indices]
@@ -413,7 +445,6 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         )
         img_hr = einops.repeat(img_hr, 'g c h w -> (l g) c h w', l=Lp)
 
-        # Grid sample in fp32 for numerical stability
         orig_dtype = img_hr.dtype
         sampled_hr = F.grid_sample(
             img_hr.float(), sample_locs.float()[..., (1, 0)],
@@ -440,16 +471,22 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
 
         return key_hd, value_hd, sampling_locs_out
 
-    def _reorganize_kv_and_mask(
+    def _reorganize_kv_mask_and_pos(
         self, key_b, value_b, attn_b, key_hd, value_hd,
+        hd_pos_ids, orig_pos_b,
         image_range_list_b, Nq, Ns, device, dtype,
     ):
-        """Insert HD KV pairs into the sequence and build attention mask.
+        """Insert HD KV pairs into the sequence and build attention mask + 3D position IDs.
+
+        Enhanced version that also tracks proper 3D mRoPE position IDs for the
+        extended KV sequence.
 
         Args:
             key_b, value_b: [Nq, kv_dim] - original KV for one batch element
-            attn_b: [1, Nq, Nq] - original attention mask (head dim = 1 for broadcast)
+            attn_b: [1, Nq, Nq] - original attention mask
             key_hd, value_hd: [Lp, Ns, kv_dim] - HD KV per answer
+            hd_pos_ids: [3, Ns] — 3D position IDs for HD tokens
+            orig_pos_b: [3, Nq] — original 3D position IDs for this batch element
             image_range_list_b: ranges for this batch element
             Nq: query sequence length
             Ns: number of HD tokens per answer
@@ -458,11 +495,13 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
             key_ext: [kv_len, kv_dim]
             value_ext: [kv_len, kv_dim]
             attn_ext: [kv_len, 1, Nq] (permuted for pad_sequence)
-            pos_q: [Nq_mapped] - Q position mapping into extended KV
+            q_pos: [3, Nq_mapped] - Q position IDs in extended KV coordinate space
+            kv_pos: [3, kv_len] - extended KV position IDs
         """
         answer_ranges = image_range_list_b[1:]
         k_split, v_split, attn_split = [], [], []
-        pos_q = []
+        kv_pos_split = []  # list of [3, seg_len] tensors
+        q_pos_indices = []  # indices into extended KV for Q positions
         insert_counter = 0
         pos_counter = 0
 
@@ -475,21 +514,24 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
                 seg = key_b[insert_counter:cur_intention_idx + 1]
                 k_split.append(seg)
                 v_split.append(value_b[insert_counter:cur_intention_idx + 1])
+                kv_pos_split.append(orig_pos_b[:, insert_counter:cur_intention_idx + 1])
                 seg_len = seg.size(0)
-                pos_q.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
+                q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
                 pos_counter += seg_len
 
-                # Part 2: HD KV
+                # Part 2: HD KV + HD position IDs
                 k_split.append(key_hd[l_idx])
                 v_split.append(value_hd[l_idx])
+                kv_pos_split.append(hd_pos_ids)  # [3, Ns]
                 pos_counter += Ns
 
                 # Part 3: after insertion to answer end (inclusive)
                 seg = key_b[cur_intention_idx + 1:ans_end + 1]
                 k_split.append(seg)
                 v_split.append(value_b[cur_intention_idx + 1:ans_end + 1])
+                kv_pos_split.append(orig_pos_b[:, cur_intention_idx + 1:ans_end + 1])
                 seg_len = seg.size(0)
-                pos_q.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
+                q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
                 pos_counter += seg_len
 
                 # Attention mask: original + HD visibility
@@ -508,19 +550,22 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
                 seg = key_b[insert_counter:cur_intention_idx + 1]
                 k_split.append(seg)
                 v_split.append(value_b[insert_counter:cur_intention_idx + 1])
+                kv_pos_split.append(orig_pos_b[:, insert_counter:cur_intention_idx + 1])
                 seg_len = seg.size(0)
-                pos_q.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
+                q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
                 pos_counter += seg_len
 
                 k_split.append(key_hd[l_idx])
                 v_split.append(value_hd[l_idx])
+                kv_pos_split.append(hd_pos_ids)
                 pos_counter += Ns
 
                 seg = key_b[cur_intention_idx + 1:ans_start]
                 k_split.append(seg)
                 v_split.append(value_b[cur_intention_idx + 1:ans_start])
+                kv_pos_split.append(orig_pos_b[:, cur_intention_idx + 1:ans_start])
                 seg_len = seg.size(0)
-                pos_q.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
+                q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
                 pos_counter += seg_len
 
                 attn_split.append(attn_b[:, :, insert_counter:cur_intention_idx + 1])
@@ -536,20 +581,26 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
             seg = key_b[insert_counter:Nq]
             k_split.append(seg)
             v_split.append(value_b[insert_counter:Nq])
+            kv_pos_split.append(orig_pos_b[:, insert_counter:Nq])
             seg_len = seg.size(0)
-            pos_q.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
+            q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
             pos_counter += seg_len
             attn_split.append(attn_b[:, :, insert_counter:Nq])
 
         if len(k_split) == 0:
-            return key_b, value_b, attn_b.permute(2, 0, 1).contiguous(), \
-                   torch.arange(key_b.size(0), device=device, dtype=torch.int64)
+            return (key_b, value_b, attn_b.permute(2, 0, 1).contiguous(),
+                    orig_pos_b, orig_pos_b)
 
         key_ext = torch.cat(k_split, dim=0)
         value_ext = torch.cat(v_split, dim=0)
         attn_ext = torch.cat(attn_split, dim=2).permute(2, 0, 1).contiguous()
-        pos_q_cat = torch.cat(pos_q, dim=0)
-        return key_ext, value_ext, attn_ext, pos_q_cat
+        kv_pos = torch.cat(kv_pos_split, dim=1)  # [3, kv_len]
+
+        # Q position IDs: extract from kv_pos using indices
+        q_indices = torch.cat(q_pos_indices, dim=0)  # [Nq]
+        q_pos = kv_pos[:, q_indices]  # [3, Nq]
+
+        return key_ext, value_ext, attn_ext, q_pos, kv_pos
 
     def forward(
         self,
@@ -561,9 +612,10 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        # DAT-specific (explicitly received from DecoderLayerDAT)
+        # DAT-specific kwargs (flow through **kwargs chain)
         image_hd_features: Optional[List[torch.Tensor]] = None,
         image_range_list: Optional[List[List]] = None,
+        mrope_position_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
         # --- Standard path: no image data ---
@@ -614,7 +666,7 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         Ns = self.grid_size * self.grid_size
         mrope_section = self.config.rope_parameters["mrope_section"]
 
-        # Ensure attention mask exists (SDPA may optimize it away)
+        # Ensure attention mask exists
         if attention_mask is None:
             attention_mask = _build_causal_mask(Nq, device, dtype)
 
@@ -627,30 +679,40 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         if use_cache:
             for b in range(B):
                 if len(image_range_list[b]) == 1:
-                    # Fallback: <|im_start|> is 3 tokens before ans_start in ChatML
                     image_range_list[b].append([Nq, -1, Nq - 3])
 
-        # Per-batch: generate offsets, sample HD, reorganize KV
-        # Build mapping from batch index to image_hd_features index.
-        # image_hd_features only contains entries for samples WITH images,
-        # so b_idx cannot be used directly when some samples lack images.
+        # Build mapping from batch index to image_hd_features index
         b_idx_to_hd_idx = {}
         hd_idx = 0
         for b in range(B):
-            if len(image_range_list[b]) > 0:  # has image
+            if len(image_range_list[b]) > 0:
                 b_idx_to_hd_idx[b] = hd_idx
                 hd_idx += 1
 
-        keys_concat, values_concat, attns_concat, pos_q_concat = [], [], [], []
+        keys_concat, values_concat, attns_concat = [], [], []
+        kv_pos_concat = []   # [3, kv_len_b] per batch
+        q_pos_concat = []    # [3, Nq] per batch
 
         for b_idx in range(B):
             if len(image_range_list[b_idx]) <= 1:
-                # No answer ranges -> standard attention for this batch element
+                # No answer ranges -> standard attention
                 keys_concat.append(key_states[b_idx])
                 values_concat.append(value_states[b_idx])
                 attns_concat.append(attention_mask[b_idx].permute(2, 0, 1).contiguous())
-                pos_q_concat.append(torch.arange(Nq, device=device, dtype=torch.int64))
+                if mrope_position_ids is not None:
+                    kv_pos_concat.append(mrope_position_ids[:, b_idx, :])
+                    q_pos_concat.append(mrope_position_ids[:, b_idx, :])
+                else:
+                    fallback = torch.arange(Nq, device=device, dtype=torch.long).unsqueeze(0).expand(3, -1)
+                    kv_pos_concat.append(fallback)
+                    q_pos_concat.append(fallback)
                 continue
+
+            # Get original 3D positions for this batch element
+            if mrope_position_ids is not None:
+                orig_pos_b = mrope_position_ids[:, b_idx, :]  # [3, Nq]
+            else:
+                orig_pos_b = torch.arange(Nq, device=device, dtype=torch.long).unsqueeze(0).expand(3, -1)
 
             # Generate offsets and sample from HD features
             hd_feat_idx = b_idx_to_hd_idx[b_idx]
@@ -658,16 +720,24 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
                 query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx,
             )
 
-            # Reorganize KV sequence with HD insertion
-            key_ext, value_ext, attn_ext, pos_q = self._reorganize_kv_and_mask(
+            # Construct HD position IDs from LR image coordinate range
+            lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0]
+            hd_pos_ids = self._construct_hd_position_ids(
+                orig_pos_b, lr_start, lr_end, lr_h, lr_w, device,
+            )
+
+            # Reorganize KV sequence with HD insertion + position tracking
+            key_ext, value_ext, attn_ext, q_pos, kv_pos = self._reorganize_kv_mask_and_pos(
                 key_states[b_idx], value_states[b_idx], attention_mask[b_idx],
-                key_hd, value_hd, image_range_list[b_idx], Nq, Ns, device, dtype,
+                key_hd, value_hd, hd_pos_ids, orig_pos_b,
+                image_range_list[b_idx], Nq, Ns, device, dtype,
             )
 
             keys_concat.append(key_ext)
             values_concat.append(value_ext)
             attns_concat.append(attn_ext)
-            pos_q_concat.append(pos_q)
+            kv_pos_concat.append(kv_pos)
+            q_pos_concat.append(q_pos)
 
         # Pad batch to uniform KV length
         key_ext_padded = nn.utils.rnn.pad_sequence(keys_concat, batch_first=True, padding_value=0)
@@ -679,29 +749,36 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
 
         kv_len = key_ext_padded.size(1)
 
+        # Pad 3D position IDs to uniform kv_len
+        # kv_pos_concat[i] is [3, kv_len_i] — pad dim=1 to kv_len
+        kv_pos_list = []
+        for kv_p in kv_pos_concat:
+            pad_size = kv_len - kv_p.size(1)
+            if pad_size > 0:
+                kv_p = F.pad(kv_p, (0, pad_size), value=0)
+            kv_pos_list.append(kv_p)
+        kv_pos_padded = torch.stack(kv_pos_list, dim=1)  # [3, B, kv_len]
+
+        # Q positions: stack directly (all have same Nq)
+        q_pos_padded = torch.stack(q_pos_concat, dim=1)  # [3, B, Nq]
+
         # Reshape to multi-head format
         query_bhnc = query_states.view(B, Nq, self.num_heads, self.head_dim).transpose(1, 2)
         key_bhnc = key_ext_padded.view(B, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_bhnc = value_ext_padded.view(B, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # --- mRoPE for extended sequence ---
+        # --- mRoPE with proper 3D position IDs ---
         if Nq < kv_len:
             # KV is extended: compute separate position embeddings for Q and KV
-            kv_pos_ids = torch.arange(kv_len, device=device, dtype=torch.long)
-            kv_pos_ids = kv_pos_ids.view(1, 1, -1).expand(3, B, -1)
-            cos_kv, sin_kv = self._dat_rotary_emb(value_bhnc, kv_pos_ids)
-
-            # Q positions: use pos_q_concat to index into KV positions
-            pos_q_padded = nn.utils.rnn.pad_sequence(pos_q_concat, batch_first=True, padding_value=0)
-            pos_q_3d = pos_q_padded.unsqueeze(0).expand(3, -1, -1)  # [3, B, Nq]
-            cos_q, sin_q = self._dat_rotary_emb(query_bhnc, pos_q_3d)
+            cos_kv, sin_kv = self._dat_rotary_emb(value_bhnc, kv_pos_padded)
+            cos_q, sin_q = self._dat_rotary_emb(query_bhnc, q_pos_padded)
 
             query_bhnc = apply_multimodal_rotary_pos_emb_single(query_bhnc, cos_q, sin_q, mrope_section)
             key_bhnc = apply_multimodal_rotary_pos_emb_single(key_bhnc, cos_kv, sin_kv, mrope_section)
 
             cos, sin = cos_kv, sin_kv
         else:
-            # No extension: use standard Qwen2VL path
+            # No extension: use standard Qwen2.5-VL path
             cos, sin = position_embeddings
             query_bhnc, key_bhnc = apply_multimodal_rotary_pos_emb(
                 query_bhnc, key_bhnc, cos, sin, mrope_section,
@@ -724,8 +801,7 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
             key_bhnc = key_bhnc.contiguous()
             value_bhnc = value_bhnc.contiguous()
 
-        # SDPA attention (disable cuDNN backend — it can fail with custom
-        # attention masks on certain sequence-length combinations)
+        # SDPA attention
         with torch.nn.attention.sdpa_kernel([
             torch.nn.attention.SDPBackend.FLASH_ATTENTION,
             torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
@@ -748,77 +824,34 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
 # DAT Decoder Layer
 # ============================================================================
 
-class Qwen2VLDecoderLayerDAT(Qwen2VLDecoderLayer):
-    """Decoder layer with DAT attention (replaces standard attention).
+class Qwen2_5_VLDecoderLayerDAT(Qwen2_5_VLDecoderLayer):
+    """Decoder layer with DAT attention.
 
-    Explicitly receives and forwards image_hd_features and image_range_list
-    to the DAT attention module.
+    The base class already passes **kwargs to self_attn, so DAT-specific kwargs
+    (image_hd_features, image_range_list, mrope_position_ids) flow through
+    automatically.
     """
 
     def __init__(self, config, layer_idx: int, dat_extra_args: dict):
         super().__init__(config, layer_idx)
         # Replace standard attention with DAT attention
-        self.self_attn = Qwen2VLAttentionDAT(config, layer_idx, dat_extra_args)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        # DAT-specific: explicitly received from kwargs flow
-        image_hd_features: Optional[List[torch.Tensor]] = None,
-        image_range_list: Optional[List[List]] = None,
-        **kwargs,
-    ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Explicitly pass HD inputs to DAT attention
-        hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            image_hd_features=image_hd_features,
-            image_range_list=image_range_list,
-        )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (self_attn_weights,)
-        return outputs
+        self.self_attn = Qwen2_5_VLAttentionDAT(config, layer_idx, dat_extra_args)
+        # DAT layers always use full attention (not sliding window)
+        self.attention_type = "full_attention"
 
 
 # ============================================================================
 # DAT ForConditionalGeneration (top-level model)
 # ============================================================================
 
-class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
-    """Qwen2VL with DAT: uses native vision encoder for both LR and HD features.
+class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
+    """Qwen2.5VL with DAT: uses native vision encoder for both LR and HD features.
 
-    In transformers >= 5.2.0:
-    - self.model = Qwen2VLModel (contains self.visual + self.language_model)
-    - self.model.language_model = Qwen2VLTextModel (decoder stack)
-    - HD kwargs flow through: self.model() -> language_model() -> decoder layers
-    - DAT layers explicitly extract and handle HD kwargs
+    The model/language_model/decoder layers are NOT subclassed. DAT kwargs flow
+    through the native **kwargs chain to reach DAT attention layers.
     """
 
-    def __init__(self, config: Qwen2VLDATConfig):
+    def __init__(self, config: Qwen2_5_VLDATConfig):
         super().__init__(config)
 
         # Replace specified decoder layers with DAT layers
@@ -832,16 +865,16 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
             )
             for i, layer_type in enumerate(layers_str):
                 if layer_type == 'D':
-                    self.model.language_model.layers[i] = Qwen2VLDecoderLayerDAT(
+                    self.model.language_model.layers[i] = Qwen2_5_VLDecoderLayerDAT(
                         text_config, i, dat_args
                     )
                 elif layer_type == 'L':
-                    pass  # Keep standard layer
+                    pass
                 else:
                     raise ValueError(f"Unknown layer type '{layer_type}' at index {i}")
 
             dat_count = sum(1 for c in layers_str if c == 'D')
-            logger.info(f"Qwen2VL-DAT: {dat_count} DAT layers, "
+            logger.info(f"Qwen2.5VL-DAT: {dat_count} DAT layers, "
                         f"{text_config.num_hidden_layers - dat_count} standard layers")
 
     def _generate_hd_features(self, pixel_values_hd, image_grid_thw_hd):
@@ -849,13 +882,6 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
 
         Uses the shared vision encoder (self.model.visual) to encode HD images.
         Returns a list of 2D spatial feature maps for grid_sample.
-
-        Args:
-            pixel_values_hd: HD pixel values (same format as Qwen2VL pixel_values)
-            image_grid_thw_hd: [num_images, 3] grid dimensions for HD
-
-        Returns:
-            List of tensors [H_hr, W_hr, hidden_size] per image
         """
         with torch.no_grad():
             pixel_values_hd = pixel_values_hd.type(self.model.visual.dtype)
@@ -873,8 +899,6 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
             n_patches = t * h_merged * w_merged
 
             feat = hd_embeds[offset:offset + n_patches]
-            # For single-frame images (t=1), reshape to 2D spatial map
-            # For video (t>1), use first frame only (DAT designed for images)
             if t > 1:
                 logger.warning(
                     f"HD features: video with t={t} detected, using first frame only. "
@@ -903,16 +927,17 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
         # DAT-specific
         pixel_values_hd: Optional[torch.Tensor] = None,
         image_grid_thw_hd: Optional[torch.LongTensor] = None,
         image_hd_features: Optional[List[torch.Tensor]] = None,
         image_range_list: Optional[List[List]] = None,
         **kwargs,
-    ) -> Union[Tuple, Qwen2VLCausalLMOutputWithPast]:
+    ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         """Forward pass with DAT HD feature injection.
 
-        In addition to standard Qwen2VL arguments, accepts:
+        In addition to standard Qwen2.5-VL arguments, accepts:
             pixel_values_hd: High-resolution pixel values for HD features
             image_grid_thw_hd: Grid dimensions for HD images
             image_hd_features: Pre-computed HD features (alternative to pixel_values_hd)
@@ -937,8 +962,24 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 spatial_merge_size=self.config.vision_config.spatial_merge_size,
             )
 
-        # === Step 3: Call base model (handles LR vision, embedding, position IDs) ===
-        # HD kwargs flow through: Model -> TextModel -> DecoderLayerDAT -> AttentionDAT
+        # === Step 3: Pre-compute 3D position IDs for DAT layers ===
+        mrope_position_ids = None
+        if image_hd_features is not None and position_ids is None and input_ids is not None:
+            position_ids, rope_deltas = self.model.get_rope_index(
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                attention_mask=attention_mask,
+            )
+            # Save the 3D position_ids for DAT layers
+            mrope_position_ids = position_ids
+        elif position_ids is not None:
+            # position_ids provided externally — use as mrope_position_ids
+            mrope_position_ids = position_ids
+
+        # === Step 4: Call base model with DAT kwargs ===
+        # These flow through: Model -> TextModel -> DecoderLayer -> Attention
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -954,13 +995,15 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
             output_hidden_states=output_hidden_states,
             return_dict=True,
             cache_position=cache_position,
-            # DAT kwargs - flow through to DAT attention layers
+            second_per_grid_ts=second_per_grid_ts,
+            # DAT kwargs — flow through to DAT attention layers
             image_hd_features=image_hd_features,
             image_range_list=image_range_list,
+            mrope_position_ids=mrope_position_ids,
             **kwargs,
         )
 
-        # === Step 4: LM head + loss ===
+        # === Step 5: LM head + loss ===
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
 
@@ -975,7 +1018,7 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
-        return Qwen2VLCausalLMOutputWithPast(
+        return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -996,39 +1039,31 @@ DAT_KEYS_MATCH = [
 ]
 
 
-def convert_qwen2vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None):
-    """Convert a pretrained Qwen2VL to Qwen2VL-DAT.
+def convert_qwen2_5vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None):
+    """Convert a pretrained Qwen2.5VL to Qwen2.5VL-DAT.
 
     Uses from_pretrained() directly with the DAT model class so that
-    DeepSpeed ZeRO-3 parameter partitioning works correctly. The old
-    two-model approach (create DAT + load base state_dict) fails under
-    ZeRO-3 because state_dict() returns empty tensors for parameters
-    on other ranks.
+    DeepSpeed ZeRO-3 parameter partitioning works correctly.
 
     Args:
-        base_model_or_path: path to pretrained Qwen2VL checkpoint
+        base_model_or_path: path to pretrained Qwen2.5VL checkpoint
         dat_extra_args: dict with DAT parameters
         torch_dtype: optional torch dtype for loading
 
     Returns:
-        Qwen2VLDATForConditionalGeneration with base weights + fresh DAT weights
+        Qwen2_5_VLDATForConditionalGeneration with base weights + fresh DAT weights
     """
     if isinstance(base_model_or_path, str):
-        base_config = Qwen2VLConfig.from_pretrained(base_model_or_path)
+        base_config = Qwen2_5_VLConfig.from_pretrained(base_model_or_path)
     else:
         base_config = base_model_or_path.config
 
     # Create DAT config from base config
-    dat_config = Qwen2VLDATConfig(**base_config.to_dict())
+    dat_config = Qwen2_5_VLDATConfig(**base_config.to_dict())
     dat_config.dat_extra_args = dat_extra_args
 
-    # Load directly with DAT model class.
-    # __init__ creates base layers then replaces D-layers with DAT layers.
-    # from_pretrained() then loads checkpoint weights into matching params.
-    # DAT-specific params (conv_lr_dw, k_proj_hd, etc.) are missing from
-    # the checkpoint and keep their random init — this is expected.
     if isinstance(base_model_or_path, str):
-        dat_model = Qwen2VLDATForConditionalGeneration.from_pretrained(
+        dat_model = Qwen2_5_VLDATForConditionalGeneration.from_pretrained(
             base_model_or_path,
             config=dat_config,
             torch_dtype=torch_dtype,
@@ -1037,8 +1072,7 @@ def convert_qwen2vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None)
     else:
         # Already-instantiated base model: swap class and reinit DAT layers
         base_model_or_path.config = dat_config
-        base_model_or_path.__class__ = Qwen2VLDATForConditionalGeneration
-        # Re-run DAT layer setup
+        base_model_or_path.__class__ = Qwen2_5_VLDATForConditionalGeneration
         layers_str = dat_extra_args.get('layers', '')
         text_config = dat_config.text_config
         if layers_str:
@@ -1046,7 +1080,7 @@ def convert_qwen2vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None)
             for i, lt in enumerate(layers_str):
                 if lt == 'D':
                     base_model_or_path.model.language_model.layers[i] = \
-                        Qwen2VLDecoderLayerDAT(text_config, i, dat_extra_args)
+                        Qwen2_5_VLDecoderLayerDAT(text_config, i, dat_extra_args)
         dat_model = base_model_or_path
 
     return dat_model

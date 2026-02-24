@@ -169,6 +169,15 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     print("检测到 Qwen2 DAT 模型架构，使用 LlavaQwen2DATForCausalLM")
                     from llava.model.language_model.llava_qwen_dat import LlavaQwen2DATForCausalLM
                     model = LlavaQwen2DATForCausalLM.from_pretrained(model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
+                elif config.model_type == "qwen2_5_vl_dat":
+                    print("检测到 Qwen2.5-VL DAT 模型架构，使用 Qwen2_5_VLDATForConditionalGeneration")
+                    from llava.model.language_model.modeling_qwen2_5vl_dat import Qwen2_5_VLDATForConditionalGeneration
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+                    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+                    model = Qwen2_5_VLDATForConditionalGeneration.from_pretrained(
+                        model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs
+                    )
+                    image_processor = processor
                 elif config.model_type == "qwen2_vl":
                     print("检测到 Qwen2-VL 模型，优先使用带生成头的类加载")
                     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)

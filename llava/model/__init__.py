@@ -5,6 +5,7 @@ try:
     from .language_model.llava_qwen import LlavaQwen2ForCausalLM, LlavaConfig
     from .language_model.llava_llama_dat import LlavaLlamaDATForCausalLM, LlavaLlamaDATConfig
     from .language_model.llava_qwen_dat import LlavaQwen2DATForCausalLM, LlavaQwen2DATConfig
+    from .language_model.modeling_qwen2_5vl_dat import Qwen2_5_VLDATForConditionalGeneration, Qwen2_5_VLDATConfig
 except ImportError:
     pass
 

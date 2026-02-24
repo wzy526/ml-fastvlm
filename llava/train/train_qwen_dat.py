@@ -1,13 +1,14 @@
 """
-Qwen2VL native training script (no LLaVA wrapper).
-Trains Qwen2VLForConditionalGeneration (or Qwen2VLDATForConditionalGeneration)
-directly using ChatML format.
+Qwen2VL / Qwen2.5VL native training script (no LLaVA wrapper).
+Trains Qwen2VLForConditionalGeneration (or DAT variants) directly using ChatML format.
 
 Supports:
-  - Baseline Qwen2VL fine-tuning
+  - Baseline Qwen2VL / Qwen2.5VL fine-tuning
   - DAT (Dynamic Attention Token) training with HD image pipeline
   - Fine-grained freeze control (tune_mm_vision, tune_mm_mlp, tune_mm_llm)
   - Separate learning rates for vision tower, projector (merger), and DAT modules
+
+Set --model_family "qwen2_5_vl" to use Qwen2.5-VL (default: "qwen2_vl").
 """
 
 import os
@@ -58,6 +59,10 @@ NEWLINE_TOKEN_ID = 198      # '\n'
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(default="./Qwen2-VL-2B")
+    model_family: str = field(
+        default="qwen2_vl",
+        metadata={"help": "Model family: 'qwen2_vl' or 'qwen2_5_vl'"}
+    )
     # Legacy flag (kept for backward compat; overridden by tune_mm_* if set)
     freeze_vision: bool = field(default=False)
     # Fine-grained freeze control (Qwen3-VL style)
@@ -95,6 +100,11 @@ class ModelArguments:
     dat_freeze_base: bool = field(
         default=True,
         metadata={"help": "When DAT is enabled, freeze all base params and only train DAT params"}
+    )
+    dat_warmup_steps: int = field(
+        default=0,
+        metadata={"help": "Two-phase DAT training: train only DAT params for this many steps, "
+                  "then unfreeze DAT+LLM (ViT/connector stay frozen). 0 = disabled."}
     )
 
 
@@ -333,10 +343,56 @@ def print_trainable_parameters(model):
 # ---------------------------------------------------------------------------
 # Data pipeline
 # ---------------------------------------------------------------------------
-def _build_messages(item, image_folder, system_message):
+
+# Regex matching normalized [0,1] bbox: [0.52, 0.59, 0.82, 0.83]
+import re
+_NORM_BBOX_RE = re.compile(
+    r'\[\s*'
+    r'(0(?:\.\d+)?|1(?:\.0+)?)\s*,\s*'
+    r'(0(?:\.\d+)?|1(?:\.0+)?)\s*,\s*'
+    r'(0(?:\.\d+)?|1(?:\.0+)?)\s*,\s*'
+    r'(0(?:\.\d+)?|1(?:\.0+)?)\s*'
+    r'\]'
+)
+
+
+def _convert_bbox_to_qwen2vl(text):
+    """Convert normalized [0,1] bbox to Qwen2-VL ×1000 integer format.
+
+    [0.52, 0.59, 0.82, 0.83] → <|box_start|>(520,590),(820,830)<|box_end|>
+    """
+    def _replace(m):
+        x1 = int(round(float(m.group(1)) * 1000))
+        y1 = int(round(float(m.group(2)) * 1000))
+        x2 = int(round(float(m.group(3)) * 1000))
+        y2 = int(round(float(m.group(4)) * 1000))
+        return f'<|box_start|>({x1},{y1}),({x2},{y2})<|box_end|>'
+    return _NORM_BBOX_RE.sub(_replace, text)
+
+
+def _convert_bbox_to_qwen2_5vl(text, image_w, image_h):
+    """Convert normalized [0,1] bbox to Qwen2.5-VL absolute pixel format.
+
+    [0.52, 0.59, 0.82, 0.83] → <|box_start|>(416,354),(656,498)<|box_end|>
+    (absolute pixel coords based on original image size)
+    """
+    def _replace(m):
+        x1 = int(round(float(m.group(1)) * image_w))
+        y1 = int(round(float(m.group(2)) * image_h))
+        x2 = int(round(float(m.group(3)) * image_w))
+        y2 = int(round(float(m.group(4)) * image_h))
+        return f'<|box_start|>({x1},{y1}),({x2},{y2})<|box_end|>'
+    return _NORM_BBOX_RE.sub(_replace, text)
+
+
+def _build_messages(item, image_folder, system_message, coord_format="qwen2_vl"):
     """
     Convert {image, conversations} → Qwen2VL chat messages format.
     Returns (messages, image_path_or_None).
+
+    coord_format: "qwen2_vl" — ×1000 normalized coords
+                  "qwen2_5_vl" — absolute pixel coords (requires reading image size)
+                  "none" — no conversion (keep original format)
     """
     conversations = item["conversations"]
     has_image = "image" in item
@@ -354,11 +410,23 @@ def _build_messages(item, image_folder, system_message):
             has_image = False
             image_path = None
 
+    # Pre-compute image size for absolute coord conversion
+    image_w, image_h = None, None
+    if coord_format == "qwen2_5_vl" and image_path is not None:
+        with Image.open(image_path) as img_tmp:
+            image_w, image_h = img_tmp.size
+
     messages = [{"role": "system", "content": system_message}]
 
     for conv in conversations:
         role_from = conv["from"]
         value = conv["value"]
+
+        # Convert bbox coordinates
+        if coord_format == "qwen2_vl":
+            value = _convert_bbox_to_qwen2vl(value)
+        elif coord_format == "qwen2_5_vl" and image_w is not None:
+            value = _convert_bbox_to_qwen2_5vl(value, image_w, image_h)
 
         if role_from in ("human", "user"):
             content_parts = []
@@ -405,7 +473,7 @@ class Qwen2VLSupervisedDataset(Dataset):
     """Dataset for Qwen2VL supervised fine-tuning (with optional DAT HD data)."""
 
     def __init__(self, data_path, processor, data_args, model_max_length,
-                 use_dat=False, processor_hd=None):
+                 use_dat=False, processor_hd=None, coord_format="qwen2_vl"):
         super().__init__()
         rank0_print(f"Loading data from {data_path}...")
         self.list_data_dict = json.load(open(data_path, "r"))
@@ -415,6 +483,7 @@ class Qwen2VLSupervisedDataset(Dataset):
         self.model_max_length = model_max_length
         self.use_dat = use_dat
         self.processor_hd = processor_hd
+        self.coord_format = coord_format
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -443,7 +512,8 @@ class Qwen2VLSupervisedDataset(Dataset):
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
         item = self.list_data_dict[i]
         messages, image_path = _build_messages(
-            item, self.data_args.image_folder, self.data_args.system_message
+            item, self.data_args.image_folder, self.data_args.system_message,
+            coord_format=self.coord_format,
         )
 
         has_image = image_path is not None and os.path.exists(image_path)
@@ -634,6 +704,56 @@ class LengthGroupedSampler(torch.utils.data.Sampler):
 
 
 # ---------------------------------------------------------------------------
+# Two-phase DAT warmup callback
+# ---------------------------------------------------------------------------
+class DATWarmupCallback(transformers.TrainerCallback):
+    """Two-phase DAT training schedule.
+
+    Phase 1 (steps 0 .. warmup_steps-1): only DAT parameters are trainable.
+    Phase 2 (steps warmup_steps .. end):  DAT + LLM are trainable.
+    ViT and connector stay frozen throughout.
+
+    Trick: before Trainer creation, DAT + LLM are all set requires_grad=True
+    so that create_optimizer() includes both in param groups.  Then on_train_begin
+    freezes LLM (params stay in optimizer but get no gradients), and on_step_begin
+    unfreezes LLM at the transition point.
+    """
+
+    def __init__(self, warmup_steps: int, dat_keys: list):
+        self.warmup_steps = warmup_steps
+        self.dat_keys = dat_keys
+        self.phase1_active = True
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+        # Phase 1: freeze LLM, keep only DAT trainable
+        lang = _get_language_module(model)
+        for p in lang.parameters():
+            p.requires_grad = False
+        model.lm_head.requires_grad_(False)
+        # Ensure DAT params stay unfrozen
+        for name, param in model.named_parameters():
+            if any(k in name for k in self.dat_keys):
+                param.requires_grad = True
+        rank0_print(f"[DATWarmup] Phase 1: DAT-only for {self.warmup_steps} steps")
+        print_trainable_parameters(model)
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if not self.phase1_active or model is None:
+            return
+        if state.global_step >= self.warmup_steps:
+            # Phase 2: unfreeze LLM
+            lang = _get_language_module(model)
+            for p in lang.parameters():
+                p.requires_grad = True
+            model.lm_head.requires_grad_(True)
+            self.phase1_active = False
+            rank0_print(f"[DATWarmup] Step {state.global_step}: Phase 2 — unfroze LLM + DAT")
+            print_trainable_parameters(model)
+
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 class Qwen2VLTrainer(transformers.Trainer):
@@ -768,12 +888,22 @@ def train():
     )
 
     # ----- Model -----
+    is_qwen2_5 = model_args.model_family == "qwen2_5_vl"
+    dat_warmup_callback = None
+
     if model_args.use_dat:
-        from llava.model.language_model.modeling_qwen2vl_dat import (
-            convert_qwen2vl_to_dat,
-            freeze_base_unfreeze_dat,
-            DAT_KEYS_MATCH as _DAT_KEYS,
-        )
+        if is_qwen2_5:
+            from llava.model.language_model.modeling_qwen2_5vl_dat import (
+                convert_qwen2_5vl_to_dat,
+                freeze_base_unfreeze_dat,
+                DAT_KEYS_MATCH as _DAT_KEYS,
+            )
+        else:
+            from llava.model.language_model.modeling_qwen2vl_dat import (
+                convert_qwen2vl_to_dat,
+                freeze_base_unfreeze_dat,
+                DAT_KEYS_MATCH as _DAT_KEYS,
+            )
 
         dat_extra_args = {
             'grid_size': model_args.dat_grid_size,
@@ -787,16 +917,35 @@ def train():
             'intention_as_gate': model_args.dat_intention_as_gate,
         }
 
-        rank0_print(f"Loading DAT model from {model_args.model_name_or_path}...")
+        rank0_print(f"Loading DAT model ({model_args.model_family}) from {model_args.model_name_or_path}...")
         rank0_print(f"DAT config: {dat_extra_args}")
-        model = convert_qwen2vl_to_dat(
+        convert_fn = convert_qwen2_5vl_to_dat if is_qwen2_5 else convert_qwen2vl_to_dat
+        model = convert_fn(
             model_args.model_name_or_path,
             dat_extra_args=dat_extra_args,
             torch_dtype=compute_dtype,
         )
 
         # Apply freeze strategy
-        if model_args.dat_freeze_base:
+        if model_args.dat_warmup_steps > 0:
+            # Two-phase: DAT+LLM trainable initially (for optimizer creation),
+            # ViT + connector frozen. Callback handles phase transition.
+            rank0_print(f"Two-phase training: DAT-only for {model_args.dat_warmup_steps} steps, then DAT+LLM")
+            visual = _get_visual_module(model)
+            for p in visual.parameters():
+                p.requires_grad = False
+            lang = _get_language_module(model)
+            for p in lang.parameters():
+                p.requires_grad = True
+            model.lm_head.requires_grad_(True)
+            for name, param in model.named_parameters():
+                if any(k in name for k in _DAT_KEYS):
+                    param.requires_grad = True
+            dat_warmup_callback = DATWarmupCallback(
+                warmup_steps=model_args.dat_warmup_steps,
+                dat_keys=_DAT_KEYS,
+            )
+        elif model_args.dat_freeze_base:
             rank0_print("Freezing base model, unfreezing DAT params only...")
             freeze_base_unfreeze_dat(model)
         else:
@@ -808,21 +957,30 @@ def train():
 
         # Validate dat_layers length
         if model_args.dat_layers:
-            num_layers = getattr(model.config, 'num_hidden_layers', None) or model.config.text_config.num_hidden_layers
-            if len(model_args.dat_layers) != num_layers:
+            _text_cfg = getattr(model.config, 'text_config', None)
+            num_layers = getattr(model.config, 'num_hidden_layers', None) or \
+                         (_text_cfg.num_hidden_layers if _text_cfg else None)
+            if num_layers and len(model_args.dat_layers) != num_layers:
                 raise ValueError(
                     f"dat_layers length ({len(model_args.dat_layers)}) "
                     f"!= num_hidden_layers ({num_layers})"
                 )
     else:
-        rank0_print(f"Loading model from {model_args.model_name_or_path}...")
-        from transformers import Qwen2VLForConditionalGeneration
-
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_name_or_path,
-            torch_dtype=compute_dtype,
-            attn_implementation="sdpa",
-        )
+        rank0_print(f"Loading model ({model_args.model_family}) from {model_args.model_name_or_path}...")
+        if is_qwen2_5:
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_args.model_name_or_path,
+                torch_dtype=compute_dtype,
+                attn_implementation="sdpa",
+            )
+        else:
+            from transformers import Qwen2VLForConditionalGeneration
+            model = Qwen2VLForConditionalGeneration.from_pretrained(
+                model_args.model_name_or_path,
+                torch_dtype=compute_dtype,
+                attn_implementation="sdpa",
+            )
 
         # Apply fine-grained freeze control
         set_model(model, model_args)
@@ -841,12 +999,17 @@ def train():
 
     # Align model config & generation_config with tokenizer special tokens
     # so the Trainer doesn't auto-override and emit a noisy warning.
-    # Qwen2-VL tokenizer: eos=151645(<|im_end|>), bos=None, pad=151643(<|endoftext|>)
+    # Qwen2-VL: eos/pad on model.config directly
+    # Qwen2.5-VL: eos/pad on model.config.text_config (nested config)
     _tok = processor.tokenizer
+    _cfg = model.config
+    _text_cfg = getattr(_cfg, 'text_config', None)  # Qwen2.5-VL only
     for _attr in ("pad_token_id", "bos_token_id", "eos_token_id"):
         _val = getattr(_tok, _attr, None)
-        if hasattr(model.config, _attr) and getattr(model.config, _attr) != _val:
-            setattr(model.config, _attr, _val)
+        if hasattr(_cfg, _attr) and getattr(_cfg, _attr, None) != _val:
+            setattr(_cfg, _attr, _val)
+        if _text_cfg is not None and hasattr(_text_cfg, _attr) and getattr(_text_cfg, _attr, None) != _val:
+            setattr(_text_cfg, _attr, _val)
         if hasattr(model, "generation_config") and getattr(model.generation_config, _attr, None) != _val:
             setattr(model.generation_config, _attr, _val)
 
@@ -893,6 +1056,8 @@ def train():
         # Use the same native template as the main processor
 
     # ----- Dataset -----
+    coord_format = model_args.model_family  # "qwen2_vl" or "qwen2_5_vl"
+    rank0_print(f"Bbox coordinate format: {coord_format}")
     train_dataset = Qwen2VLSupervisedDataset(
         data_path=data_args.data_path,
         processor=processor,
@@ -900,10 +1065,15 @@ def train():
         model_max_length=training_args.model_max_length,
         use_dat=model_args.use_dat,
         processor_hd=processor_hd,
+        coord_format=coord_format,
     )
     data_collator = Qwen2VLDataCollator(pad_token_id=ENDOFTEXT_ID)
 
     # ----- Trainer -----
+    callbacks = []
+    if dat_warmup_callback is not None:
+        callbacks.append(dat_warmup_callback)
+
     trainer = Qwen2VLTrainer(
         model=model,
         processing_class=processor.tokenizer,
@@ -911,6 +1081,7 @@ def train():
         train_dataset=train_dataset,
         eval_dataset=None,
         data_collator=data_collator,
+        callbacks=callbacks if callbacks else None,
     )
 
     # ----- Train -----
