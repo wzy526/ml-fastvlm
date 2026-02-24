@@ -531,6 +531,16 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
                 attn_split.append(self._flip_and_fill(hd_vis))
                 attn_split.append(attn_b[:, :, cur_intention_idx + 1:ans_start])
 
+        # Handle trailing tokens after the last answer range
+        if insert_counter < Nq:
+            seg = key_b[insert_counter:Nq]
+            k_split.append(seg)
+            v_split.append(value_b[insert_counter:Nq])
+            seg_len = seg.size(0)
+            pos_q.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
+            pos_counter += seg_len
+            attn_split.append(attn_b[:, :, insert_counter:Nq])
+
         if len(k_split) == 0:
             return key_b, value_b, attn_b.permute(2, 0, 1).contiguous(), \
                    torch.arange(key_b.size(0), device=device, dtype=torch.int64)

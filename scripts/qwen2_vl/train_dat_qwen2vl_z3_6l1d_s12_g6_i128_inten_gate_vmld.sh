@@ -43,7 +43,7 @@ ds llava/train/train_qwen_dat.py \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --logging_nan_inf_filter False \
-    --model_max_length 4096 \
+    --model_max_length 32768 \
     --gradient_checkpointing True \
     --group_by_modality_length True \
     --dataloader_num_workers 4 \
