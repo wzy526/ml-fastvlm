@@ -499,10 +499,15 @@ def compute_coupled_sizes(orig_h, orig_w, lr_pixels, hr_scale,
 class Qwen2VLCoupledDATDataset(Dataset):
     """Dataset with coupled LR-HD image processing for DAT training.
 
-    Resizes every image to a fixed HD target (~lr_pixels * hr_scale²),
-    then downsamples by hr_scale to produce LR.  This guarantees a
-    consistent scale relationship between LR and HD for all images.
+    HD resolution is determined by the processor's default min/max pixels
+    (i.e. whatever smart_resize picks for the original image).  LR is
+    derived as HD / hr_scale in each spatial dimension, rounded to the
+    nearest patch-merge factor (28).
     """
+
+    PATCH_SIZE = 14
+    MERGE_SIZE = 2
+    FACTOR = PATCH_SIZE * MERGE_SIZE  # 28
 
     def __init__(self, data_path, processor, data_args, model_args,
                  model_max_length, coord_format="qwen2_vl"):
@@ -516,12 +521,11 @@ class Qwen2VLCoupledDATDataset(Dataset):
         self.model_max_length = model_max_length
         self.coord_format = coord_format
 
-        self.lr_pixels = data_args.lr_pixels
         self.hr_scale = model_args.dat_hr_scale
 
         rank0_print(
-            f"Coupled LR-HD: lr_pixels={self.lr_pixels}, hr_scale={self.hr_scale}, "
-            f"hd_pixels={self.lr_pixels * self.hr_scale ** 2}"
+            f"Coupled LR-HD: hr_scale={self.hr_scale}, "
+            f"HD pixels by processor default, LR = HD / {self.hr_scale ** 2}"
         )
 
     def __len__(self):
@@ -566,35 +570,30 @@ class Qwen2VLCoupledDATDataset(Dataset):
 
         inputs_hd = None
         if has_image and img is not None:
-            orig_w, orig_h = img.size
-
-            hd_h, hd_w, lr_h, lr_w = compute_coupled_sizes(
-                orig_h, orig_w,
-                lr_pixels=self.lr_pixels,
-                hr_scale=self.hr_scale,
+            # Step 1: HD — let processor pick resolution with its defaults
+            inputs_hd = self.processor(
+                images=[img],
+                text=["<|im_start|>"],
+                return_tensors="pt",
+                padding=False,
             )
 
-            img_hd = img.resize((hd_w, hd_h), Image.BICUBIC)
-            img_lr = img_hd.resize((lr_w, lr_h), Image.BICUBIC)
-
+            # Step 2: derive LR dims from HD actual dims
+            thw = inputs_hd["image_grid_thw"][0]
+            hd_h = thw[1].item() * self.FACTOR
+            hd_w = thw[2].item() * self.FACTOR
+            lr_h = max(self.FACTOR, (hd_h // self.hr_scale // self.FACTOR) * self.FACTOR)
+            lr_w = max(self.FACTOR, (hd_w // self.hr_scale // self.FACTOR) * self.FACTOR)
             lr_total = lr_h * lr_w
+
+            # Step 3: LR — force processor to use derived resolution
             inputs = self.processor(
-                images=[img_lr],
+                images=[img],
                 text=[text],
                 return_tensors="pt",
                 padding=False,
                 min_pixels=lr_total,
                 max_pixels=lr_total,
-            )
-
-            hd_total = hd_h * hd_w
-            inputs_hd = self.processor(
-                images=[img_hd],
-                text=["<|im_start|>"],
-                return_tensors="pt",
-                padding=False,
-                min_pixels=hd_total,
-                max_pixels=hd_total,
             )
         else:
             inputs = self.processor(

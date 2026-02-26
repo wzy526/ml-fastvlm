@@ -392,7 +392,6 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             '(h w) (g c) -> g c h w',
             g=self.off_grps, c=self.off_dim, h=lr_h, w=lr_w,
         )
-
         # 2. Offset generation: DW Conv -> LN -> SiLU -> Conv1x1 -> Pool
         local_embed_lr = self.conv_lr_dw(img_lr)
         local_embed_lr = F.silu(self.ln_1(local_embed_lr))
@@ -500,7 +499,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         """
         answer_ranges = image_range_list_b[1:]
         k_split, v_split, attn_split = [], [], []
-        kv_pos_split = []  # list of [3, seg_len] tensors
+        kv_pos_split = []
         q_pos_indices = []  # indices into extended KV for Q positions
         insert_counter = 0
         pos_counter = 0
@@ -576,6 +575,8 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 attn_split.append(self._flip_and_fill(hd_vis))
                 attn_split.append(attn_b[:, :, cur_intention_idx + 1:ans_start])
 
+                insert_counter = ans_start
+
         # Handle trailing tokens after the last answer range
         if insert_counter < Nq:
             seg = key_b[insert_counter:Nq]
@@ -594,7 +595,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         key_ext = torch.cat(k_split, dim=0)
         value_ext = torch.cat(v_split, dim=0)
         attn_ext = torch.cat(attn_split, dim=2).permute(2, 0, 1).contiguous()
-        kv_pos = torch.cat(kv_pos_split, dim=1)  # [3, kv_len]
+        kv_pos = torch.cat(kv_pos_split, dim=1)
 
         # Q position IDs: extract from kv_pos using indices
         q_indices = torch.cat(q_pos_indices, dim=0)  # [Nq]
@@ -708,7 +709,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                     q_pos_concat.append(fallback)
                 continue
 
-            # Get original 3D positions for this batch element
+            # Get original 3D mRoPE positions for this batch element
             if mrope_position_ids is not None:
                 orig_pos_b = mrope_position_ids[:, b_idx, :]  # [3, Nq]
             else:
@@ -850,6 +851,7 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
     The model/language_model/decoder layers are NOT subclassed. DAT kwargs flow
     through the native **kwargs chain to reach DAT attention layers.
     """
+    config_class = Qwen2_5_VLDATConfig
 
     def __init__(self, config: Qwen2_5_VLDATConfig):
         super().__init__(config)
@@ -876,6 +878,51 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             dat_count = sum(1 for c in layers_str if c == 'D')
             logger.info(f"Qwen2.5VL-DAT: {dat_count} DAT layers, "
                         f"{text_config.num_hidden_layers - dat_count} standard layers")
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        second_per_grid_ts=None,
+        is_first_iteration=False,
+        pixel_values_hd=None,
+        image_grid_thw_hd=None,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+            is_first_iteration=is_first_iteration,
+            **kwargs,
+        )
+
+        if is_first_iteration:
+            model_inputs["pixel_values_hd"] = pixel_values_hd
+            model_inputs["image_grid_thw_hd"] = image_grid_thw_hd
+        else:
+            model_inputs["pixel_values_hd"] = None
+            model_inputs["image_grid_thw_hd"] = None
+
+        return model_inputs
 
     def _generate_hd_features(self, pixel_values_hd, image_grid_thw_hd):
         """Generate HD feature maps from high-resolution pixel values."""
@@ -917,6 +964,7 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
@@ -943,6 +991,7 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # === Step 1: HD feature generation ===
         if image_hd_features is None and pixel_values_hd is not None and image_grid_thw_hd is not None:
@@ -958,7 +1007,10 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 spatial_merge_size=self.config.vision_config.spatial_merge_size,
             )
 
-        # === Step 3: Pre-compute 3D position IDs for DAT layers ===
+        # === Step 3: Pre-compute 3D mRoPE position IDs for DAT layers ===
+        # DAT layers need [3, B, seq_len] positions (temporal, height, width).
+        # In transformers 5.x, get_rope_index returns [4, B, seq_len] where
+        # dim-0 is text position; strip it so DAT always works with 3D.
         mrope_position_ids = None
         if image_hd_features is not None and position_ids is None and input_ids is not None:
             position_ids, rope_deltas = self.model.get_rope_index(
@@ -968,11 +1020,9 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 second_per_grid_ts=second_per_grid_ts,
                 attention_mask=attention_mask,
             )
-            # Save the 3D position_ids for DAT layers
-            mrope_position_ids = position_ids
+            mrope_position_ids = position_ids[-3:] if position_ids.size(0) == 4 else position_ids
         elif position_ids is not None:
-            # position_ids provided externally — use as mrope_position_ids
-            mrope_position_ids = position_ids
+            mrope_position_ids = position_ids[-3:] if position_ids.size(0) == 4 else position_ids
 
         # === Step 4: Call base model with DAT kwargs ===
         # These flow through: Model -> TextModel -> DecoderLayer -> Attention
@@ -989,7 +1039,7 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
+            return_dict=return_dict,
             cache_position=cache_position,
             second_per_grid_ts=second_per_grid_ts,
             # DAT kwargs — flow through to DAT attention layers
