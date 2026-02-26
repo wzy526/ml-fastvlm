@@ -845,18 +845,7 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
                         f"{text_config.num_hidden_layers - dat_count} standard layers")
 
     def _generate_hd_features(self, pixel_values_hd, image_grid_thw_hd):
-        """Generate HD feature maps from high-resolution pixel values.
-
-        Uses the shared vision encoder (self.model.visual) to encode HD images.
-        Returns a list of 2D spatial feature maps for grid_sample.
-
-        Args:
-            pixel_values_hd: HD pixel values (same format as Qwen2VL pixel_values)
-            image_grid_thw_hd: [num_images, 3] grid dimensions for HD
-
-        Returns:
-            List of tensors [H_hr, W_hr, hidden_size] per image
-        """
+        """Generate HD feature maps from high-resolution pixel values."""
         with torch.no_grad():
             pixel_values_hd = pixel_values_hd.type(self.model.visual.dtype)
             hd_output = self.model.visual(pixel_values_hd, grid_thw=image_grid_thw_hd, return_dict=True)

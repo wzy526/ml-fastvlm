@@ -15,6 +15,7 @@ import os
 import copy
 import json
 import logging
+import math
 import pathlib
 import random
 from dataclasses import dataclass, field
@@ -118,6 +119,9 @@ class DataArguments:
     # HD data for DAT
     hd_min_pixels: int = field(default=28224, metadata={"help": "Min pixels for HD image (3^2 * 56*56, 3x linear scale)"})
     hd_max_pixels: int = field(default=9031680, metadata={"help": "Max pixels for HD image (3^2 * max_pixels, 3x linear scale)"})
+    # Coupled LR-HD mode
+    lr_pixels: int = field(default=112896, metadata={"help": "Target LR pixel count for coupled mode (default 336^2=112896)"})
+    coupled_lr_hd: bool = field(default=False, metadata={"help": "Use coupled LR-HD processing: fixed HD target, LR = HD / hr_scale"})
 
 
 @dataclass
@@ -467,6 +471,161 @@ def _apply_label_mask(input_ids, ignore_index=IGNORE_INDEX):
 
 
 # ---------------------------------------------------------------------------
+# Coupled LR-HD sizing
+# ---------------------------------------------------------------------------
+def compute_coupled_sizes(orig_h, orig_w, lr_pixels, hr_scale,
+                          patch_size=14, merge_size=2):
+    """Compute coupled (HD, LR) dimensions for DAT training.
+
+    HD dims are multiples of (patch_size * merge_size * hr_scale) so that
+    HD / hr_scale yields LR dims that are multiples of (patch_size * merge_size).
+    """
+    hd_pixels = lr_pixels * hr_scale * hr_scale
+    lr_factor = patch_size * merge_size           # 28
+    hd_factor = lr_factor * hr_scale              # 84 for hr_scale=3
+
+    aspect = orig_w / orig_h
+    hd_h = max(hd_factor, round(math.sqrt(hd_pixels / aspect) / hd_factor) * hd_factor)
+    hd_w = max(hd_factor, round(math.sqrt(hd_pixels * aspect) / hd_factor) * hd_factor)
+
+    lr_h = hd_h // hr_scale
+    lr_w = hd_w // hr_scale
+    return hd_h, hd_w, lr_h, lr_w
+
+
+# ---------------------------------------------------------------------------
+# Coupled LR-HD Dataset for DAT
+# ---------------------------------------------------------------------------
+class Qwen2VLCoupledDATDataset(Dataset):
+    """Dataset with coupled LR-HD image processing for DAT training.
+
+    Resizes every image to a fixed HD target (~lr_pixels * hr_scale²),
+    then downsamples by hr_scale to produce LR.  This guarantees a
+    consistent scale relationship between LR and HD for all images.
+    """
+
+    def __init__(self, data_path, processor, data_args, model_args,
+                 model_max_length, coord_format="qwen2_vl"):
+        super().__init__()
+        rank0_print(f"Loading data from {data_path} (coupled LR-HD mode)...")
+        self.list_data_dict = json.load(open(data_path, "r"))
+        rank0_print(f"Loaded {len(self.list_data_dict)} samples.")
+
+        self.processor = processor
+        self.data_args = data_args
+        self.model_max_length = model_max_length
+        self.coord_format = coord_format
+
+        self.lr_pixels = data_args.lr_pixels
+        self.hr_scale = model_args.dat_hr_scale
+
+        rank0_print(
+            f"Coupled LR-HD: lr_pixels={self.lr_pixels}, hr_scale={self.hr_scale}, "
+            f"hd_pixels={self.lr_pixels * self.hr_scale ** 2}"
+        )
+
+    def __len__(self):
+        return len(self.list_data_dict)
+
+    @property
+    def modality_lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+            cur_len = cur_len if 'image' in sample else -cur_len
+            length_list.append(cur_len)
+        return length_list
+
+    def __getitem__(self, i):
+        MAX_RETRIES = 10
+        for attempt in range(MAX_RETRIES):
+            try:
+                return self._get_item(i)
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    logging.warning(f"Error loading sample {i}: {e}. Retrying...")
+                    i = random.randint(0, len(self) - 1)
+                else:
+                    raise RuntimeError(f"Failed after {MAX_RETRIES} attempts: {e}")
+
+    def _get_item(self, i):
+        item = self.list_data_dict[i]
+        messages, image_path = _build_messages(
+            item, self.data_args.image_folder, self.data_args.system_message,
+            coord_format=self.coord_format,
+        )
+
+        has_image = image_path is not None and os.path.exists(image_path)
+        img = None
+        if has_image:
+            img = Image.open(image_path).convert("RGB")
+
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+
+        inputs_hd = None
+        if has_image and img is not None:
+            orig_w, orig_h = img.size
+
+            hd_h, hd_w, lr_h, lr_w = compute_coupled_sizes(
+                orig_h, orig_w,
+                lr_pixels=self.lr_pixels,
+                hr_scale=self.hr_scale,
+            )
+
+            img_hd = img.resize((hd_w, hd_h), Image.BICUBIC)
+            img_lr = img_hd.resize((lr_w, lr_h), Image.BICUBIC)
+
+            lr_total = lr_h * lr_w
+            inputs = self.processor(
+                images=[img_lr],
+                text=[text],
+                return_tensors="pt",
+                padding=False,
+                min_pixels=lr_total,
+                max_pixels=lr_total,
+            )
+
+            hd_total = hd_h * hd_w
+            inputs_hd = self.processor(
+                images=[img_hd],
+                text=["<|im_start|>"],
+                return_tensors="pt",
+                padding=False,
+                min_pixels=hd_total,
+                max_pixels=hd_total,
+            )
+        else:
+            inputs = self.processor(
+                text=[text],
+                return_tensors="pt",
+                padding=False,
+            )
+
+        input_ids = inputs["input_ids"]
+        if input_ids.size(1) > self.model_max_length:
+            input_ids = input_ids[:, :self.model_max_length]
+
+        labels = _apply_label_mask(input_ids)
+
+        result = {
+            "input_ids": input_ids.squeeze(0),
+            "labels": labels.squeeze(0),
+        }
+
+        if "pixel_values" in inputs:
+            result["pixel_values"] = inputs["pixel_values"]
+            result["image_grid_thw"] = inputs["image_grid_thw"]
+
+        if inputs_hd is not None:
+            result["pixel_values_hd"] = inputs_hd["pixel_values"]
+            result["image_grid_thw_hd"] = inputs_hd["image_grid_thw"]
+
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 class Qwen2VLSupervisedDataset(Dataset):
@@ -758,6 +917,41 @@ class DATWarmupCallback(transformers.TrainerCallback):
 # ---------------------------------------------------------------------------
 class Qwen2VLTrainer(transformers.Trainer):
 
+    def _inner_training_loop(self, *args, **kwargs):
+        """Override to disable gradient checkpointing on frozen vision encoder.
+
+        ZeRO-3 partitions all parameters (including frozen ones).  When gradient
+        checkpointing is active on frozen vision blocks, the recompute pass sees
+        partitioned (shape-[0]) tensors instead of the gathered ones from the
+        original forward, causing a CheckpointError.  Disabling gradient
+        checkpointing for frozen visual blocks avoids this entirely.
+        """
+        try:
+            visual = _get_visual_module(self.model)
+        except AttributeError:
+            visual = None
+
+        vis_frozen = visual is not None and not any(p.requires_grad for p in visual.parameters())
+
+        if vis_frozen:
+            _orig_gc_enable = self.model.gradient_checkpointing_enable
+
+            def _patched_gc_enable(**kw):
+                _orig_gc_enable(**kw)
+                for module in visual.modules():
+                    if hasattr(module, 'gradient_checkpointing'):
+                        module.gradient_checkpointing = False
+                rank0_print("[Trainer] Disabled gradient checkpointing for frozen visual encoder (ZeRO-3 compat)")
+
+            self.model.gradient_checkpointing_enable = _patched_gc_enable
+
+        result = super()._inner_training_loop(*args, **kwargs)
+
+        if vis_frozen:
+            self.model.gradient_checkpointing_enable = _orig_gc_enable
+
+        return result
+
     def _get_train_sampler(self, train_dataset=None):
         dataset = train_dataset or self.train_dataset
         if dataset is None or not transformers.trainer.has_length(dataset):
@@ -822,11 +1016,13 @@ class Qwen2VLTrainer(transformers.Trainer):
                     "weight_decay": 0.0,
                 },
             ]
+            assigned = set()
             for module_keyword, lr in lr_mapper.items():
                 module_parameters = [
                     name for name, _ in opt_model.named_parameters()
-                    if module_keyword in name
+                    if module_keyword in name and name not in assigned
                 ]
+                assigned.update(module_parameters)
                 optimizer_grouped_parameters.extend([
                     {
                         "params": [
@@ -1044,29 +1240,38 @@ def train():
         model = get_peft_model(model, lora_config)
         rank0_print(f"LoRA target modules: {lora_config.target_modules}")
 
-    # ----- HD Processor for DAT -----
+    # ----- HD Processor for DAT (only for uncoupled mode) -----
     processor_hd = None
-    if model_args.use_dat:
+    if model_args.use_dat and not data_args.coupled_lr_hd:
         processor_hd = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
             use_fast=False,
             min_pixels=data_args.hd_min_pixels,
             max_pixels=data_args.hd_max_pixels,
         )
-        # Use the same native template as the main processor
 
     # ----- Dataset -----
     coord_format = model_args.model_family  # "qwen2_vl" or "qwen2_5_vl"
     rank0_print(f"Bbox coordinate format: {coord_format}")
-    train_dataset = Qwen2VLSupervisedDataset(
-        data_path=data_args.data_path,
-        processor=processor,
-        data_args=data_args,
-        model_max_length=training_args.model_max_length,
-        use_dat=model_args.use_dat,
-        processor_hd=processor_hd,
-        coord_format=coord_format,
-    )
+    if model_args.use_dat and data_args.coupled_lr_hd:
+        train_dataset = Qwen2VLCoupledDATDataset(
+            data_path=data_args.data_path,
+            processor=processor,
+            data_args=data_args,
+            model_args=model_args,
+            model_max_length=training_args.model_max_length,
+            coord_format=coord_format,
+        )
+    else:
+        train_dataset = Qwen2VLSupervisedDataset(
+            data_path=data_args.data_path,
+            processor=processor,
+            data_args=data_args,
+            model_max_length=training_args.model_max_length,
+            use_dat=model_args.use_dat,
+            processor_hd=processor_hd,
+            coord_format=coord_format,
+        )
     data_collator = Qwen2VLDataCollator(pad_token_id=ENDOFTEXT_ID)
 
     # ----- Trainer -----
@@ -1105,13 +1310,6 @@ def train():
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-
-    # Save DAT-only weights for easy reuse
-    if model_args.use_dat and (training_args.local_rank in (0, -1)):
-        dat_state = {k: v.cpu() for k, v in model.state_dict().items()
-                     if any(dk in k for dk in DAT_KEYS_MATCH)}
-        torch.save(dat_state, os.path.join(training_args.output_dir, 'dat_weights.bin'))
-        rank0_print(f"Saved {len(dat_state)} DAT parameter tensors to dat_weights.bin")
 
     # Save processor (Qwen3-VL pattern)
     if training_args.local_rank in (0, -1):
