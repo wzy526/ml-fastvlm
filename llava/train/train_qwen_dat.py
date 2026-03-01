@@ -26,6 +26,11 @@ import transformers
 from torch.utils.data import Dataset, Sampler
 from PIL import Image
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 IGNORE_INDEX = -100
 
 local_rank = None
@@ -912,6 +917,130 @@ class DATWarmupCallback(transformers.TrainerCallback):
 
 
 # ---------------------------------------------------------------------------
+# WandB DAT Monitor Callback
+# ---------------------------------------------------------------------------
+class WandbDATMonitorCallback(transformers.TrainerCallback):
+    """Monitors DAT-specific grad norms, weight norms, and actual LR.
+
+    Grad norm is captured via param.register_hook, which fires during the
+    backward pass—before DeepSpeed's engine.step() internally calls zero_grad.
+    This is the only reliable capture point under ZeRO-2/3.
+
+    Per-micro-step norms are buffered and averaged over the logging interval,
+    then reported to WandB and the console at every on_log call.
+    """
+
+    def __init__(self):
+        self._model     = None
+        self._optimizer = None
+        self._hooks     = []
+        # Accumulates squared norms across DAT params for the current backward
+        self._step_sq   = 0.0
+        self._step_cnt  = 0
+        # One entry per micro-step, flushed at on_log
+        self._norm_buf  = []
+
+    # ------------------------------------------------------------------
+    def on_train_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
+        if model is not None:
+            self._model = model
+            self._register_hooks(model)
+        if optimizer is not None:
+            self._optimizer = optimizer
+
+    def _register_hooks(self, model):
+        """Attach a backward hook to every DAT parameter."""
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+        for name, param in model.named_parameters():
+            if any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad:
+                def _h(grad, _self=self):
+                    # Fires on every GPU; restrict accumulation to rank-0
+                    if local_rank == 0:
+                        _self._step_sq  += grad.detach().norm(2).item() ** 2
+                        _self._step_cnt += 1
+                self._hooks.append(param.register_hook(_h))
+
+    def _flush_step(self, state):
+        """Commit the current micro-step's accumulated grad norm to the buffer."""
+        if state.is_world_process_zero and self._step_cnt > 0:
+            self._norm_buf.append(self._step_sq ** 0.5)
+        self._step_sq  = 0.0
+        self._step_cnt = 0
+
+    # on_substep_end fires after each intermediate micro-step (accum > 1)
+    def on_substep_end(self, args, state, control, **kwargs):
+        self._flush_step(state)
+
+    # on_step_end fires after the final micro-step + optimizer.step().
+    # Gradients in param.grad are already cleared at this point, but the
+    # backward hook already ran and stored the norm in _step_sq/_step_cnt.
+    def on_step_end(self, args, state, control, model=None, optimizer=None, **kwargs):
+        if model is not None:
+            self._model = model
+        if optimizer is not None:
+            self._optimizer = optimizer
+        self._flush_step(state)
+
+    # ------------------------------------------------------------------
+    def on_log(self, args, state, control, logs=None, model=None, optimizer=None, **kwargs):
+        """Flush buffered metrics to WandB and console."""
+        if not state.is_world_process_zero:
+            return
+
+        _model     = model     or self._model
+        _optimizer = optimizer or self._optimizer
+        metrics    = {}
+
+        # 1. DAT weight norm (params are always readable)
+        if _model is not None:
+            sq, cnt = 0.0, 0
+            for name, param in _model.named_parameters():
+                if any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad:
+                    try:
+                        sq  += param.data.norm(2).item() ** 2
+                        cnt += 1
+                    except Exception:
+                        pass
+            if cnt > 0:
+                metrics["dat/weight_norm"] = sq ** 0.5
+
+        # 2. Average DAT grad norm over the logging interval
+        if self._norm_buf:
+            metrics["dat/grad_norm"] = sum(self._norm_buf) / len(self._norm_buf)
+            self._norm_buf.clear()
+
+        # 3. Real DAT LR from the optimizer param group
+        if _optimizer is not None and _model is not None:
+            try:
+                probe = next(
+                    p for n, p in _model.named_parameters()
+                    if any(k in n for k in DAT_KEYS_MATCH) and p.requires_grad
+                )
+                for g in _optimizer.param_groups:
+                    if any(id(p) == id(probe) for p in g['params']):
+                        metrics["dat/lr"] = g['lr']
+                        break
+            except StopIteration:
+                pass
+
+        if not metrics:
+            return
+
+        # commit=False: merges with Trainer's own wandb.log at the same step
+        if wandb is not None and wandb.run is not None:
+            wandb.log(metrics, step=state.global_step, commit=False)
+        parts = [f"{k}={v:.6g}" for k, v in sorted(metrics.items())]
+        rank0_print(f"[DATMonitor] step {state.global_step}: {', '.join(parts)}")
+
+    def on_train_end(self, args, state, control, **kwargs):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 class Qwen2VLTrainer(transformers.Trainer):
@@ -1068,6 +1197,9 @@ class Qwen2VLTrainer(transformers.Trainer):
 # ---------------------------------------------------------------------------
 def train():
     global local_rank
+
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    rank0_print("[train] Disabled cuDNN SDPA backend to avoid mha_graph execution failures")
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, Qwen2VLTrainingArguments)
@@ -1277,6 +1409,8 @@ def train():
     callbacks = []
     if dat_warmup_callback is not None:
         callbacks.append(dat_warmup_callback)
+    if model_args.use_dat:
+        callbacks.append(WandbDATMonitorCallback())
 
     trainer = Qwen2VLTrainer(
         model=model,
