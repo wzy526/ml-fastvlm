@@ -266,7 +266,7 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         self.ln_1 = LayerNorm2d(self.off_dim)
         self.conv_lr_proj = nn.Conv2d(
             self.off_dim, self.inter_size,
-            kernel_size=1, stride=1, padding=0, bias=False,
+            kernel_size=1, stride=1, padding=0,
         )
 
         # Intention branch
@@ -315,10 +315,10 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
             if self.v_proj_hd.bias is not None:
                 nn.init.zeros_(self.v_proj_hd.bias)
 
-    def _grid_generate(self, h, w, n_repeats, device, dtype):
+    def _grid_generate(self, h, w, n_repeats, device):
         """Generate reference sampling grid in [-1, 1]."""
-        grid_y = torch.linspace(-1, 1, h, device=device, dtype=dtype)
-        grid_x = torch.linspace(-1, 1, w, device=device, dtype=dtype)
+        grid_y = torch.linspace(-1, 1, h, device=device, dtype=torch.float32)
+        grid_x = torch.linspace(-1, 1, w, device=device, dtype=torch.float32)
         grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
         grid = torch.stack([grid_x, grid_y], dim=0)  # [2, H, W]
         return grid.unsqueeze(0).repeat(n_repeats * self.off_grps, 1, 1, 1)
@@ -394,16 +394,27 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
 
         if self.use_intention_branch:
             if self.intention_as_gate:
-                off_guide = embed_lr_rep * (embed_intention.sigmoid() * 2.0)
+                gate = embed_intention.sigmoid()
+                off_guide = embed_lr_rep * (gate * 2.0)
+                if self.training:
+                    self._dat_gate_stats = (
+                        gate.detach().mean().item(),
+                        gate.detach().std().item(),
+                    )
             else:
                 off_guide = torch.cat([embed_lr_rep, embed_intention], dim=1)
         else:
             off_guide = embed_lr_rep
 
         # 4. Predict offsets
-        offsets = self.conv_off_proj(F.silu(self.ln_2(off_guide)))
-        references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device, offsets.dtype)
-        sample_locs = (references + offsets).clamp(-1., 1.).permute(0, 2, 3, 1)
+        offsets = self.conv_off_proj(F.silu(self.ln_2(off_guide))).float() # fp32 offsets
+        if self.training:
+            self._dat_offset_stats = (
+                offsets.detach().mean().item(),
+                offsets.detach().std().item(),
+            )
+        references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device) # fp32 grid
+        sample_locs = (references + offsets).clamp(-1., 1.).permute(0, 2, 3, 1) # fp32 sample_locs
 
         # 5. Grid sample from HD features
         hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
@@ -413,12 +424,11 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         )
         img_hr = einops.repeat(img_hr, 'g c h w -> (l g) c h w', l=Lp)
 
-        # Grid sample in fp32 for numerical stability
         orig_dtype = img_hr.dtype
         sampled_hr = F.grid_sample(
-            img_hr.float(), sample_locs.float()[..., (1, 0)],
+            img_hr.float(), sample_locs[..., (1, 0)],
             mode='bilinear', align_corners=True,
-        ).to(orig_dtype)
+        ).to(orig_dtype) # bf16 sampled_hr
 
         sampled_hr = einops.rearrange(
             sampled_hr,

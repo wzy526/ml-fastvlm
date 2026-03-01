@@ -928,17 +928,26 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
 
     Per-micro-step norms are buffered and averaged over the logging interval,
     then reported to WandB and the console at every on_log call.
+
+    Also collects per-forward DAT diagnostics:
+      - offset mean / std (deformable sampling offsets)
+      - gate value mean / std (intention_as_gate sigmoid output)
+    These are stored on each DAT attention module during forward and harvested
+    at on_step_end.
     """
 
     def __init__(self):
         self._model     = None
         self._optimizer = None
         self._hooks     = []
-        # Accumulates squared norms across DAT params for the current backward
         self._step_sq   = 0.0
         self._step_cnt  = 0
-        # One entry per micro-step, flushed at on_log
         self._norm_buf  = []
+        # Buffers for forward-pass diagnostics (flushed at on_log)
+        self._offset_mean_buf = []
+        self._offset_std_buf  = []
+        self._gate_mean_buf   = []
+        self._gate_std_buf    = []
 
     # ------------------------------------------------------------------
     def on_train_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
@@ -956,7 +965,6 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         for name, param in model.named_parameters():
             if any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad:
                 def _h(grad, _self=self):
-                    # Fires on every GPU; restrict accumulation to rank-0
                     if local_rank == 0:
                         _self._step_sq  += grad.detach().norm(2).item() ** 2
                         _self._step_cnt += 1
@@ -969,42 +977,96 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         self._step_sq  = 0.0
         self._step_cnt = 0
 
-    # on_substep_end fires after each intermediate micro-step (accum > 1)
-    def on_substep_end(self, args, state, control, **kwargs):
-        self._flush_step(state)
+    def _harvest_forward_diagnostics(self, model):
+        """Collect offset / gate stats stashed by DAT attention layers during forward."""
+        if model is None or local_rank != 0:
+            return
+        off_means, off_stds = [], []
+        gate_means, gate_stds = [], []
+        for module in model.modules():
+            if hasattr(module, '_dat_offset_stats'):
+                m, s = module._dat_offset_stats
+                off_means.append(m)
+                off_stds.append(s)
+                del module._dat_offset_stats
+            if hasattr(module, '_dat_gate_stats'):
+                m, s = module._dat_gate_stats
+                gate_means.append(m)
+                gate_stds.append(s)
+                del module._dat_gate_stats
+        if off_means:
+            self._offset_mean_buf.append(sum(off_means) / len(off_means))
+            self._offset_std_buf.append(sum(off_stds) / len(off_stds))
+        if gate_means:
+            self._gate_mean_buf.append(sum(gate_means) / len(gate_means))
+            self._gate_std_buf.append(sum(gate_stds) / len(gate_stds))
 
-    # on_step_end fires after the final micro-step + optimizer.step().
-    # Gradients in param.grad are already cleared at this point, but the
-    # backward hook already ran and stored the norm in _step_sq/_step_cnt.
+    def on_substep_end(self, args, state, control, model=None, **kwargs):
+        self._flush_step(state)
+        self._harvest_forward_diagnostics(model or self._model)
+
     def on_step_end(self, args, state, control, model=None, optimizer=None, **kwargs):
         if model is not None:
             self._model = model
         if optimizer is not None:
             self._optimizer = optimizer
         self._flush_step(state)
+        self._harvest_forward_diagnostics(model or self._model)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _compute_weight_norm(model):
+        """Compute global L2 norm of all DAT parameters in true fp32 precision.
+
+        Under ZeRO-2 + bf16 mixed precision, param.data is the bf16 copy.
+        bf16 has ~7-bit mantissa (relative precision ~0.78%), so with small
+        learning rates the bf16 copy appears frozen even though the fp32
+        master weights in the optimizer are moving.
+
+        Uses DeepSpeed's safe_get_full_fp32_param() to retrieve the actual
+        fp32 master weights (involves an all-gather across ranks).  Only
+        called at logging intervals so the communication cost is acceptable.
+        Falls back to param.data.float() when the API is unavailable.
+        """
+        try:
+            from deepspeed.utils import safe_get_full_fp32_param
+            _get_fp32 = safe_get_full_fp32_param
+        except ImportError:
+            _get_fp32 = None
+
+        sq, cnt = 0.0, 0
+        for name, param in model.named_parameters():
+            if not (any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad):
+                continue
+            try:
+                fp32_tensor = _get_fp32(param) if _get_fp32 is not None else None
+                if fp32_tensor is not None:
+                    sq += fp32_tensor.norm(2).item() ** 2
+                else:
+                    sq += param.data.float().norm(2).item() ** 2
+                cnt += 1
+            except Exception:
+                pass
+        if cnt > 0:
+            return sq ** 0.5
+        return None
+
     def on_log(self, args, state, control, logs=None, model=None, optimizer=None, **kwargs):
         """Flush buffered metrics to WandB and console."""
+        _model     = model     or self._model
+        _optimizer = optimizer or self._optimizer
+
+        # Weight norm must be computed on ALL ranks (safe_get_full_fp32_param
+        # does an all-gather), then only rank 0 reports the result.
+        wn = self._compute_weight_norm(_model) if _model is not None else None
+
         if not state.is_world_process_zero:
             return
 
-        _model     = model     or self._model
-        _optimizer = optimizer or self._optimizer
-        metrics    = {}
+        metrics = {}
 
-        # 1. DAT weight norm (params are always readable)
-        if _model is not None:
-            sq, cnt = 0.0, 0
-            for name, param in _model.named_parameters():
-                if any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad:
-                    try:
-                        sq  += param.data.norm(2).item() ** 2
-                        cnt += 1
-                    except Exception:
-                        pass
-            if cnt > 0:
-                metrics["dat/weight_norm"] = sq ** 0.5
+        if wn is not None:
+            metrics["dat/weight_norm"] = wn
 
         # 2. Average DAT grad norm over the logging interval
         if self._norm_buf:
@@ -1025,10 +1087,23 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             except StopIteration:
                 pass
 
+        # 4. Offset statistics (mean / std of predicted offsets)
+        if self._offset_mean_buf:
+            metrics["dat/offset_mean"] = sum(self._offset_mean_buf) / len(self._offset_mean_buf)
+            metrics["dat/offset_std"]  = sum(self._offset_std_buf)  / len(self._offset_std_buf)
+            self._offset_mean_buf.clear()
+            self._offset_std_buf.clear()
+
+        # 5. Gate value statistics (intention_as_gate sigmoid output)
+        if self._gate_mean_buf:
+            metrics["dat/gate_mean"] = sum(self._gate_mean_buf) / len(self._gate_mean_buf)
+            metrics["dat/gate_std"]  = sum(self._gate_std_buf)  / len(self._gate_std_buf)
+            self._gate_mean_buf.clear()
+            self._gate_std_buf.clear()
+
         if not metrics:
             return
 
-        # commit=False: merges with Trainer's own wandb.log at the same step
         if wandb is not None and wandb.run is not None:
             wandb.log(metrics, step=state.global_step, commit=False)
         parts = [f"{k}={v:.6g}" for k, v in sorted(metrics.items())]

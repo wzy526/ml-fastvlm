@@ -246,7 +246,6 @@ class Qwen2AttentionDAT(Qwen2AttentionEx):
             kernel_size=1,
             stride=1,
             padding=0,
-            bias=False
         )
         if self.use_intention_branch:
             self.proj_intention = nn.Linear(
@@ -421,10 +420,10 @@ class Qwen2AttentionDAT(Qwen2AttentionEx):
         return torch.cat(query_rot_list, dim=-1), torch.cat(key_rot_list, dim=-1)
         
     @torch.no_grad()
-    def _grid_generate(self, Hk, Wk, B, device, dtype):
+    def _grid_generate(self, Hk, Wk, B, device):
         ref_y, ref_x = torch.meshgrid(
-            torch.linspace(0.5, Hk - 0.5, Hk, dtype=dtype, device=device),
-            torch.linspace(0.5, Wk - 0.5, Wk, dtype=dtype, device=device),
+            torch.linspace(0.5, Hk - 0.5, Hk, dtype=torch.float32, device=device),
+            torch.linspace(0.5, Wk - 0.5, Wk, dtype=torch.float32, device=device),
             indexing='ij'
         )
         ref = torch.stack((ref_y, ref_x), -1)
@@ -565,16 +564,27 @@ class Qwen2AttentionDAT(Qwen2AttentionEx):
             )
             if self.use_intention_branch:
                 if self.intention_as_gate:
-                    off_guide = embed_lr.mul(embed_intention.sigmoid().mul(2.0)) # Lp * g, C_inter, Hg, Wg
+                    gate = embed_intention.sigmoid()
+                    off_guide = embed_lr.mul(gate.mul(2.0))
+                    if self.training:
+                        self._dat_gate_stats = (
+                            gate.detach().mean().item(),
+                            gate.detach().std().item(),
+                        )
                 else:
                     off_guide = torch.cat([embed_lr, embed_intention], dim=1) # Lp * g, 2C_inter, Hg, Wg
             else:
                 off_guide = embed_lr # Lp * g, C_inter, Hg, Wg
             # 4. We predict offsets
-            offsets = self.conv_off_proj(self.act(self.ln_2(off_guide))) # Lp * g, 2, Hg, Wg
+            offsets = self.conv_off_proj(self.act(self.ln_2(off_guide))).float() # fp32 offsets
+            if self.training:
+                self._dat_offset_stats = (
+                    offsets.detach().mean().item(),
+                    offsets.detach().std().item(),
+                )
             # 5. We generate a grid then add offsets to them
-            references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, offsets.device, offsets.dtype)
-            sample_locs = (references + offsets).clamp(-1., 1.).permute(0, 2, 3, 1) # Lp * g, 2, Hg, Wg
+            references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, offsets.device) # fp32 grid
+            sample_locs = (references + offsets).clamp(-1., 1.).permute(0, 2, 3, 1) # fp32 sample_locs
             img_hr = einops.repeat(
                 image_hd_features[b_idx], # n_hr, C
                 'n c -> l n c',
@@ -585,18 +595,12 @@ class Qwen2AttentionDAT(Qwen2AttentionEx):
                 'l (h w) (g c) -> (l g) c h w',
                 l=Lp, h=self.hr_size, w=self.hr_size, g=self.off_grps, c=self.off_dim
             )
-            # 6. We sample tokens from the hr image features and then 
-            # Fix sampling to fp32
-            dtype = img_hr.dtype
-            img_hr = img_hr.to(torch.float32)
-            sample_locs = sample_locs.to(torch.float32)
+            # 6. We sample tokens from the hr image features
+            orig_dtype = img_hr.dtype
             sampled_hr = F.grid_sample(
-                img_hr, 
-                sample_locs[..., (1, 0)],
-                mode='bilinear', align_corners=True
-            ) # (Lp * g), Cg, H_grid, W_grid
-            sampled_hr = sampled_hr.to(dtype)
-            # end of precision fix
+                img_hr.float(), sample_locs[..., (1, 0)],
+                mode='bilinear', align_corners=True,
+            ).to(orig_dtype) # bf16 sampled_hr
             sampled_hr = einops.rearrange(
                 sampled_hr,
                 '(l g) c h w -> l (h w) (g c)',
