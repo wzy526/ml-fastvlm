@@ -157,6 +157,7 @@ class Qwen2VLTrainingArguments(transformers.TrainingArguments):
     lora_r: int = 64
     lora_alpha: int = 16
     lora_dropout: float = 0.05
+    visualization_every_n_steps: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +617,7 @@ class Qwen2VLCoupledDATDataset(Dataset):
         result = {
             "input_ids": input_ids.squeeze(0),
             "labels": labels.squeeze(0),
+            "image_path": image_path,
         }
 
         if "pixel_values" in inputs:
@@ -719,6 +721,7 @@ class Qwen2VLSupervisedDataset(Dataset):
         result = {
             "input_ids": input_ids.squeeze(0),      # [seq_len]
             "labels": labels.squeeze(0),             # [seq_len]
+            "image_path": image_path,                # str or None
         }
 
         if "pixel_values" in inputs:
@@ -778,6 +781,11 @@ class Qwen2VLDataCollator:
         else:
             batch["pixel_values"] = None
             batch["image_grid_thw"] = None
+
+        # Image paths for visualization (list of str, not a tensor)
+        image_paths = [inst.get("image_path") for inst in instances]
+        if any(p is not None for p in image_paths):
+            batch["image_paths"] = image_paths
 
         # HD pixel values for DAT
         pv_hd_list = [inst["pixel_values_hd"] for inst in instances if "pixel_values_hd" in inst]
@@ -936,7 +944,9 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
     at on_step_end.
     """
 
-    def __init__(self):
+    KVHD_KEYS = ('k_proj_hd', 'v_proj_hd')
+
+    def __init__(self, use_kvhd: bool = False):
         self._model     = None
         self._optimizer = None
         self._hooks     = []
@@ -948,6 +958,11 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         self._offset_std_buf  = []
         self._gate_mean_buf   = []
         self._gate_std_buf    = []
+        # KVHD-specific gradient monitoring (only when hd_proj is enabled)
+        self._use_kvhd       = use_kvhd
+        self._kvhd_step_sq   = 0.0
+        self._kvhd_step_cnt  = 0
+        self._kvhd_norm_buf  = []
 
     # ------------------------------------------------------------------
     def on_train_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
@@ -964,18 +979,27 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         self._hooks.clear()
         for name, param in model.named_parameters():
             if any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad:
-                def _h(grad, _self=self):
+                is_kvhd = any(k in name for k in self.KVHD_KEYS)
+                def _h(grad, _self=self, _is_kvhd=is_kvhd):
                     if local_rank == 0:
-                        _self._step_sq  += grad.detach().norm(2).item() ** 2
+                        gnorm_sq = grad.detach().norm(2).item() ** 2
+                        _self._step_sq  += gnorm_sq
                         _self._step_cnt += 1
+                        if _is_kvhd and _self._use_kvhd:
+                            _self._kvhd_step_sq  += gnorm_sq
+                            _self._kvhd_step_cnt += 1
                 self._hooks.append(param.register_hook(_h))
 
     def _flush_step(self, state):
         """Commit the current micro-step's accumulated grad norm to the buffer."""
         if state.is_world_process_zero and self._step_cnt > 0:
             self._norm_buf.append(self._step_sq ** 0.5)
+        if state.is_world_process_zero and self._kvhd_step_cnt > 0:
+            self._kvhd_norm_buf.append(self._kvhd_step_sq ** 0.5)
         self._step_sq  = 0.0
         self._step_cnt = 0
+        self._kvhd_step_sq  = 0.0
+        self._kvhd_step_cnt = 0
 
     def _harvest_forward_diagnostics(self, model):
         """Collect offset / gate stats stashed by DAT attention layers during forward."""
@@ -1014,19 +1038,16 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         self._harvest_forward_diagnostics(model or self._model)
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _compute_weight_norm(model):
-        """Compute global L2 norm of all DAT parameters in true fp32 precision.
+    def _compute_weight_norms(self, model):
+        """Compute fp32 L2 weight norms for DAT params (and kvhd subset) in one pass.
 
         Under ZeRO-2 + bf16 mixed precision, param.data is the bf16 copy.
-        bf16 has ~7-bit mantissa (relative precision ~0.78%), so with small
-        learning rates the bf16 copy appears frozen even though the fp32
-        master weights in the optimizer are moving.
-
         Uses DeepSpeed's safe_get_full_fp32_param() to retrieve the actual
         fp32 master weights (involves an all-gather across ranks).  Only
         called at logging intervals so the communication cost is acceptable.
         Falls back to param.data.float() when the API is unavailable.
+
+        Returns (dat_weight_norm, kvhd_weight_norm).  Either may be None.
         """
         try:
             from deepspeed.utils import safe_get_full_fp32_param
@@ -1034,22 +1055,27 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         except ImportError:
             _get_fp32 = None
 
-        sq, cnt = 0.0, 0
+        dat_sq, dat_cnt = 0.0, 0
+        kvhd_sq, kvhd_cnt = 0.0, 0
         for name, param in model.named_parameters():
             if not (any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad):
                 continue
             try:
                 fp32_tensor = _get_fp32(param) if _get_fp32 is not None else None
                 if fp32_tensor is not None:
-                    sq += fp32_tensor.norm(2).item() ** 2
+                    norm_sq = fp32_tensor.norm(2).item() ** 2
                 else:
-                    sq += param.data.float().norm(2).item() ** 2
-                cnt += 1
+                    norm_sq = param.data.float().norm(2).item() ** 2
+                dat_sq += norm_sq
+                dat_cnt += 1
+                if self._use_kvhd and any(k in name for k in self.KVHD_KEYS):
+                    kvhd_sq += norm_sq
+                    kvhd_cnt += 1
             except Exception:
                 pass
-        if cnt > 0:
-            return sq ** 0.5
-        return None
+        dat_wn = dat_sq ** 0.5 if dat_cnt > 0 else None
+        kvhd_wn = kvhd_sq ** 0.5 if kvhd_cnt > 0 else None
+        return dat_wn, kvhd_wn
 
     def on_log(self, args, state, control, logs=None, model=None, optimizer=None, **kwargs):
         """Flush buffered metrics to WandB and console."""
@@ -1058,7 +1084,7 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
 
         # Weight norm must be computed on ALL ranks (safe_get_full_fp32_param
         # does an all-gather), then only rank 0 reports the result.
-        wn = self._compute_weight_norm(_model) if _model is not None else None
+        wn, kvhd_wn = self._compute_weight_norms(_model) if _model is not None else (None, None)
 
         if not state.is_world_process_zero:
             return
@@ -1101,6 +1127,14 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             self._gate_mean_buf.clear()
             self._gate_std_buf.clear()
 
+        # 6. KVHD-specific metrics (only when hd_proj is enabled)
+        if self._use_kvhd:
+            if kvhd_wn is not None:
+                metrics["dat/kvhd_weight_norm"] = kvhd_wn
+            if self._kvhd_norm_buf:
+                metrics["dat/kvhd_grad_norm"] = sum(self._kvhd_norm_buf) / len(self._kvhd_norm_buf)
+                self._kvhd_norm_buf.clear()
+
         if not metrics:
             return
 
@@ -1116,9 +1150,208 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
 
 
 # ---------------------------------------------------------------------------
+# WandB Sampling-Point Visualization Callback
+# ---------------------------------------------------------------------------
+class WandbSamplingVisCallback(transformers.TrainerCallback):
+    """Visualise DAT sampling-point positions on WandB at logging time.
+
+    For one randomly chosen sample in the batch, draws the sampling grid of
+    every DAT layer: points coloured by offset-group (H in HSV) with
+    brightness proportional to a per-point attention proxy (V in HSV).
+    Thin arrows show offsets from the uniform reference grid.
+    """
+
+    def __init__(self, tokenizer=None, vis_every_n_logs: int = 10):
+        self._model = None
+        self._tokenizer = tokenizer
+        self._vis_every_n_logs = vis_every_n_logs
+        self._log_count = 0
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is not None:
+            self._model = model
+            vis_pick = random.randint(0, 2**31)
+            for m in model.modules():
+                if hasattr(m, 'grid_size'):
+                    m._dat_request_vis = True
+                    m._dat_vis_pick = vis_pick
+
+    def on_log(self, args, state, control, logs=None, model=None, **kwargs):
+        _model = model or self._model
+        self._log_count += 1
+
+        is_vis_step = (
+            _model is not None
+            and state.is_world_process_zero
+            and self._log_count % self._vis_every_n_logs == 0
+            and wandb is not None and wandb.run is not None
+        )
+
+        # Harvest results computed during the most recent forward
+        if is_vis_step:
+            try:
+                import matplotlib.pyplot as plt
+                figs = self._create_sampling_vis(_model, self._tokenizer)
+                for key, fig in figs.items():
+                    wandb.log(
+                        {key: wandb.Image(fig)},
+                        step=state.global_step, commit=False,
+                    )
+                    plt.close(fig)
+            except Exception as e:
+                rank0_print(f"[SamplingVis] Error: {e}")
+
+        # Cleanup stored vis data on ALL ranks
+        if _model is not None:
+            for m in _model.modules():
+                if hasattr(m, '_dat_vis_data'):
+                    del m._dat_vis_data
+            for _attr in ('_dat_vis_input_ids', '_dat_vis_image_path',
+                          '_batch_image_paths'):
+                if hasattr(_model, _attr):
+                    delattr(_model, _attr)
+
+        # Request vis computation for the NEXT forward pass
+        # (one logging interval before the next vis step)
+        next_vis = (
+            _model is not None
+            and self._log_count % self._vis_every_n_logs
+                == self._vis_every_n_logs - 1
+        )
+        if next_vis:
+            vis_pick = random.randint(0, 2**31)
+            for m in _model.modules():
+                if hasattr(m, 'grid_size'):
+                    m._dat_request_vis = True
+                    m._dat_vis_pick = vis_pick
+
+    @staticmethod
+    def _create_sampling_vis(model, tokenizer=None):
+        """Return dict of {wandb_key: matplotlib_figure}, one per DAT layer.
+
+        Each figure shows the original image as background with the top-20
+        sampling points (by attention) overlaid per group.
+        """
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        import numpy as np
+        import textwrap
+        from PIL import Image
+        TOP_K = 10
+
+        layer_data = []
+        for name, module in model.named_modules():
+            if hasattr(module, '_dat_vis_data') and module._dat_vis_data:
+                layer_data.append((name, module._dat_vis_data))
+        if not layer_data:
+            return {}
+
+        # --- Decode question text ---
+        conv_text = ''
+        if tokenizer is not None and hasattr(model, '_dat_vis_input_ids'):
+            try:
+                full = tokenizer.decode(
+                    model._dat_vis_input_ids, skip_special_tokens=True,
+                )
+                if 'user\n' in full:
+                    question = full.split('user\n')[-1].split('assistant')[0].strip()
+                else:
+                    question = full[-300:]
+                conv_text = textwrap.shorten(question, width=90, placeholder=' ...')
+            except Exception:
+                pass
+
+        # --- Load original image ---
+        bg_img = None
+        if hasattr(model, '_dat_vis_image_path') and model._dat_vis_image_path:
+            try:
+                bg_img = np.asarray(Image.open(model._dat_vis_image_path).convert('RGB'))
+            except Exception:
+                pass
+
+        # --- One figure per layer ---
+        figs = {}
+        for name, (locs, attn) in layer_data:
+            # locs: [Lp, off_grps, grid_h, grid_w, 2]
+            # attn: [Lp, grid_h, grid_w] or None
+            lp_idx = random.randint(0, locs.size(0) - 1) if locs.size(0) > 1 else 0
+            locs_0 = locs[lp_idx].cpu().numpy()
+            attn_0 = attn[lp_idx].cpu().numpy() if attn is not None else None
+            n_grps, gh, gw = locs_0.shape[0], locs_0.shape[1], locs_0.shape[2]
+
+            fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+
+            if bg_img is not None:
+                ax.imshow(bg_img, extent=[-1, 1, 1, -1], aspect='auto', alpha=0.85)
+            else:
+                ax.set_facecolor('#f0f0f0')
+
+            for g in range(n_grps):
+                hue = g / max(n_grps, 1)
+                pts = locs_0[g]               # [gh, gw, 2]
+                x_all = pts[:, :, 0].flatten()
+                y_all = pts[:, :, 1].flatten()
+
+                if attn_0 is not None:
+                    a_all = attn_0.flatten()
+                    top_idx = np.argsort(a_all)[-TOP_K:]
+                    x_pts = x_all[top_idx]
+                    y_pts = y_all[top_idx]
+                    a_sel = a_all[top_idx]
+                    a_min, a_max = a_sel.min(), a_sel.max()
+                    if a_max > a_min:
+                        vals = (a_sel - a_min) / (a_max - a_min)
+                    else:
+                        vals = np.ones_like(a_sel)
+                    vals = 0.5 + 0.5 * vals
+                else:
+                    n_pts = gh * gw
+                    sel = np.random.choice(n_pts, min(TOP_K, n_pts), replace=False)
+                    x_pts, y_pts = x_all[sel], y_all[sel]
+                    vals = np.ones(len(sel))
+
+                colors = [mcolors.hsv_to_rgb([hue, 1.0, float(v)]) for v in vals]
+                ax.scatter(
+                    x_pts, y_pts, c=colors, s=60,
+                    edgecolors='white', linewidths=0.8, zorder=3,
+                )
+
+            ax.set_xlim(-1.05, 1.05)
+            ax.set_ylim(1.05, -1.05)
+            ax.set_aspect('equal')
+            ax.tick_params(labelsize=6)
+
+            # Layer label
+            layer_label = name
+            for k, part in enumerate(name.split('.')):
+                if part == 'layers' and k + 1 < len(name.split('.')):
+                    layer_label = f'L{name.split(".")[k + 1]}'
+                    break
+
+            title = layer_label
+            if conv_text:
+                title += f'\nQ: {conv_text}'
+            fig.suptitle(title, fontsize=8, y=0.99)
+            fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+            figs[f'dat/sampling_{layer_label}'] = fig
+
+        return figs
+
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 class Qwen2VLTrainer(transformers.Trainer):
+
+    def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
+        image_paths = inputs.pop('image_paths', None)
+        if image_paths is not None:
+            inner = model.module if hasattr(model, 'module') else model
+            inner._batch_image_paths = image_paths
+        return super().training_step(model, inputs, num_items_in_batch, **kwargs)
 
     def _inner_training_loop(self, *args, **kwargs):
         """Override to disable gradient checkpointing on frozen vision encoder.
@@ -1485,7 +1718,15 @@ def train():
     if dat_warmup_callback is not None:
         callbacks.append(dat_warmup_callback)
     if model_args.use_dat:
-        callbacks.append(WandbDATMonitorCallback())
+        callbacks.append(
+            WandbDATMonitorCallback(use_kvhd=model_args.dat_hd_proj)
+        )
+    if training_args.visualization_every_n_steps > 0:
+        callbacks.append(
+            WandbSamplingVisCallback(
+                tokenizer=processor.tokenizer, vis_every_n_logs=training_args.visualization_every_n_steps,
+            )
+        )
 
     trainer = Qwen2VLTrainer(
         model=model,

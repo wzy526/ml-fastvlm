@@ -3,10 +3,10 @@
 export WANDB_PROJECT="vldat_experiments"
 
 CKPT_ROOT="/mnt/ephemeral/vldat_experiments"
-EXP_NAME="qwen2_5vl-3b-dat-z3_5l1d_s12_g6_i128_inten_gate_ld_1M"
+EXP_NAME="qwen2_5vl-3b-dat-z3_5l1d_s12_g8_i128_inten_gate_hd_prec_1M"
 mkdir -p $CKPT_ROOT/$EXP_NAME
 
-# 36-layer Qwen2.5-VL-3B: 5L1D pattern, DAT on layers 5, 11, 17, 23, 29, 35 (0-indexed)
+# 36-layer Qwen2.5-VL-3B: 8L1D pattern, DAT on layers 8, 17, 26, 35 (0-indexed)
 DAT_LAYERS="LLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLLD"
 
 ds llava/train/train_qwen_dat.py \
@@ -22,11 +22,12 @@ ds llava/train/train_qwen_dat.py \
     --dat_off_grps 8 \
     --dat_inter_size 128 \
     --dat_hr_scale 3 \
-    --dat_hd_proj False \
+    --dat_hd_proj True \
     --dat_use_intention_branch True \
     --dat_intention_as_gate True \
     --dat_freeze_base False \
-    --dat_lr 1e-5 \
+    --dat_lr 1e-4 \
+    --visualization_every_n_steps 50 \
     --tune_mm_vision False \
     --tune_mm_mlp False \
     --tune_mm_llm True \
@@ -40,19 +41,18 @@ ds llava/train/train_qwen_dat.py \
     --gradient_accumulation_steps 4 \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 2000 \
-    --learning_rate 1e-6 \
+    --save_steps 500 \
+    --learning_rate 1e-5 \
     --weight_decay 0. \
     --warmup_steps 100 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
-    --logging_nan_inf_filter False \
     --model_max_length 32768 \
     --gradient_checkpointing True \
     --group_by_modality_length True \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers 8 \
     --dataloader_pin_memory True \
-    --dataloader_prefetch_factor 3 \
+    --dataloader_prefetch_factor 2 \
     --dataloader_persistent_workers True \
     --dataloader_drop_last True \
     --seed 42 \

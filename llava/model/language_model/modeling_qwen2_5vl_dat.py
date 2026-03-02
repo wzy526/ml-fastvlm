@@ -481,6 +481,76 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         return key_hd, value_hd, sampling_locs_out
 
+    def _compute_hd_kv_positions(self, image_range_list_b, Nq, Ns):
+        """Compute HD token positions in the extended KV sequence.
+
+        Mirrors the insertion logic of _reorganize_kv_mask_and_pos
+        without constructing the actual tensors.
+        """
+        answer_ranges = image_range_list_b[1:]
+        hd_positions = []
+        cum = 0
+        insert_counter = 0
+
+        for ar in answer_ranges:
+            ans_start, ans_end, cur_intention_idx = ar[0], ar[1], ar[2]
+
+            if ans_end > 0:  # training
+                cum += cur_intention_idx + 1 - insert_counter
+                hd_positions.extend(range(cum, cum + Ns))
+                cum += Ns
+                cum += ans_end + 1 - (cur_intention_idx + 1)
+                insert_counter = ans_end + 1
+            else:  # inference
+                cum += cur_intention_idx + 1 - insert_counter
+                hd_positions.extend(range(cum, cum + Ns))
+                cum += Ns
+                cum += ans_start - (cur_intention_idx + 1)
+                insert_counter = ans_start
+
+        return hd_positions
+
+    def _compute_hd_attention(self, b_idx, slocs, hd_pos,
+                              query_bhnc, key_bhnc, attn_mask_4d):
+        """Compute mean attention from all queries to HD KV tokens (one sample).
+
+        Extracts the HD columns from the attention score matrix
+        (Q @ K^T / sqrt(d)), applies the causal mask, softmaxes over
+        HD positions, then averages over heads and query positions.
+
+        Returns:
+            (sampling_locs, attn_map) where attn_map is
+            [Lp, grid_h, grid_w] or None.
+        """
+        if not hd_pos:
+            return (slocs, None)
+
+        with torch.no_grad():
+            hd_idx = torch.tensor(
+                hd_pos, device=query_bhnc.device, dtype=torch.long,
+            )
+
+            q_b = query_bhnc[b_idx]                       # [H, Nq, D]
+            k_hd = key_bhnc[b_idx, :, hd_idx, :]          # [H, n_hd, D]
+
+            scores = torch.matmul(
+                q_b, k_hd.transpose(-1, -2),
+            ) / math.sqrt(self.head_dim)                   # [H, Nq, n_hd]
+
+            mask_hd = attn_mask_4d[b_idx, :, :, hd_idx]   # [1, Nq, n_hd]
+            scores = scores + mask_hd
+
+            attn = F.softmax(scores.float(), dim=-1)       # [H, Nq, n_hd]
+            attn = attn.nan_to_num(0.0)
+
+            attn_avg = attn.mean(dim=(0, 1))               # [n_hd]
+
+            Lp = slocs.size(0)
+            attn_map = attn_avg.reshape(
+                Lp, self.grid_size, self.grid_size,
+            )
+            return (slocs, attn_map)
+
     def _reorganize_kv_mask_and_pos(
         self, key_b, value_b, attn_b, key_hd, value_hd,
         hd_pos_ids, orig_pos_b,
@@ -704,6 +774,9 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         keys_concat, values_concat, attns_concat = [], [], []
         kv_pos_concat = []   # [3, kv_len_b] per batch
         q_pos_concat = []    # [3, Nq] per batch
+        _want_vis = (self.training
+                     and getattr(self, '_dat_request_vis', False))
+        _dat_vis = [] if _want_vis else None
 
         for b_idx in range(B):
             if len(image_range_list[b_idx]) <= 1:
@@ -728,9 +801,14 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
             # Generate offsets and sample from HD features
             hd_feat_idx = b_idx_to_hd_idx[b_idx]
-            key_hd, value_hd, _ = self._generate_offsets_and_sample(
+            key_hd, value_hd, _slocs = self._generate_offsets_and_sample(
                 query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx,
             )
+            if _dat_vis is not None:
+                _hd_pos = self._compute_hd_kv_positions(
+                    image_range_list[b_idx], Nq, Ns,
+                )
+                _dat_vis.append((b_idx, _slocs, _hd_pos))
 
             # Construct HD position IDs from LR image coordinate range
             lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0]
@@ -825,6 +903,16 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=False,
             )
+
+        if _dat_vis:
+            self._dat_request_vis = False
+            pick = getattr(self, '_dat_vis_pick', 0) % len(_dat_vis)
+            b_idx_v, slocs_v, hd_pos_v = _dat_vis[pick]
+            self._dat_vis_data = self._compute_hd_attention(
+                b_idx_v, slocs_v, hd_pos_v,
+                query_bhnc, key_bhnc, attn_mask_4d,
+            )
+            self._dat_vis_b_idx = b_idx_v
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, Nq, self.hidden_size)
         attn_output = self.o_proj(attn_output)
@@ -1059,6 +1147,17 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             mrope_position_ids=mrope_position_ids,
             **kwargs,
         )
+
+        # === Vis: capture input_ids + image_path for the selected sample ===
+        if self.training and input_ids is not None:
+            for _m in self.modules():
+                if hasattr(_m, '_dat_vis_b_idx'):
+                    vis_b = _m._dat_vis_b_idx
+                    self._dat_vis_input_ids = input_ids[vis_b].detach().cpu()
+                    if hasattr(self, '_batch_image_paths'):
+                        self._dat_vis_image_path = self._batch_image_paths[vis_b]
+                    del _m._dat_vis_b_idx
+                    break
 
         # === Step 5: LM head + loss ===
         hidden_states = outputs.last_hidden_state
