@@ -881,12 +881,41 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 query_bhnc, key_bhnc, cos, sin, mrope_section,
             )
 
-        # KV cache update
+        # KV cache update — store only original Nq-length KV so that all
+        # layers (DAT and standard) have consistent cache lengths.  The
+        # extended KV (with HD tokens) is used only for the current
+        # attention computation; decode steps retrieve the standard cache.
         if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_bhnc, value_bhnc = past_key_values.update(
-                key_bhnc, value_bhnc, self.layer_idx, cache_kwargs,
-            )
+            if kv_len > Nq:
+                cos_std, sin_std = position_embeddings
+                cos_std = cos_std.to(device)
+                sin_std = sin_std.to(device)
+                key_orig = key_states.view(
+                    B, Nq, self.num_key_value_heads, self.head_dim
+                ).transpose(1, 2)
+                value_orig = value_states.view(
+                    B, Nq, self.num_key_value_heads, self.head_dim
+                ).transpose(1, 2)
+                key_orig = apply_multimodal_rotary_pos_emb_single(
+                    key_orig, cos_std, sin_std, mrope_section
+                )
+                cache_kwargs = {
+                    "sin": sin_std,
+                    "cos": cos_std,
+                    "cache_position": cache_position,
+                }
+                past_key_values.update(
+                    key_orig, value_orig, self.layer_idx, cache_kwargs
+                )
+            else:
+                cache_kwargs = {
+                    "sin": sin,
+                    "cos": cos,
+                    "cache_position": cache_position,
+                }
+                key_bhnc, value_bhnc = past_key_values.update(
+                    key_bhnc, value_bhnc, self.layer_idx, cache_kwargs,
+                )
 
         # GQA: repeat KV heads to match Q heads
         key_bhnc = repeat_kv(key_bhnc, self.num_key_value_groups)
@@ -1175,11 +1204,10 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             logits = logits.float()
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss = F.cross_entropy(shift_logits, shift_labels)
 
         return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,

@@ -462,7 +462,7 @@ def _apply_label_mask(input_ids, ignore_index=IGNORE_INDEX):
     L = flat.size(0)
     pos = 0
     while pos < L:
-        if flat[pos].item() == ASSISTANT_TOKEN_ID:
+        if flat[pos].item() == ASSISTANT_TOKEN_ID and pos > 0 and flat[pos - 1].item() == IM_START_TOKEN_ID:
             ans_start = pos + 2  # skip 'assistant' + '\n'
             ans_end = ans_start
             while ans_end < L and flat[ans_end].item() != IM_END_TOKEN_ID:
@@ -1560,7 +1560,7 @@ def train():
             dat_extra_args=dat_extra_args,
             torch_dtype=compute_dtype,
         )
-
+对
         # Apply freeze strategy
         if model_args.dat_warmup_steps > 0:
             # Two-phase: DAT+LLM trainable initially (for optimizer creation),
