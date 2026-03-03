@@ -303,13 +303,20 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
 
     @torch.no_grad()
     def _init_dat_weights(self):
-        _init = lambda w: nn.init.trunc_normal_(w, std=1e-4, a=-1e-2, b=1e-2)
-        _init(self.conv_lr_dw.weight)
-        _init(self.conv_lr_proj.weight)
-        _init(self.conv_off_proj.weight)
+        # Conv layers: Kaiming normal
+        nn.init.kaiming_normal_(self.conv_lr_dw.weight)
+        nn.init.kaiming_normal_(self.conv_lr_proj.weight)
+        nn.init.kaiming_normal_(self.conv_off_proj.weight)
+        if self.conv_lr_proj.bias is not None:
+            nn.init.zeros_(self.conv_lr_proj.bias)
+        # Linear layers: Xavier uniform
+        if isinstance(self.proj_intention, nn.Linear):
+            nn.init.xavier_uniform_(self.proj_intention.weight)
+            if self.proj_intention.bias is not None:
+                nn.init.zeros_(self.proj_intention.bias)
         if self.k_proj_hd is not None:
-            _init(self.k_proj_hd.weight)
-            _init(self.v_proj_hd.weight)
+            nn.init.xavier_uniform_(self.k_proj_hd.weight)
+            nn.init.xavier_uniform_(self.v_proj_hd.weight)
             if self.k_proj_hd.bias is not None:
                 nn.init.zeros_(self.k_proj_hd.bias)
             if self.v_proj_hd.bias is not None:

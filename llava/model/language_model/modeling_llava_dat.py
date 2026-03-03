@@ -279,10 +279,25 @@ class LlamaAttentionDAT(LlamaAttentionEx):
 
 
     @torch.no_grad()
-    def init_conv_weights(self): 
-        nn.init.kaiming_normal_(self.conv_lr_dw.weight, mode='fan_in', nonlinearity='linear')
+    def init_conv_weights(self):
+        # Conv layers: Kaiming normal
+        nn.init.kaiming_normal_(self.conv_lr_dw.weight)
         nn.init.kaiming_normal_(self.conv_lr_proj.weight)
         nn.init.kaiming_normal_(self.conv_off_proj.weight)
+        if self.conv_lr_proj.bias is not None:
+            nn.init.zeros_(self.conv_lr_proj.bias)
+        # Linear layers: Xavier uniform
+        if isinstance(self.proj_intention, nn.Linear):
+            nn.init.xavier_uniform_(self.proj_intention.weight)
+            if self.proj_intention.bias is not None:
+                nn.init.zeros_(self.proj_intention.bias)
+        if isinstance(self.k_proj_hd, nn.Linear):
+            nn.init.xavier_uniform_(self.k_proj_hd.weight)
+            nn.init.xavier_uniform_(self.v_proj_hd.weight)
+            if self.k_proj_hd.bias is not None:
+                nn.init.zeros_(self.k_proj_hd.bias)
+            if self.v_proj_hd.bias is not None:
+                nn.init.zeros_(self.v_proj_hd.bias)
         
     @torch.no_grad()
     def _grid_generate(self, Hk, Wk, B, device):
