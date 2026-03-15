@@ -44,6 +44,31 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 from transformers.cache_utils import Cache
 
+# FlexAttention (PyTorch >= 2.5): DAT mask is causal in extended-KV space,
+# so we use block_mask (kv_idx <= q_upper_bounds) instead of full attn_mask_4d.
+#
+# Gradient-checkpointing compatibility: flex_attention's internal Triton
+# autograd Function saves tensors whose metadata differs between the first
+# forward pass and the recomputed forward pass inside GC, triggering
+# "Recomputed values have different metadata" errors.
+# Fix: wrap flex_attention in our own torch.autograd.Function (_DATFlexAttn)
+# so that GC only sees the explicit tensors we save (q, k, v, out) — all with
+# deterministic shapes — and never sees flex_attention's internal tensors.
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention_compiled
+    from torch.nn.attention.flex_attention import create_block_mask
+    # NOTE: do NOT wrap with torch.compile here.
+    # torch.compile(flex_attention) is non-deterministic across calls with
+    # respect to internally saved tensors: the first call does dynamo tracing
+    # and saves a different set of intermediate tensors than subsequent calls
+    # which use the cached compiled kernel. This breaks gradient checkpointing's
+    # "saved vs recomputed metadata" verification (CheckpointError).
+    # The raw flex_attention dispatches to Triton internally and is GC-safe.
+    _FLEX_ATTENTION_AVAILABLE = True
+except (ImportError, Exception):
+    _flex_attention_compiled = create_block_mask = None
+    _FLEX_ATTENTION_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -584,6 +609,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             attn_ext: [kv_len, 1, Nq] (permuted for pad_sequence)
             q_pos: [3, Nq_mapped] - Q position IDs in extended KV coordinate space
             kv_pos: [3, kv_len] - extended KV position IDs
+            q_upper_bounds: [Nq] int - extended KV index upper bound per Q (for FlexAttention)
         """
         answer_ranges = image_range_list_b[1:]
         k_split, v_split, attn_split = [], [], []
@@ -677,8 +703,9 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             attn_split.append(attn_b[:, :, insert_counter:Nq])
 
         if len(k_split) == 0:
+            q_indices = torch.arange(Nq, device=device, dtype=torch.int64)
             return (key_b, value_b, attn_b.permute(2, 0, 1).contiguous(),
-                    orig_pos_b, orig_pos_b)
+                    orig_pos_b, orig_pos_b, q_indices)
 
         key_ext = torch.cat(k_split, dim=0)
         value_ext = torch.cat(v_split, dim=0)
@@ -686,10 +713,10 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         kv_pos = torch.cat(kv_pos_split, dim=1)
 
         # Q position IDs: extract from kv_pos using indices
-        q_indices = torch.cat(q_pos_indices, dim=0)  # [Nq]
+        q_indices = torch.cat(q_pos_indices, dim=0)  # [Nq] — extended KV upper bound per Q
         q_pos = kv_pos[:, q_indices]  # [3, Nq]
 
-        return key_ext, value_ext, attn_ext, q_pos, kv_pos
+        return key_ext, value_ext, attn_ext, q_pos, kv_pos, q_indices
 
     def forward(
         self,
@@ -781,6 +808,8 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         keys_concat, values_concat, attns_concat = [], [], []
         kv_pos_concat = []   # [3, kv_len_b] per batch
         q_pos_concat = []    # [3, Nq] per batch
+        # Default causal (no extension); DAT path overwrites for batch indices that have HD
+        q_upper_bounds = torch.arange(Nq, device=device, dtype=torch.int64).unsqueeze(0).expand(B, -1).clone()
         _want_vis = (self.training
                      and getattr(self, '_dat_request_vis', False))
         _dat_vis = [] if _want_vis else None
@@ -824,7 +853,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             )
 
             # Reorganize KV sequence with HD insertion + position tracking
-            key_ext, value_ext, attn_ext, q_pos, kv_pos = self._reorganize_kv_mask_and_pos(
+            key_ext, value_ext, attn_ext, q_pos, kv_pos, q_upper_b = self._reorganize_kv_mask_and_pos(
                 key_states[b_idx], value_states[b_idx], attention_mask[b_idx],
                 key_hd, value_hd, hd_pos_ids, orig_pos_b,
                 image_range_list[b_idx], Nq, Ns, device, dtype,
@@ -835,16 +864,22 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             attns_concat.append(attn_ext)
             kv_pos_concat.append(kv_pos)
             q_pos_concat.append(q_pos)
+            q_upper_bounds[b_idx] = q_upper_b
 
         # Pad batch to uniform KV length
         key_ext_padded = nn.utils.rnn.pad_sequence(keys_concat, batch_first=True, padding_value=0)
         value_ext_padded = nn.utils.rnn.pad_sequence(values_concat, batch_first=True, padding_value=0)
-        attn_padded = nn.utils.rnn.pad_sequence(
-            attns_concat, batch_first=True, padding_value=torch.finfo(dtype).min,
-        )
-        attn_mask_4d = attn_padded.permute(0, 2, 3, 1).contiguous()  # [B, heads, Nq, kv_len]
-
         kv_len = key_ext_padded.size(1)
+
+        use_flex = False  # flex_attention disabled: non-deterministic GC tensor saves
+        build_attn_mask_4d = (not use_flex) or _dat_vis  # SDPA fallback or visualization
+        if build_attn_mask_4d:
+            attn_padded = nn.utils.rnn.pad_sequence(
+                attns_concat, batch_first=True, padding_value=torch.finfo(dtype).min,
+            )
+            attn_mask_4d = attn_padded.permute(0, 2, 3, 1).contiguous()  # [B, heads, Nq, kv_len]
+        else:
+            attn_mask_4d = None
 
         # Pad 3D position IDs to uniform kv_len
         # kv_pos_concat[i] is [3, kv_len_i] — pad dim=1 to kv_len
@@ -921,24 +956,41 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         key_bhnc = repeat_kv(key_bhnc, self.num_key_value_groups)
         value_bhnc = repeat_kv(value_bhnc, self.num_key_value_groups)
 
-        # Ensure contiguous for SDPA
+        # Ensure contiguous
         if query_bhnc.device.type == "cuda":
             query_bhnc = query_bhnc.contiguous()
             key_bhnc = key_bhnc.contiguous()
             value_bhnc = value_bhnc.contiguous()
-            
-        # SDPA attention
-        with torch.nn.attention.sdpa_kernel([
-            torch.nn.attention.SDPBackend.FLASH_ATTENTION,
-            torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
-            torch.nn.attention.SDPBackend.MATH,
-        ]):
-            attn_output = F.scaled_dot_product_attention(
-                query_bhnc, key_bhnc, value_bhnc,
-                attn_mask=attn_mask_4d,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                is_causal=False,
+
+        # DAT attention: FlexAttention (block_mask) when available, else SDPA with attn_mask_4d
+        if use_flex and attn_mask_4d is None:
+            # mask_mod: kv_idx <= q_upper_bounds[b, q_idx] (causal in extended-KV space)
+            # create_block_mask needs no gradients — wrap in no_grad to keep
+            # its internal tensors out of GC's save-tensor tracking.
+            with torch.no_grad():
+                def _dat_mask_mod(b, h, q_idx, kv_idx):
+                    return kv_idx <= q_upper_bounds[b, q_idx]
+                block_mask = create_block_mask(
+                    _dat_mask_mod,
+                    B=B, H=None, Q_LEN=Nq, KV_LEN=kv_len, device=device,
+                )
+            attn_output = _flex_attention_compiled(
+                query_bhnc, key_bhnc, value_bhnc, block_mask=block_mask,
             )
+            if self.training and self.attention_dropout > 0.0:
+                attn_output = F.dropout(attn_output, p=self.attention_dropout, training=True)
+        else:
+            with torch.nn.attention.sdpa_kernel([
+                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                torch.nn.attention.SDPBackend.MATH,
+            ]):
+                attn_output = F.scaled_dot_product_attention(
+                    query_bhnc, key_bhnc, value_bhnc,
+                    attn_mask=attn_mask_4d,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    is_causal=False,
+                )
 
         if _dat_vis:
             self._dat_request_vis = False
