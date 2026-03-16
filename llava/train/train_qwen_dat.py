@@ -39,6 +39,7 @@ local_rank = None
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
+    'hd_attn_bias',
 ]
 
 
@@ -111,6 +112,11 @@ class ModelArguments:
         default=0,
         metadata={"help": "Two-phase DAT training: train only DAT params for this many steps, "
                   "then unfreeze DAT+LLM (ViT/connector stay frozen). 0 = disabled."}
+    )
+    dat_hd_attn_bias: float = field(
+        default=0.0,
+        metadata={"help": "Learnable attention bias for HD keys. "
+                  "<0 enables (used as init value, e.g. -10.0), >=0 disables."}
     )
 
 
@@ -1047,7 +1053,8 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         called at logging intervals so the communication cost is acceptable.
         Falls back to param.data.float() when the API is unavailable.
 
-        Returns (dat_weight_norm, kvhd_weight_norm).  Either may be None.
+        Returns (dat_weight_norm, kvhd_weight_norm, hd_attn_bias_mean).
+        Any may be None.
         """
         try:
             from deepspeed.utils import safe_get_full_fp32_param
@@ -1057,11 +1064,17 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
 
         dat_sq, dat_cnt = 0.0, 0
         kvhd_sq, kvhd_cnt = 0.0, 0
+        hd_bias_sum, hd_bias_cnt = 0.0, 0
         for name, param in model.named_parameters():
             if not (any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad):
                 continue
             try:
                 fp32_tensor = _get_fp32(param) if _get_fp32 is not None else None
+                if 'hd_attn_bias' in name:
+                    val = fp32_tensor.item() if fp32_tensor is not None else param.data.float().item()
+                    hd_bias_sum += val
+                    hd_bias_cnt += 1
+                    continue
                 if fp32_tensor is not None:
                     norm_sq = fp32_tensor.norm(2).item() ** 2
                 else:
@@ -1075,7 +1088,8 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 pass
         dat_wn = dat_sq ** 0.5 if dat_cnt > 0 else None
         kvhd_wn = kvhd_sq ** 0.5 if kvhd_cnt > 0 else None
-        return dat_wn, kvhd_wn
+        hd_bias = hd_bias_sum / hd_bias_cnt if hd_bias_cnt > 0 else None
+        return dat_wn, kvhd_wn, hd_bias
 
     def on_log(self, args, state, control, logs=None, model=None, optimizer=None, **kwargs):
         """Flush buffered metrics to WandB and console."""
@@ -1084,7 +1098,7 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
 
         # Weight norm must be computed on ALL ranks (safe_get_full_fp32_param
         # does an all-gather), then only rank 0 reports the result.
-        wn, kvhd_wn = self._compute_weight_norms(_model) if _model is not None else (None, None)
+        wn, kvhd_wn, hd_bias = self._compute_weight_norms(_model) if _model is not None else (None, None, None)
 
         if not state.is_world_process_zero:
             return
@@ -1134,6 +1148,10 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             if self._kvhd_norm_buf:
                 metrics["dat/kvhd_grad_norm"] = sum(self._kvhd_norm_buf) / len(self._kvhd_norm_buf)
                 self._kvhd_norm_buf.clear()
+
+        # 7. HD attention bias (learnable scalar, averaged across DAT layers)
+        if hd_bias is not None:
+            metrics["dat/hd_attn_bias"] = hd_bias
 
         if not metrics:
             return
@@ -1550,6 +1568,7 @@ def train():
             'layers': model_args.dat_layers,
             'use_intention_branch': model_args.dat_use_intention_branch,
             'intention_as_gate': model_args.dat_intention_as_gate,
+            'hd_attn_bias': model_args.dat_hd_attn_bias,
         }
 
         rank0_print(f"Loading DAT model ({model_args.model_family}) from {model_args.model_name_or_path}...")
@@ -1560,7 +1579,7 @@ def train():
             dat_extra_args=dat_extra_args,
             torch_dtype=compute_dtype,
         )
-对
+
         # Apply freeze strategy
         if model_args.dat_warmup_steps > 0:
             # Two-phase: DAT+LLM trainable initially (for optimizer creation),

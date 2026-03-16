@@ -6,7 +6,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 
 # ================= 配置区 =================
-SFT_DATA_DIR = "/mnt/ephemeral/sft_data"
+SFT_DATA_DIR = "/home/coder/downloaded_data/sft_data"
 TRAIN_SPLIT_DIR = os.path.join(SFT_DATA_DIR, "train_split")
 OUTPUT_JSONL = os.path.join(SFT_DATA_DIR, "hd_supplements.jsonl")
 # 中间文件：每个数据集处理完追加写入，支持 resume

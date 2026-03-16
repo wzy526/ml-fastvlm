@@ -14,7 +14,7 @@ import os
 from collections import defaultdict
 
 # ================= Config =================
-SFT_DATA_DIR = "/mnt/ephemeral/sft_data"
+SFT_DATA_DIR = "/home/coder/downloaded_data/sft_data"
 
 BASE_JSON = os.path.join(SFT_DATA_DIR, "llava_v1_5_mix665k_shuffled.json")
 HD_JSONL = os.path.join(SFT_DATA_DIR, "hd_supplements.jsonl")

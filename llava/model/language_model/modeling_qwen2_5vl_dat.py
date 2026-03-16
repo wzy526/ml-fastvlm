@@ -82,6 +82,7 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
             'layers': '',              # Layer type string, e.g. "LLLDLLLD..."
             'use_intention_branch': True,
             'intention_as_gate': True,
+            'hd_attn_bias': 0.0,       # <0 to enable learnable HD attention bias (init value)
         }
 
 
@@ -238,6 +239,12 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         self.hd_proj = dat['hd_proj']
         self.intention_as_gate = dat['intention_as_gate']
         self.use_intention_branch = dat['use_intention_branch']
+
+        _hd_attn_bias_init = float(dat.get('hd_attn_bias', 0.0))
+        if _hd_attn_bias_init < 0:
+            self.hd_attn_bias = nn.Parameter(torch.zeros(1).fill_(_hd_attn_bias_init))
+        else:
+            self.hd_attn_bias = None
 
         self.off_dim = self.hidden_size // self.off_grps
 
@@ -627,7 +634,10 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                     torch.zeros(1, cur_intention_idx + 1, Ns, device=device, dtype=dtype),
                     torch.ones(1, Nq - cur_intention_idx - 1, Ns, device=device, dtype=dtype),
                 ], dim=1)
-                attn_split.append(self._flip_and_fill(hd_vis))
+                hd_mask = self._flip_and_fill(hd_vis)
+                if self.hd_attn_bias is not None:
+                    hd_mask = hd_mask + self.hd_attn_bias.clamp(min=-30.0, max=5.0).to(dtype=dtype)
+                attn_split.append(hd_mask)
                 attn_split.append(attn_b[:, :, cur_intention_idx + 1:ans_end + 1])
 
                 insert_counter = ans_end + 1
@@ -660,7 +670,10 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                     torch.zeros(1, cur_intention_idx + 1, Ns, device=device, dtype=dtype),
                     torch.ones(1, Nq - cur_intention_idx - 1, Ns, device=device, dtype=dtype),
                 ], dim=1)
-                attn_split.append(self._flip_and_fill(hd_vis))
+                hd_mask = self._flip_and_fill(hd_vis)
+                if self.hd_attn_bias is not None:
+                    hd_mask = hd_mask + self.hd_attn_bias.clamp(min=-30.0, max=5.0).to(dtype=dtype)
+                attn_split.append(hd_mask)
                 attn_split.append(attn_b[:, :, cur_intention_idx + 1:ans_start])
 
                 insert_counter = ans_start
@@ -1227,6 +1240,7 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
+    'hd_attn_bias',
 ]
 
 
