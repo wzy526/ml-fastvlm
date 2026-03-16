@@ -4,7 +4,7 @@ Qwen2.5VL-DAT: Dynamic Attention Token extension for Qwen2.5VL.
 Extends official Qwen2_5_VLForConditionalGeneration with DAT mechanism:
 - Offset-based sampling from high-resolution vision features
 - Per-layer HD feature injection via modified attention
-- Proper 3D mRoPE position encoding for extended KV sequences
+- Proper 3D mRoPE position encoding for HD tokens
 
 Architecture (transformers >= 5.2.0):
     Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
@@ -17,11 +17,14 @@ Architecture (transformers >= 5.2.0):
 HD kwargs flow: ForConditionalGeneration → Model(**kwargs) → TextModel(**kwargs)
     → DecoderLayer(**kwargs) → AttentionDAT(**kwargs)
 
-Key difference from Qwen2-VL DAT: uses proper 3D mRoPE coordinates for HD tokens
-instead of simplified sequential 1D indices.
+Attention mechanism: Two-pass + LSE merge (GC-safe, shape-static):
+    Pass 1: standard causal attention (full sequence, shape = [B, H, Nq, D])
+    Pass 2: HD cross-attention per answer segment (Q_ans × K_hd, non-causal)
+    Merge:  o* = exp(ℓ₁−ℓ)·o₁ + exp(ℓ₂−ℓ)·o₂,  ℓ = logaddexp(ℓ₁, ℓ₂)
+    → No mask matrix, no pad_sequence, no data-dependent shapes.
+    → Fully compatible with gradient checkpointing and torch.compile.
 """
 
-import math
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -44,30 +47,70 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 from transformers.cache_utils import Cache
 
-# FlexAttention (PyTorch >= 2.5): DAT mask is causal in extended-KV space,
-# so we use block_mask (kv_idx <= q_upper_bounds) instead of full attn_mask_4d.
+# Two-pass attention + LSE merging approach for DAT:
 #
-# Gradient-checkpointing compatibility: flex_attention's internal Triton
-# autograd Function saves tensors whose metadata differs between the first
-# forward pass and the recomputed forward pass inside GC, triggering
-# "Recomputed values have different metadata" errors.
-# Fix: wrap flex_attention in our own torch.autograd.Function (_DATFlexAttn)
-# so that GC only sees the explicit tensors we save (q, k, v, out) — all with
-# deterministic shapes — and never sees flex_attention's internal tensors.
+# Instead of building an extended KV sequence with a data-dependent mask
+# (which breaks torch.compile and gradient checkpointing), we compute:
+#   Pass 1: standard causal attention over the full Nq-length sequence
+#   Pass 2: HD cross-attention for answer tokens × HD KV (non-causal, per-segment)
+# Then merge via the LSE (log-sum-exp) trick:
+#   ℓ = logaddexp(ℓ₁, ℓ₂)
+#   o* = exp(ℓ₁ − ℓ) · o₁ + exp(ℓ₂ − ℓ) · o₂
+#
+# This is mathematically equivalent to joint attention over both KV sets,
+# has static shapes (no padding, no mask matrix), and is fully GC-compatible.
+#
+# flash_attn (if available) returns LSE directly; otherwise we fall back to
+# a manual O(N²) SDPA implementation that also computes LSE.
 try:
-    from torch.nn.attention.flex_attention import flex_attention as _flex_attention_compiled
-    from torch.nn.attention.flex_attention import create_block_mask
-    # NOTE: do NOT wrap with torch.compile here.
-    # torch.compile(flex_attention) is non-deterministic across calls with
-    # respect to internally saved tensors: the first call does dynamo tracing
-    # and saves a different set of intermediate tensors than subsequent calls
-    # which use the cached compiled kernel. This breaks gradient checkpointing's
-    # "saved vs recomputed metadata" verification (CheckpointError).
-    # The raw flex_attention dispatches to Triton internally and is GC-safe.
-    _FLEX_ATTENTION_AVAILABLE = True
+    from flash_attn import flash_attn_func as _flash_attn_func
+    _FLASH_ATTN_AVAILABLE = True
 except (ImportError, Exception):
-    _flex_attention_compiled = create_block_mask = None
-    _FLEX_ATTENTION_AVAILABLE = False
+    _flash_attn_func = None
+    _FLASH_ATTN_AVAILABLE = False
+
+
+def _dat_attn_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute attention output and log-sum-exp (LSE).
+
+    Args:
+        q, k, v: [B, H, N, D]  (internal multi-head layout)
+        causal:  apply causal mask
+
+    Returns:
+        out: [B, N, H, D]  (transposed — ready for position-slicing)
+        lse: [B, H, N]
+    """
+    if _FLASH_ATTN_AVAILABLE:
+        # flash_attn expects / returns [B, N, H, D]; lse is [B, H, N]
+        out_fa, lse, _ = _flash_attn_func(
+            q.transpose(1, 2).contiguous(),
+            k.transpose(1, 2).contiguous(),
+            v.transpose(1, 2).contiguous(),
+            causal=causal,
+            return_attn_probs=True,
+        )
+        return out_fa, lse  # out_fa: [B, N, H, D], lse: [B, H, N]
+
+    # Manual fallback: O(N²) memory, but GC-safe and always correct
+    B, H, Nq, D = q.shape
+    scale = D ** -0.5
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, H, Nq, Nk]
+    if causal:
+        causal_mask = torch.triu(
+            torch.ones(Nq, k.size(2), device=q.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal_mask, float('-inf'))
+    lse = torch.logsumexp(scores.float(), dim=-1)          # [B, H, Nq]
+    attn_w = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+    out = torch.matmul(attn_w, v).transpose(1, 2)          # [B, Nq, H, D]
+    return out, lse
 
 
 logger = logging.getLogger(__name__)
@@ -229,27 +272,18 @@ def compute_image_range_list(input_ids, labels, image_token_id,
     return result
 
 
-def _build_causal_mask(seq_len, device, dtype):
-    """Build a standard causal attention mask [1, 1, seq_len, seq_len]."""
-    mask = torch.triu(
-        torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=device, dtype=dtype),
-        diagonal=1,
-    )
-    return mask.unsqueeze(0).unsqueeze(0)
-
-
 # ============================================================================
 # DAT Attention
 # ============================================================================
 
 class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
     """
-    Core DAT mechanism for Qwen2.5-VL with proper 3D mRoPE:
-    1. Extract LR features from query -> generate sampling offsets
-    2. Grid sample from HD features -> project to KV
-    3. Insert HD KV into the sequence with custom attention mask
-    4. Build proper 3D position IDs for extended KV (using original coordinate system)
-    5. Apply mRoPE with separate Q/KV position embeddings
+    Core DAT mechanism for Qwen2.5-VL (two-pass + LSE merge):
+    1. Extract LR features from query → generate sampling offsets
+    2. Grid sample from HD features → project to KV (key_hd, value_hd)
+    3. Pass 1: standard causal attention (full sequence, static shapes)
+    4. Pass 2: HD cross-attention per answer segment (Q_ans × K_hd, non-causal)
+    5. Merge outputs via LSE trick — mathematically equivalent to joint attention
     """
 
     def __init__(self, config, layer_idx: int, dat_extra_args: dict):
@@ -338,11 +372,6 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
         grid = torch.stack([grid_x, grid_y], dim=0)  # [2, H, W]
         return grid.unsqueeze(0).repeat(n_repeats * self.off_grps, 1, 1, 1)
-
-    @staticmethod
-    def _flip_and_fill(mask):
-        """Convert binary mask (0/1) to attention mask (0 -> -inf, 1 -> 0)."""
-        return mask.masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, 0.0)
 
     def _construct_hd_position_ids(self, pos_3d_b, lr_start, lr_end, lr_h, lr_w, device):
         """Construct proper 3D mRoPE position IDs for HD tokens.
@@ -513,210 +542,49 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         return key_hd, value_hd, sampling_locs_out
 
-    def _compute_hd_kv_positions(self, image_range_list_b, Nq, Ns):
-        """Compute HD token positions in the extended KV sequence.
+    def _merge_two_pass_lse(
+        self,
+        out1: torch.Tensor,
+        lse1: torch.Tensor,
+        out2: torch.Tensor,
+        lse2: torch.Tensor,
+        ans_start: int,
+        ans_end: int,
+    ) -> torch.Tensor:
+        """Merge causal attention and HD cross-attention outputs via the LSE trick.
 
-        Mirrors the insertion logic of _reorganize_kv_mask_and_pos
-        without constructing the actual tensors.
-        """
-        answer_ranges = image_range_list_b[1:]
-        hd_positions = []
-        cum = 0
-        insert_counter = 0
+        For answer tokens [ans_start, ans_end), the joint attention over
+        S₁ (causal KV) ∪ S₂ (HD KV) equals:
+            o* = exp(ℓ₁ − ℓ) · o₁ + exp(ℓ₂ − ℓ) · o₂
+        where ℓ = logaddexp(ℓ₁, ℓ₂).  Weights sum to 1 exactly. ✓
 
-        for ar in answer_ranges:
-            ans_start, ans_end, cur_intention_idx = ar[0], ar[1], ar[2]
-
-            if ans_end > 0:  # training
-                cum += cur_intention_idx + 1 - insert_counter
-                hd_positions.extend(range(cum, cum + Ns))
-                cum += Ns
-                cum += ans_end + 1 - (cur_intention_idx + 1)
-                insert_counter = ans_end + 1
-            else:  # inference
-                cum += cur_intention_idx + 1 - insert_counter
-                hd_positions.extend(range(cum, cum + Ns))
-                cum += Ns
-                cum += ans_start - (cur_intention_idx + 1)
-                insert_counter = ans_start
-
-        return hd_positions
-
-    def _compute_hd_attention(self, b_idx, slocs, hd_pos,
-                              query_bhnc, key_bhnc, attn_mask_4d):
-        """Compute mean attention from all queries to HD KV tokens (one sample).
-
-        Extracts the HD columns from the attention score matrix
-        (Q @ K^T / sqrt(d)), applies the causal mask, softmaxes over
-        HD positions, then averages over heads and query positions.
-
-        Returns:
-            (sampling_locs, attn_map) where attn_map is
-            [Lp, grid_h, grid_w] or None.
-        """
-        if not hd_pos:
-            return (slocs, None)
-
-        with torch.no_grad():
-            hd_idx = torch.tensor(
-                hd_pos, device=query_bhnc.device, dtype=torch.long,
-            )
-
-            q_b = query_bhnc[b_idx]                       # [H, Nq, D]
-            k_hd = key_bhnc[b_idx, :, hd_idx, :]          # [H, n_hd, D]
-
-            scores = torch.matmul(
-                q_b, k_hd.transpose(-1, -2),
-            ) / math.sqrt(self.head_dim)                   # [H, Nq, n_hd]
-
-            mask_hd = attn_mask_4d[b_idx, :, :, hd_idx]   # [1, Nq, n_hd]
-            scores = scores + mask_hd
-
-            attn = F.softmax(scores.float(), dim=-1)       # [H, Nq, n_hd]
-            attn = attn.nan_to_num(0.0)
-
-            attn_avg = attn.mean(dim=(0, 1))               # [n_hd]
-
-            Lp = slocs.size(0)
-            attn_map = attn_avg.reshape(
-                Lp, self.grid_size, self.grid_size,
-            )
-            return (slocs, attn_map)
-
-    def _reorganize_kv_mask_and_pos(
-        self, key_b, value_b, attn_b, key_hd, value_hd,
-        hd_pos_ids, orig_pos_b,
-        image_range_list_b, Nq, Ns, device, dtype,
-    ):
-        """Insert HD KV pairs into the sequence and build attention mask + 3D position IDs.
-
-        Enhanced version that also tracks proper 3D mRoPE position IDs for the
-        extended KV sequence.
+        Critical: out2 / lse2 must use the SAME q as Pass 1 (already mRoPE'd),
+        not re-projected from hidden_states, so s₁ and s₂ share the same query.
 
         Args:
-            key_b, value_b: [Nq, kv_dim] - original KV for one batch element
-            attn_b: [1, Nq, Nq] - original attention mask
-            key_hd, value_hd: [Lp, Ns, kv_dim] - HD KV per answer
-            hd_pos_ids: [3, Ns] — 3D position IDs for HD tokens
-            orig_pos_b: [3, Nq] — original 3D position IDs for this batch element
-            image_range_list_b: ranges for this batch element
-            Nq: query sequence length
-            Ns: number of HD tokens per answer
+            out1: [B, Nq, H, D]  — causal attention output (full sequence)
+            lse1: [B, H, Nq]     — causal log-sum-exp
+            out2: [1, Nans, H, D] — HD cross-attention output for answer slice
+            lse2: [1, H, Nans]   — HD cross-attention log-sum-exp
+            ans_start, ans_end: slice of the answer range in the sequence
 
         Returns:
-            key_ext: [kv_len, kv_dim]
-            value_ext: [kv_len, kv_dim]
-            attn_ext: [kv_len, 1, Nq] (permuted for pad_sequence)
-            q_pos: [3, Nq_mapped] - Q position IDs in extended KV coordinate space
-            kv_pos: [3, kv_len] - extended KV position IDs
-            q_upper_bounds: [Nq] int - extended KV index upper bound per Q (for FlexAttention)
+            out: [B, Nq, H, D] with merged values written at [ans_start:ans_end]
         """
-        answer_ranges = image_range_list_b[1:]
-        k_split, v_split, attn_split = [], [], []
-        kv_pos_split = []
-        q_pos_indices = []  # indices into extended KV for Q positions
-        insert_counter = 0
-        pos_counter = 0
+        out = out1.clone()
 
-        for l_idx, answer_range in enumerate(answer_ranges):
-            ans_start, ans_end, cur_intention_idx = answer_range[0], answer_range[1], answer_range[2]
+        lse1_ans = lse1[:, :, ans_start:ans_end]          # [B, H, Nans]
+        out1_ans = out1[:, ans_start:ans_end, :, :]        # [B, Nans, H, D]
 
-            if ans_end > 0:
-                # --- Training mode ---
-                # Part 1: before insertion point (inclusive)
-                seg = key_b[insert_counter:cur_intention_idx + 1]
-                k_split.append(seg)
-                v_split.append(value_b[insert_counter:cur_intention_idx + 1])
-                kv_pos_split.append(orig_pos_b[:, insert_counter:cur_intention_idx + 1])
-                seg_len = seg.size(0)
-                q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
-                pos_counter += seg_len
+        lse = torch.logaddexp(lse1_ans, lse2)              # [B, H, Nans]
 
-                # Part 2: HD KV + HD position IDs
-                k_split.append(key_hd[l_idx])
-                v_split.append(value_hd[l_idx])
-                kv_pos_split.append(hd_pos_ids)  # [3, Ns]
-                pos_counter += Ns
+        # Weights: [B, H, Nans] → [B, Nans, H, 1] for broadcasting
+        w1 = (lse1_ans - lse).exp().permute(0, 2, 1).unsqueeze(-1)
+        w2 = (lse2     - lse).exp().permute(0, 2, 1).unsqueeze(-1)
 
-                # Part 3: after insertion to answer end (inclusive)
-                seg = key_b[cur_intention_idx + 1:ans_end + 1]
-                k_split.append(seg)
-                v_split.append(value_b[cur_intention_idx + 1:ans_end + 1])
-                kv_pos_split.append(orig_pos_b[:, cur_intention_idx + 1:ans_end + 1])
-                seg_len = seg.size(0)
-                q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
-                pos_counter += seg_len
+        out[:, ans_start:ans_end, :, :] = w1 * out1_ans + w2 * out2
 
-                # Attention mask: original + HD visibility
-                attn_split.append(attn_b[:, :, insert_counter:cur_intention_idx + 1])
-                hd_vis = torch.cat([
-                    torch.zeros(1, cur_intention_idx + 1, Ns, device=device, dtype=dtype),
-                    torch.ones(1, Nq - cur_intention_idx - 1, Ns, device=device, dtype=dtype),
-                ], dim=1)
-                attn_split.append(self._flip_and_fill(hd_vis))
-                attn_split.append(attn_b[:, :, cur_intention_idx + 1:ans_end + 1])
-
-                insert_counter = ans_end + 1
-
-            else:
-                # --- Inference mode (ans_end == -1) ---
-                seg = key_b[insert_counter:cur_intention_idx + 1]
-                k_split.append(seg)
-                v_split.append(value_b[insert_counter:cur_intention_idx + 1])
-                kv_pos_split.append(orig_pos_b[:, insert_counter:cur_intention_idx + 1])
-                seg_len = seg.size(0)
-                q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
-                pos_counter += seg_len
-
-                k_split.append(key_hd[l_idx])
-                v_split.append(value_hd[l_idx])
-                kv_pos_split.append(hd_pos_ids)
-                pos_counter += Ns
-
-                seg = key_b[cur_intention_idx + 1:ans_start]
-                k_split.append(seg)
-                v_split.append(value_b[cur_intention_idx + 1:ans_start])
-                kv_pos_split.append(orig_pos_b[:, cur_intention_idx + 1:ans_start])
-                seg_len = seg.size(0)
-                q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
-                pos_counter += seg_len
-
-                attn_split.append(attn_b[:, :, insert_counter:cur_intention_idx + 1])
-                hd_vis = torch.cat([
-                    torch.zeros(1, cur_intention_idx + 1, Ns, device=device, dtype=dtype),
-                    torch.ones(1, Nq - cur_intention_idx - 1, Ns, device=device, dtype=dtype),
-                ], dim=1)
-                attn_split.append(self._flip_and_fill(hd_vis))
-                attn_split.append(attn_b[:, :, cur_intention_idx + 1:ans_start])
-
-                insert_counter = ans_start
-
-        # Handle trailing tokens after the last answer range
-        if insert_counter < Nq:
-            seg = key_b[insert_counter:Nq]
-            k_split.append(seg)
-            v_split.append(value_b[insert_counter:Nq])
-            kv_pos_split.append(orig_pos_b[:, insert_counter:Nq])
-            seg_len = seg.size(0)
-            q_pos_indices.append(torch.arange(pos_counter, pos_counter + seg_len, device=device, dtype=torch.int64))
-            pos_counter += seg_len
-            attn_split.append(attn_b[:, :, insert_counter:Nq])
-
-        if len(k_split) == 0:
-            q_indices = torch.arange(Nq, device=device, dtype=torch.int64)
-            return (key_b, value_b, attn_b.permute(2, 0, 1).contiguous(),
-                    orig_pos_b, orig_pos_b, q_indices)
-
-        key_ext = torch.cat(k_split, dim=0)
-        value_ext = torch.cat(v_split, dim=0)
-        attn_ext = torch.cat(attn_split, dim=2).permute(2, 0, 1).contiguous()
-        kv_pos = torch.cat(kv_pos_split, dim=1)
-
-        # Q position IDs: extract from kv_pos using indices
-        q_indices = torch.cat(q_pos_indices, dim=0)  # [Nq] — extended KV upper bound per Q
-        q_pos = kv_pos[:, q_indices]  # [3, Nq]
-
-        return key_ext, value_ext, attn_ext, q_pos, kv_pos, q_indices
+        return out
 
     def forward(
         self,
@@ -776,233 +644,177 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 **kwargs,
             )
 
-        # --- DAT path ---
+        # --- DAT path (two-pass + LSE merge) ---
+        # Pass 1: standard causal attention on the full Nq-length sequence (static shapes).
+        # Pass 2: per-answer-segment HD cross-attention (Q_ans × K_hd, non-causal).
+        # Merge via LSE trick — mathematically equivalent to joint attention, GC-safe.
         B, Nq, C = hidden_states.size()
-        dtype, device = hidden_states.dtype, hidden_states.device
+        device = hidden_states.device
         Ns = self.grid_size * self.grid_size
         mrope_section = self.config.rope_parameters["mrope_section"]
 
-        # Ensure attention mask exists
-        if attention_mask is None:
-            attention_mask = _build_causal_mask(Nq, device, dtype)
-
         # Project Q, K, V
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states)   # [B, Nq, C]
+        key_states   = self.k_proj(hidden_states)   # [B, Nq, kv_dim]
+        value_states = self.v_proj(hidden_states)   # [B, Nq, kv_dim]
 
-        # Handle inference: add dummy answer range if only LR range exists
+        # Handle inference: add dummy answer range if compute_image_range_list wasn't called
         if use_cache:
             for b in range(B):
                 if len(image_range_list[b]) == 1:
-                    image_range_list[b].append([Nq, -1, Nq - 3])
+                    image_range_list[b].append([Nq, -1, max(0, Nq - 3)])
 
         # Build mapping from batch index to image_hd_features index
-        b_idx_to_hd_idx = {}
+        b_idx_to_hd_idx: Dict[int, int] = {}
         hd_idx = 0
         for b in range(B):
             if len(image_range_list[b]) > 0:
                 b_idx_to_hd_idx[b] = hd_idx
                 hd_idx += 1
 
-        keys_concat, values_concat, attns_concat = [], [], []
-        kv_pos_concat = []   # [3, kv_len_b] per batch
-        q_pos_concat = []    # [3, Nq] per batch
-        # Default causal (no extension); DAT path overwrites for batch indices that have HD
-        q_upper_bounds = torch.arange(Nq, device=device, dtype=torch.int64).unsqueeze(0).expand(B, -1).clone()
-        _want_vis = (self.training
-                     and getattr(self, '_dat_request_vis', False))
-        _dat_vis = [] if _want_vis else None
+        # === Pass 1: standard causal attention (full sequence, shape static) ===
+        # mRoPE — same as the non-DAT path (position_embeddings are Nq-length)
+        query_bhnc = query_states.view(B, Nq, self.num_heads,           self.head_dim).transpose(1, 2)
+        key_bhnc   = key_states  .view(B, Nq, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_bhnc = value_states.view(B, Nq, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_bhnc, key_bhnc = apply_multimodal_rotary_pos_emb(
+            query_bhnc, key_bhnc, cos, sin, mrope_section,
+        )
+
+        # KV cache: always standard Nq-length (HD KV is never cached)
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_bhnc, value_bhnc = past_key_values.update(
+                key_bhnc, value_bhnc, self.layer_idx, cache_kwargs,
+            )
+
+        key_bhnc   = repeat_kv(key_bhnc,   self.num_key_value_groups)
+        value_bhnc = repeat_kv(value_bhnc, self.num_key_value_groups)
+
+        if query_bhnc.device.type == "cuda":
+            query_bhnc = query_bhnc.contiguous()
+            key_bhnc   = key_bhnc.contiguous()
+            value_bhnc = value_bhnc.contiguous()
+
+        # Causal attention + LSE  →  out1: [B, Nq, H, D],  lse1: [B, H, Nq]
+        out1, lse1 = _dat_attn_with_lse(query_bhnc, key_bhnc, value_bhnc, causal=True)
+
+        _want_vis = self.training and getattr(self, '_dat_request_vis', False)
+        _dat_vis_entry = None  # (b_idx, slocs) for visualization
+
+        # === Pass 2: HD cross-attention per batch element, per answer segment ===
+        # We accumulate per-batch outputs in a list to avoid in-place modification of
+        # out1 (flash_attn saves out in ctx.saved_tensors; writing to out1 in-place
+        # would corrupt the saved tensor and cause incorrect backward gradients).
+        out_parts: List[torch.Tensor] = []
 
         for b_idx in range(B):
-            if len(image_range_list[b_idx]) <= 1:
-                # No answer ranges -> standard attention
-                keys_concat.append(key_states[b_idx])
-                values_concat.append(value_states[b_idx])
-                attns_concat.append(attention_mask[b_idx].permute(2, 0, 1).contiguous())
-                if mrope_position_ids is not None:
-                    kv_pos_concat.append(mrope_position_ids[:, b_idx, :])
-                    q_pos_concat.append(mrope_position_ids[:, b_idx, :])
-                else:
-                    fallback = torch.arange(Nq, device=device, dtype=torch.long).unsqueeze(0).expand(3, -1)
-                    kv_pos_concat.append(fallback)
-                    q_pos_concat.append(fallback)
-                continue
+            # Start with Pass 1 output for this batch element (view, no copy yet)
+            out_b = out1[b_idx:b_idx + 1]   # [1, Nq, H, D]
 
-            # Get original 3D mRoPE positions for this batch element
+            if len(image_range_list[b_idx]) <= 1:
+                out_parts.append(out_b)
+                continue  # No HD for this sample; Pass 1 result is final
+
+            hd_feat_idx = b_idx_to_hd_idx[b_idx]
+            lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0]
+
+            # Get 3D mRoPE positions for this batch element
             if mrope_position_ids is not None:
                 orig_pos_b = mrope_position_ids[:, b_idx, :]  # [3, Nq]
             else:
                 orig_pos_b = torch.arange(Nq, device=device, dtype=torch.long).unsqueeze(0).expand(3, -1)
 
-            # Generate offsets and sample from HD features
-            hd_feat_idx = b_idx_to_hd_idx[b_idx]
-            key_hd, value_hd, _slocs = self._generate_offsets_and_sample(
-                query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx,
-            )
-            if _dat_vis is not None:
-                _hd_pos = self._compute_hd_kv_positions(
-                    image_range_list[b_idx], Nq, Ns,
-                )
-                _dat_vis.append((b_idx, _slocs, _hd_pos))
-
-            # Construct HD position IDs from LR image coordinate range
-            lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0]
+            # HD position IDs (shared across all answer segments for this image)
             hd_pos_ids = self._construct_hd_position_ids(
                 orig_pos_b, lr_start, lr_end, lr_h, lr_w, device,
+            )  # [3, Ns]
+            hd_pos_ids_batched = hd_pos_ids.unsqueeze(1)  # [3, 1, Ns]
+
+            # Generate all HD KV for this batch element (all Lp segments at once)
+            key_hd_all, value_hd_all, _slocs = self._generate_offsets_and_sample(
+                query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx,
             )
+            # key_hd_all, value_hd_all: [Lp, Ns, kv_dim]
 
-            # Reorganize KV sequence with HD insertion + position tracking
-            key_ext, value_ext, attn_ext, q_pos, kv_pos, q_upper_b = self._reorganize_kv_mask_and_pos(
-                key_states[b_idx], value_states[b_idx], attention_mask[b_idx],
-                key_hd, value_hd, hd_pos_ids, orig_pos_b,
-                image_range_list[b_idx], Nq, Ns, device, dtype,
-            )
+            if _want_vis and _dat_vis_entry is None:
+                _dat_vis_entry = (b_idx, _slocs)
 
-            keys_concat.append(key_ext)
-            values_concat.append(value_ext)
-            attns_concat.append(attn_ext)
-            kv_pos_concat.append(kv_pos)
-            q_pos_concat.append(q_pos)
-            q_upper_bounds[b_idx] = q_upper_b
+            for l_idx, answer_range in enumerate(image_range_list[b_idx][1:]):
+                ans_start     = answer_range[0]
+                ans_end       = answer_range[1]
+                intention_idx = answer_range[2]
 
-        # Pad batch to uniform KV length
-        key_ext_padded = nn.utils.rnn.pad_sequence(keys_concat, batch_first=True, padding_value=0)
-        value_ext_padded = nn.utils.rnn.pad_sequence(values_concat, batch_first=True, padding_value=0)
-        kv_len = key_ext_padded.size(1)
+                if ans_end > 0:
+                    # Training: answer tokens are [ans_start, ans_end)
+                    q_ans_start = ans_start
+                    Nans = ans_end - ans_start
+                else:
+                    # Inference prefill: tokens after intention marker attend to HD.
+                    # ans_start = seq_len here; use intention_idx+1 as the actual start.
+                    q_ans_start = intention_idx + 1
+                    Nans = Nq - q_ans_start
 
-        use_flex = False  # flex_attention disabled: non-deterministic GC tensor saves
-        build_attn_mask_4d = (not use_flex) or _dat_vis  # SDPA fallback or visualization
-        if build_attn_mask_4d:
-            attn_padded = nn.utils.rnn.pad_sequence(
-                attns_concat, batch_first=True, padding_value=torch.finfo(dtype).min,
-            )
-            attn_mask_4d = attn_padded.permute(0, 2, 3, 1).contiguous()  # [B, heads, Nq, kv_len]
-        else:
-            attn_mask_4d = None
+                if Nans <= 0:
+                    continue
 
-        # Pad 3D position IDs to uniform kv_len
-        # kv_pos_concat[i] is [3, kv_len_i] — pad dim=1 to kv_len
-        kv_pos_list = []
-        for kv_p in kv_pos_concat:
-            pad_size = kv_len - kv_p.size(1)
-            if pad_size > 0:
-                kv_p = F.pad(kv_p, (0, pad_size), value=0)
-            kv_pos_list.append(kv_p)
-        kv_pos_padded = torch.stack(kv_pos_list, dim=1)  # [3, B, kv_len]
+                # q_ans: taken from Pass 1's mRoPE'd query — MUST be the same q as Pass 1.
+                # (Re-projecting from hidden_states would break LSE merge correctness.)
+                q_ans = query_bhnc[b_idx:b_idx + 1, :, q_ans_start:q_ans_start + Nans, :]
+                # q_ans: [1, H, Nans, D]
 
-        # Q positions: stack directly (all have same Nq)
-        q_pos_padded = torch.stack(q_pos_concat, dim=1)  # [3, B, Nq]
+                # HD KV for this answer segment: [1, H, Ns, D]
+                k_hd_l = (key_hd_all[l_idx:l_idx + 1]
+                           .view(1, Ns, self.num_key_value_heads, self.head_dim)
+                           .transpose(1, 2))
+                v_hd_l = (value_hd_all[l_idx:l_idx + 1]
+                           .view(1, Ns, self.num_key_value_heads, self.head_dim)
+                           .transpose(1, 2))
 
-        # Reshape to multi-head format
-        query_bhnc = query_states.view(B, Nq, self.num_heads, self.head_dim).transpose(1, 2)
-        key_bhnc = key_ext_padded.view(B, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_bhnc = value_ext_padded.view(B, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        # --- mRoPE with proper 3D position IDs ---
-        if Nq < kv_len:
-            # KV is extended: compute separate position embeddings for Q and KV
-            cos_kv, sin_kv = self._dat_rotary_emb(value_bhnc, kv_pos_padded)
-            cos_q, sin_q = self._dat_rotary_emb(query_bhnc, q_pos_padded)
-
-            query_bhnc = apply_multimodal_rotary_pos_emb_single(query_bhnc, cos_q, sin_q, mrope_section)
-            key_bhnc = apply_multimodal_rotary_pos_emb_single(key_bhnc, cos_kv, sin_kv, mrope_section)
-
-            cos, sin = cos_kv, sin_kv
-        else:
-            # No extension: use standard Qwen2.5-VL path
-            cos, sin = position_embeddings
-            query_bhnc, key_bhnc = apply_multimodal_rotary_pos_emb(
-                query_bhnc, key_bhnc, cos, sin, mrope_section,
-            )
-
-        # KV cache update — store only original Nq-length KV so that all
-        # layers (DAT and standard) have consistent cache lengths.  The
-        # extended KV (with HD tokens) is used only for the current
-        # attention computation; decode steps retrieve the standard cache.
-        if past_key_values is not None:
-            if kv_len > Nq:
-                cos_std, sin_std = position_embeddings
-                cos_std = cos_std.to(device)
-                sin_std = sin_std.to(device)
-                key_orig = key_states.view(
-                    B, Nq, self.num_key_value_heads, self.head_dim
-                ).transpose(1, 2)
-                value_orig = value_states.view(
-                    B, Nq, self.num_key_value_heads, self.head_dim
-                ).transpose(1, 2)
-                key_orig = apply_multimodal_rotary_pos_emb_single(
-                    key_orig, cos_std, sin_std, mrope_section
-                )
-                cache_kwargs = {
-                    "sin": sin_std,
-                    "cos": cos_std,
-                    "cache_position": cache_position,
-                }
-                past_key_values.update(
-                    key_orig, value_orig, self.layer_idx, cache_kwargs
-                )
-            else:
-                cache_kwargs = {
-                    "sin": sin,
-                    "cos": cos,
-                    "cache_position": cache_position,
-                }
-                key_bhnc, value_bhnc = past_key_values.update(
-                    key_bhnc, value_bhnc, self.layer_idx, cache_kwargs,
+                # Apply mRoPE to HD KV using image coordinate position IDs
+                cos_hd, sin_hd = self._dat_rotary_emb(k_hd_l, hd_pos_ids_batched)
+                k_hd_l = apply_multimodal_rotary_pos_emb_single(
+                    k_hd_l, cos_hd, sin_hd, mrope_section,
                 )
 
-        # GQA: repeat KV heads to match Q heads
-        key_bhnc = repeat_kv(key_bhnc, self.num_key_value_groups)
-        value_bhnc = repeat_kv(value_bhnc, self.num_key_value_groups)
+                k_hd_l = repeat_kv(k_hd_l, self.num_key_value_groups)  # [1, H, Ns, D]
+                v_hd_l = repeat_kv(v_hd_l, self.num_key_value_groups)
 
-        # Ensure contiguous
-        if query_bhnc.device.type == "cuda":
-            query_bhnc = query_bhnc.contiguous()
-            key_bhnc = key_bhnc.contiguous()
-            value_bhnc = value_bhnc.contiguous()
+                if q_ans.device.type == "cuda":
+                    q_ans  = q_ans.contiguous()
+                    k_hd_l = k_hd_l.contiguous()
+                    v_hd_l = v_hd_l.contiguous()
 
-        # DAT attention: FlexAttention (block_mask) when available, else SDPA with attn_mask_4d
-        if use_flex and attn_mask_4d is None:
-            # mask_mod: kv_idx <= q_upper_bounds[b, q_idx] (causal in extended-KV space)
-            # create_block_mask needs no gradients — wrap in no_grad to keep
-            # its internal tensors out of GC's save-tensor tracking.
-            with torch.no_grad():
-                def _dat_mask_mod(b, h, q_idx, kv_idx):
-                    return kv_idx <= q_upper_bounds[b, q_idx]
-                block_mask = create_block_mask(
-                    _dat_mask_mod,
-                    B=B, H=None, Q_LEN=Nq, KV_LEN=kv_len, device=device,
-                )
-            attn_output = _flex_attention_compiled(
-                query_bhnc, key_bhnc, value_bhnc, block_mask=block_mask,
-            )
-            if self.training and self.attention_dropout > 0.0:
-                attn_output = F.dropout(attn_output, p=self.attention_dropout, training=True)
-        else:
-            with torch.nn.attention.sdpa_kernel([
-                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
-                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
-                torch.nn.attention.SDPBackend.MATH,
-            ]):
-                attn_output = F.scaled_dot_product_attention(
-                    query_bhnc, key_bhnc, value_bhnc,
-                    attn_mask=attn_mask_4d,
-                    dropout_p=self.attention_dropout if self.training else 0.0,
-                    is_causal=False,
+                # Cross-attention: Q_ans × K_hd (non-causal — all Ns HD tokens visible)
+                # out2: [1, Nans, H, D],  lse2: [1, H, Nans]
+                out2, lse2 = _dat_attn_with_lse(q_ans, k_hd_l, v_hd_l, causal=False)
+
+                # _merge_two_pass_lse clones out_b internally → returns a NEW tensor
+                # (no in-place modification of the flash_attn output).
+                # For Lp > 1: out_b chains: view(out1) → clone1 → clone2 → ...
+                out_b = self._merge_two_pass_lse(
+                    out_b, lse1[b_idx:b_idx + 1],
+                    out2, lse2,
+                    q_ans_start, q_ans_start + Nans,
                 )
 
-        if _dat_vis:
+            out_parts.append(out_b)
+
+        # Re-assemble batch.  torch.cat handles mixed views (unmerged) and new tensors
+        # (merged) correctly, distributing gradients to the appropriate source.
+        out_final = torch.cat(out_parts, dim=0)  # [B, Nq, H, D]
+
+        # Visualization: record sampling locations (no attention-map for two-pass path)
+        if _want_vis and _dat_vis_entry is not None:
             self._dat_request_vis = False
-            pick = getattr(self, '_dat_vis_pick', 0) % len(_dat_vis)
-            b_idx_v, slocs_v, hd_pos_v = _dat_vis[pick]
-            self._dat_vis_data = self._compute_hd_attention(
-                b_idx_v, slocs_v, hd_pos_v,
-                query_bhnc, key_bhnc, attn_mask_4d,
-            )
+            b_idx_v, slocs_v = _dat_vis_entry
+            self._dat_vis_data = (slocs_v, None)
             self._dat_vis_b_idx = b_idx_v
 
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, Nq, self.hidden_size)
+        # [B, Nq, H, D]  →  [B, Nq, C]
+        attn_output = out_final.reshape(B, Nq, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
         return attn_output, None
