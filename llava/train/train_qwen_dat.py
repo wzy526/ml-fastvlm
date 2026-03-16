@@ -1391,6 +1391,10 @@ class Qwen2VLTrainer(transformers.Trainer):
             _orig_gc_enable = self.model.gradient_checkpointing_enable
 
             def _patched_gc_enable(**kw):
+                # Merge use_reentrant=False so FlexAttention is compatible with GC
+                kw.setdefault("gradient_checkpointing_kwargs", {})
+                if isinstance(kw["gradient_checkpointing_kwargs"], dict):
+                    kw["gradient_checkpointing_kwargs"].setdefault("use_reentrant", False)
                 _orig_gc_enable(**kw)
                 for module in visual.modules():
                     if hasattr(module, 'gradient_checkpointing'):
