@@ -50,7 +50,7 @@ from packaging import version
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
 
 DAT_KEYS_MATCH = [
-    'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention', 'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd'
+    'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention', 'ln_2', 'conv_off_proj', 'kv_proj_hd'
 ]
 
 @dataclass

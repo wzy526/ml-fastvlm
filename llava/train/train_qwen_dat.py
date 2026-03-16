@@ -38,7 +38,7 @@ local_rank = None
 # DAT parameter patterns (must match modeling_qwen2vl_dat.py)
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
-    'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
+    'ln_2', 'conv_off_proj', 'kv_proj_hd',
     'hd_attn_bias',
 ]
 
@@ -950,7 +950,7 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
     at on_step_end.
     """
 
-    KVHD_KEYS = ('k_proj_hd', 'v_proj_hd')
+    KVHD_KEYS = ('kv_proj_hd',)
 
     def __init__(self, use_kvhd: bool = False):
         self._model     = None

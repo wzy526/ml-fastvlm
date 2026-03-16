@@ -108,7 +108,7 @@ def _dat_attn_with_lse(
         )
         scores = scores.masked_fill(causal_mask, float('-inf'))
     lse = torch.logsumexp(scores.float(), dim=-1)          # [B, H, Nq]
-    attn_w = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+    attn_w = F.softmax(scores.float(), dim=-1).to(q.dtype)
     out = torch.matmul(attn_w, v).transpose(1, 2)          # [B, Nq, H, D]
     return out, lse
 
@@ -337,14 +337,9 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 self.inter_size * 2, 2, kernel_size=1, stride=1, padding=0, bias=False,
             )
 
-        # HD feature KV projection
-        if self.hd_proj:
-            kv_dim = self.num_key_value_heads * self.head_dim
-            self.k_proj_hd = nn.Linear(self.hidden_size, kv_dim)
-            self.v_proj_hd = nn.Linear(self.hidden_size, kv_dim)
-        else:
-            self.k_proj_hd = None
-            self.v_proj_hd = None
+        # HD feature KV projection (fused K+V into one linear)
+        kv_dim = self.num_key_value_heads * self.head_dim
+        self.kv_proj_hd = nn.Linear(self.hidden_size, 2 * kv_dim)
 
         # Rotary embedding for extended KV (Qwen2.5-VL Attention doesn't have one)
         self._dat_rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
@@ -364,13 +359,38 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             nn.init.xavier_uniform_(self.proj_intention.weight)
             if self.proj_intention.bias is not None:
                 nn.init.zeros_(self.proj_intention.bias)
-        if self.k_proj_hd is not None:
-            nn.init.xavier_uniform_(self.k_proj_hd.weight)
-            nn.init.xavier_uniform_(self.v_proj_hd.weight)
-            if self.k_proj_hd.bias is not None:
-                nn.init.zeros_(self.k_proj_hd.bias)
-            if self.v_proj_hd.bias is not None:
-                nn.init.zeros_(self.v_proj_hd.bias)
+        nn.init.xavier_uniform_(self.kv_proj_hd.weight)
+        if self.kv_proj_hd.bias is not None:
+            nn.init.zeros_(self.kv_proj_hd.bias)
+
+    @torch.no_grad()
+    def fuse_qkv_proj(self):
+        """Fuse q_proj, k_proj, v_proj into a single linear for inference.
+
+        Replaces three separate matmuls with one, then splits the output.
+        Call this once before inference (after loading weights).
+
+        Note: original q/k/v_proj are kept for the decode path
+        (super().forward()), where seq_len=1 makes fusion negligible.
+        """
+        q_dim = self.num_heads * self.head_dim
+        kv_dim = self.num_key_value_heads * self.head_dim
+
+        weight = torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
+        bias = torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], dim=0)
+
+        self.qkv_proj = nn.Linear(self.hidden_size, q_dim + 2 * kv_dim, bias=True)
+        self.qkv_proj.weight.copy_(weight)
+        self.qkv_proj.bias.copy_(bias)
+        self.qkv_proj.to(device=self.q_proj.weight.device, dtype=self.q_proj.weight.dtype)
+        self._qkv_split = [q_dim, kv_dim, kv_dim]
+        self._qkv_fused = True
+
+    def _project_qkv(self, hidden_states):
+        """Project hidden_states to Q, K, V — uses fused linear if available."""
+        if getattr(self, '_qkv_fused', False):
+            return self.qkv_proj(hidden_states).split(self._qkv_split, dim=-1)
+        return self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
     def _grid_generate(self, h, w, n_repeats, device):
         """Generate reference sampling grid in [-1, 1]."""
@@ -535,63 +555,15 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             l=Lp, g=self.off_grps, c=self.off_dim,
         )
 
-        # 6. Project to KV
-        if self.hd_proj:
-            key_hd = self.k_proj_hd(sampled_hr)
-            value_hd = self.v_proj_hd(sampled_hr)
-        else:
-            key_hd = self.k_proj(sampled_hr)
-            value_hd = self.v_proj(sampled_hr)
+        # 6. Project to KV (fused: one linear, Lp as batch dim)
+        kv_hd = self.kv_proj_hd(sampled_hr)               # [Lp, Ns, 2*kv_dim]
+        key_hd, value_hd = kv_hd.chunk(2, dim=-1)         # each [Lp, Ns, kv_dim]
 
         sampling_locs_out = sample_locs.reshape(
             Lp, self.off_grps, self.grid_size, self.grid_size, 2
         ).clone().detach()
 
         return key_hd, value_hd, sampling_locs_out
-
-    def _merge_two_pass_lse(
-        self,
-        out1: torch.Tensor,
-        lse1: torch.Tensor,
-        out2: torch.Tensor,
-        lse2: torch.Tensor,
-        ans_start: int,
-        ans_end: int,
-    ) -> torch.Tensor:
-        """Merge causal attention and HD cross-attention outputs via the LSE trick.
-
-        For answer tokens [ans_start, ans_end), the joint attention over
-        S₁ (causal KV) ∪ S₂ (HD KV) equals:
-            o* = exp(ℓ₁ − ℓ) · o₁ + exp(ℓ₂ − ℓ) · o₂
-        where ℓ = logaddexp(ℓ₁, ℓ₂).  Weights sum to 1 exactly. ✓
-
-        Critical: out2 / lse2 must use the SAME q as Pass 1 (already mRoPE'd),
-        not re-projected from hidden_states, so s₁ and s₂ share the same query.
-
-        Args:
-            out1: [B, Nq, H, D]  — causal attention output (full sequence)
-            lse1: [B, H, Nq]     — causal log-sum-exp
-            out2: [1, Nans, H, D] — HD cross-attention output for answer slice
-            lse2: [1, H, Nans]   — HD cross-attention log-sum-exp
-            ans_start, ans_end: slice of the answer range in the sequence
-
-        Returns:
-            out: [B, Nq, H, D] with merged values written at [ans_start:ans_end]
-        """
-        out = out1.clone()
-
-        lse1_ans = lse1[:, :, ans_start:ans_end]          # [B, H, Nans]
-        out1_ans = out1[:, ans_start:ans_end, :, :]        # [B, Nans, H, D]
-
-        lse = torch.logaddexp(lse1_ans, lse2)              # [B, H, Nans]
-
-        # Weights: [B, H, Nans] → [B, Nans, H, 1] for broadcasting
-        w1 = (lse1_ans - lse).exp().permute(0, 2, 1).unsqueeze(-1)
-        w2 = (lse2     - lse).exp().permute(0, 2, 1).unsqueeze(-1)
-
-        out[:, ans_start:ans_end, :, :] = w1 * out1_ans + w2 * out2
-
-        return out
 
     def forward(
         self,
@@ -660,10 +632,8 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         Ns = self.grid_size * self.grid_size
         mrope_section = self.config.rope_parameters["mrope_section"]
 
-        # Project Q, K, V
-        query_states = self.q_proj(hidden_states)   # [B, Nq, C]
-        key_states   = self.k_proj(hidden_states)   # [B, Nq, kv_dim]
-        value_states = self.v_proj(hidden_states)   # [B, Nq, kv_dim]
+        # Project Q, K, V (fused if available)
+        query_states, key_states, value_states = self._project_qkv(hidden_states)
 
         # Handle inference: add dummy answer range if compute_image_range_list wasn't called
         if use_cache:
@@ -712,14 +682,13 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         _dat_vis_entry = None  # (b_idx, slocs) for visualization
 
         # === Pass 2: HD cross-attention per batch element, per answer segment ===
-        # We accumulate per-batch outputs in a list to avoid in-place modification of
-        # out1 (flash_attn saves out in ctx.saved_tensors; writing to out1 in-place
-        # would corrupt the saved tensor and cause incorrect backward gradients).
+        # Each merge clones the current accumulated out/lse to avoid in-place
+        # modification of tensors in the autograd graph.
         out_parts: List[torch.Tensor] = []
 
         for b_idx in range(B):
-            # Start with Pass 1 output for this batch element (view, no copy yet)
-            out_b = out1[b_idx:b_idx + 1]   # [1, Nq, H, D]
+            out_b = out1[b_idx:b_idx + 1]   # [1, Nq, H, D]  (view, no copy yet)
+            lse_b = lse1[b_idx:b_idx + 1]   # [1, H, Nq]
 
             if len(image_range_list[b_idx]) <= 1:
                 out_parts.append(out_b)
@@ -749,68 +718,60 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             if _want_vis and _dat_vis_entry is None:
                 _dat_vis_entry = (b_idx, _slocs)
 
+            # Reshape to [Lp, num_kv_heads, Ns, D], apply mRoPE + GQA expand once
+            Lp = key_hd_all.size(0)
+            key_hd_all = key_hd_all.view(Lp, Ns, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_hd_all = value_hd_all.view(Lp, Ns, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+            # mRoPE: cos/sin depend only on hd_pos_ids (same for all segments)
+            cos_hd, sin_hd = self._dat_rotary_emb(key_hd_all[:1], hd_pos_ids_batched)
+            key_hd_all = apply_multimodal_rotary_pos_emb_single(
+                key_hd_all, cos_hd, sin_hd, mrope_section,
+            )
+
+            # GQA expand: [Lp, num_kv_heads, Ns, D] → [Lp, H, Ns, D]
+            key_hd_all = repeat_kv(key_hd_all, self.num_key_value_groups)
+            value_hd_all = repeat_kv(value_hd_all, self.num_key_value_groups)
+
+            if key_hd_all.device.type == "cuda":
+                key_hd_all = key_hd_all.contiguous()
+                value_hd_all = value_hd_all.contiguous()
+
             for l_idx, answer_range in enumerate(image_range_list[b_idx][1:]):
-                ans_start     = answer_range[0]
-                ans_end       = answer_range[1]
                 intention_idx = answer_range[2]
 
-                if ans_end > 0:
-                    # Training: answer tokens are [ans_start, ans_end)
-                    q_ans_start = ans_start
-                    Nans = ans_end - ans_start
-                else:
-                    # Inference prefill: tokens after intention marker attend to HD.
-                    # ans_start = seq_len here; use intention_idx+1 as the actual start.
-                    q_ans_start = intention_idx + 1
-                    Nans = Nq - q_ans_start
+                q_ans_start = intention_idx + 1
+                Nans = Nq - q_ans_start
 
                 if Nans <= 0:
                     continue
 
-                # q_ans: taken from Pass 1's mRoPE'd query — MUST be the same q as Pass 1.
-                # (Re-projecting from hidden_states would break LSE merge correctness.)
-                q_ans = query_bhnc[b_idx:b_idx + 1, :, q_ans_start:q_ans_start + Nans, :]
-                # q_ans: [1, H, Nans, D]
+                q_ans = query_bhnc[b_idx:b_idx + 1, :, q_ans_start:, :]
 
-                # HD KV for this answer segment: [1, H, Ns, D]
-                k_hd_l = (key_hd_all[l_idx:l_idx + 1]
-                           .view(1, Ns, self.num_key_value_heads, self.head_dim)
-                           .transpose(1, 2))
-                v_hd_l = (value_hd_all[l_idx:l_idx + 1]
-                           .view(1, Ns, self.num_key_value_heads, self.head_dim)
-                           .transpose(1, 2))
-
-                # Apply mRoPE to HD KV using image coordinate position IDs
-                cos_hd, sin_hd = self._dat_rotary_emb(k_hd_l, hd_pos_ids_batched)
-                k_hd_l = apply_multimodal_rotary_pos_emb_single(
-                    k_hd_l, cos_hd, sin_hd, mrope_section,
-                )
-
-                k_hd_l = repeat_kv(k_hd_l, self.num_key_value_groups)  # [1, H, Ns, D]
-                v_hd_l = repeat_kv(v_hd_l, self.num_key_value_groups)
+                k_hd_l = key_hd_all[l_idx:l_idx + 1]    # [1, H, Ns, D]
+                v_hd_l = value_hd_all[l_idx:l_idx + 1]
 
                 if q_ans.device.type == "cuda":
-                    q_ans  = q_ans.contiguous()
-                    k_hd_l = k_hd_l.contiguous()
-                    v_hd_l = v_hd_l.contiguous()
+                    q_ans = q_ans.contiguous()
 
-                # Cross-attention: Q_ans × K_hd (non-causal — all Ns HD tokens visible)
-                # out2: [1, Nans, H, D],  lse2: [1, H, Nans]
                 out2, lse2 = _dat_attn_with_lse(q_ans, k_hd_l, v_hd_l, causal=False)
 
-                # _merge_two_pass_lse clones out_b internally → returns a NEW tensor
-                # (no in-place modification of the flash_attn output).
-                # For Lp > 1: out_b chains: view(out1) → clone1 → clone2 → ...
-                out_b = self._merge_two_pass_lse(
-                    out_b, lse1[b_idx:b_idx + 1],
-                    out2, lse2,
-                    q_ans_start, q_ans_start + Nans,
-                )
+                # LSE merge via cat (prefix unchanged + merged suffix).
+                # Accumulated: ((lse1 ⊕ lse2_0) ⊕ lse2_1) ⊕ ...
+                lse_prev = lse_b[:, :, q_ans_start:]
+                out_prev = out_b[:, q_ans_start:, :, :]
+
+                lse_merged = torch.logaddexp(lse_prev, lse2)
+                w1 = (lse_prev - lse_merged).exp().permute(0, 2, 1).unsqueeze(-1)
+                w2 = (lse2     - lse_merged).exp().permute(0, 2, 1).unsqueeze(-1)
+
+                merged_out = w1 * out_prev + w2 * out2
+
+                out_b = torch.cat([out_b[:, :q_ans_start, :, :], merged_out], dim=1)
+                lse_b = torch.cat([lse_b[:, :, :q_ans_start], lse_merged], dim=2)
 
             out_parts.append(out_b)
 
-        # Re-assemble batch.  torch.cat handles mixed views (unmerged) and new tensors
-        # (merged) correctly, distributing gradients to the appropriate source.
         out_final = torch.cat(out_parts, dim=0)  # [B, Nq, H, D]
 
         # Visualization: record sampling locations (no attention-map for two-pass path)
@@ -1097,7 +1058,7 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 # DAT-specific parameter name patterns (for selective unfreezing)
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
-    'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
+    'ln_2', 'conv_off_proj', 'kv_proj_hd',
     'hd_attn_bias',
 ]
 
