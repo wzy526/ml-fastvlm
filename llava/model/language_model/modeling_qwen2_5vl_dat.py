@@ -63,10 +63,13 @@ from transformers.cache_utils import Cache
 # flash_attn (if available) returns LSE directly; otherwise we fall back to
 # a manual O(N²) SDPA implementation that also computes LSE.
 try:
+    import inspect as _inspect
     from flash_attn import flash_attn_func as _flash_attn_func
+    _FA_HAS_SOFTMAX_LSE = "return_softmax_lse" in _inspect.signature(_flash_attn_func).parameters
     _FLASH_ATTN_AVAILABLE = True
 except (ImportError, Exception):
     _flash_attn_func = None
+    _FA_HAS_SOFTMAX_LSE = False
     _FLASH_ATTN_AVAILABLE = False
 
 
@@ -85,16 +88,21 @@ def _dat_attn_with_lse(
     Returns:
         out: [B, N, H, D]  (transposed — ready for position-slicing)
         lse: [B, H, N]
+
+    flash_attn path:
+        >= 2.6  return_softmax_lse=True  -> (out, lse)           O(N) memory
+        <  2.6  return_attn_probs=True   -> (out, lse, S_dmask)  O(N2) overhead
     """
     if _FLASH_ATTN_AVAILABLE:
-        # flash_attn expects / returns [B, N, H, D]; lse is [B, H, N]
-        out_fa, lse, _ = _flash_attn_func(
-            q.transpose(1, 2).contiguous(),
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
-            causal=causal,
-            return_attn_probs=True,
-        )
+        q_fa = q.transpose(1, 2).contiguous()
+        k_fa = k.transpose(1, 2).contiguous()
+        v_fa = v.transpose(1, 2).contiguous()
+        if _FA_HAS_SOFTMAX_LSE:
+            out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
+                                           return_softmax_lse=True)
+        else:
+            out_fa, lse, _ = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
+                                               return_attn_probs=True)
         return out_fa, lse  # out_fa: [B, N, H, D], lse: [B, H, N]
 
     # Manual fallback: O(N²) memory, but GC-safe and always correct
