@@ -118,6 +118,10 @@ class ModelArguments:
         metadata={"help": "Learnable attention bias for HD keys. "
                   "<0 enables (used as init value, e.g. -10.0), >=0 disables."}
     )
+    dat_manual_attn: bool = field(
+        default=False,
+        metadata={"help": "Use manual mask-based attention implementation instead of two-pass LSE merge."}
+    )
 
 
 @dataclass
@@ -1549,7 +1553,13 @@ def train():
     dat_warmup_callback = None
 
     if model_args.use_dat:
-        if is_qwen2_5:
+        if is_qwen2_5 and model_args.dat_manual_attn:
+            from llava.model.language_model.modeling_qwen2_5vl_dat_manual import (
+                convert_qwen2_5vl_to_dat,
+                freeze_base_unfreeze_dat,
+                DAT_KEYS_MATCH as _DAT_KEYS,
+            )
+        elif is_qwen2_5:
             from llava.model.language_model.modeling_qwen2_5vl_dat import (
                 convert_qwen2_5vl_to_dat,
                 freeze_base_unfreeze_dat,
