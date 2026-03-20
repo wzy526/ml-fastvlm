@@ -1754,7 +1754,7 @@ def train():
         callbacks.append(
             WandbDATMonitorCallback(use_kvhd=model_args.dat_hd_proj)
         )
-    if training_args.visualization_every_n_steps > 0:
+    if training_args.visualization_every_n_steps > 0 and model_args.dat_manual_attn:
         callbacks.append(
             WandbSamplingVisCallback(
                 tokenizer=processor.tokenizer, vis_every_n_logs=training_args.visualization_every_n_steps,

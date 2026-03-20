@@ -60,21 +60,57 @@ from transformers.cache_utils import Cache
 # This is mathematically equivalent to joint attention over both KV sets,
 # has static shapes (no padding, no mask matrix), and is fully GC-compatible.
 #
-# flash_attn (if available) returns LSE directly; otherwise we fall back to
-# a manual O(N²) SDPA implementation that also computes LSE.
+# flash_attn backend selection: try FA4 (cute) → FA3 (hopper) → FA2 → manual fallback.
+# All backends return (out, lse) with out: [B, N, H, D], lse: [B, H, N].
+_FA_BACKEND = None   # "fa4" | "fa3" | "fa2" | None
+_flash_attn_func = None
+_flash_attn_varlen_func = None
+_FA_HAS_SOFTMAX_LSE = False  # FA2 >= 2.6 flag
+
+# --- FA4: flash_attn.cute ---
 try:
-    import inspect as _inspect
-    from flash_attn import flash_attn_func as _flash_attn_func
-    # flash_attn >= 2.6 exposes `return_softmax_lse` which returns (out, lse)
-    # directly without materialising the full O(N²) S_dmask matrix.
-    # Older versions only have `return_attn_probs` which returns (out, lse, S_dmask)
-    # where S_dmask is a full [B, H, Nq, Nk] fp32 tensor — expensive for large N.
-    _FA_HAS_SOFTMAX_LSE = "return_softmax_lse" in _inspect.signature(_flash_attn_func).parameters
-    _FLASH_ATTN_AVAILABLE = True
+    from flash_attn.cute import flash_attn_func as _fa4_func
+    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func
+    import flash_attn as _fa_mod
+    _flash_attn_func = _fa4_func
+    _flash_attn_varlen_func = _fa4_varlen_func
+    _FA_BACKEND = "fa4"
+    _fa_ver = getattr(_fa_mod, "__version__", "unknown")
+    print(f"[DAT-LSE] flash_attn 4 (cute) v{_fa_ver} loaded — using return_lse=True + varlen")
 except (ImportError, Exception):
-    _flash_attn_func = None
-    _FA_HAS_SOFTMAX_LSE = False
-    _FLASH_ATTN_AVAILABLE = False
+    pass
+
+# --- FA3: flash_attn_interface (hopper) ---
+if _FA_BACKEND is None:
+    try:
+        from flash_attn_interface import flash_attn_func as _fa3_func
+        from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen_func
+        _flash_attn_func = _fa3_func
+        _flash_attn_varlen_func = _fa3_varlen_func
+        _FA_BACKEND = "fa3"
+        print("[DAT-LSE] flash_attn 3 (hopper) loaded — using return_attn_probs=True + varlen")
+    except (ImportError, Exception):
+        pass
+
+# --- FA2: flash_attn ---
+if _FA_BACKEND is None:
+    try:
+        import inspect as _inspect
+        from flash_attn import flash_attn_func as _fa2_func
+        from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
+        import flash_attn as _fa_mod
+        _flash_attn_func = _fa2_func
+        _flash_attn_varlen_func = _fa2_varlen_func
+        _FA_HAS_SOFTMAX_LSE = "return_softmax_lse" in _inspect.signature(_fa2_func).parameters
+        _FA_BACKEND = "fa2"
+        _fa_ver = getattr(_fa_mod, "__version__", "unknown")
+        _lse_api = "return_softmax_lse" if _FA_HAS_SOFTMAX_LSE else "return_attn_probs (S_dmask overhead)"
+        print(f"[DAT-LSE] flash_attn 2 v{_fa_ver} loaded — using {_lse_api} + varlen")
+    except (ImportError, Exception):
+        pass
+
+if _FA_BACKEND is None:
+    print("[DAT-LSE] flash_attn NOT available, using O(N²) manual SDPA fallback — expect slower training")
 
 
 def _dat_attn_with_lse(
@@ -92,26 +128,26 @@ def _dat_attn_with_lse(
     Returns:
         out: [B, N, H, D]  (transposed — ready for position-slicing)
         lse: [B, H, N]     (float32)
-
-    flash_attn path:
-        >= 2.6  use return_softmax_lse=True  → (out, lse), no S_dmask  ← O(N) memory
-        <  2.6  use return_attn_probs=True   → (out, lse, S_dmask)     ← O(N²) memory overhead
-    Manual fallback: plain SDPA, O(N²) memory but always correct.
     """
-    if _FLASH_ATTN_AVAILABLE:
-        # flash_attn expects / returns [B, N, H, D]; lse shape is [B, H, N]
+    if _FA_BACKEND is not None:
         q_fa = q.transpose(1, 2).contiguous()
         k_fa = k.transpose(1, 2).contiguous()
         v_fa = v.transpose(1, 2).contiguous()
-        if _FA_HAS_SOFTMAX_LSE:
-            # >= 2.6: clean API — no S_dmask materialisation
+
+        if _FA_BACKEND == "fa4":
             out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
-                                           return_softmax_lse=True)
-        else:
-            # < 2.6: discard S_dmask (third element)
-            out_fa, lse, _ = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
-                                               return_attn_probs=True)
-        return out_fa, lse  # out_fa: [B, N, H, D], lse: [B, H, N]
+                                           return_lse=True)
+        elif _FA_BACKEND == "fa3":
+            out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
+                                           return_attn_probs=True)
+        else:  # fa2
+            if _FA_HAS_SOFTMAX_LSE:
+                out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
+                                               return_softmax_lse=True)
+            else:
+                out_fa, lse, _ = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
+                                                   return_attn_probs=True)
+        return out_fa, lse
 
     # Manual fallback: O(N²) memory, but GC-safe and always correct
     B, H, Nq, D = q.shape
@@ -127,6 +163,86 @@ def _dat_attn_with_lse(
     attn_w = torch.softmax(scores.float(), dim=-1).to(q.dtype)
     out = torch.matmul(attn_w, v).transpose(1, 2)          # [B, Nq, H, D]
     return out, lse
+
+
+def _dat_cross_attn_varlen(
+    q_list: List[torch.Tensor],
+    k_list: List[torch.Tensor],
+    v_list: List[torch.Tensor],
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """Batched non-causal cross-attention via flash_attn_varlen_func (single kernel).
+
+    Args:
+        q_list: list of [Nans_i, H, D] tensors (variable query lengths)
+        k_list: list of [Ns_i, H, D] tensors
+        v_list: list of [Ns_i, H, D] tensors
+
+    Returns:
+        out_list: list of [1, Nans_i, H, D] tensors
+        lse_list: list of [1, H, Nans_i] tensors
+    """
+    n_segs = len(q_list)
+    device = q_list[0].device
+    H = q_list[0].shape[1]
+
+    nq_lens = [q.shape[0] for q in q_list]
+    nk_lens = [k.shape[0] for k in k_list]
+
+    q_packed = torch.cat(q_list, dim=0)          # [total_q, H, D]
+    k_packed = torch.cat(k_list, dim=0)          # [total_k, H, D]
+    v_packed = torch.cat(v_list, dim=0)          # [total_k, H, D]
+
+    cu_q = torch.zeros(n_segs + 1, dtype=torch.int32, device=device)
+    cu_k = torch.zeros(n_segs + 1, dtype=torch.int32, device=device)
+    for i in range(n_segs):
+        cu_q[i + 1] = cu_q[i] + nq_lens[i]
+        cu_k[i + 1] = cu_k[i] + nk_lens[i]
+
+    if _FA_BACKEND == "fa4":
+        out_packed, lse_packed = _flash_attn_varlen_func(
+            q_packed, k_packed, v_packed,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max(nq_lens), max_seqlen_k=max(nk_lens),
+            causal=False, return_lse=True,
+        )
+        # out_packed: [total_q, H, D],  lse_packed: [H, total_q]
+    elif _FA_BACKEND == "fa3":
+        out_packed, lse_packed = _flash_attn_varlen_func(
+            q_packed, k_packed, v_packed,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max(nq_lens), max_seqlen_k=max(nk_lens),
+            causal=False, return_attn_probs=True,
+        )
+    else:  # fa2
+        if _FA_HAS_SOFTMAX_LSE:
+            out_packed, lse_packed = _flash_attn_varlen_func(
+                q_packed, k_packed, v_packed,
+                cu_q, cu_k, max(nq_lens), max(nk_lens),
+                causal=False, return_softmax_lse=True,
+            )
+        else:
+            out_packed, lse_packed, _ = _flash_attn_varlen_func(
+                q_packed, k_packed, v_packed,
+                cu_q, cu_k, max(nq_lens), max(nk_lens),
+                causal=False, return_attn_probs=True,
+            )
+        # FA2 varlen lse: [batch, H, max_seqlen_q] — convert to packed [H, total_q]
+        lse_parts = []
+        for i in range(n_segs):
+            lse_parts.append(lse_packed[i, :, :nq_lens[i]])  # [H, nq_i]
+        lse_packed = torch.cat(lse_parts, dim=1)  # [H, total_q]
+
+    # Unpack: split by segment query lengths
+    out_list = []
+    lse_list = []
+    q_offset = 0
+    for i in range(n_segs):
+        nq = nq_lens[i]
+        out_list.append(out_packed[q_offset:q_offset + nq].unsqueeze(0))     # [1, Nans, H, D]
+        lse_list.append(lse_packed[:, q_offset:q_offset + nq].unsqueeze(0))  # [1, H, Nans]
+        q_offset += nq
+
+    return out_list, lse_list
 
 
 logger = logging.getLogger(__name__)
@@ -720,40 +836,33 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         _want_vis = self.training and getattr(self, '_dat_request_vis', False)
         _dat_vis_entry = None  # (b_idx, slocs) for visualization
 
-        # === Pass 2: HD cross-attention per batch element, per answer segment ===
-        # We accumulate per-batch outputs in a list to avoid in-place modification of
-        # out1 (flash_attn saves out in ctx.saved_tensors; writing to out1 in-place
-        # would corrupt the saved tensor and cause incorrect backward gradients).
-        out_parts: List[torch.Tensor] = []
+        # === Pass 2: HD cross-attention (batched via varlen for minimal kernel launches) ===
+        # Phase 2a: Prepare all cross-attention segment pairs
+        seg_q_list: List[torch.Tensor] = []   # [Nans_i, H, D] each
+        seg_k_list: List[torch.Tensor] = []   # [Ns, H, D] each
+        seg_v_list: List[torch.Tensor] = []   # [Ns, H, D] each
+        seg_meta: List[Tuple[int, int, int]] = []  # (b_idx, q_ans_start, Nans)
 
         for b_idx in range(B):
-            # Start with Pass 1 output for this batch element (view, no copy yet)
-            out_b = out1[b_idx:b_idx + 1]   # [1, Nq, H, D]
-
             if len(image_range_list[b_idx]) <= 1:
-                out_parts.append(out_b)
-                continue  # No HD for this sample; Pass 1 result is final
+                continue
 
             hd_feat_idx = b_idx_to_hd_idx[b_idx]
             lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0]
 
-            # Get 3D mRoPE positions for this batch element
             if mrope_position_ids is not None:
-                orig_pos_b = mrope_position_ids[:, b_idx, :]  # [3, Nq]
+                orig_pos_b = mrope_position_ids[:, b_idx, :]
             else:
                 orig_pos_b = torch.arange(Nq, device=device, dtype=torch.long).unsqueeze(0).expand(3, -1)
 
-            # HD position IDs (shared across all answer segments for this image)
             hd_pos_ids = self._construct_hd_position_ids(
                 orig_pos_b, lr_start, lr_end, lr_h, lr_w, device,
-            )  # [3, Ns]
-            hd_pos_ids_batched = hd_pos_ids.unsqueeze(1)  # [3, 1, Ns]
+            )
+            hd_pos_ids_batched = hd_pos_ids.unsqueeze(1)
 
-            # Generate all HD KV for this batch element (all Lp segments at once)
             key_hd_all, value_hd_all, _slocs = self._generate_offsets_and_sample(
                 query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx,
             )
-            # key_hd_all, value_hd_all: [Lp, Ns, kv_dim]
 
             if _want_vis and _dat_vis_entry is None:
                 _dat_vis_entry = (b_idx, _slocs)
@@ -764,32 +873,30 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 intention_idx = answer_range[2]
 
                 if ans_end > 0:
-                    # Training: answer tokens are [ans_start, ans_end)
                     q_ans_start = ans_start
                     Nans = ans_end - ans_start
                 else:
-                    # Inference prefill: tokens after intention marker attend to HD.
-                    # ans_start = seq_len here; use intention_idx+1 as the actual start.
                     q_ans_start = intention_idx + 1
                     Nans = Nq - q_ans_start
 
                 if Nans <= 0:
                     continue
 
-                # q_ans: taken from Pass 1's mRoPE'd query — MUST be the same q as Pass 1.
-                # (Re-projecting from hidden_states would break LSE merge correctness.)
-                q_ans = query_bhnc[b_idx:b_idx + 1, :, q_ans_start:q_ans_start + Nans, :]
-                # q_ans: [1, H, Nans, D]
+                # q: [H, Nans, D] → [Nans, H, D] for varlen packing
+                q_seg = query_bhnc[b_idx, :, q_ans_start:q_ans_start + Nans, :] \
+                    .transpose(0, 1).contiguous()   # [Nans, H, D]
 
-                # HD KV for this answer segment: [1, H, Ns, D]
-                k_hd_l = (key_hd_all[l_idx:l_idx + 1]
-                           .view(1, Ns, self.num_key_value_heads, self.head_dim)
-                           .transpose(1, 2))
-                v_hd_l = (value_hd_all[l_idx:l_idx + 1]
-                           .view(1, Ns, self.num_key_value_heads, self.head_dim)
-                           .transpose(1, 2))
+                k_hd_l = (key_hd_all[l_idx]
+                          .view(Ns, self.num_key_value_heads, self.head_dim)
+                          .unsqueeze(0).unsqueeze(0))  # [1, 1, Ns, D_kv]
+                v_hd_l = (value_hd_all[l_idx]
+                          .view(Ns, self.num_key_value_heads, self.head_dim)
+                          .unsqueeze(0).unsqueeze(0))  # [1, 1, Ns, D_kv]
 
-                # Apply mRoPE to HD KV using image coordinate position IDs
+                # Reshape for RoPE: [1, H_kv, Ns, D]
+                k_hd_l = k_hd_l.view(1, Ns, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                v_hd_l = v_hd_l.view(1, Ns, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
                 cos_hd, sin_hd = self._dat_rotary_emb(k_hd_l, hd_pos_ids_batched)
                 k_hd_l = apply_multimodal_rotary_pos_emb_single(
                     k_hd_l, cos_hd, sin_hd, mrope_section,
@@ -798,28 +905,47 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 k_hd_l = repeat_kv(k_hd_l, self.num_key_value_groups)  # [1, H, Ns, D]
                 v_hd_l = repeat_kv(v_hd_l, self.num_key_value_groups)
 
-                if q_ans.device.type == "cuda":
-                    q_ans  = q_ans.contiguous()
-                    k_hd_l = k_hd_l.contiguous()
-                    v_hd_l = v_hd_l.contiguous()
+                # [1, H, Ns, D] → [Ns, H, D]
+                seg_k_list.append(k_hd_l.squeeze(0).transpose(0, 1).contiguous())
+                seg_v_list.append(v_hd_l.squeeze(0).transpose(0, 1).contiguous())
+                seg_q_list.append(q_seg)
+                seg_meta.append((b_idx, q_ans_start, Nans))
 
-                # Cross-attention: Q_ans × K_hd (non-causal — all Ns HD tokens visible)
-                # out2: [1, Nans, H, D],  lse2: [1, H, Nans]
-                out2, lse2 = _dat_attn_with_lse(q_ans, k_hd_l, v_hd_l, causal=False)
+        # Phase 2b: Batched cross-attention — ONE kernel for all segments
+        if seg_q_list and _flash_attn_varlen_func is not None:
+            out2_list, lse2_list = _dat_cross_attn_varlen(
+                seg_q_list, seg_k_list, seg_v_list,
+            )
+        elif seg_q_list:
+            # Fallback: per-segment calls (no varlen available)
+            out2_list, lse2_list = [], []
+            for q_s, k_s, v_s in zip(seg_q_list, seg_k_list, seg_v_list):
+                q_bhnc = q_s.transpose(0, 1).unsqueeze(0)  # [1, H, Nans, D]
+                k_bhnc = k_s.transpose(0, 1).unsqueeze(0)
+                v_bhnc = v_s.transpose(0, 1).unsqueeze(0)
+                o2, l2 = _dat_attn_with_lse(q_bhnc, k_bhnc, v_bhnc, causal=False)
+                out2_list.append(o2)
+                lse2_list.append(l2)
+        else:
+            out2_list, lse2_list = [], []
 
-                # _merge_two_pass_lse clones out_b internally → returns a NEW tensor
-                # (no in-place modification of the flash_attn output).
-                # For Lp > 1: out_b chains: view(out1) → clone1 → clone2 → ...
+        # Phase 2c: LSE merge — assemble per-batch outputs
+        out_parts: List[torch.Tensor] = []
+        seg_iter = 0
+        for b_idx in range(B):
+            out_b = out1[b_idx:b_idx + 1]  # [1, Nq, H, D]
+
+            while seg_iter < len(seg_meta) and seg_meta[seg_iter][0] == b_idx:
+                _, q_ans_start, Nans = seg_meta[seg_iter]
                 out_b = self._merge_two_pass_lse(
                     out_b, lse1[b_idx:b_idx + 1],
-                    out2, lse2,
+                    out2_list[seg_iter], lse2_list[seg_iter],
                     q_ans_start, q_ans_start + Nans,
                 )
+                seg_iter += 1
 
             out_parts.append(out_b)
 
-        # Re-assemble batch.  torch.cat handles mixed views (unmerged) and new tensors
-        # (merged) correctly, distributing gradients to the appropriate source.
         out_final = torch.cat(out_parts, dim=0)  # [B, Nq, H, D]
 
         # Visualization: record sampling locations (no attention-map for two-pass path)
