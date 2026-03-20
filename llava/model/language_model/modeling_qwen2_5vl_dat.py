@@ -23,6 +23,7 @@ Attention mechanism: Two-pass + LSE merge (GC-safe, shape-static):
     Merge:  o* = exp(ℓ₁−ℓ)·o₁ + exp(ℓ₂−ℓ)·o₂,  ℓ = logaddexp(ℓ₁, ℓ₂)
     → No mask matrix, no pad_sequence, no data-dependent shapes.
     → Fully compatible with gradient checkpointing and torch.compile.
+    → Backend selectable via _FA_BACKEND constant: "fa2" | "fa3" | "fa4".
 """
 
 import logging
@@ -59,58 +60,43 @@ from transformers.cache_utils import Cache
 #
 # This is mathematically equivalent to joint attention over both KV sets,
 # has static shapes (no padding, no mask matrix), and is fully GC-compatible.
-#
-# flash_attn backend selection: try FA4 (cute) → FA3 (hopper) → FA2 → manual fallback.
-# All backends return (out, lse) with out: [B, N, H, D], lse: [B, H, N].
-_FA_BACKEND = None   # "fa4" | "fa3" | "fa2" | None
+
+# ── Backend selection ────────────────────────────────────────────────
+# Change this constant to switch flash_attn backend:
+#   "fa2"  — flash_attn 2.x   (flash_attn.flash_attn_func)
+#   "fa3"  — flash_attn 3 / Hopper  (flash_attn_interface)
+#   "fa4"  — flash_attn 4 / Cute    (flash_attn.cute)
+_FA_BACKEND = "fa3"
+# ─────────────────────────────────────────────────────────────────────
+
 _flash_attn_func = None
 _flash_attn_varlen_func = None
-_FA_HAS_SOFTMAX_LSE = False  # FA2 >= 2.6 flag
+_FA_HAS_SOFTMAX_LSE = False
 
-# --- FA4: flash_attn.cute ---
-try:
-    from flash_attn.cute import flash_attn_func as _fa4_func
-    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func
+if _FA_BACKEND == "fa4":
+    from flash_attn.cute import flash_attn_func as _flash_attn_func          # type: ignore[assignment]
+    from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore[assignment]
     import flash_attn as _fa_mod
-    _flash_attn_func = _fa4_func
-    _flash_attn_varlen_func = _fa4_varlen_func
-    _FA_BACKEND = "fa4"
     _fa_ver = getattr(_fa_mod, "__version__", "unknown")
-    print(f"[DAT-LSE] flash_attn 4 (cute) v{_fa_ver} loaded — using return_lse=True + varlen")
-except (ImportError, Exception):
-    pass
+    print(f"[DAT-LSE] flash_attn 4 (cute) v{_fa_ver} — return_lse=True + varlen")
 
-# --- FA3: flash_attn_interface (hopper) ---
-if _FA_BACKEND is None:
-    try:
-        from flash_attn_interface import flash_attn_func as _fa3_func
-        from flash_attn_interface import flash_attn_varlen_func as _fa3_varlen_func
-        _flash_attn_func = _fa3_func
-        _flash_attn_varlen_func = _fa3_varlen_func
-        _FA_BACKEND = "fa3"
-        print("[DAT-LSE] flash_attn 3 (hopper) loaded — using return_attn_probs=True + varlen")
-    except (ImportError, Exception):
-        pass
+elif _FA_BACKEND == "fa3":
+    from flash_attn_interface import flash_attn_func as _flash_attn_func           # type: ignore[assignment]
+    from flash_attn_interface import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore[assignment]
+    print("[DAT-LSE] flash_attn 3 (hopper) — return_attn_probs=True + varlen")
 
-# --- FA2: flash_attn ---
-if _FA_BACKEND is None:
-    try:
-        import inspect as _inspect
-        from flash_attn import flash_attn_func as _fa2_func
-        from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
-        import flash_attn as _fa_mod
-        _flash_attn_func = _fa2_func
-        _flash_attn_varlen_func = _fa2_varlen_func
-        _FA_HAS_SOFTMAX_LSE = "return_softmax_lse" in _inspect.signature(_fa2_func).parameters
-        _FA_BACKEND = "fa2"
-        _fa_ver = getattr(_fa_mod, "__version__", "unknown")
-        _lse_api = "return_softmax_lse" if _FA_HAS_SOFTMAX_LSE else "return_attn_probs (S_dmask overhead)"
-        print(f"[DAT-LSE] flash_attn 2 v{_fa_ver} loaded — using {_lse_api} + varlen")
-    except (ImportError, Exception):
-        pass
+elif _FA_BACKEND == "fa2":
+    import inspect as _inspect
+    from flash_attn import flash_attn_func as _flash_attn_func                # type: ignore[assignment]
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore[assignment]
+    import flash_attn as _fa_mod
+    _FA_HAS_SOFTMAX_LSE = "return_softmax_lse" in _inspect.signature(_flash_attn_func).parameters
+    _fa_ver = getattr(_fa_mod, "__version__", "unknown")
+    _lse_api = "return_softmax_lse" if _FA_HAS_SOFTMAX_LSE else "return_attn_probs"
+    print(f"[DAT-LSE] flash_attn 2 v{_fa_ver} — {_lse_api} + varlen")
 
-if _FA_BACKEND is None:
-    print("[DAT-LSE] flash_attn NOT available, using O(N²) manual SDPA fallback — expect slower training")
+else:
+    raise ValueError(f"Unknown _FA_BACKEND={_FA_BACKEND!r}. Choose 'fa2', 'fa3', or 'fa4'.")
 
 
 def _dat_attn_with_lse(
@@ -129,40 +115,24 @@ def _dat_attn_with_lse(
         out: [B, N, H, D]  (transposed — ready for position-slicing)
         lse: [B, H, N]     (float32)
     """
-    if _FA_BACKEND is not None:
-        q_fa = q.transpose(1, 2).contiguous()
-        k_fa = k.transpose(1, 2).contiguous()
-        v_fa = v.transpose(1, 2).contiguous()
+    q_fa = q.transpose(1, 2).contiguous()
+    k_fa = k.transpose(1, 2).contiguous()
+    v_fa = v.transpose(1, 2).contiguous()
 
-        if _FA_BACKEND == "fa4":
+    if _FA_BACKEND == "fa4":
+        out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
+                                       return_lse=True)
+    elif _FA_BACKEND == "fa3":
+        out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
+                                       return_attn_probs=True)
+    else:  # fa2
+        if _FA_HAS_SOFTMAX_LSE:
             out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
-                                           return_lse=True)
-        elif _FA_BACKEND == "fa3":
-            out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
-                                           return_attn_probs=True)
-        else:  # fa2
-            if _FA_HAS_SOFTMAX_LSE:
-                out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
-                                               return_softmax_lse=True)
-            else:
-                out_fa, lse, _ = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
-                                                   return_attn_probs=True)
-        return out_fa, lse
-
-    # Manual fallback: O(N²) memory, but GC-safe and always correct
-    B, H, Nq, D = q.shape
-    scale = D ** -0.5
-    scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, H, Nq, Nk]
-    if causal:
-        causal_mask = torch.triu(
-            torch.ones(Nq, k.size(2), device=q.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        scores = scores.masked_fill(causal_mask, float('-inf'))
-    lse = torch.logsumexp(scores.float(), dim=-1)          # [B, H, Nq]
-    attn_w = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-    out = torch.matmul(attn_w, v).transpose(1, 2)          # [B, Nq, H, D]
-    return out, lse
+                                           return_softmax_lse=True)
+        else:
+            out_fa, lse, _ = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
+                                               return_attn_probs=True)
+    return out_fa, lse
 
 
 def _dat_cross_attn_varlen(
@@ -226,7 +196,7 @@ def _dat_cross_attn_varlen(
                 cu_q, cu_k, max(nq_lens), max(nk_lens),
                 causal=False, return_attn_probs=True,
             )
-        # FA2 varlen lse: [batch, H, max_seqlen_q] — convert to packed [H, total_q]
+        # FA2 varlen lse: [batch, H, max_seqlen_q] → packed [H, total_q]
         lse_parts = []
         for i in range(n_segs):
             lse_parts.append(lse_packed[i, :, :nq_lens[i]])  # [H, nq_i]
@@ -912,20 +882,10 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 seg_meta.append((b_idx, q_ans_start, Nans))
 
         # Phase 2b: Batched cross-attention — ONE kernel for all segments
-        if seg_q_list and _flash_attn_varlen_func is not None:
+        if seg_q_list:
             out2_list, lse2_list = _dat_cross_attn_varlen(
                 seg_q_list, seg_k_list, seg_v_list,
             )
-        elif seg_q_list:
-            # Fallback: per-segment calls (no varlen available)
-            out2_list, lse2_list = [], []
-            for q_s, k_s, v_s in zip(seg_q_list, seg_k_list, seg_v_list):
-                q_bhnc = q_s.transpose(0, 1).unsqueeze(0)  # [1, H, Nans, D]
-                k_bhnc = k_s.transpose(0, 1).unsqueeze(0)
-                v_bhnc = v_s.transpose(0, 1).unsqueeze(0)
-                o2, l2 = _dat_attn_with_lse(q_bhnc, k_bhnc, v_bhnc, causal=False)
-                out2_list.append(o2)
-                lse2_list.append(l2)
         else:
             out2_list, lse2_list = [], []
 
