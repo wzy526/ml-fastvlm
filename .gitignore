@@ -171,3 +171,6 @@ PLAN.md
 
 # test outputs
 test_output/
+
+# bench logs
+bench_logs/
