@@ -67,7 +67,7 @@ try:
     from flash_attn import flash_attn_func as _flash_attn_func
     # flash_attn >= 2.6 exposes `return_softmax_lse` which returns (out, lse)
     # directly without materialising the full O(N²) S_dmask matrix.
-    # Older versions only have `return_attn_probs` which returns (out, lse, S_dmask)
+    # Older versions only have `rketurn_attn_probs` which returns (out, lse, S_dmask)
     # where S_dmask is a full [B, H, Nq, Nk] fp32 tensor — expensive for large N.
     _FA_HAS_SOFTMAX_LSE = "return_softmax_lse" in _inspect.signature(_flash_attn_func).parameters
     _FLASH_ATTN_AVAILABLE = True
