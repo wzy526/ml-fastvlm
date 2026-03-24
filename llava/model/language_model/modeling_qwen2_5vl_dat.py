@@ -27,6 +27,7 @@ Attention mechanism: Two-pass + LSE merge (GC-safe, shape-static):
 """
 
 import logging
+import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -252,6 +253,7 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
             'layers': '',              # Layer type string, e.g. "LLLDLLLD..."
             'use_intention_branch': True,
             'intention_as_gate': True,
+            'hd_gate_warmup_steps': 0,
         }
 
 
@@ -444,6 +446,10 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         # Rotary embedding for extended KV (Qwen2.5-VL Attention doesn't have one)
         self._dat_rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
 
+        # HD gating: linear warmup via LSE bias
+        self._warmup_steps = dat.get('hd_gate_warmup_steps', 0)
+        self.register_buffer('_dat_warmup_step', torch.tensor(0, dtype=torch.long))
+
         self._init_dat_weights()
 
     @torch.no_grad()
@@ -459,13 +465,22 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             nn.init.xavier_uniform_(self.proj_intention.weight)
             if self.proj_intention.bias is not None:
                 nn.init.zeros_(self.proj_intention.bias)
+        # HD KV projections: copy from base k_proj / v_proj so HD path
+        # starts identical to the standard KV path (pretrained weights
+        # are copied again after from_pretrained via init_hd_proj_from_kv).
         if self.k_proj_hd is not None:
-            nn.init.xavier_uniform_(self.k_proj_hd.weight)
-            nn.init.xavier_uniform_(self.v_proj_hd.weight)
+            self.k_proj_hd.weight.copy_(self.k_proj.weight)
+            self.v_proj_hd.weight.copy_(self.v_proj.weight)
             if self.k_proj_hd.bias is not None:
-                nn.init.zeros_(self.k_proj_hd.bias)
+                if self.k_proj.bias is not None:
+                    self.k_proj_hd.bias.copy_(self.k_proj.bias)
+                else:
+                    nn.init.zeros_(self.k_proj_hd.bias)
             if self.v_proj_hd.bias is not None:
-                nn.init.zeros_(self.v_proj_hd.bias)
+                if self.v_proj.bias is not None:
+                    self.v_proj_hd.bias.copy_(self.v_proj.bias)
+                else:
+                    nn.init.zeros_(self.v_proj_hd.bias)
 
     def _grid_generate(self, h, w, n_repeats, device):
         """Generate reference sampling grid in [-1, 1]."""
@@ -660,6 +675,15 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             o* = exp(ℓ₁ − ℓ) · o₁ + exp(ℓ₂ − ℓ) · o₂
         where ℓ = logaddexp(ℓ₁, ℓ₂).  Weights sum to 1 exactly. ✓
 
+        HD gating via LSE bias (linear warmup):
+            During warmup, gate g ∈ (0, 1] linearly increases from ~0 to 1.
+            We apply ℓ₂_gated = ℓ₂ + log(g), which scales the HD partition
+            function Z₂ by g:  Z₂_gated = g · Z₂.
+            The merge weights remain normalized (w₁+w₂ = 1) but the effective
+            HD contribution is smoothly suppressed:
+                w₂ = g·Z₂ / (Z₁ + g·Z₂)
+            At g→0: o* ≈ o₁ (pure causal).  At g=1: standard merge.
+
         Critical: out2 / lse2 must use the SAME q as Pass 1 (already mRoPE'd),
         not re-projected from hidden_states, so s₁ and s₂ share the same query.
 
@@ -675,16 +699,28 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         """
         out = out1.clone()
 
-        lse1_ans = lse1[:, :, ans_start:ans_end]          # [B, H, Nans]
+        # Ensure fp32 for numerically sensitive LSE merge (logaddexp / exp).
+        # flash_attn returns fp32 LSE today, but we make it explicit.
+        lse1_ans = lse1[:, :, ans_start:ans_end].float()   # [B, H, Nans]
+        lse2 = lse2.float()                                # [1, H, Nans]
         out1_ans = out1[:, ans_start:ans_end, :, :]        # [B, Nans, H, D]
 
-        lse = torch.logaddexp(lse1_ans, lse2)              # [B, H, Nans]
+        # HD gating: add log(g) bias to ℓ₂ so the HD partition function is
+        # scaled by g.  g linearly warms up from ~0 to 1 over warmup_steps.
+        if self._warmup_steps > 0 and self.training:
+            step = self._dat_warmup_step.item()
+            gate = min(step / self._warmup_steps, 1.0)
+            gate = max(gate, 1e-6)
+            lse2 = lse2 + math.log(gate)
+            self._dat_hd_gate_value = gate
 
-        # Weights: [B, H, Nans] → [B, Nans, H, 1] for broadcasting
+        lse = torch.logaddexp(lse1_ans, lse2)              # [B, H, Nans] fp32
+
+        # Weights: [B, H, Nans] → [B, Nans, H, 1] for broadcasting (fp32)
         w1 = (lse1_ans - lse).exp().permute(0, 2, 1).unsqueeze(-1)
         w2 = (lse2     - lse).exp().permute(0, 2, 1).unsqueeze(-1)
 
-        out[:, ans_start:ans_end, :, :] = w1 * out1_ans + w2 * out2
+        out[:, ans_start:ans_end, :, :] = (w1 * out1_ans + w2 * out2).to(out.dtype)
 
         return out
 
@@ -980,6 +1016,37 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             logger.info(f"Qwen2.5VL-DAT: {dat_count} DAT layers, "
                         f"{text_config.num_hidden_layers - dat_count} standard layers")
 
+    @torch.no_grad()
+    def init_hd_proj_from_kv(self):
+        """Copy pretrained k_proj/v_proj weights into k_proj_hd/v_proj_hd.
+
+        Must be called AFTER from_pretrained() so that k_proj/v_proj hold the
+        pretrained weights (not the random init present during __init__).
+        """
+        n = 0
+        for m in self.modules():
+            if isinstance(m, Qwen2_5_VLAttentionDAT) and m.k_proj_hd is not None:
+                m.k_proj_hd.weight.copy_(m.k_proj.weight)
+                m.v_proj_hd.weight.copy_(m.v_proj.weight)
+                if m.k_proj_hd.bias is not None and m.k_proj.bias is not None:
+                    m.k_proj_hd.bias.copy_(m.k_proj.bias)
+                if m.v_proj_hd.bias is not None and m.v_proj.bias is not None:
+                    m.v_proj_hd.bias.copy_(m.v_proj.bias)
+                n += 1
+        logger.info(f"Copied k_proj/v_proj → k_proj_hd/v_proj_hd for {n} DAT layers")
+
+    def dat_set_warmup_step(self, step: int):
+        """Set the current warmup step on all DAT attention layers.
+
+        Call this once per training step from the training loop:
+            model.dat_set_warmup_step(global_step)
+        The gate value g = clamp(step / warmup_steps, 0, 1) is computed
+        inside _merge_two_pass_lse.
+        """
+        for m in self.modules():
+            if isinstance(m, Qwen2_5_VLAttentionDAT):
+                m._dat_warmup_step.fill_(step)
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1239,6 +1306,9 @@ def convert_qwen2_5vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=Non
                     base_model_or_path.model.language_model.layers[i] = \
                         Qwen2_5_VLDecoderLayerDAT(text_config, i, dat_extra_args)
         dat_model = base_model_or_path
+
+    # Now that pretrained weights are loaded, copy k_proj/v_proj → k_proj_hd/v_proj_hd
+    dat_model.init_hd_proj_from_kv()
 
     return dat_model
 
