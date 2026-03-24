@@ -81,9 +81,20 @@ if _FA_BACKEND == "fa4":
     print(f"[DAT-LSE] flash_attn 4 (cute) v{_fa_ver} — return_lse=True + varlen")
 
 elif _FA_BACKEND == "fa3":
-    from flash_attn_interface import flash_attn_func as _flash_attn_func           # type: ignore[assignment]
-    from flash_attn_interface import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore[assignment]
-    print("[DAT-LSE] flash_attn 3 (hopper) — return_attn_probs=True + varlen")
+    try:
+        from flash_attn_interface import flash_attn_func as _flash_attn_func           # type: ignore[assignment]
+        from flash_attn_interface import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore[assignment]
+        print("[DAT-LSE] flash_attn 3 (hopper) — return_attn_probs=True + varlen")
+    except ImportError:
+        import inspect as _inspect
+        from flash_attn import flash_attn_func as _flash_attn_func                # type: ignore[assignment]
+        from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore[assignment]
+        import flash_attn as _fa_mod
+        _FA_HAS_SOFTMAX_LSE = "return_softmax_lse" in _inspect.signature(_flash_attn_func).parameters
+        _fa_ver = getattr(_fa_mod, "__version__", "unknown")
+        _FA_BACKEND = "fa2"  # type: ignore[assignment]
+        _lse_api = "return_softmax_lse" if _FA_HAS_SOFTMAX_LSE else "return_attn_probs"
+        print(f"[DAT-LSE] fa3 not available, fell back to flash_attn 2 v{_fa_ver} — {_lse_api} + varlen")
 
 elif _FA_BACKEND == "fa2":
     import inspect as _inspect
@@ -196,11 +207,9 @@ def _dat_cross_attn_varlen(
                 cu_q, cu_k, max(nq_lens), max(nk_lens),
                 causal=False, return_attn_probs=True,
             )
-        # FA2 varlen lse: [batch, H, max_seqlen_q] → packed [H, total_q]
-        lse_parts = []
-        for i in range(n_segs):
-            lse_parts.append(lse_packed[i, :, :nq_lens[i]])  # [H, nq_i]
-        lse_packed = torch.cat(lse_parts, dim=1)  # [H, total_q]
+        # FA2 varlen: lse_packed is already [H, total_q] (packed, not batched).
+        # Unlike non-varlen flash_attn_func which returns [B, H, N],
+        # flash_attn_varlen_func packs all sequences into a single axis.
 
     # Unpack: split by segment query lengths
     out_list = []
@@ -1026,12 +1035,16 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         return model_inputs
 
     def _generate_hd_features(self, pixel_values_hd, image_grid_thw_hd):
-        """Generate HD feature maps from high-resolution pixel values."""
+        """Generate HD feature maps from high-resolution pixel values (separate ViT call)."""
         with torch.no_grad():
             pixel_values_hd = pixel_values_hd.type(self.model.visual.dtype)
             hd_output = self.model.visual(pixel_values_hd, grid_thw=image_grid_thw_hd, return_dict=True)
             hd_embeds = hd_output.pooler_output
 
+        return self._parse_hd_embeds(hd_embeds, image_grid_thw_hd)
+
+    def _parse_hd_embeds(self, hd_embeds, image_grid_thw_hd):
+        """Parse flat HD embeddings into per-image [H_hd, W_hd, C] feature maps."""
         spatial_merge = self.config.vision_config.spatial_merge_size
         image_hd_features = []
         offset = 0
@@ -1053,6 +1066,48 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             offset += n_patches
 
         return image_hd_features
+
+    def _merged_vit_forward(self, pixel_values, image_grid_thw, pixel_values_hd, image_grid_thw_hd):
+        """Single fused ViT call for both LR and HD pixel values.
+
+        Saves one full ViT forward pass compared to calling _generate_hd_features
+        separately plus the base-class LR ViT call.
+
+        Gradient semantics preserved:
+          - LR path : gradients flow normally (pixel_values untouched).
+          - HD path : pixel_values_hd is detached before concat, so no gradients
+                      flow into ViT weights from the HD branch (same as the
+                      ``with torch.no_grad()`` guard in _generate_hd_features).
+
+        Returns:
+            lr_embeds      : [N_lr_merged_patches, C]  — flat LR embeddings ready
+                             for masked_scatter into inputs_embeds.
+            image_hd_features : List[[H_hd, W_hd, C]] — one tensor per image.
+        """
+        spatial_merge = self.config.vision_config.spatial_merge_size
+        vit_dtype = self.model.visual.dtype
+
+        # Concat LR + HD; detach HD so its path stays gradient-free
+        pv_combined = torch.cat([
+            pixel_values.to(dtype=vit_dtype),
+            pixel_values_hd.detach().to(dtype=vit_dtype),
+        ], dim=0)
+        thw_combined = torch.cat([image_grid_thw, image_grid_thw_hd], dim=0)
+
+        # One ViT call for both resolutions
+        combined_output = self.model.visual(pv_combined, grid_thw=thw_combined, return_dict=True)
+        combined_embeds = combined_output.pooler_output   # [total_merged_patches, C]
+
+        # Split back by per-image merged-patch count
+        split_sizes = (thw_combined.prod(-1) // (spatial_merge ** 2)).tolist()
+        all_splits = torch.split(combined_embeds, [int(s) for s in split_sizes])
+
+        n_lr = len(image_grid_thw)
+        lr_embeds = torch.cat(list(all_splits[:n_lr]), dim=0)           # [N_lr, C]
+        hd_embeds = torch.cat(list(all_splits[n_lr:]), dim=0)           # [N_hd, C]
+        image_hd_features = self._parse_hd_embeds(hd_embeds, image_grid_thw_hd)
+
+        return lr_embeds, image_hd_features
 
     def forward(
         self,
