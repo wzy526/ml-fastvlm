@@ -118,6 +118,13 @@ class ModelArguments:
         metadata={"help": "Learnable attention bias for HD keys. "
                   "<0 enables (used as init value, e.g. -10.0), >=0 disables."}
     )
+    dat_hd_gate_warmup_steps: int = field(
+        default=0,
+        metadata={"help": "Linear warmup steps for HD attention gating via LSE bias. "
+                  "During warmup, g linearly increases from ~0 to 1 and is applied as "
+                  "lse2_gated = lse2 + log(g), smoothly ramping up HD contribution. "
+                  "0 = disabled (full HD from the start)."}
+    )
     dat_manual_attn: bool = field(
         default=False,
         metadata={"help": "Use manual mask-based attention implementation instead of two-pass LSE merge."}
@@ -935,6 +942,22 @@ class DATWarmupCallback(transformers.TrainerCallback):
 
 
 # ---------------------------------------------------------------------------
+# HD gate warmup callback (LSE-based gating)
+# ---------------------------------------------------------------------------
+class HDGateWarmupCallback(transformers.TrainerCallback):
+    """Sets the HD gate warmup step on each training step.
+
+    This drives the linear warmup of HD attention contribution via
+    model.dat_set_warmup_step(global_step), which adds log(g) bias
+    to lse2 in the LSE merge.
+    """
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if model is not None and hasattr(model, 'dat_set_warmup_step'):
+            model.dat_set_warmup_step(state.global_step)
+
+
+# ---------------------------------------------------------------------------
 # WandB DAT Monitor Callback
 # ---------------------------------------------------------------------------
 class WandbDATMonitorCallback(transformers.TrainerCallback):
@@ -968,6 +991,7 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         self._offset_std_buf  = []
         self._gate_mean_buf   = []
         self._gate_std_buf    = []
+        self._hd_gate_buf     = []
         # KVHD-specific gradient monitoring (only when hd_proj is enabled)
         self._use_kvhd       = use_kvhd
         self._kvhd_step_sq   = 0.0
@@ -1028,6 +1052,9 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 gate_means.append(m)
                 gate_stds.append(s)
                 del module._dat_gate_stats
+            if hasattr(module, '_dat_hd_gate_value'):
+                self._hd_gate_buf.append(module._dat_hd_gate_value)
+                del module._dat_hd_gate_value
         if off_means:
             self._offset_mean_buf.append(sum(off_means) / len(off_means))
             self._offset_std_buf.append(sum(off_stds) / len(off_stds))
@@ -1156,6 +1183,11 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         # 7. HD attention bias (learnable scalar, averaged across DAT layers)
         if hd_bias is not None:
             metrics["dat/hd_attn_bias"] = hd_bias
+
+        # 8. HD gate warmup value (LSE-based gating, same across layers)
+        if self._hd_gate_buf:
+            metrics["dat/hd_gate"] = self._hd_gate_buf[-1]
+            self._hd_gate_buf.clear()
 
         if not metrics:
             return
@@ -1583,6 +1615,7 @@ def train():
             'use_intention_branch': model_args.dat_use_intention_branch,
             'intention_as_gate': model_args.dat_intention_as_gate,
             'hd_attn_bias': model_args.dat_hd_attn_bias,
+            'hd_gate_warmup_steps': model_args.dat_hd_gate_warmup_steps,
         }
 
         rank0_print(f"Loading DAT model ({model_args.model_family}) from {model_args.model_name_or_path}...")
@@ -1754,6 +1787,9 @@ def train():
         callbacks.append(
             WandbDATMonitorCallback(use_kvhd=model_args.dat_hd_proj)
         )
+        if model_args.dat_hd_gate_warmup_steps > 0:
+            callbacks.append(HDGateWarmupCallback())
+            rank0_print(f"HD gate warmup enabled: {model_args.dat_hd_gate_warmup_steps} steps")
     if training_args.visualization_every_n_steps > 0 and model_args.dat_manual_attn:
         callbacks.append(
             WandbSamplingVisCallback(
