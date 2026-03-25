@@ -1134,47 +1134,84 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
         return image_hd_features
 
-    def _merged_vit_forward(self, pixel_values, image_grid_thw, pixel_values_hd, image_grid_thw_hd):
-        """Single fused ViT call for both LR and HD pixel values.
+    def _fused_vit_forward(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.LongTensor,
+        pixel_values_hd: torch.Tensor,
+        image_grid_thw_hd: torch.LongTensor,
+        input_ids: torch.LongTensor,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Fused ViT call for LR + HD in one kernel, returning inputs_embeds and HD features.
 
-        Saves one full ViT forward pass compared to calling _generate_hd_features
-        separately plus the base-class LR ViT call.
+        The Qwen2.5-VL ViT internally builds cu_seqlens from grid_thw and uses
+        flash_attn_varlen, so LR and HD images never cross-attend — semantically
+        identical to two separate calls.
 
-        Gradient semantics preserved:
-          - LR path : gradients flow normally (pixel_values untouched).
-          - HD path : pixel_values_hd is detached before concat, so no gradients
-                      flow into ViT weights from the HD branch (same as the
-                      ``with torch.no_grad()`` guard in _generate_hd_features).
+        Gradient handling:
+          - ViT frozen (standard DAT) or inference: one combined ViT call.
+          - ViT trainable: HD under torch.no_grad(), LR with grad (two ViT calls).
+            Avoids ~10× activation memory from storing HD patch activations for backward.
+
+        By building inputs_embeds here and passing pixel_values=None to self.model(),
+        the base model's internal ViT call is bypassed in both branches.
 
         Returns:
-            lr_embeds      : [N_lr_merged_patches, C]  — flat LR embeddings ready
-                             for masked_scatter into inputs_embeds.
-            image_hd_features : List[[H_hd, W_hd, C]] — one tensor per image.
+            inputs_embeds: [B, seq_len, C] with LR patches already scattered in.
+            image_hd_features: List[[H_hd, W_hd, C]], one feature map per image.
         """
         spatial_merge = self.config.vision_config.spatial_merge_size
         vit_dtype = self.model.visual.dtype
+        # Only split calls when ViT weights are actually receiving gradients this step.
+        # requires_grad=True alone is not sufficient: eval mode or torch.no_grad() context
+        # means no backward will run, so the activation-memory concern doesn't apply.
+        vit_trainable = any(p.requires_grad for p in self.model.visual.parameters())
+        need_split = self.training and torch.is_grad_enabled() and vit_trainable
 
-        # Concat LR + HD; detach HD so its path stays gradient-free
-        pv_combined = torch.cat([
-            pixel_values.to(dtype=vit_dtype),
-            pixel_values_hd.detach().to(dtype=vit_dtype),
-        ], dim=0)
-        thw_combined = torch.cat([image_grid_thw, image_grid_thw_hd], dim=0)
+        if need_split:
+            # ViT trainable + grad enabled: HD strictly no_grad to avoid storing HD activations for backward.
+            with torch.no_grad():
+                hd_embeds = self.model.visual(
+                    pixel_values_hd.to(vit_dtype),
+                    grid_thw=image_grid_thw_hd,
+                    return_dict=True,
+                ).pooler_output
+            lr_embeds = self.model.visual(
+                pixel_values.to(vit_dtype),
+                grid_thw=image_grid_thw,
+                return_dict=True,
+            ).pooler_output
+        else:
+            # Inference, or training with ViT frozen / no_grad: one combined ViT call.
+            # grid_thw drives cu_seqlens inside the ViT → block-diagonal attention,
+            # LR and HD patches attend only within their own image boundaries.
+            pv_combined = torch.cat([
+                pixel_values.to(vit_dtype),
+                pixel_values_hd.to(vit_dtype),
+            ], dim=0)
+            thw_combined = torch.cat([image_grid_thw, image_grid_thw_hd], dim=0)
 
-        # One ViT call for both resolutions
-        combined_output = self.model.visual(pv_combined, grid_thw=thw_combined, return_dict=True)
-        combined_embeds = combined_output.pooler_output   # [total_merged_patches, C]
+            combined_embeds = self.model.visual(
+                pv_combined, grid_thw=thw_combined, return_dict=True,
+            ).pooler_output  # [N_lr + N_hd, C]
 
-        # Split back by per-image merged-patch count
-        split_sizes = (thw_combined.prod(-1) // (spatial_merge ** 2)).tolist()
-        all_splits = torch.split(combined_embeds, [int(s) for s in split_sizes])
+            split_sizes = (thw_combined.prod(-1) // spatial_merge ** 2).tolist()
+            splits = torch.split(combined_embeds, [int(s) for s in split_sizes])
+            n_lr = len(image_grid_thw)
+            lr_embeds = torch.cat(list(splits[:n_lr]), dim=0)   # [N_lr, C]
+            hd_embeds = torch.cat(list(splits[n_lr:]), dim=0)   # [N_hd, C]
 
-        n_lr = len(image_grid_thw)
-        lr_embeds = torch.cat(list(all_splits[:n_lr]), dim=0)           # [N_lr, C]
-        hd_embeds = torch.cat(list(all_splits[n_lr:]), dim=0)           # [N_hd, C]
         image_hd_features = self._parse_hd_embeds(hd_embeds, image_grid_thw_hd)
 
-        return lr_embeds, image_hd_features
+        # Scatter LR embeddings into token sequence (replaces base model's internal scatter).
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        lr_embeds = lr_embeds.to(inputs_embeds.dtype)
+        image_mask, _ = self.model.get_placeholder_mask(
+            input_ids, inputs_embeds=inputs_embeds, image_features=lr_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, lr_embeds)
+
+        return inputs_embeds, image_hd_features
 
     def forward(
         self,
@@ -1216,8 +1253,28 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # === Step 1: HD feature generation ===
-        if image_hd_features is None and pixel_values_hd is not None and image_grid_thw_hd is not None:
+        # === Step 1: ViT feature extraction ===
+        # Fast path: fuse LR + HD into a single ViT call and build inputs_embeds here,
+        # so self.model() receives inputs_embeds directly (pixel_values=None) and skips
+        # its internal ViT call.  Falls back to separate calls when inputs_embeds is
+        # already provided or when pixel_values / input_ids are unavailable.
+        _pixel_values_for_model = pixel_values       # passed to self.model(); set to None when fused
+        _image_grid_thw_for_model = image_grid_thw   # same: None when fused (position_ids pre-computed)
+
+        if (image_hd_features is None
+                and pixel_values is not None and image_grid_thw is not None
+                and pixel_values_hd is not None and image_grid_thw_hd is not None
+                and input_ids is not None and inputs_embeds is None):
+            # Fused path: one ViT call covers both LR and HD.
+            inputs_embeds, image_hd_features = self._fused_vit_forward(
+                pixel_values, image_grid_thw,
+                pixel_values_hd, image_grid_thw_hd,
+                input_ids,
+            )
+            _pixel_values_for_model = None
+            _image_grid_thw_for_model = None
+        elif image_hd_features is None and pixel_values_hd is not None and image_grid_thw_hd is not None:
+            # Fallback: HD-only separate call (inputs_embeds already provided or no pixel_values).
             image_hd_features = self._generate_hd_features(pixel_values_hd, image_grid_thw_hd)
 
         # === Step 2: Compute image_range_list if not provided ===
@@ -1251,9 +1308,9 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         # These flow through: Model -> TextModel -> DecoderLayer -> Attention
         outputs = self.model(
             input_ids=input_ids,
-            pixel_values=pixel_values,
+            pixel_values=_pixel_values_for_model,
             pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
+            image_grid_thw=_image_grid_thw_for_model,
             video_grid_thw=video_grid_thw,
             position_ids=position_ids,
             attention_mask=attention_mask,

@@ -35,6 +35,7 @@ ds llava/train/train_qwen_dat.py \
     --tf32 True \
     --max_grad_norm 1.0 \
     --output_dir $CKPT_ROOT/$EXP_NAME \
+    --resume_from_checkpoint $CKPT_ROOT/$EXP_NAME/checkpoint-3000 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 1 \
