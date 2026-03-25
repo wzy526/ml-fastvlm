@@ -125,6 +125,11 @@ class ModelArguments:
                   "lse2_gated = lse2 + log(g), smoothly ramping up HD contribution. "
                   "0 = disabled (full HD from the start)."}
     )
+    dat_fused_vit: bool = field(
+        default=False,
+        metadata={"help": "Fuse LR+HD into one ViT call (saves kernel launches; "
+                  "costs ~2× activation memory). Default False = separate ViT calls."}
+    )
     dat_manual_attn: bool = field(
         default=False,
         metadata={"help": "Use manual mask-based attention implementation instead of two-pass LSE merge."}
@@ -1616,6 +1621,7 @@ def train():
             'intention_as_gate': model_args.dat_intention_as_gate,
             'hd_attn_bias': model_args.dat_hd_attn_bias,
             'hd_gate_warmup_steps': model_args.dat_hd_gate_warmup_steps,
+            'use_fused_vit': model_args.dat_fused_vit,
         }
 
         rank0_print(f"Loading DAT model ({model_args.model_family}) from {model_args.model_name_or_path}...")

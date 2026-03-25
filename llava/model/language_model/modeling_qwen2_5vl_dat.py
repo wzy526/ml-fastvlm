@@ -67,7 +67,7 @@ from transformers.cache_utils import Cache
 #   "fa2"  — flash_attn 2.x   (flash_attn.flash_attn_func)
 #   "fa3"  — flash_attn 3 / Hopper  (flash_attn_interface)
 #   "fa4"  — flash_attn 4 / Cute    (flash_attn.cute)
-_FA_BACKEND = "fa3"
+_FA_BACKEND = "fa2"
 # ─────────────────────────────────────────────────────────────────────
 
 _flash_attn_func = None
@@ -263,6 +263,7 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
             'use_intention_branch': True,
             'intention_as_gate': True,
             'hd_gate_warmup_steps': 0,
+            'use_fused_vit': False,    # Fuse LR+HD into one ViT call (saves kernel launch; costs ~2× activation memory)
         }
 
 
@@ -1261,11 +1262,15 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         _pixel_values_for_model = pixel_values       # passed to self.model(); set to None when fused
         _image_grid_thw_for_model = image_grid_thw   # same: None when fused (position_ids pre-computed)
 
-        if (image_hd_features is None
+        _use_fused_vit = self.config.dat_extra_args.get('use_fused_vit', False)
+
+        if (_use_fused_vit
+                and image_hd_features is None
                 and pixel_values is not None and image_grid_thw is not None
                 and pixel_values_hd is not None and image_grid_thw_hd is not None
                 and input_ids is not None and inputs_embeds is None):
-            # Fused path: one ViT call covers both LR and HD.
+            # Fused path: one ViT call covers both LR and HD (saves kernel launches;
+            # costs ~2× activation memory vs separate calls — enable only when VRAM allows).
             inputs_embeds, image_hd_features = self._fused_vit_forward(
                 pixel_values, image_grid_thw,
                 pixel_values_hd, image_grid_thw_hd,

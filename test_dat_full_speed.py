@@ -67,6 +67,7 @@ DAT_EXTRA_ARGS = {
     'use_intention_branch': True,
     'intention_as_gate':   True,
     'layers':           DAT_LAYERS,
+    'use_fused_vit':       False,  # 关闭：LR 和 HD 走独立 ViT 调用（省显存）；True 合并为一次调用
 }
 
 PATCH_SIZE = 14
