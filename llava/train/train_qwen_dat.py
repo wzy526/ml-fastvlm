@@ -38,7 +38,7 @@ local_rank = None
 # DAT parameter patterns (must match modeling_qwen2vl_dat.py)
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
-    'ln_2', 'conv_off_proj', 'kv_proj_hd',
+    'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_attn_bias',
 ]
 
@@ -178,9 +178,18 @@ class Qwen2VLTrainingArguments(transformers.TrainingArguments):
     )
     # LoRA
     lora_enable: bool = False
-    lora_r: int = 64
+    lora_r: int = 8
     lora_alpha: int = 16
-    lora_dropout: float = 0.05
+    lora_dropout: float = 0.0
+    lora_target_layers: str = field(
+        default="all",
+        metadata={"help": "LoRA target scope: 'dat' (QKVO in DAT layers only) "
+                  "or 'all' (QKVO in all decoder layers)"}
+    )
+    lora_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Separate learning rate for LoRA adapter parameters"}
+    )
     visualization_every_n_steps: int = 10
 
 
@@ -245,6 +254,26 @@ def find_all_linear_names(model):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
     return list(lora_module_names)
+
+
+def get_lora_target_modules(dat_layers_str, target_layers="all"):
+    """Build regex pattern for PEFT LoRA targeting QKVO projections.
+
+    Args:
+        dat_layers_str: Layer type string e.g. 'DLLLLLDLLLLL...'
+        target_layers: 'dat' applies LoRA only to DAT layer QKVO,
+            'all' applies LoRA to every decoder layer's QKVO.
+
+    Returns:
+        Regex pattern string for ``LoraConfig(target_modules=...)``.
+    """
+    qkvo = r"(q_proj|k_proj|v_proj|o_proj)"
+    if target_layers == "dat" and dat_layers_str:
+        dat_indices = [str(i) for i, c in enumerate(dat_layers_str) if c == 'D']
+        layer_pattern = "|".join(dat_indices)
+        return rf"model\.language_model\.layers\.({layer_pattern})\.self_attn\.{qkvo}"
+    else:
+        return rf"model\.language_model\.layers\.\d+\.self_attn\.{qkvo}"
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -351,13 +380,15 @@ def print_trainable_parameters(model):
                 f"({100 * trainable_params / total_params:.2f}%)")
 
     components = {"visual.blocks": 0, "visual.merger": 0,
-                  "model.layers": 0, "lm_head": 0, "DAT": 0, "other": 0}
+                  "model.layers": 0, "lm_head": 0, "DAT": 0, "LoRA": 0, "other": 0}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         n = param.numel()
         if any(k in name for k in DAT_KEYS_MATCH):
             components["DAT"] += n
+        elif "lora_" in name:
+            components["LoRA"] += n
         elif "merger" in name:
             components["visual.merger"] += n
         elif "visual" in name:
@@ -1031,11 +1062,36 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 self._hooks.append(param.register_hook(_h))
 
     def _flush_step(self, state):
-        """Commit the current micro-step's accumulated grad norm to the buffer."""
-        if state.is_world_process_zero and self._step_cnt > 0:
-            self._norm_buf.append(self._step_sq ** 0.5)
-        if state.is_world_process_zero and self._kvhd_step_cnt > 0:
-            self._kvhd_norm_buf.append(self._kvhd_step_sq ** 0.5)
+        """Commit the current micro-step's accumulated grad norm to the buffer.
+
+        If backward hooks fired, use their accumulated values.  Otherwise fall
+        back to reading ``param.grad`` directly (needed under PEFT wrapping
+        where ``register_hook`` may silently fail to trigger).
+        """
+        if state.is_world_process_zero:
+            if self._step_cnt > 0:
+                self._norm_buf.append(self._step_sq ** 0.5)
+            elif self._model is not None:
+                dat_sq, dat_cnt = 0.0, 0
+                kvhd_sq, kvhd_cnt = 0.0, 0
+                for name, param in self._model.named_parameters():
+                    if not (any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad):
+                        continue
+                    if param.grad is not None:
+                        gsq = param.grad.detach().float().norm(2).item() ** 2
+                        dat_sq += gsq
+                        dat_cnt += 1
+                        if self._use_kvhd and any(k in name for k in self.KVHD_KEYS):
+                            kvhd_sq += gsq
+                            kvhd_cnt += 1
+                if dat_cnt > 0:
+                    self._norm_buf.append(dat_sq ** 0.5)
+                if kvhd_cnt > 0:
+                    self._kvhd_norm_buf.append(kvhd_sq ** 0.5)
+
+            if self._kvhd_step_cnt > 0:
+                self._kvhd_norm_buf.append(self._kvhd_step_sq ** 0.5)
+
         self._step_sq  = 0.0
         self._step_cnt = 0
         self._kvhd_step_sq  = 0.0
@@ -1494,6 +1550,9 @@ class Qwen2VLTrainer(transformers.Trainer):
         if getattr(self.args, 'dat_lr', None) is not None:
             for key in DAT_KEYS_MATCH:
                 lr_mapper[key] = self.args.dat_lr
+        # LoRA adapter LR
+        if getattr(self.args, 'lora_lr', None) is not None:
+            lr_mapper["lora_"] = self.args.lora_lr
 
         if len(lr_mapper) > 0:
             special_lr_parameters = [
@@ -1635,7 +1694,11 @@ def train():
         )
 
         # Apply freeze strategy
-        if model_args.dat_warmup_steps > 0:
+        if training_args.lora_enable:
+            # LoRA mode: PEFT will freeze all base params and add adapters.
+            # DAT-specific params will be unfrozen after PEFT wrapping.
+            rank0_print("LoRA mode: deferring freeze control to PEFT")
+        elif model_args.dat_warmup_steps > 0:
             # Two-phase: DAT+LLM trainable initially (for optimizer creation),
             # ViT + connector frozen. Callback handles phase transition.
             rank0_print(f"Two-phase training: DAT-only for {model_args.dat_warmup_steps} steps, then DAT+LLM")
@@ -1734,10 +1797,19 @@ def train():
     # ----- LoRA -----
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
+
+        if model_args.use_dat:
+            target_modules = get_lora_target_modules(
+                model_args.dat_layers,
+                target_layers=training_args.lora_target_layers,
+            )
+        else:
+            target_modules = find_all_linear_names(model)
+
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=target_modules,
             lora_dropout=training_args.lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
@@ -1746,9 +1818,21 @@ def train():
             model.to(torch.bfloat16)
         if training_args.fp16:
             model.to(torch.float16)
-        rank0_print("Adding LoRA adapters...")
+        rank0_print(f"Adding LoRA adapters (target_layers={training_args.lora_target_layers})...")
         model = get_peft_model(model, lora_config)
-        rank0_print(f"LoRA target modules: {lora_config.target_modules}")
+        rank0_print(f"LoRA target modules pattern: {target_modules}")
+
+        # After PEFT wrapping (which freezes all base params), unfreeze DAT-specific
+        # parameters so they remain fully trainable with their own learning rate.
+        if model_args.use_dat:
+            dat_unfrozen = 0
+            for name, param in model.named_parameters():
+                if any(k in name for k in DAT_KEYS_MATCH):
+                    param.requires_grad = True
+                    dat_unfrozen += 1
+            rank0_print(f"Unfroze {dat_unfrozen} DAT parameters after LoRA wrapping")
+
+        print_trainable_parameters(model)
 
     # ----- Dataset -----
     coord_format = model_args.model_family  # "qwen2_vl" or "qwen2_5_vl"

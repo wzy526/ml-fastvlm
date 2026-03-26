@@ -23,6 +23,57 @@ from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
+def _load_qwen25vl_dat_lora(model_base, lora_path, dat_config, **kwargs):
+    """Load Qwen2.5-VL DAT model with LoRA adapters and merge.
+
+    Returns (model, tokenizer, processor).
+    """
+    from llava.model.language_model.modeling_qwen2_5vl_dat import (
+        convert_qwen2_5vl_to_dat,
+        Qwen2_5_VLDATConfig,
+    )
+    from peft import PeftModel
+
+    if not isinstance(dat_config, Qwen2_5_VLDATConfig):
+        dat_config = Qwen2_5_VLDATConfig.from_pretrained(lora_path)
+
+    processor = AutoProcessor.from_pretrained(model_base, trust_remote_code=True, use_fast=False)
+    tokenizer = processor.tokenizer
+
+    print(f"[DAT+LoRA] Loading base model from {model_base} ...")
+    torch_dtype = kwargs.pop('torch_dtype', torch.float16)
+    model = convert_qwen2_5vl_to_dat(
+        model_base,
+        dat_extra_args=dat_config.dat_extra_args,
+        torch_dtype=torch_dtype,
+    )
+
+    nlt_path = os.path.join(lora_path, 'non_lora_trainables.bin')
+    if os.path.exists(nlt_path):
+        print(f"[DAT+LoRA] Loading DAT weights from {nlt_path} ...")
+        non_lora_trainables = torch.load(nlt_path, map_location='cpu')
+        non_lora_trainables = {
+            (k[11:] if k.startswith('base_model.') else k): v
+            for k, v in non_lora_trainables.items()
+        }
+        if any(k.startswith('model.model.') for k in non_lora_trainables):
+            non_lora_trainables = {
+                (k[6:] if k.startswith('model.') else k): v
+                for k, v in non_lora_trainables.items()
+            }
+        model.load_state_dict(non_lora_trainables, strict=False)
+        print(f"  Loaded {len(non_lora_trainables)} DAT parameter tensors")
+
+    if os.path.exists(os.path.join(lora_path, 'adapter_config.json')):
+        print(f"[DAT+LoRA] Loading LoRA adapters from {lora_path} ...")
+        model = PeftModel.from_pretrained(model, lora_path)
+        print("[DAT+LoRA] Merging LoRA weights into base model ...")
+        model = model.merge_and_unload()
+
+    print("[DAT+LoRA] Model loaded and merged.")
+    return model, tokenizer, processor
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
 
@@ -135,16 +186,22 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     else:
         # Load language model
         if model_base is not None:
-            # PEFT model
-            from peft import PeftModel
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-            model = AutoModelForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, **kwargs)
-            print(f"Loading LoRA weights from {model_path}")
-            model = PeftModel.from_pretrained(model, model_path)
-            print(f"Merging weights")
-            model = model.merge_and_unload()
-            print('Convert to FP16...')
-            model.to(torch.float16)
+            # PEFT / LoRA model — check config to pick the right loading path
+            ckpt_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+            if getattr(ckpt_config, 'model_type', '') == 'qwen2_5_vl_dat':
+                model, tokenizer, image_processor = _load_qwen25vl_dat_lora(
+                    model_base, model_path, ckpt_config, **kwargs)
+            else:
+                from peft import PeftModel
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                model = AutoModelForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, **kwargs)
+                print(f"Loading LoRA weights from {model_path}")
+                model = PeftModel.from_pretrained(model, model_path)
+                print(f"Merging weights")
+                model = model.merge_and_unload()
+                print('Convert to FP16...')
+                model.to(torch.float16)
         else:
             use_fast = False
             if 'mpt' in model_name.lower():

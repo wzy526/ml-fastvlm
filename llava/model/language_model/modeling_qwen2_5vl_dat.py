@@ -1441,3 +1441,25 @@ def freeze_base_unfreeze_dat(model):
         else:
             param.requires_grad = False
     logger.info(f"Frozen: {total - trainable}/{total} params. Trainable (DAT): {trainable}/{total}")
+
+
+def get_lora_target_modules(dat_layers_str, target_layers="all"):
+    """Build regex pattern for PEFT LoRA targeting QKVO projections.
+
+    Args:
+        dat_layers_str: Layer type string e.g. 'DLLLLLDLLLLL...'
+            (L=standard, D=DAT). Length must equal num_hidden_layers.
+        target_layers: 'dat' applies LoRA only to DAT layer QKVO,
+            'all' applies LoRA to every decoder layer's QKVO.
+
+    Returns:
+        Regex pattern string suitable for ``LoraConfig(target_modules=...)``.
+        Matched against full module keys via ``re.fullmatch``.
+    """
+    qkvo = r"(q_proj|k_proj|v_proj|o_proj)"
+    if target_layers == "dat" and dat_layers_str:
+        dat_indices = [str(i) for i, c in enumerate(dat_layers_str) if c == 'D']
+        layer_pattern = "|".join(dat_indices)
+        return rf"model\.language_model\.layers\.({layer_pattern})\.self_attn\.{qkvo}"
+    else:
+        return rf"model\.language_model\.layers\.\d+\.self_attn\.{qkvo}"
