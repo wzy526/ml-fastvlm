@@ -1,36 +1,34 @@
 """
-test_dat_full_speed.py  (v2)
+test_dat_full_speed.py  (v3)
 
 Qwen2.5-VL-DAT 端到端测速脚本（与训练配置对齐）。
 
 三项基准：
   A) 单层 Attention 速度
        从 DAT 模型取出 DAT attention 层，用真实 vstar 序列长度测速。
-       DAT 路径（含 HD cross-attention）vs Baseline（无 HD，退化为标准 causal attention）。
+       DAT 路径（含 HD cross-attention）vs LR-only（无 HD，退化为标准 causal attention）。
        flash_attn vs manual SDPA 对比。
 
-  B) 全模型 Prefill 延迟（DAT vs Baseline）
-       DAT 模型传入 pixel_values_hd → HD 视觉编码 + 两路 attention + LSE merge。
-       同一模型不传 pixel_values_hd → 退化为标准 attention（Baseline）。
-       拆分：HD-enc（ViT HD 路）/ LLM-only（预计算 HD features）/ 端到端 / Baseline。
+  B) 全模型 Prefill 延迟（DAT vs Fair-HD vs LR-only）
+       三路公平对比（均携带相同视觉信息量）：
+         · DAT       : pixel_values_hd → HD ViT + LR ViT + LLM(Nq_lr) + HD cross-attn
+         · Fair-HD   : HD 图像直接作为输入 tokens → HD ViT + LLM(Nq_hd) 纯因果 attn
+                       与 DAT 信息量对等，是 naive 高分辨率基线
+         · LR-only   : pixel_values_hd=None → 仅 LR ViT + LLM(Nq_lr)，无 HD 信息（参考下界）
 
   C) 逐层耗时分布（CUDA event hook）
-       对 DAT 模型（with HD）和 Baseline（no HD），用 CUDA event 测量每个 decoder layer
-       的前向时间，显示 DAT 层（6 个）与标准层（30 个）的逐层开销。
+       DAT(Nq_lr) vs Fair-HD(Nq_hd)：逐层对比，展示两种 HD 集成方案的每层开销差异。
 
 配置与训练脚本对齐：
   来源：train_dat_qwen2_5vl_z3_1d5l_s12_g8_i128_inten_gate_hd_prec_1M.sh
   DAT_LAYERS = "DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"  (1D5L，DAT 层 0,6,12,18,24,30)
   grid_size=12, off_grps=8, inter_size=128, hr_scale=3
 
-v1 → v2 修复/改进：
-  1. DAT_EXTRA_ARGS 与训练脚本对齐（off_grps=8, grid_size=12, layers=1D5L）。
-  2. Part A 的 hd_feat 尺寸修正：使用 _generate_hd_features 的实际输出尺寸
-     [thw_hd[1]//MERGE_SIZE, thw_hd[2]//MERGE_SIZE]，而非 lr_h_tok*HR_SCALE（偏大 2x）。
-  3. probe_sizes 元组增加 hd_h_feat / hd_w_feat 字段。
-  4. 合成 case 的 ans_end 不再越界（clamp 到 Nq-1）。
-  5. 新增 Part C 逐层耗时（CUDA event hook）。
-  6. 全模型基准增加 Baseline 列（pixel_values_hd=None）对比。
+v2 → v3 改进：
+  Fair-HD Baseline：将 HD 图像以原生分辨率直接作为输入 token（而非仅 LR-only 退化），
+  实现与 DAT 信息量对等的公平对比。
+  process_sample 新增 Step 4（inputs_hd_full）：同一问题文本 + HD 分辨率约束，
+  生成含 Nq_hd 图像 token 的完整输入，用于 Fair-HD 前向。
 
 hd_h / lr_h 计算约定（与训练 Qwen2VLCoupledDATDataset._get_item 完全一致）：
   thw = inputs_hd["image_grid_thw"][0]   # (t, h_raw_patches, w_raw_patches)
@@ -69,6 +67,7 @@ DAT_EXTRA_ARGS = {
     'use_intention_branch': True,
     'intention_as_gate':   True,
     'layers':           DAT_LAYERS,
+    'use_fused_vit':       False,  # 关闭：LR 和 HD 走独立 ViT 调用（省显存）；True 合并为一次调用
 }
 
 PATCH_SIZE = 14
@@ -88,20 +87,30 @@ DEVICE      = 'cuda'
 # ════════════════════════════════════════════════════════════════════════════════
 def process_sample(processor, img_path, question, device=DEVICE):
     """
-    耦合 LR/HD 双路处理，与训练流程完全一致。
+    耦合 LR/HD 双路处理，与训练流程完全一致。额外生成 Fair-HD 完整输入。
 
-    返回：
+    返回（5-tuple）：
       inputs_lr      : LR 路完整输入（input_ids, pixel_values, image_grid_thw, ...）
-      inputs_hd      : HD 路图像输入（pixel_values, image_grid_thw）
+      inputs_hd      : HD 路图像输入（pixel_values, image_grid_thw，仅含最小占位文本）
       (lr_h_tok,
        lr_w_tok)     : LR merge 后每维 token 数
       (hd_h_feat,
        hd_w_feat)    : _generate_hd_features 实际输出的 HD feature 每维 token 数
                        = (thw_hd[1]//MERGE_SIZE, thw_hd[2]//MERGE_SIZE)
+      inputs_hd_full : Fair-HD 路完整输入（input_ids, pixel_values, image_grid_thw）
+                       与 inputs_lr 使用相同问题文本，但图像以 HD 分辨率处理，
+                       产生 Nq_hd >> Nq_lr 的较长序列，用于 naive-HD baseline。
     """
     img = Image.open(img_path).convert('RGB')
 
-    # Step 1: HD — processor 默认分辨率
+    # 预先构建完整对话文本（LR 和 HD-full 共用）
+    msgs = [{"role": "user", "content": [
+        {"type": "image", "image": img},
+        {"type": "text",  "text": question + "\nAnswer with the option's letter directly."},
+    ]}]
+    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+    # Step 1: HD — processor 默认分辨率（仅取 pixel_values / image_grid_thw）
     inputs_hd = processor(
         images=[img], text=["<|im_start|>"],
         return_tensors="pt", padding=False,
@@ -123,15 +132,21 @@ def process_sample(processor, img_path, question, device=DEVICE):
     hd_w_feat = thw[2].item() // MERGE_SIZE
 
     # Step 3: LR — 强制分辨率
-    msgs = [{"role": "user", "content": [
-        {"type": "image", "image": img},
-        {"type": "text",  "text": question + "\nAnswer with the option's letter directly."},
-    ]}]
-    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs_lr = processor(
         images=[img], text=[text],
         return_tensors="pt", padding=False,
         min_pixels=lr_tot, max_pixels=lr_tot,
+    )
+
+    # Step 4: HD-full（Fair-HD baseline）
+    # 强制与 inputs_hd 相同的分辨率（thw[1]*thw[2]*14² 总像素），但包含完整问题文本。
+    # 生成的 input_ids 含 thw[1]//2 * thw[2]//2 = hd_h_feat * hd_w_feat 个图像 token，
+    # 序列长度 Nq_hd ≈ Nq_lr + (HD tokens - LR tokens)。
+    hd_tot = thw[1].item() * thw[2].item() * PATCH_SIZE * PATCH_SIZE
+    inputs_hd_full = processor(
+        images=[img], text=[text],
+        return_tensors="pt", padding=False,
+        min_pixels=hd_tot, max_pixels=hd_tot,
     )
 
     return (
@@ -139,6 +154,7 @@ def process_sample(processor, img_path, question, device=DEVICE):
         {k: v.to(device) for k, v in inputs_hd.items()},
         (lr_h_tok, lr_w_tok),
         (hd_h_feat, hd_w_feat),
+        {k: v.to(device) for k, v in inputs_hd_full.items()},
     )
 
 
@@ -157,17 +173,6 @@ def benchmark_fn(fn, warmup=WARMUP, iters=ITERS):
 
 
 import llava.model.language_model.modeling_qwen2_5vl_dat as _dat_mod
-
-
-@contextlib.contextmanager
-def manual_sdpa_mode():
-    """临时关闭 flash_attn，切换为 manual SDPA（monkey-patch 模块全局变量）。"""
-    orig = _dat_mod._FLASH_ATTN_AVAILABLE
-    _dat_mod._FLASH_ATTN_AVAILABLE = False
-    try:
-        yield
-    finally:
-        _dat_mod._FLASH_ATTN_AVAILABLE = orig
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -226,7 +231,7 @@ def run_layer_benchmark(dat_model, sample_sizes, device=DEVICE, dtype=DTYPE):
     注意：这与 lr_h_tok * HR_SCALE 不同（约差 2x）！
     """
     from llava.model.language_model.modeling_qwen2_5vl_dat import (
-        Qwen2_5_VLAttentionDAT, _FLASH_ATTN_AVAILABLE,
+        Qwen2_5_VLAttentionDAT, _FA_BACKEND,
     )
 
     text_cfg = dat_model.config.text_config
@@ -241,17 +246,15 @@ def run_layer_benchmark(dat_model, sample_sizes, device=DEVICE, dtype=DTYPE):
     assert dat_layer is not None, "No DAT attention layer found"
     dat_layer.eval()
 
-    fa_tag = 'YES' if _FLASH_ATTN_AVAILABLE else 'NO'
-    print(f"\n{'═'*104}")
-    print(f"Part A — 单层 Attention 速度  (flash_attn={fa_tag},"
+    print(f"\n{'═'*96}")
+    print(f"Part A — 单层 Attention 速度  (backend={_FA_BACKEND},"
           f" DAT 层索引={DAT_LAYER_INDICES}, grid_size={DAT_EXTRA_ARGS['grid_size']},"
           f" off_grps={DAT_EXTRA_ARGS['off_grps']})")
-    print(f"  DAT=两路attn+LSE merge  |  Baseline=标准因果attn（无HD）")
-    print(f"{'─'*104}")
+    print(f"  DAT=两路attn+LSE merge  |  LR-only=标准因果attn（无HD）")
+    print(f"{'─'*96}")
     print(f"  {'Case':<34} {'Nq':>5}  {'LR':>7}  {'HD feat':>9}"
-          f"  {'DAT-fa':>8}  {'DAT-man':>8}  {'fa加速':>7}"
-          f"  {'Baseline':>9}  {'DAT开销':>10}")
-    print(f"{'─'*104}")
+          f"  {'DAT(ms)':>9}  {'LR-only(ms)':>12}  {'DAT开销':>10}")
+    print(f"{'─'*96}")
 
     for row in sample_sizes:
         label, B, Nq, lr_h_tok, lr_w_tok, hd_h_feat, hd_w_feat, ans_len, grid_size = row
@@ -303,21 +306,16 @@ def run_layer_benchmark(dat_model, sample_sizes, device=DEVICE, dtype=DTYPE):
                     mrope_position_ids=mrope_pos,
                 )
 
-        t_dat_fa  = benchmark_fn(run_dat)
+        t_dat      = benchmark_fn(run_dat)
         t_baseline = benchmark_fn(run_baseline)
-        with manual_sdpa_mode():
-            t_dat_man = benchmark_fn(run_dat)
 
-        fa_spd   = t_dat_man / t_dat_fa
-        dat_ovhd = (t_dat_fa - t_baseline) / t_baseline * 100
-        hd_toks  = hd_h_feat * hd_w_feat
+        dat_ovhd = (t_dat - t_baseline) / t_baseline * 100
 
         print(f"  {label:<34} {Nq:>5}  {lr_h_tok}×{lr_w_tok:<4}"
               f"  {hd_h_feat}×{hd_w_feat:<5}"
-              f"  {t_dat_fa:>8.2f}  {t_dat_man:>8.2f}  {fa_spd:>6.2f}x"
-              f"  {t_baseline:>9.2f}  {dat_ovhd:>+9.1f}%")
+              f"  {t_dat:>9.2f}  {t_baseline:>12.2f}  {dat_ovhd:>+9.1f}%")
 
-    print(f"{'─'*104}")
+    print(f"{'─'*96}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -326,26 +324,30 @@ def run_layer_benchmark(dat_model, sample_sizes, device=DEVICE, dtype=DTYPE):
 def run_full_model_benchmark(dat_model, processor, vstar_samples,
                              device=DEVICE, dtype=DTYPE):
     """
-    对比（同一 DAT 模型）：
-      · DAT prefill    : pixel_values_hd → HD ViT 编码 + 两路 attention + LSE merge
-      · Baseline        : pixel_values_hd=None → 退化为标准因果 attention（等价于原版模型）
+    三路公平对比（均使用相同视觉信息量）：
+      · DAT       : pixel_values + pixel_values_hd → LR ViT + HD ViT + LLM(Nq_lr, cross-attn)
+      · Fair-HD   : pixel_values=HD, pixel_values_hd=None → HD ViT + LLM(Nq_hd, causal attn)
+                    与 DAT 信息量对等，naive 高分辨率基线
+      · LR-only   : pixel_values=LR, pixel_values_hd=None → LR ViT + LLM(Nq_lr)，无 HD（参考）
 
-    额外拆分：
+    额外拆分（DAT 专项）：
       · HD 视觉编码（_generate_hd_features，含 ViT forward）
       · LLM-only DAT（预计算 HD features，仅测 LLM forward）
-      · LLM-only flash vs manual SDPA 加速比
+      · flash vs manual SDPA 加速比
     """
-    print(f"\n{'═'*104}")
-    print("Part B — 全模型 Prefill 延迟（DAT vs Baseline，真实 vstar 图像）")
-    print(f"  Baseline = 同模型，pixel_values_hd=None（DAT 层退化为标准 attention）")
-    print(f"{'═'*104}")
-    print(f"  {'#':>3}  {'Nq':>4}  {'LR':>6}  {'HD feat':>8}"
-          f"  {'DAT':>8}  {'HD-enc':>8}  {'LLM-fa':>8}  {'LLM-man':>9}"
-          f"  {'fa加速':>7}  {'Baseline':>9}  {'LLM净开销':>10}")
-    print(f"  {'─'*98}")
+    print(f"\n{'═'*116}")
+    print("Part B — 全模型 Prefill 延迟（DAT vs Fair-HD vs LR-only，真实 vstar 图像）")
+    print(f"  Fair-HD = 同模型，HD 图像作为普通输入 token（Nq 更长，标准因果 attn）")
+    print(f"  LR-only = 同模型，pixel_values_hd=None（无 HD 信息，速度下界参考）")
+    print(f"{'═'*116}")
+    print(f"  {'#':>3}  {'Nq-LR':>5}  {'Nq-HD':>5}  {'LR':>6}  {'HD feat':>8}"
+          f"  {'DAT':>8}  {'Fair-HD':>8}  {'LR-only':>8}"
+          f"  {'DAT/FairHD':>10}  {'LLM开销(DAT)':>12}  {'LLM开销(FairHD)':>15}")
+    print(f"  {'─'*113}")
 
-    results = defaultdict(list)
-    seq_lens = []
+    results  = defaultdict(list)
+    nq_lrs   = []
+    nq_hds   = []
 
     # ── 全局 warmup ──────────────────────────────────────────────────────────
     print("  [全局 warmup] 预热全模型路径…", end="", flush=True)
@@ -355,15 +357,21 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
         if not os.path.exists(wimg):
             continue
         try:
-            wi_lr, wi_hd, _, _ = process_sample(processor, wimg, ws['text'], device=device)
-            pv_hd = wi_hd['pixel_values'].to(dtype); thw_hd = wi_hd['image_grid_thw']
-            pv_lr = wi_lr['pixel_values'].to(dtype); thw_lr = wi_lr['image_grid_thw']
-            iids  = wi_lr['input_ids'];              amask  = wi_lr.get('attention_mask')
+            wi_lr, wi_hd, _, _, wi_hd_full = process_sample(processor, wimg, ws['text'], device=device)
+            pv_hd  = wi_hd['pixel_values'].to(dtype);      thw_hd  = wi_hd['image_grid_thw']
+            pv_lr  = wi_lr['pixel_values'].to(dtype);      thw_lr  = wi_lr['image_grid_thw']
+            iids   = wi_lr['input_ids'];                   amask   = wi_lr.get('attention_mask')
+            pv_hdf = wi_hd_full['pixel_values'].to(dtype); thw_hdf = wi_hd_full['image_grid_thw']
+            iids_hdf = wi_hd_full['input_ids'];            amask_hdf = wi_hd_full.get('attention_mask')
             for _ in range(3):
                 with torch.no_grad():
                     dat_model(input_ids=iids, attention_mask=amask,
                               pixel_values=pv_lr, image_grid_thw=thw_lr,
                               pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
+                              use_cache=False)
+                    dat_model(input_ids=iids_hdf, attention_mask=amask_hdf,
+                              pixel_values=pv_hdf, image_grid_thw=thw_hdf,
+                              pixel_values_hd=None, image_grid_thw_hd=None,
                               use_cache=False)
                     dat_model(input_ids=iids, attention_mask=amask,
                               pixel_values=pv_lr, image_grid_thw=thw_lr,
@@ -381,14 +389,16 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
         if not os.path.exists(img_path):
             continue
         try:
-            inputs_lr, inputs_hd, lr_hw, hd_hw = process_sample(
+            inputs_lr, inputs_hd, lr_hw, hd_hw, inputs_hd_full = process_sample(
                 processor, img_path, sample['text'], device=device)
         except Exception as e:
             print(f"  [skip {i}] {e}")
             continue
 
-        Nq = inputs_lr['input_ids'].shape[1]
-        seq_lens.append(Nq)
+        Nq    = inputs_lr['input_ids'].shape[1]
+        Nq_hd = inputs_hd_full['input_ids'].shape[1]
+        nq_lrs.append(Nq)
+        nq_hds.append(Nq_hd)
 
         pv_hd  = inputs_hd['pixel_values'].to(dtype)
         thw_hd = inputs_hd['image_grid_thw']
@@ -396,8 +406,12 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
         thw_lr = inputs_lr['image_grid_thw']
         iids   = inputs_lr['input_ids']
         amask  = inputs_lr.get('attention_mask')
+        pv_hdf   = inputs_hd_full['pixel_values'].to(dtype)
+        thw_hdf  = inputs_hd_full['image_grid_thw']
+        iids_hdf = inputs_hd_full['input_ids']
+        amask_hdf = inputs_hd_full.get('attention_mask')
 
-        # 预计算 HD features（排除 ViT 编码时间来单独测 LLM forward）
+        # 预计算 HD features（排除 ViT 编码时间来单独测 LLM-DAT forward）
         with torch.no_grad():
             hd_feats = dat_model._generate_hd_features(pv_hd, thw_hd)
 
@@ -418,58 +432,93 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
                           pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
                           use_cache=False)
 
-        def fwd_baseline():
+        def fwd_fair_hd():
+            with torch.no_grad():
+                dat_model(input_ids=iids_hdf, attention_mask=amask_hdf,
+                          pixel_values=pv_hdf, image_grid_thw=thw_hdf,
+                          pixel_values_hd=None, image_grid_thw_hd=None,
+                          use_cache=False)
+
+        def fwd_lr_only():
             with torch.no_grad():
                 dat_model(input_ids=iids, attention_mask=amask,
                           pixel_values=pv_lr, image_grid_thw=thw_lr,
                           pixel_values_hd=None, image_grid_thw_hd=None,
                           use_cache=False)
 
-        t_hd_enc  = benchmark_fn(fwd_hd_enc,   warmup=2, iters=5)
-        t_llm_fa  = benchmark_fn(fwd_llm_dat,  warmup=2, iters=5)
-        t_dat     = benchmark_fn(fwd_dat,      warmup=2, iters=5)
-        t_base    = benchmark_fn(fwd_baseline, warmup=2, iters=5)
-        with manual_sdpa_mode():
-            t_llm_man = benchmark_fn(fwd_llm_dat, warmup=2, iters=5)
+        t_hd_enc  = benchmark_fn(fwd_hd_enc,  warmup=2, iters=5)
+        t_llm_dat = benchmark_fn(fwd_llm_dat, warmup=2, iters=5)
+        t_dat     = benchmark_fn(fwd_dat,     warmup=2, iters=5)
+        t_fair    = benchmark_fn(fwd_fair_hd, warmup=2, iters=5)
+        t_lr      = benchmark_fn(fwd_lr_only, warmup=2, iters=5)
 
-        fa_spd  = t_llm_man / t_llm_fa
-        net_llm = t_llm_fa - t_base   # LLM-only DAT 相对 Baseline 的净开销
+        llm_dat_ovhd  = t_llm_dat - t_lr   # DAT LLM-only 净开销 vs LR-only
+        llm_fair_ovhd = t_fair - t_lr       # Fair-HD 净开销 vs LR-only
+        dat_vs_fair   = t_dat / t_fair      # DAT E2E vs Fair-HD E2E
 
         results['dat'].append(t_dat)
-        results['base'].append(t_base)
+        results['fair'].append(t_fair)
+        results['lr'].append(t_lr)
         results['hd_enc'].append(t_hd_enc)
-        results['llm_fa'].append(t_llm_fa)
-        results['llm_man'].append(t_llm_man)
+        results['llm_dat'].append(t_llm_dat)
 
         hd_h_feat, hd_w_feat = hd_hw
-        print(f"  [{i:02d}] {Nq:4d}  {lr_hw[0]}×{lr_hw[1]:<3d}  "
+        print(f"  [{i:02d}] {Nq:5d}  {Nq_hd:5d}  {lr_hw[0]}×{lr_hw[1]:<3d}  "
               f"{hd_h_feat}×{hd_w_feat:<4d}"
-              f"  {t_dat:>8.1f}  {t_hd_enc:>8.1f}  {t_llm_fa:>8.1f}  {t_llm_man:>9.1f}"
-              f"  {fa_spd:>6.2f}x  {t_base:>9.1f}  {net_llm:>+9.1f}")
+              f"  {t_dat:>8.1f}  {t_fair:>8.1f}  {t_lr:>8.1f}"
+              f"  {dat_vs_fair:>9.2f}x"
+              f"  {llm_dat_ovhd:>+11.1f}  {llm_fair_ovhd:>+14.1f}")
 
     if not results['dat']:
         print("  没有成功处理的样本，跳过 Part B")
         return
 
     def avg(k): return sum(results[k]) / len(results[k])
-    aN        = len(results['dat'])
-    a_dat     = avg('dat'); a_base = avg('base')
-    a_hd      = avg('hd_enc')
-    a_llm_fa  = avg('llm_fa'); a_llm_man = avg('llm_man')
-    a_nq      = sum(seq_lens) / aN
-    a_fa_spd  = a_llm_man / a_llm_fa
+    aN       = len(results['dat'])
+    a_dat    = avg('dat');  a_fair = avg('fair');  a_lr = avg('lr')
+    a_hd     = avg('hd_enc')
+    a_llm_dat = avg('llm_dat')
+    a_nq_lr  = sum(nq_lrs) / aN
+    a_nq_hd  = sum(nq_hds) / aN
 
-    print(f"\n{'─'*104}")
-    print(f"  样本数: {aN}  平均 Nq={a_nq:.0f}")
-    print(f"  Baseline prefill         : {a_base:.1f} ms   （标准 causal attn，无 HD）")
-    print(f"  HD 视觉编码 (ViT HD路)   : {a_hd:.1f} ms   （_generate_hd_features）")
-    print(f"  LLM-only DAT flash       : {a_llm_fa:.1f} ms   （预计算 HD features）")
-    print(f"  LLM-only DAT manual SDPA : {a_llm_man:.1f} ms")
-    print(f"  flash vs manual 加速比   : {a_fa_spd:.2f}x")
-    print(f"  DAT 端到端               : {a_dat:.1f} ms")
-    print(f"  LLM 净 DAT 开销 (flash)  : {a_llm_fa - a_base:+.1f} ms"
-          f"  ({(a_llm_fa - a_base) / a_base * 100:+.1f}%)")
-    print(f"{'─'*104}")
+    # 时间分解：
+    #   LR-only  E2E = LR ViT + LLM(Nq_lr)
+    #   Fair-HD  E2E = HD ViT + LLM(Nq_hd)
+    #   DAT      E2E = LR ViT + HD ViT + LLM-DAT(Nq_lr, cross-attn)
+    #   LR ViT 估算 = DAT E2E - HD ViT - LLM-DAT-only
+    vit_lr_est    = a_dat - a_hd - a_llm_dat   # LR ViT 时间估算
+    llm_lr_est    = a_lr - vit_lr_est           # LLM-only LR 时间估算
+    llm_fair_only = a_fair - a_hd               # LLM-only Fair-HD（≈ Fair-HD - HD ViT）
+
+    print(f"\n{'─'*116}")
+    print(f"  样本数: {aN}  平均 Nq-LR={a_nq_lr:.0f}  Nq-HD={a_nq_hd:.0f}"
+          f"  (HD序列比LR长 {(a_nq_hd/a_nq_lr - 1)*100:.0f}%，"
+          f"HD token数比LR多 {(a_nq_hd - a_nq_lr):.0f})")
+    print()
+    print(f"  ┌─── E2E Prefill 延迟（含 ViT 编码）───────────────────────────")
+    print(f"  │  LR-only  : {a_lr:>7.1f} ms  (LR ViT + LLM Nq={a_nq_lr:.0f}，无 HD，速度下界)")
+    print(f"  │  Fair-HD  : {a_fair:>7.1f} ms  (HD ViT + LLM Nq={a_nq_hd:.0f}，HD 直接作为 tokens）")
+    print(f"  │  DAT      : {a_dat:>7.1f} ms  (LR ViT + HD ViT + LLM Nq={a_nq_lr:.0f}，cross-attn)")
+    print(f"  │  Fair-HD vs LR-only : {a_fair - a_lr:>+7.1f} ms  ({(a_fair/a_lr - 1)*100:+.1f}%)")
+    print(f"  │  DAT      vs LR-only: {a_dat  - a_lr:>+7.1f} ms  ({(a_dat /a_lr - 1)*100:+.1f}%)")
+    print(f"  │  DAT      vs Fair-HD: {a_dat/a_fair:.2f}x  "
+          f"({'慢' if a_dat > a_fair else '快'} {abs(a_dat - a_fair):.1f} ms)")
+    print(f"  │")
+    print(f"  ├─── ViT 编码拆分 ──────────────────────────────────────────────")
+    print(f"  │  HD ViT (单独测量)  : {a_hd:>7.1f} ms")
+    print(f"  │  LR ViT (估算)      : {vit_lr_est:>7.1f} ms  (DAT E2E - HD ViT - LLM-DAT)")
+    print(f"  │  HD/LR ViT 比       : {a_hd/vit_lr_est:.2f}x")
+    print(f"  │")
+    print(f"  └─── LLM-only 开销对比（排除 ViT）────────────────────────────")
+    print(f"       LLM LR-only  (Nq={a_nq_lr:.0f}): {llm_lr_est:>7.1f} ms  (参考，估算)")
+    print(f"       LLM Fair-HD  (Nq={a_nq_hd:.0f}): {llm_fair_only:>7.1f} ms  (≈ Fair-HD - HD ViT，估算)")
+    print(f"       LLM DAT-only (Nq={a_nq_lr:.0f}): {a_llm_dat:>7.1f} ms  (cross-attn，直接测量)")
+    print(f"       LLM Fair-HD vs LR-only : {llm_fair_only - llm_lr_est:>+7.1f} ms"
+          f"  ({(llm_fair_only/llm_lr_est - 1)*100:+.1f}%，序列长 {a_nq_hd/a_nq_lr:.1f}x)")
+    print(f"       LLM DAT     vs LR-only : {a_llm_dat - llm_lr_est:>+7.1f} ms"
+          f"  ({(a_llm_dat/llm_lr_est - 1)*100:+.1f}%，DAT cross-attn 开销)")
+    print(f"       DAT LLM 效率优势        : {llm_fair_only / a_llm_dat:.1f}x  (Fair-HD LLM / DAT LLM)")
+    print(f"{'─'*116}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -478,22 +527,23 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
 def run_layerwise_benchmark(dat_model, processor, vstar_samples,
                             n_iters=5, device=DEVICE, dtype=DTYPE):
     """
-    对 DAT（with HD）和 Baseline（no HD）分别用 CUDA event 测量每个 decoder layer
-    的前向时间，输出逐层对比表。
+    用 CUDA event hook 逐层对比两种 HD 集成方案：
+      · DAT     : Nq_lr 序列 + HD cross-attention（6 DAT 层有额外开销）
+      · Fair-HD : Nq_hd 序列 + 标准因果 attention（更长序列 → 每层均更慢）
     """
-    print(f"\n{'═'*104}")
-    print(f"Part C — 逐层耗时分布（CUDA event hook，{n_iters} iters）")
+    print(f"\n{'═'*116}")
+    print(f"Part C — 逐层耗时分布（DAT(Nq_lr) vs Fair-HD(Nq_hd)，CUDA event hook，{n_iters} iters）")
     print(f"  DAT 层索引: {DAT_LAYER_INDICES}  (共 {len(DAT_LAYER_INDICES)} 层)")
-    print(f"{'═'*104}")
+    print(f"{'═'*116}")
 
     # 找第一个有效样本
-    inputs_lr = inputs_hd = None
+    inputs_lr = inputs_hd = inputs_hd_full = None
     for sample in vstar_samples:
         img_path = os.path.join(VSTAR_DIR, sample['image'])
         if not os.path.exists(img_path):
             continue
         try:
-            inputs_lr, inputs_hd, _, _ = process_sample(
+            inputs_lr, inputs_hd, _, _, inputs_hd_full = process_sample(
                 processor, img_path, sample['text'], device=device)
             break
         except Exception:
@@ -503,13 +553,18 @@ def run_layerwise_benchmark(dat_model, processor, vstar_samples,
         print("  没有可用样本，跳过 Part C")
         return
 
-    pv_hd  = inputs_hd['pixel_values'].to(dtype)
-    thw_hd = inputs_hd['image_grid_thw']
-    pv_lr  = inputs_lr['pixel_values'].to(dtype)
-    thw_lr = inputs_lr['image_grid_thw']
-    iids   = inputs_lr['input_ids']
-    amask  = inputs_lr.get('attention_mask')
-    Nq     = iids.shape[1]
+    pv_hd     = inputs_hd['pixel_values'].to(dtype)
+    thw_hd    = inputs_hd['image_grid_thw']
+    pv_lr     = inputs_lr['pixel_values'].to(dtype)
+    thw_lr    = inputs_lr['image_grid_thw']
+    iids      = inputs_lr['input_ids']
+    amask     = inputs_lr.get('attention_mask')
+    Nq        = iids.shape[1]
+    pv_hdf    = inputs_hd_full['pixel_values'].to(dtype)
+    thw_hdf   = inputs_hd_full['image_grid_thw']
+    iids_hdf  = inputs_hd_full['input_ids']
+    amask_hdf = inputs_hd_full.get('attention_mask')
+    Nq_hd     = iids_hdf.shape[1]
 
     with torch.no_grad():
         hd_feats = dat_model._generate_hd_features(pv_hd, thw_hd)
@@ -520,10 +575,10 @@ def run_layerwise_benchmark(dat_model, processor, vstar_samples,
                       pixel_values=pv_lr, image_grid_thw=thw_lr,
                       image_hd_features=hd_feats, use_cache=False)
 
-    def fwd_baseline():
+    def fwd_fair_hd():
         with torch.no_grad():
-            dat_model(input_ids=iids, attention_mask=amask,
-                      pixel_values=pv_lr, image_grid_thw=thw_lr,
+            dat_model(input_ids=iids_hdf, attention_mask=amask_hdf,
+                      pixel_values=pv_hdf, image_grid_thw=thw_hdf,
                       pixel_values_hd=None, image_grid_thw_hd=None,
                       use_cache=False)
 
@@ -531,54 +586,55 @@ def run_layerwise_benchmark(dat_model, processor, vstar_samples,
     with torch.no_grad():
         for _ in range(3):
             fwd_dat()
-            fwd_baseline()
+            fwd_fair_hd()
     torch.cuda.synchronize()
 
-    print(f"  测量中（Nq={Nq}）…", end="", flush=True)
-    t_dat  = layerwise_timing(dat_model, fwd_dat,      n_iters=n_iters)
-    t_base = layerwise_timing(dat_model, fwd_baseline, n_iters=n_iters)
+    print(f"  测量中（DAT Nq={Nq}，Fair-HD Nq={Nq_hd}）…", end="", flush=True)
+    t_dat  = layerwise_timing(dat_model, fwd_dat,     n_iters=n_iters)
+    t_fair = layerwise_timing(dat_model, fwd_fair_hd, n_iters=n_iters)
     print(" done")
 
-    N          = len(dat_model.model.language_model.layers)
-    total_dat  = sum(t_dat.values())
-    total_base = sum(t_base.values())
-    dat_set    = set(DAT_LAYER_INDICES)
-    std_set    = set(range(N)) - dat_set
+    N           = len(dat_model.model.language_model.layers)
+    total_dat   = sum(t_dat.values())
+    total_fair  = sum(t_fair.values())
+    dat_set     = set(DAT_LAYER_INDICES)
+    std_set     = set(range(N)) - dat_set
 
-    print(f"\n  {'层':>4}  {'类型':>5}  {'DAT(ms)':>9}  {'Base(ms)':>9}"
-          f"  {'开销(ms)':>9}  {'开销%':>7}  {'占总时%':>7}")
-    print(f"  {'─'*66}")
+    print(f"\n  {'层':>4}  {'类型':>5}  {'DAT(ms)':>9}  {'FairHD(ms)':>11}"
+          f"  {'开销(ms)':>9}  {'开销%':>8}  {'DAT占总%':>8}")
+    print(f"  {'─'*72}")
 
     for i in range(N):
         layer_type = 'DAT' if i in dat_set else 'Std'
-        td = t_dat.get(i, 0.0); tb = t_base.get(i, 0.0)
-        diff = td - tb
-        pct_ovhd = diff / tb * 100 if tb > 0 else 0
+        td = t_dat.get(i, 0.0); tf = t_fair.get(i, 0.0)
+        diff = td - tf
+        pct_ovhd = diff / tf * 100 if tf > 0 else 0
         pct_tot  = td / total_dat * 100
         marker   = ' ◄' if i in dat_set else ''
-        print(f"  {i:>4}  {layer_type:>5}  {td:>9.2f}  {tb:>9.2f}"
-              f"  {diff:>+9.2f}  {pct_ovhd:>+6.1f}%  {pct_tot:>6.1f}%{marker}")
+        print(f"  {i:>4}  {layer_type:>5}  {td:>9.2f}  {tf:>11.2f}"
+              f"  {diff:>+9.2f}  {pct_ovhd:>+7.1f}%  {pct_tot:>7.1f}%{marker}")
 
-    print(f"  {'─'*66}")
-    print(f"  {'合计':>4}  {'':>5}  {total_dat:>9.2f}  {total_base:>9.2f}"
-          f"  {total_dat - total_base:>+9.2f}"
-          f"  {(total_dat - total_base) / total_base * 100:>+6.1f}%")
+    print(f"  {'─'*72}")
+    print(f"  {'合计':>4}  {'':>5}  {total_dat:>9.2f}  {total_fair:>11.2f}"
+          f"  {total_dat - total_fair:>+9.2f}"
+          f"  {(total_dat - total_fair) / total_fair * 100:>+7.1f}%")
 
     # 分组统计
-    avg_dat_d  = sum(t_dat[i]  for i in dat_set) / len(dat_set)
-    avg_base_d = sum(t_base[i] for i in dat_set) / len(dat_set)
-    avg_dat_s  = sum(t_dat[i]  for i in std_set) / len(std_set)
-    avg_base_s = sum(t_base[i] for i in std_set) / len(std_set)
+    avg_dat_d   = sum(t_dat[i]  for i in dat_set) / len(dat_set)
+    avg_fair_d  = sum(t_fair[i] for i in dat_set) / len(dat_set)
+    avg_dat_s   = sum(t_dat[i]  for i in std_set) / len(std_set)
+    avg_fair_s  = sum(t_fair[i] for i in std_set) / len(std_set)
 
     print(f"\n  平均每 DAT 层（{len(dat_set)} 层）  :"
-          f" {avg_dat_d:.2f} ms  vs  Baseline {avg_base_d:.2f} ms"
-          f"  (开销 {avg_dat_d - avg_base_d:+.2f} ms /"
-          f" {(avg_dat_d - avg_base_d) / avg_base_d * 100:+.1f}%)")
+          f" DAT={avg_dat_d:.2f} ms  vs  FairHD={avg_fair_d:.2f} ms"
+          f"  (DAT开销 {avg_dat_d - avg_fair_d:+.2f} ms /"
+          f" {(avg_dat_d - avg_fair_d) / avg_fair_d * 100:+.1f}%)")
     print(f"  平均每标准层（{len(std_set)} 层） :"
-          f" {avg_dat_s:.2f} ms  vs  Baseline {avg_base_s:.2f} ms"
-          f"  (开销 {avg_dat_s - avg_base_s:+.2f} ms /"
-          f" {(avg_dat_s - avg_base_s) / avg_base_s * 100:+.1f}%)")
-    print(f"{'─'*104}")
+          f" DAT={avg_dat_s:.2f} ms  vs  FairHD={avg_fair_s:.2f} ms"
+          f"  (DAT开销 {avg_dat_s - avg_fair_s:+.2f} ms /"
+          f" {(avg_dat_s - avg_fair_s) / avg_fair_s * 100:+.1f}%)")
+    print(f"  注：FairHD 每层均因 Nq={Nq_hd}>{Nq} 而更慢；DAT 层额外含 HD cross-attn 但受益于短序列")
+    print(f"{'─'*116}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -587,13 +643,13 @@ def run_layerwise_benchmark(dat_model, processor, vstar_samples,
 def main():
     from transformers import AutoProcessor
     from llava.model.language_model.modeling_qwen2_5vl_dat import (
-        convert_qwen2_5vl_to_dat, _FLASH_ATTN_AVAILABLE,
+        convert_qwen2_5vl_to_dat, _FA_BACKEND,
     )
 
-    print(f"\nPyTorch  : {torch.__version__}")
-    print(f"CUDA     : {torch.version.cuda}")
-    print(f"GPU      : {torch.cuda.get_device_name(0)}")
-    print(f"flash_attn: {'YES' if _FLASH_ATTN_AVAILABLE else 'NO'}")
+    print(f"\nPyTorch   : {torch.__version__}")
+    print(f"CUDA      : {torch.version.cuda}")
+    print(f"GPU       : {torch.cuda.get_device_name(0)}")
+    print(f"FA backend: {_FA_BACKEND}")
     print(f"\n训练配置：")
     print(f"  DAT_LAYERS   = {DAT_LAYERS}")
     print(f"  DAT 层索引   = {DAT_LAYER_INDICES}  (共 {len(DAT_LAYER_INDICES)} 层)")
@@ -634,7 +690,7 @@ def main():
         if not os.path.exists(img_path):
             continue
         try:
-            inputs_lr, _, lr_hw, hd_hw = process_sample(
+            inputs_lr, _, lr_hw, hd_hw, _ = process_sample(
                 processor, img_path, sample['text'], device=DEVICE)
             Nq = inputs_lr['input_ids'].shape[1]
             lr_h_tok, lr_w_tok   = lr_hw
@@ -679,20 +735,27 @@ def main():
     # ── 峰值显存（第一个有效 vstar 样本）──────────────────────────────────────
     print(f"\n{'═'*72}")
     print("显存峰值（第一个可用 vstar 样本）")
+    print(f"  DAT = LR ViT + HD ViT + LLM(Nq_lr)")
+    print(f"  Fair-HD = HD ViT + LLM(Nq_hd)")
+    print(f"  LR-only = LR ViT + LLM(Nq_lr)")
     print(f"{'═'*72}")
     for sample in vstar_samples:
         img_path = os.path.join(VSTAR_DIR, sample['image'])
         if not os.path.exists(img_path):
             continue
         try:
-            inputs_lr, inputs_hd, _, _ = process_sample(
+            inputs_lr, inputs_hd, _, _, inputs_hd_full = process_sample(
                 processor, img_path, sample['text'], device=DEVICE)
-            pv_hd  = inputs_hd['pixel_values'].to(DTYPE)
-            thw_hd = inputs_hd['image_grid_thw']
-            pv_lr  = inputs_lr['pixel_values'].to(DTYPE)
-            thw_lr = inputs_lr['image_grid_thw']
-            iids   = inputs_lr['input_ids']
-            amask  = inputs_lr.get('attention_mask')
+            pv_hd    = inputs_hd['pixel_values'].to(DTYPE)
+            thw_hd   = inputs_hd['image_grid_thw']
+            pv_lr    = inputs_lr['pixel_values'].to(DTYPE)
+            thw_lr   = inputs_lr['image_grid_thw']
+            iids     = inputs_lr['input_ids']
+            amask    = inputs_lr.get('attention_mask')
+            pv_hdf   = inputs_hd_full['pixel_values'].to(DTYPE)
+            thw_hdf  = inputs_hd_full['image_grid_thw']
+            iids_hdf = inputs_hd_full['input_ids']
+            amask_hdf = inputs_hd_full.get('attention_mask')
 
             def measure_peak(fn):
                 torch.cuda.synchronize()
@@ -707,15 +770,26 @@ def main():
                 pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
                 use_cache=False,
             ))
-            mem_base = measure_peak(lambda: dat_model(
+            mem_fair = measure_peak(lambda: dat_model(
+                input_ids=iids_hdf, attention_mask=amask_hdf,
+                pixel_values=pv_hdf, image_grid_thw=thw_hdf,
+                pixel_values_hd=None, image_grid_thw_hd=None,
+                use_cache=False,
+            ))
+            mem_lr = measure_peak(lambda: dat_model(
                 input_ids=iids, attention_mask=amask,
                 pixel_values=pv_lr, image_grid_thw=thw_lr,
                 pixel_values_hd=None, image_grid_thw_hd=None,
                 use_cache=False,
             ))
-            print(f"  Nq={iids.shape[1]}"
-                  f"  Peak DAT: {mem_dat:.0f} MB  |  Baseline: {mem_base:.0f} MB"
-                  f"  |  额外: {mem_dat - mem_base:+.0f} MB")
+            Nq_lr_m  = iids.shape[1]
+            Nq_hd_m  = iids_hdf.shape[1]
+            print(f"  Nq_lr={Nq_lr_m}  Nq_hd={Nq_hd_m}")
+            print(f"  Peak DAT     : {mem_dat:.0f} MB  (LR ViT + HD ViT + LLM-DAT)")
+            print(f"  Peak Fair-HD : {mem_fair:.0f} MB  (HD ViT + LLM-FairHD)")
+            print(f"  Peak LR-only : {mem_lr:.0f} MB  (LR ViT + LLM-LR)")
+            print(f"  DAT vs LR-only  : {mem_dat - mem_lr:+.0f} MB")
+            print(f"  Fair-HD vs LR-only: {mem_fair - mem_lr:+.0f} MB")
             break
         except Exception as e:
             print(f"  [skip] {e}")

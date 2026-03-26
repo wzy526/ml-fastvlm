@@ -2,7 +2,7 @@
 
 export WANDB_PROJECT="vldat_experiments"
 
-CKPT_ROOT="/mnt/ephemeral/vldat_experiments"
+CKPT_ROOT="/data/vldat_experiments"
 EXP_NAME="qwen2_5vl-3b-dat-z3_1d5l_s12_g8_i128_hdgate"
 mkdir -p $CKPT_ROOT/$EXP_NAME
 
@@ -11,10 +11,10 @@ DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
 ds llava/train/train_qwen_dat.py \
     --deepspeed ./scripts/zero_configs/zero2.json \
-    --model_name_or_path /home/coder/downloaded_data/base_models/Qwen2.5-VL-3B-Instruct \
+    --model_name_or_path /data/base_models/Qwen2.5-VL-3B-Instruct \
     --model_family qwen2_5_vl \
-    --data_path /home/coder/downloaded_data/sft_data/llava_hd_merged_1m.json \
-    --image_folder /home/coder/downloaded_data/sft_data/train_split \
+    --data_path /data/sft_data/llava_hd_merged_1m.json \
+    --image_folder /data/sft_data/train_split \
     --coupled_lr_hd True \
     --use_dat True \
     --dat_layers "$DAT_LAYERS" \
@@ -35,10 +35,11 @@ ds llava/train/train_qwen_dat.py \
     --tf32 True \
     --max_grad_norm 1.0 \
     --output_dir $CKPT_ROOT/$EXP_NAME \
+    --resume_from_checkpoint $CKPT_ROOT/$EXP_NAME/checkpoint-3000 \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 8 \
+    --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 8 \
     --eval_strategy "no" \
     --save_strategy "steps" \
     --save_steps 250 \
