@@ -713,7 +713,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             gate = max(gate, 1e-6)
             lse2 = lse2 + math.log(gate)
             self._dat_hd_gate_value = gate
-
+        
         lse = torch.logaddexp(lse1_ans, lse2)              # [B, H, Nans] fp32
 
         # Weights: [B, H, Nans] → [B, Nans, H, 1] for broadcasting (fp32)

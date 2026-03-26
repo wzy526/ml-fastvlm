@@ -136,16 +136,18 @@ class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to JSON training data."})
     image_folder: Optional[str] = field(default=None)
     system_message: str = field(default="You are a helpful assistant.")
-    min_pixels: int = field(default=3136)       # 56*56
-    max_pixels: int = field(default=1003520)    # 28*28*1280
-    # HD data for DAT
-    hd_min_pixels: int = field(default=28224, metadata={"help": "Min pixels for HD image (3^2 * 56*56, 3x linear scale)"})
-    hd_max_pixels: int = field(default=9031680, metadata={"help": "Max pixels for HD image (3^2 * max_pixels, 3x linear scale)"})
-    # Coupled LR-HD mode
-    lr_pixels: int = field(default=112896, metadata={"help": "Target LR pixel count for coupled mode (default 336^2=112896)"})
-    coupled_lr_hd: bool = field(default=False, metadata={"help": "Use coupled LR-HD processing: fixed HD target, LR = HD / hr_scale"})
-
-
+    hd_max_pixels: int = field(
+        default=3211264,
+        metadata={"help": "Hard cap on HD pixel count to prevent OOM (default ~4096 HD tokens)"}
+    )
+    coupled_lr_hd: bool = field(
+        default=True,
+        metadata={"help": "DEPRECATED: coupled LR-HD is now the default for DAT. Kept for backward compat."}
+    )
+    # LR: 比默认略低但仍在 pretrained 合理范围
+    lr_min_pixels: int = field(default=200704)    # 256*28*28 (默认)
+    lr_max_pixels: int = field(default=501760)    # 640*28*28 (~640 tokens)
+    
 @dataclass
 class Qwen2VLTrainingArguments(transformers.TrainingArguments):
     model_max_length: int = field(default=4096)
@@ -545,10 +547,13 @@ class Qwen2VLCoupledDATDataset(Dataset):
         self.coord_format = coord_format
 
         self.hr_scale = model_args.dat_hr_scale
+        self.hd_max_pixels = data_args.hd_max_pixels
 
         rank0_print(
             f"Coupled LR-HD: hr_scale={self.hr_scale}, "
-            f"HD pixels by processor default, LR = HD / {self.hr_scale ** 2}"
+            f"LR pixels=[{data_args.lr_min_pixels}, {data_args.lr_max_pixels}], "
+            f"HD = LR * {self.hr_scale}² "
+            f"(capped at orig_pixels and hd_max_pixels={self.hd_max_pixels})"
         )
 
     def __len__(self):
@@ -593,30 +598,44 @@ class Qwen2VLCoupledDATDataset(Dataset):
 
         inputs_hd = None
         if has_image and img is not None:
-            # Step 1: HD — let processor pick resolution with its defaults
-            inputs_hd = self.processor(
-                images=[img],
-                text=["<|im_start|>"],
-                return_tensors="pt",
-                padding=False,
-            )
-
-            # Step 2: derive LR dims from HD actual dims
-            thw = inputs_hd["image_grid_thw"][0]
-            hd_h = thw[1].item() * self.FACTOR
-            hd_w = thw[2].item() * self.FACTOR
-            lr_h = max(self.FACTOR, (hd_h // self.hr_scale // self.FACTOR) * self.FACTOR)
-            lr_w = max(self.FACTOR, (hd_w // self.hr_scale // self.FACTOR) * self.FACTOR)
-            lr_total = lr_h * lr_w
-
-            # Step 3: LR — force processor to use derived resolution
+            # Step 1: LR — processor 默认（不覆盖 min/max）
             inputs = self.processor(
                 images=[img],
                 text=[text],
                 return_tensors="pt",
                 padding=False,
-                min_pixels=lr_total,
-                max_pixels=lr_total,
+                min_pixels=self.data_args.lr_min_pixels,
+                max_pixels=self.data_args.lr_max_pixels,
+            )
+
+            # Step 2: HD — 尽可能高，但有上限
+            orig_pixels = img.width * img.height
+            thw = inputs["image_grid_thw"][0]
+            lr_h = thw[1].item() * self.FACTOR
+            lr_w = thw[2].item() * self.FACTOR
+            lr_pixels = lr_h * lr_w
+
+            # HD 目标：LR 的 hr_scale² 倍，但不超过原图，也不超过显存上限
+            hd_target = lr_pixels * (self.hr_scale ** 2)
+            hd_target = min(hd_target, orig_pixels)     # 不超过原图
+            hd_target = min(hd_target, self.hd_max_pixels)  # 显存上限
+
+            # 保持宽高比，对齐到 FACTOR
+            aspect = img.width / img.height
+            hd_h = int(math.sqrt(hd_target / aspect))
+            hd_w = int(hd_h * aspect)
+            hd_h = max(self.FACTOR, (hd_h // self.FACTOR) * self.FACTOR)
+            hd_w = max(self.FACTOR, (hd_w // self.FACTOR) * self.FACTOR)
+            hd_total = hd_h * hd_w
+
+            # Step 3: HD processing
+            inputs_hd = self.processor(
+                images=[img],
+                text=["<|im_start|>"],
+                return_tensors="pt",
+                padding=False,
+                min_pixels=hd_total,
+                max_pixels=hd_total,
             )
         else:
             inputs = self.processor(
@@ -652,10 +671,10 @@ class Qwen2VLCoupledDATDataset(Dataset):
 # Dataset
 # ---------------------------------------------------------------------------
 class Qwen2VLSupervisedDataset(Dataset):
-    """Dataset for Qwen2VL supervised fine-tuning (with optional DAT HD data)."""
+    """Dataset for Qwen2VL/Qwen2.5VL supervised fine-tuning (baseline, no DAT)."""
 
     def __init__(self, data_path, processor, data_args, model_max_length,
-                 use_dat=False, processor_hd=None, coord_format="qwen2_vl"):
+                 coord_format="qwen2_vl"):
         super().__init__()
         rank0_print(f"Loading data from {data_path}...")
         self.list_data_dict = json.load(open(data_path, "r"))
@@ -663,8 +682,6 @@ class Qwen2VLSupervisedDataset(Dataset):
         self.processor = processor
         self.data_args = data_args
         self.model_max_length = model_max_length
-        self.use_dat = use_dat
-        self.processor_hd = processor_hd
         self.coord_format = coord_format
 
     def __len__(self):
@@ -709,15 +726,14 @@ class Qwen2VLSupervisedDataset(Dataset):
             messages, tokenize=False, add_generation_prompt=False
         )
 
-        # Process through Qwen2VL processor
         if images:
             inputs = self.processor(
                 images=images,
                 text=[text],
                 return_tensors="pt",
                 padding=False,
-                min_pixels=self.data_args.min_pixels,
-                max_pixels=self.data_args.max_pixels,
+                min_pixels=self.data_args.lr_min_pixels,
+                max_pixels=self.data_args.lr_max_pixels,
             )
         else:
             inputs = self.processor(
@@ -728,35 +744,20 @@ class Qwen2VLSupervisedDataset(Dataset):
 
         input_ids = inputs["input_ids"]  # [1, seq_len]
 
-        # Truncate to model_max_length
         if input_ids.size(1) > self.model_max_length:
             input_ids = input_ids[:, :self.model_max_length]
 
-        # Create labels with masking
         labels = _apply_label_mask(input_ids)
 
         result = {
-            "input_ids": input_ids.squeeze(0),      # [seq_len]
-            "labels": labels.squeeze(0),             # [seq_len]
-            "image_path": image_path,                # str or None
+            "input_ids": input_ids.squeeze(0),
+            "labels": labels.squeeze(0),
+            "image_path": image_path,
         }
 
         if "pixel_values" in inputs:
-            result["pixel_values"] = inputs["pixel_values"]          # [N, 1176]
-            result["image_grid_thw"] = inputs["image_grid_thw"]      # [num_images, 3]
-
-        # --- HD processing for DAT ---
-        if self.use_dat and has_image and self.processor_hd is not None:
-            inputs_hd = self.processor_hd(
-                images=[img],  # reuse already-opened PIL image
-                text=["<|im_start|>"],  # minimal text to satisfy API
-                return_tensors="pt",
-                padding=False,
-                min_pixels=self.data_args.hd_min_pixels,
-                max_pixels=self.data_args.hd_max_pixels,
-            )
-            result["pixel_values_hd"] = inputs_hd["pixel_values"]
-            result["image_grid_thw_hd"] = inputs_hd["image_grid_thw"]
+            result["pixel_values"] = inputs["pixel_values"]
+            result["image_grid_thw"] = inputs["image_grid_thw"]
 
         return result
 
@@ -1692,8 +1693,6 @@ def train():
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path,
         use_fast=False,
-        min_pixels=data_args.min_pixels,
-        max_pixels=data_args.max_pixels,
     )
     processor.tokenizer.model_max_length = training_args.model_max_length
     processor.tokenizer.padding_side = "right"
@@ -1745,20 +1744,10 @@ def train():
         model = get_peft_model(model, lora_config)
         rank0_print(f"LoRA target modules: {lora_config.target_modules}")
 
-    # ----- HD Processor for DAT (only for uncoupled mode) -----
-    processor_hd = None
-    if model_args.use_dat and not data_args.coupled_lr_hd:
-        processor_hd = AutoProcessor.from_pretrained(
-            model_args.model_name_or_path,
-            use_fast=False,
-            min_pixels=data_args.hd_min_pixels,
-            max_pixels=data_args.hd_max_pixels,
-        )
-
     # ----- Dataset -----
     coord_format = model_args.model_family  # "qwen2_vl" or "qwen2_5_vl"
     rank0_print(f"Bbox coordinate format: {coord_format}")
-    if model_args.use_dat and data_args.coupled_lr_hd:
+    if model_args.use_dat:
         train_dataset = Qwen2VLCoupledDATDataset(
             data_path=data_args.data_path,
             processor=processor,
@@ -1773,8 +1762,6 @@ def train():
             processor=processor,
             data_args=data_args,
             model_max_length=training_args.model_max_length,
-            use_dat=model_args.use_dat,
-            processor_hd=processor_hd,
             coord_format=coord_format,
         )
     data_collator = Qwen2VLDataCollator(pad_token_id=ENDOFTEXT_ID)
