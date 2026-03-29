@@ -1527,6 +1527,38 @@ class Qwen2VLTrainer(transformers.Trainer):
 
         return result
 
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Save LoRA adapter *and* non-LoRA trainables (DAT weights) + config.
+
+        The default Trainer only calls PeftModel.save_pretrained() which stores
+        LoRA adapter weights.  DAT modules (conv_lr_dw, hd_gate, …) are
+        trainable but not part of LoRA, so we persist them separately as
+        ``non_lora_trainables.bin`` — the same format used by the end-of-
+        training save in :func:`train`.
+        """
+        super().save_model(output_dir, _internal_call=_internal_call)
+
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        if not self.args.should_save:
+            return
+        if not getattr(self.args, 'lora_enable', False):
+            return
+
+        peft_model = self.accelerator.unwrap_model(self.model)
+
+        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
+            peft_model.named_parameters()
+        )
+        if non_lora_state_dict:
+            torch.save(non_lora_state_dict,
+                       os.path.join(output_dir, 'non_lora_trainables.bin'))
+            rank0_print(f"  Saved {len(non_lora_state_dict)} non-LoRA tensors "
+                        f"to {output_dir}/non_lora_trainables.bin")
+
+        if hasattr(peft_model, 'config'):
+            peft_model.config.save_pretrained(output_dir)
+
     def _inner_training_loop(self, *args, **kwargs):
         """Override to disable gradient checkpointing on frozen vision encoder.
 
