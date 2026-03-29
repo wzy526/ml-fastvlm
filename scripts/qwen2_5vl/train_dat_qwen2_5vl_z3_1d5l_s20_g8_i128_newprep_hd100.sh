@@ -25,7 +25,6 @@ ds llava/train/train_qwen_dat.py \
     --dat_use_intention_branch True \
     --dat_intention_as_gate True \
     --dat_freeze_base False \
-    --dat_hd_gate_warmup_steps 100 \
     --dat_lr 1e-5 \
     --tune_mm_vision False \
     --tune_mm_mlp False \

@@ -39,7 +39,7 @@ local_rank = None
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
-    'hd_attn_bias',
+    'hd_gate',
 ]
 
 
@@ -113,17 +113,12 @@ class ModelArguments:
         metadata={"help": "Two-phase DAT training: train only DAT params for this many steps, "
                   "then unfreeze DAT+LLM (ViT/connector stay frozen). 0 = disabled."}
     )
-    dat_hd_attn_bias: float = field(
-        default=0.0,
-        metadata={"help": "Learnable attention bias for HD keys. "
-                  "<0 enables (used as init value, e.g. -10.0), >=0 disables."}
-    )
-    dat_hd_gate_warmup_steps: int = field(
-        default=0,
-        metadata={"help": "Linear warmup steps for HD attention gating via LSE bias. "
-                  "During warmup, g linearly increases from ~0 to 1 and is applied as "
-                  "lse2_gated = lse2 + log(g), smoothly ramping up HD contribution. "
-                  "0 = disabled (full HD from the start)."}
+    dat_hd_gate_init: Optional[float] = field(
+        default=None,
+        metadata={"help": "Learnable HD gate init value (nn.Parameter). Applied as "
+                  "lse2 += log(sigmoid(hd_gate)). Use e.g. -10.0 so sigmoid ≈ 0 "
+                  "at the start, preventing HD from dominating before offset modules "
+                  "learn meaningful sampling. None = disabled."}
     )
     dat_fused_vit: bool = field(
         default=False,
@@ -979,22 +974,6 @@ class DATWarmupCallback(transformers.TrainerCallback):
 
 
 # ---------------------------------------------------------------------------
-# HD gate warmup callback (LSE-based gating)
-# ---------------------------------------------------------------------------
-class HDGateWarmupCallback(transformers.TrainerCallback):
-    """Sets the HD gate warmup step on each training step.
-
-    This drives the linear warmup of HD attention contribution via
-    model.dat_set_warmup_step(global_step), which adds log(g) bias
-    to lse2 in the LSE merge.
-    """
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        if model is not None and hasattr(model, 'dat_set_warmup_step'):
-            model.dat_set_warmup_step(state.global_step)
-
-
-# ---------------------------------------------------------------------------
 # WandB DAT Monitor Callback
 # ---------------------------------------------------------------------------
 class WandbDATMonitorCallback(transformers.TrainerCallback):
@@ -1014,7 +993,7 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
     at on_step_end.
     """
 
-    KVHD_KEYS = ('kv_proj_hd',)
+    KVHD_KEYS = ('k_proj_hd', 'v_proj_hd')
 
     def __init__(self, use_kvhd: bool = False):
         self._model     = None
@@ -1034,6 +1013,10 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         self._kvhd_step_sq   = 0.0
         self._kvhd_step_cnt  = 0
         self._kvhd_norm_buf  = []
+        # Trainer-captured grad norms (after backward, before zero_grad).
+        # Reliable fallback when register_hook silently fails under PEFT/DDP.
+        self._trainer_grad_buf      = []
+        self._trainer_kvhd_grad_buf = []
 
     # ------------------------------------------------------------------
     def on_train_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
@@ -1060,17 +1043,61 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                             _self._kvhd_step_sq  += gnorm_sq
                             _self._kvhd_step_cnt += 1
                 self._hooks.append(param.register_hook(_h))
+        rank0_print(f"[DATMonitor] Registered {len(self._hooks)} backward hooks on DAT params")
+
+    def capture_grad_norms(self, model):
+        """Capture DAT grad norms after backward, before zero_grad.
+
+        Called by Trainer.training_step() so that grad norms are available
+        even when register_hook silently fails under PEFT/DDP wrapping.
+        With gradient_accumulation_steps=1, on_substep_end never fires and
+        on_step_end fires AFTER zero_grad, making the old param.grad fallback
+        ineffective.  This method runs at the right timing (post-backward,
+        pre-zero_grad) regardless of accumulation settings.
+        """
+        if local_rank != 0:
+            return
+        dat_sq, dat_cnt = 0.0, 0
+        kvhd_sq, kvhd_cnt = 0.0, 0
+        for name, param in model.named_parameters():
+            if not (any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad):
+                continue
+            if param.grad is not None:
+                gsq = param.grad.detach().float().norm(2).item() ** 2
+                dat_sq += gsq
+                dat_cnt += 1
+                if self._use_kvhd and any(k in name for k in self.KVHD_KEYS):
+                    kvhd_sq += gsq
+                    kvhd_cnt += 1
+        if dat_cnt > 0:
+            self._trainer_grad_buf.append(dat_sq ** 0.5)
+            if not hasattr(self, '_capture_confirmed'):
+                rank0_print(f"[DATMonitor] capture_grad_norms OK: "
+                            f"{dat_cnt} DAT params with grad, norm={dat_sq**0.5:.4f}")
+                self._capture_confirmed = True
+        if kvhd_cnt > 0:
+            self._trainer_kvhd_grad_buf.append(kvhd_sq ** 0.5)
 
     def _flush_step(self, state):
         """Commit the current micro-step's accumulated grad norm to the buffer.
 
-        If backward hooks fired, use their accumulated values.  Otherwise fall
-        back to reading ``param.grad`` directly (needed under PEFT wrapping
-        where ``register_hook`` may silently fail to trigger).
+        Priority order:
+          1. register_hook accumulator (fires during backward on each param)
+          2. Trainer-captured grad norms (capture_grad_norms, post-backward pre-zero_grad)
+          3. Direct param.grad read (only works if called before zero_grad,
+             e.g. from on_substep_end with gradient_accumulation_steps > 1)
         """
         if state.is_world_process_zero:
             if self._step_cnt > 0:
                 self._norm_buf.append(self._step_sq ** 0.5)
+                if not hasattr(self, '_flush_path_logged'):
+                    rank0_print("[DATMonitor] Grad norm source: backward hooks")
+                    self._flush_path_logged = True
+            elif self._trainer_grad_buf:
+                self._norm_buf.extend(self._trainer_grad_buf)
+                if not hasattr(self, '_flush_path_logged'):
+                    rank0_print("[DATMonitor] Grad norm source: Trainer post-backward capture")
+                    self._flush_path_logged = True
             elif self._model is not None:
                 dat_sq, dat_cnt = 0.0, 0
                 kvhd_sq, kvhd_cnt = 0.0, 0
@@ -1091,7 +1118,11 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
 
             if self._kvhd_step_cnt > 0:
                 self._kvhd_norm_buf.append(self._kvhd_step_sq ** 0.5)
+            elif self._trainer_kvhd_grad_buf:
+                self._kvhd_norm_buf.extend(self._trainer_kvhd_grad_buf)
 
+        self._trainer_grad_buf.clear()
+        self._trainer_kvhd_grad_buf.clear()
         self._step_sq  = 0.0
         self._step_cnt = 0
         self._kvhd_step_sq  = 0.0
@@ -1103,6 +1134,7 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             return
         off_means, off_stds = [], []
         gate_means, gate_stds = [], []
+        hd_gate_vals = []
         for module in model.modules():
             if hasattr(module, '_dat_offset_stats'):
                 m, s = module._dat_offset_stats
@@ -1115,8 +1147,10 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 gate_stds.append(s)
                 del module._dat_gate_stats
             if hasattr(module, '_dat_hd_gate_value'):
-                self._hd_gate_buf.append(module._dat_hd_gate_value)
+                hd_gate_vals.append(module._dat_hd_gate_value)
                 del module._dat_hd_gate_value
+        if hd_gate_vals:
+            self._hd_gate_buf.append(sum(hd_gate_vals) / len(hd_gate_vals))
         if off_means:
             self._offset_mean_buf.append(sum(off_means) / len(off_means))
             self._offset_std_buf.append(sum(off_stds) / len(off_stds))
@@ -1146,8 +1180,8 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         called at logging intervals so the communication cost is acceptable.
         Falls back to param.data.float() when the API is unavailable.
 
-        Returns (dat_weight_norm, kvhd_weight_norm, hd_attn_bias_mean).
-        Any may be None.
+        Returns (dat_weight_norm, kvhd_weight_norm,
+                 hd_gate_raw, hd_gate_sigmoid).  Any may be None.
         """
         try:
             from deepspeed.utils import safe_get_full_fp32_param
@@ -1157,16 +1191,17 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
 
         dat_sq, dat_cnt = 0.0, 0
         kvhd_sq, kvhd_cnt = 0.0, 0
-        hd_bias_sum, hd_bias_cnt = 0.0, 0
+        hd_gate_sum, hd_gate_cnt = 0.0, 0
         for name, param in model.named_parameters():
             if not (any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad):
                 continue
             try:
                 fp32_tensor = _get_fp32(param) if _get_fp32 is not None else None
-                if 'hd_attn_bias' in name:
+                # Scalar params: report value directly, don't fold into L2 norm
+                if 'hd_gate' in name and param.numel() == 1:
                     val = fp32_tensor.item() if fp32_tensor is not None else param.data.float().item()
-                    hd_bias_sum += val
-                    hd_bias_cnt += 1
+                    hd_gate_sum += val
+                    hd_gate_cnt += 1
                     continue
                 if fp32_tensor is not None:
                     norm_sq = fp32_tensor.norm(2).item() ** 2
@@ -1181,17 +1216,28 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 pass
         dat_wn = dat_sq ** 0.5 if dat_cnt > 0 else None
         kvhd_wn = kvhd_sq ** 0.5 if kvhd_cnt > 0 else None
-        hd_bias = hd_bias_sum / hd_bias_cnt if hd_bias_cnt > 0 else None
-        return dat_wn, kvhd_wn, hd_bias
+        hd_gate_raw = hd_gate_sum / hd_gate_cnt if hd_gate_cnt > 0 else None
+        hd_gate_sig = torch.sigmoid(torch.tensor(hd_gate_raw)).item() if hd_gate_raw is not None else None
+        return dat_wn, kvhd_wn, hd_gate_raw, hd_gate_sig
 
     def on_log(self, args, state, control, logs=None, model=None, optimizer=None, **kwargs):
         """Flush buffered metrics to WandB and console."""
         _model     = model     or self._model
         _optimizer = optimizer or self._optimizer
 
-        # Weight norm must be computed on ALL ranks (safe_get_full_fp32_param
-        # does an all-gather), then only rank 0 reports the result.
-        wn, kvhd_wn, hd_bias = self._compute_weight_norms(_model) if _model is not None else (None, None, None)
+        # Under ZeRO-2/3, safe_get_full_fp32_param does an all-gather so ALL
+        # ranks must call _compute_weight_norms.  Under DDP (no ZeRO), each rank
+        # has the full model — only rank 0 needs to compute.
+        _uses_zero = _model is not None and any(
+            hasattr(p, 'ds_id') for p in _model.parameters()
+        )
+        if _uses_zero or state.is_world_process_zero:
+            wn, kvhd_wn, hd_gate_raw, hd_gate_sig = (
+                self._compute_weight_norms(_model) if _model is not None
+                else (None, None, None, None)
+            )
+        else:
+            wn = kvhd_wn = hd_gate_raw = hd_gate_sig = None
 
         if not state.is_world_process_zero:
             return
@@ -1242,13 +1288,15 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 metrics["dat/kvhd_grad_norm"] = sum(self._kvhd_norm_buf) / len(self._kvhd_norm_buf)
                 self._kvhd_norm_buf.clear()
 
-        # 7. HD attention bias (learnable scalar, averaged across DAT layers)
-        if hd_bias is not None:
-            metrics["dat/hd_attn_bias"] = hd_bias
+        # 7. Learnable HD gate (from weight norm pass, averaged across layers)
+        if hd_gate_raw is not None:
+            metrics["dat/hd_gate_raw"] = hd_gate_raw
+        if hd_gate_sig is not None:
+            metrics["dat/hd_gate_sigmoid"] = hd_gate_sig
 
-        # 8. HD gate warmup value (LSE-based gating, same across layers)
+        # 8. HD gate sigmoid from forward pass (averaged across layers and steps)
         if self._hd_gate_buf:
-            metrics["dat/hd_gate"] = self._hd_gate_buf[-1]
+            metrics["dat/hd_gate"] = sum(self._hd_gate_buf) / len(self._hd_gate_buf)
             self._hd_gate_buf.clear()
 
         if not metrics:
@@ -1467,7 +1515,17 @@ class Qwen2VLTrainer(transformers.Trainer):
         if image_paths is not None:
             inner = model.module if hasattr(model, 'module') else model
             inner._batch_image_paths = image_paths
-        return super().training_step(model, inputs, num_items_in_batch, **kwargs)
+        result = super().training_step(model, inputs, num_items_in_batch, **kwargs)
+
+        # After backward (before zero_grad): capture DAT grad norms and
+        # forward diagnostics.  Under DDP+PEFT, register_hook may silently
+        # fail and on_step_end fires after zero_grad, so this is the only
+        # reliable capture point.
+        if hasattr(self, '_dat_monitor_callback') and self._dat_monitor_callback is not None:
+            self._dat_monitor_callback.capture_grad_norms(model)
+            self._dat_monitor_callback._harvest_forward_diagnostics(model)
+
+        return result
 
     def _inner_training_loop(self, *args, **kwargs):
         """Override to disable gradient checkpointing on frozen vision encoder.
@@ -1679,8 +1737,7 @@ def train():
             'layers': model_args.dat_layers,
             'use_intention_branch': model_args.dat_use_intention_branch,
             'intention_as_gate': model_args.dat_intention_as_gate,
-            'hd_attn_bias': model_args.dat_hd_attn_bias,
-            'hd_gate_warmup_steps': model_args.dat_hd_gate_warmup_steps,
+            'hd_gate_init': model_args.dat_hd_gate_init,
             'use_fused_vit': model_args.dat_fused_vit,
         }
 
@@ -1858,15 +1915,12 @@ def train():
 
     # ----- Trainer -----
     callbacks = []
+    dat_monitor = None
     if dat_warmup_callback is not None:
         callbacks.append(dat_warmup_callback)
     if model_args.use_dat:
-        callbacks.append(
-            WandbDATMonitorCallback(use_kvhd=model_args.dat_hd_proj)
-        )
-        if model_args.dat_hd_gate_warmup_steps > 0:
-            callbacks.append(HDGateWarmupCallback())
-            rank0_print(f"HD gate warmup enabled: {model_args.dat_hd_gate_warmup_steps} steps")
+        dat_monitor = WandbDATMonitorCallback(use_kvhd=model_args.dat_hd_proj)
+        callbacks.append(dat_monitor)
     if training_args.visualization_every_n_steps > 0 and model_args.dat_manual_attn:
         callbacks.append(
             WandbSamplingVisCallback(
@@ -1883,6 +1937,7 @@ def train():
         data_collator=data_collator,
         callbacks=callbacks if callbacks else None,
     )
+    trainer._dat_monitor_callback = dat_monitor
 
     # ----- Train -----
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):

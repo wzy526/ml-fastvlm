@@ -25,7 +25,6 @@ torchrun --nproc_per_node=4 --master_port 39501 llava/train/train_qwen_dat.py \
     --dat_use_intention_branch True \
     --dat_intention_as_gate True \
     --dat_freeze_base False \
-    --dat_hd_gate_warmup_steps 0 \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \

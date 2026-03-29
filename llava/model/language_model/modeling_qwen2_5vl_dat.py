@@ -262,7 +262,7 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
             'layers': '',              # Layer type string, e.g. "LLLDLLLD..."
             'use_intention_branch': True,
             'intention_as_gate': True,
-            'hd_gate_warmup_steps': 0,
+            'hd_gate_init': None,      # Learnable HD gate init value (e.g. -10.0); None = disabled
             'use_fused_vit': False,    # Fuse LR+HD into one ViT call (saves kernel launch; costs ~2× activation memory)
         }
 
@@ -456,9 +456,15 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         # Rotary embedding for extended KV (Qwen2.5-VL Attention doesn't have one)
         self._dat_rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
 
-        # HD gating: linear warmup via LSE bias
-        self._warmup_steps = dat.get('hd_gate_warmup_steps', 0)
-        self.register_buffer('_dat_warmup_step', torch.tensor(0, dtype=torch.long))
+        # Learnable HD gate: sigmoid(hd_gate) scales the HD partition function.
+        # Init to a large negative value (e.g. -10) so sigmoid ≈ 0 at the start,
+        # preventing HD features from dominating before the offset/sampling modules
+        # have learned meaningful representations.
+        hd_gate_init = dat.get('hd_gate_init', None)
+        if hd_gate_init is not None:
+            self.hd_gate = nn.Parameter(torch.tensor(float(hd_gate_init)))
+        else:
+            self.hd_gate = None
 
         self._init_dat_weights()
 
@@ -715,15 +721,15 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         lse2 = lse2.float()                                # [1, H, Nans]
         out1_ans = out1[:, ans_start:ans_end, :, :]        # [B, Nans, H, D]
 
-        # HD gating: add log(g) bias to ℓ₂ so the HD partition function is
-        # scaled by g.  g linearly warms up from ~0 to 1 over warmup_steps.
-        if self._warmup_steps > 0 and self.training:
-            step = self._dat_warmup_step.item()
-            gate = min(step / self._warmup_steps, 1.0)
-            gate = max(gate, 1e-6)
-            lse2 = lse2 + math.log(gate)
-            self._dat_hd_gate_value = gate
-        
+        # HD gating: suppress HD contribution at the start of training.
+        # hd_gate is an nn.Parameter, applied as lse2_gated = lse2 + log(sigmoid(hd_gate)).
+        # With hd_gate init ≈ -10, sigmoid ≈ 4.5e-5, so HD is ~silent initially.
+        # The model learns to open the gate during training.
+        if self.hd_gate is not None:
+            lse2 = lse2 + F.logsigmoid(self.hd_gate)
+            if self.training:
+                self._dat_hd_gate_value = self.hd_gate.detach().sigmoid().item()
+
         lse = torch.logaddexp(lse1_ans, lse2)              # [B, H, Nans] fp32
 
         # Weights: [B, H, Nans] → [B, Nans, H, 1] for broadcasting (fp32)
@@ -1045,18 +1051,6 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 n += 1
         logger.info(f"Copied k_proj/v_proj → k_proj_hd/v_proj_hd for {n} DAT layers")
 
-    def dat_set_warmup_step(self, step: int):
-        """Set the current warmup step on all DAT attention layers.
-
-        Call this once per training step from the training loop:
-            model.dat_set_warmup_step(global_step)
-        The gate value g = clamp(step / warmup_steps, 0, 1) is computed
-        inside _merge_two_pass_lse.
-        """
-        for m in self.modules():
-            if isinstance(m, Qwen2_5_VLAttentionDAT):
-                m._dat_warmup_step.fill_(step)
-
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1377,6 +1371,7 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
+    'hd_gate',
 ]
 
 

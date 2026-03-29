@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 
 export WANDB_PROJECT="vldat_experiments"
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 CKPT_ROOT="/mnt/ephemeral/vldat_experiments"
-EXP_NAME="qwen2_5vl-3b-dat-z3_1d5l_s20_g8_i128_newprep_lora_dat"
+EXP_NAME="train_dat_qwen2_5vl_z3_1d5l_s20_g8_i128_hd251k_lora_dat"
 mkdir -p $CKPT_ROOT/$EXP_NAME
 
 # 36-layer Qwen2.5-VL-3B: 1D5L pattern, DAT on layers 0, 6, 12, 18, 24, 30 (0-indexed)
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
-torchrun --nproc_per_node=4 --master_port 39502 llava/train/train_qwen_dat.py \
+torchrun --nproc_per_node=8 --master_port 40010 llava/train/train_qwen_dat.py \
     --model_name_or_path /home/coder/downloaded_data/base_models/Qwen2.5-VL-3B-Instruct \
     --model_family qwen2_5_vl \
-    --data_path /home/coder/downloaded_data/sft_data/llava_hd_merged_1m.json \
+    --data_path /home/coder/downloaded_data/sft_data/llava_hd251k.json \
     --image_folder /home/coder/downloaded_data/sft_data/train_split \
     --use_dat True \
     --dat_layers "$DAT_LAYERS" \
@@ -29,7 +29,7 @@ torchrun --nproc_per_node=4 --master_port 39502 llava/train/train_qwen_dat.py \
     --lora_enable True \
     --lora_r 8 \
     --lora_alpha 16 \
-    --lora_target_layers dat \
+    --lora_target_layers "dat" \
     --lora_lr 2e-5 \
     --tune_mm_vision False \
     --tune_mm_mlp False \
@@ -41,13 +41,13 @@ torchrun --nproc_per_node=4 --master_port 39502 llava/train/train_qwen_dat.py \
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 1 \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 1000 \
+    --save_steps 500 \
     --learning_rate 2e-5 \
     --weight_decay 0. \
-    --warmup_steps 100 \
+    --warmup_steps 50 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --model_max_length 32768 \

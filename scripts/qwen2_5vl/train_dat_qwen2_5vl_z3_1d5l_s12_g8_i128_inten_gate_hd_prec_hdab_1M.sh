@@ -25,7 +25,6 @@ ds llava/train/train_qwen_dat.py \
     --dat_hd_proj True \
     --dat_use_intention_branch True \
     --dat_intention_as_gate True \
-    --dat_hd_attn_bias -10.0 \
     --dat_freeze_base False \
     --dat_lr 5e-6 \
     --visualization_every_n_steps 50 \
