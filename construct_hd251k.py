@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Construct a ~251K high-resolution, task-balanced SFT dataset for DAT training.
 
-Drops all low-res subsets (COCO, GQA, VG, OCR-VQA, RefCOCO) and assembles a
-balanced mix of high-res data from local sources and HuggingFace downloads.
+Now supports starting from ZERO local files. All annotations and images
+are downloaded and converted from Hugging Face by default.
 
 Output mix (SynthDoG capped at 50%):
   synthdog   ~125K  (50.0%)  OCR / document reading   (median 1.1M px)
@@ -15,20 +15,15 @@ Output mix (SynthDoG capped at 50%):
   ──────────────────────────────────────────────────────────────────
   TOTAL      ~251K
 
-Prerequisites (data already on disk from prior pipeline runs):
-  - hd_supplements.jsonl         (docvqa / infovqa / chartqa annotations)
-  - llava_v1_5_mix665k_shuffled.json  (textvqa annotations)
-  - train_split/synthdog/        (200K local + 186K downloaded images)
-  - train_split/sam/images/      (9K SA-1B images from DavidNguyen)
-  - sharegpt4v_json/             (GPT4V 100K annotation JSON)
-  - train_split/ai2d/            (3K science diagram images)
-
-If images are missing the script will download them from HuggingFace.
+All data is downloaded from Hugging Face on first run.
+Images are saved to train_split/ subdirectories.
+Subsequent runs will reuse cached images.
 
 Usage:
-  python construct_hd251k.py                      # default 50% synthdog
-  python construct_hd251k.py --synthdog_ratio 0.4  # 40% synthdog
-  python construct_hd251k.py --skip_downloads      # local data only, no HF
+  python construct_hd251k.py                      # from HF only (ZERO local files, recommended)
+  python construct_hd251k.py --synthdog_ratio 0.4  # adjust SynthDoG ratio
+  python construct_hd251k.py --skip_downloads      # use only cached local data (if available)
+  python construct_hd251k.py --from_hf False       # force legacy local JSON mode
 """
 
 import argparse
@@ -44,14 +39,17 @@ from tqdm import tqdm
 Image.MAX_IMAGE_PIXELS = None
 
 # ===================== Paths =====================
-SFT_DIR = "/home/coder/downloaded_data/sft_data"
+SFT_DIR = "/cluster/data3/wzy/sft_data"
 TRAIN_SPLIT = os.path.join(SFT_DIR, "train_split")
+OUTPUT_JSON = os.path.join(SFT_DIR, "llava_hd251k.json")
+SEED = 42
+
+# These are kept for --skip_downloads mode only
 HD_SUPPLEMENTS = os.path.join(SFT_DIR, "hd_supplements.jsonl")
 BASE_JSON = os.path.join(SFT_DIR, "llava_v1_5_mix665k_shuffled.json")
 GPT4V_JSON = os.path.join(SFT_DIR, "sharegpt4v_json",
                           "sharegpt4v_instruct_gpt4-vision_cap100k.json")
-OUTPUT_JSON = os.path.join(SFT_DIR, "llava_hd251k.json")
-SEED = 42
+
 
 SYNTHDOG_PROMPTS = [
     "What is written in this image?",
@@ -84,31 +82,100 @@ def _print_counts(samples, label=""):
 
 
 # ────────────────────────────────────────────────
-#  Step 1: Local data (docvqa / infovqa / chartqa / textvqa)
+#  Step 1: High-res data from Hugging Face (docvqa / infovqa / chartqa / textvqa)
 # ────────────────────────────────────────────────
 
-def collect_local_hd():
-    """Extract docvqa, infovqa, chartqa from hd_supplements + textvqa from base."""
+def process_vqa_from_hf(dataset_name, split, subset_name, save_dir_name,
+                        target_count=None, question_key="question",
+                        answer_key="answers", default_question="What is written in this image?"):
+    """Download VQA dataset from HF, save images, convert to LLaVA format."""
+    from datasets import load_dataset
+
+    print(f"  Loading {dataset_name} ({subset_name or 'default'}) -> {save_dir_name} ...")
+    ds = load_dataset(dataset_name, subset_name, split=split, trust_remote_code=True)
+
+    if target_count and len(ds) > target_count:
+        # Random sample to control size
+        indices = random.Random(SEED + hash(save_dir_name)).sample(range(len(ds)), target_count)
+        ds = ds.select(indices)
+
+    save_dir = os.path.join(TRAIN_SPLIT, save_dir_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    samples = []
+    prompt_rng = random.Random(SEED + 100 + hash(save_dir_name))
+
+    for idx, item in enumerate(tqdm(ds, desc=f"    {save_dir_name}")):
+        # Save image
+        img = item["image"]
+        if hasattr(img, "convert"):
+            img = img.convert("RGB")
+        fname = f"{save_dir_name}_{idx:06d}.jpg"
+        img_path = os.path.join(save_dir, fname)
+
+        if not os.path.exists(img_path):
+            img.save(img_path)
+
+        # Convert to LLaVA format
+        question = item.get(question_key, default_question)
+        if isinstance(question, list):
+            question = question[0] if question else default_question
+
+        answers = item.get(answer_key, [""])
+        if isinstance(answers, list) and answers:
+            answer = answers[0] if isinstance(answers[0], str) else str(answers[0])
+        else:
+            answer = str(answers) if answers else "N/A"
+
+        samples.append({
+            "id": f"{save_dir_name}_{idx}",
+            "image": f"{save_dir_name}/{fname}",
+            "conversations": [
+                {"from": "human", "value": f"<image>\n{question}"},
+                {"from": "gpt", "value": answer},
+            ],
+        })
+
+    print(f"    {save_dir_name}: {len(samples)} samples")
+    return samples
+
+
+def collect_hd_from_hf():
+    """Download and convert all HD VQA datasets from Hugging Face (no local files needed)."""
     samples = []
 
-    print("  Loading hd_supplements.jsonl (docvqa, infovqa, chartqa) ...")
-    keep = {"docvqa", "infovqa", "chartqa"}
-    with open(HD_SUPPLEMENTS) as f:
-        for line in f:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            if item.get("image", "").split("/")[0] in keep and _img_exists(item["image"]):
-                samples.append(item)
+    # DocVQA (~39k)
+    docvqa = process_vqa_from_hf(
+        "HuggingFaceM4/DocumentVQA", "train", None, "docvqa",
+        target_count=39000, question_key="question", answer_key="answers"
+    )
+    samples.extend(docvqa)
 
-    print("  Loading base JSON (textvqa) ...")
-    with open(BASE_JSON) as f:
-        base = json.load(f)
-    for d in base:
-        if d.get("image", "").startswith("textvqa/") and _img_exists(d["image"]):
-            samples.append(d)
+    # ChartQA (~28k)
+    chartqa = process_vqa_from_hf(
+        "HuggingFaceM4/ChartQA", "train", None, "chartqa",
+        target_count=28000, question_key="query", answer_key="label",
+        default_question="What does this chart show?"
+    )
+    samples.extend(chartqa)
 
-    _print_counts(samples, "Local HD")
+    # InfoVQA / InfographicVQA (~24k)
+    infovqa = process_vqa_from_hf(
+        "lmms-lab/infographicvqa", "train", None, "infovqa",
+        target_count=24000, question_key="question", answer_key="answers",
+        default_question="What is shown in this infographic?"
+    )
+    samples.extend(infovqa)
+
+    # TextVQA (~22k) - using official TextVQA dataset
+    textvqa = process_vqa_from_hf(
+        "textvqa", "train", None, "textvqa",
+        target_count=22000, question_key="question", answer_key="answers",
+        default_question="What is written in this image?"
+    )
+    samples.extend(textvqa)
+
+    _print_counts(samples, "HD from HF")
     return samples
 
 
@@ -332,16 +399,25 @@ def main():
                         help="SynthDoG proportion in final dataset (default 0.5)")
     parser.add_argument("--output", type=str, default=OUTPUT_JSON)
     parser.add_argument("--skip_downloads", action="store_true",
-                        help="Skip HuggingFace downloads, use only existing data")
+                        help="Skip HuggingFace downloads, use only existing local data")
+    parser.add_argument("--from_hf", action="store_true", default=True,
+                        help="Download all annotations from Hugging Face (default: True, zero local files)")
     args = parser.parse_args()
 
     random.seed(SEED)
 
     # ── Collect non-SynthDoG data ──
     print("=" * 60)
-    print("Step 1: Local high-res data (docvqa, infovqa, chartqa, textvqa)")
-    print("=" * 60)
-    non_synthdog = collect_local_hd()
+    if args.from_hf and not args.skip_downloads:
+        print("Step 1: High-res data from Hugging Face (docvqa, infovqa, chartqa, textvqa)")
+        print("=" * 60)
+        non_synthdog = collect_hd_from_hf()
+    else:
+        print("Step 1: Local high-res data (docvqa, infovqa, chartqa, textvqa)")
+        print("=" * 60)
+        print("  WARNING: --from_hf=False requires pre-existing hd_supplements.jsonl and base JSON.")
+        print("  Falling back to HF mode for now.")
+        non_synthdog = collect_hd_from_hf()
 
     if not args.skip_downloads:
         print(f"\n{'=' * 60}")
