@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, List
 
 import torch
+import torch.nn.functional as F
 import transformers
 from torch.utils.data import Dataset, Sampler
 from PIL import Image
@@ -186,6 +187,43 @@ class Qwen2VLTrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Separate learning rate for LoRA adapter parameters"}
     )
     visualization_every_n_steps: int = 10
+    # ---- Online layer-wise Knowledge Distillation (KD) ----
+    kd_on: bool = field(
+        default=False,
+        metadata={"help": "Enable online layer-wise KD that aligns student's per-layer "
+                  "output logits distribution to a frozen base VLM snapshot. "
+                  "Teacher is a pure base Qwen2VL / Qwen2.5VL (no DAT, no LoRA)."}
+    )
+    kd_loss_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight of the aggregated layer-wise KL distillation loss."}
+    )
+    kd_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Temperature used for softmax/log_softmax when computing KD KL divergence."}
+    )
+    kd_layer_stride: int = field(
+        default=1,
+        metadata={"help": "Stride over decoder hidden states for KD (1 = every layer). "
+                  "The final layer is always included. Use >1 to reduce memory/compute."}
+    )
+    kd_base_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the pure base VLM checkpoint used as KD teacher. "
+                  "If None, re-uses model_name_or_path. Loaded fresh without DAT/LoRA wrapping."}
+    )
+    kd_teacher_min_pixels: Optional[int] = field(
+        default=None,
+        metadata={"help": "min_pixels used when feeding images to the KD teacher. "
+                  "Default None -> use processor default (base VLM recommended)."}
+    )
+    kd_teacher_max_pixels: Optional[int] = field(
+        default=None,
+        metadata={"help": "max_pixels used when feeding images to the KD teacher. "
+                  "Default None -> use processor default (base VLM recommended). "
+                  "Teacher typically takes the original HR resolution, while the student's "
+                  "vision pathway takes LR (lr_min_pixels/lr_max_pixels)."}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +604,10 @@ class Qwen2VLCoupledDATDataset(Dataset):
     FACTOR = PATCH_SIZE * MERGE_SIZE  # 28
 
     def __init__(self, data_path, processor, data_args, model_args,
-                 model_max_length, coord_format="qwen2_vl"):
+                 model_max_length, coord_format="qwen2_vl",
+                 kd_enabled: bool = False,
+                 kd_teacher_min_pixels: Optional[int] = None,
+                 kd_teacher_max_pixels: Optional[int] = None):
         super().__init__()
         rank0_print(f"Loading data from {data_path} (coupled LR-HD mode)...")
         self.list_data_dict = json.load(open(data_path, "r"))
@@ -580,12 +621,22 @@ class Qwen2VLCoupledDATDataset(Dataset):
         self.hr_scale = model_args.dat_hr_scale
         self.hd_max_pixels = data_args.hd_max_pixels
 
+        # Knowledge distillation teacher image resolution configuration
+        self.kd_enabled = kd_enabled
+        self.kd_teacher_min_pixels = kd_teacher_min_pixels
+        self.kd_teacher_max_pixels = kd_teacher_max_pixels
+
         rank0_print(
             f"Coupled LR-HD: hr_scale={self.hr_scale}, "
             f"LR pixels=[{data_args.lr_min_pixels}, {data_args.lr_max_pixels}], "
             f"HD = LR * {self.hr_scale}² "
             f"(capped at orig_pixels and hd_max_pixels={self.hd_max_pixels})"
         )
+        if self.kd_enabled:
+            rank0_print(
+                f"[KD-data] Teacher image resolution: min_pixels={self.kd_teacher_min_pixels}, "
+                f"max_pixels={self.kd_teacher_max_pixels} (None => processor default)"
+            )
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -695,6 +746,38 @@ class Qwen2VLCoupledDATDataset(Dataset):
             result["pixel_values_hd"] = inputs_hd["pixel_values"]
             result["image_grid_thw_hd"] = inputs_hd["image_grid_thw"]
 
+        # ---- Optional KD teacher input: higher resolution for the pure base VLM ----
+        # Teacher typically sees the full HR image (processor default min/max pixels),
+        # while the student LR pathway uses lr_min_pixels/lr_max_pixels and relies on
+        # DAT HD features for detail. We reuse the same chat-template text so the
+        # assistant-answer token content (and therefore labels != IGNORE_INDEX count)
+        # is identical on both sides -- only their absolute positions differ because
+        # the two sides end up with different image_pad counts.
+        if self.kd_enabled:
+            teacher_kwargs = {
+                "text": [text],
+                "return_tensors": "pt",
+                "padding": False,
+            }
+            if has_image and img is not None:
+                teacher_kwargs["images"] = [img]
+                if self.kd_teacher_min_pixels is not None:
+                    teacher_kwargs["min_pixels"] = self.kd_teacher_min_pixels
+                if self.kd_teacher_max_pixels is not None:
+                    teacher_kwargs["max_pixels"] = self.kd_teacher_max_pixels
+
+            inputs_teacher = self.processor(**teacher_kwargs)
+            t_ids = inputs_teacher["input_ids"]
+            if t_ids.size(1) > self.model_max_length:
+                t_ids = t_ids[:, :self.model_max_length]
+            t_labels = _apply_label_mask(t_ids)
+
+            result["input_ids_teacher"] = t_ids.squeeze(0)
+            result["labels_teacher"] = t_labels.squeeze(0)
+            if "pixel_values" in inputs_teacher:
+                result["pixel_values_teacher"] = inputs_teacher["pixel_values"]
+                result["image_grid_thw_teacher"] = inputs_teacher["image_grid_thw"]
+
         return result
 
 
@@ -705,7 +788,10 @@ class Qwen2VLSupervisedDataset(Dataset):
     """Dataset for Qwen2VL/Qwen2.5VL supervised fine-tuning (baseline, no DAT)."""
 
     def __init__(self, data_path, processor, data_args, model_max_length,
-                 coord_format="qwen2_vl"):
+                 coord_format="qwen2_vl",
+                 kd_enabled: bool = False,
+                 kd_teacher_min_pixels: Optional[int] = None,
+                 kd_teacher_max_pixels: Optional[int] = None):
         super().__init__()
         rank0_print(f"Loading data from {data_path}...")
         self.list_data_dict = json.load(open(data_path, "r"))
@@ -714,6 +800,9 @@ class Qwen2VLSupervisedDataset(Dataset):
         self.data_args = data_args
         self.model_max_length = model_max_length
         self.coord_format = coord_format
+        self.kd_enabled = kd_enabled
+        self.kd_teacher_min_pixels = kd_teacher_min_pixels
+        self.kd_teacher_max_pixels = kd_teacher_max_pixels
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -790,6 +879,32 @@ class Qwen2VLSupervisedDataset(Dataset):
             result["pixel_values"] = inputs["pixel_values"]
             result["image_grid_thw"] = inputs["image_grid_thw"]
 
+        # ---- Optional KD teacher input (same text, possibly different image resolution) ----
+        if self.kd_enabled:
+            teacher_kwargs = {
+                "text": [text],
+                "return_tensors": "pt",
+                "padding": False,
+            }
+            if has_image and images:
+                teacher_kwargs["images"] = images
+                if self.kd_teacher_min_pixels is not None:
+                    teacher_kwargs["min_pixels"] = self.kd_teacher_min_pixels
+                if self.kd_teacher_max_pixels is not None:
+                    teacher_kwargs["max_pixels"] = self.kd_teacher_max_pixels
+
+            inputs_teacher = self.processor(**teacher_kwargs)
+            t_ids = inputs_teacher["input_ids"]
+            if t_ids.size(1) > self.model_max_length:
+                t_ids = t_ids[:, :self.model_max_length]
+            t_labels = _apply_label_mask(t_ids)
+
+            result["input_ids_teacher"] = t_ids.squeeze(0)
+            result["labels_teacher"] = t_labels.squeeze(0)
+            if "pixel_values" in inputs_teacher:
+                result["pixel_values_teacher"] = inputs_teacher["pixel_values"]
+                result["image_grid_thw_teacher"] = inputs_teacher["image_grid_thw"]
+
         return result
 
 
@@ -843,6 +958,31 @@ class Qwen2VLDataCollator:
         if pv_hd_list:
             batch["pixel_values_hd"] = torch.cat(pv_hd_list, dim=0)
             batch["image_grid_thw_hd"] = torch.cat(grid_hd_list, dim=0)
+
+        # ---- KD teacher: separate inputs with possibly different image resolution ----
+        has_teacher = any("input_ids_teacher" in inst for inst in instances)
+        if has_teacher:
+            input_ids_t = [inst["input_ids_teacher"] for inst in instances]
+            labels_t = [inst["labels_teacher"] for inst in instances]
+            input_ids_t = torch.nn.utils.rnn.pad_sequence(
+                input_ids_t, batch_first=True, padding_value=self.pad_token_id
+            )
+            labels_t = torch.nn.utils.rnn.pad_sequence(
+                labels_t, batch_first=True, padding_value=IGNORE_INDEX
+            )
+            attention_mask_t = input_ids_t.ne(self.pad_token_id)
+            batch["input_ids_teacher"] = input_ids_t
+            batch["labels_teacher"] = labels_t
+            batch["attention_mask_teacher"] = attention_mask_t
+
+            pv_t_list = [inst["pixel_values_teacher"] for inst in instances if "pixel_values_teacher" in inst]
+            gt_t_list = [inst["image_grid_thw_teacher"] for inst in instances if "image_grid_thw_teacher" in inst]
+            if pv_t_list:
+                batch["pixel_values_teacher"] = torch.cat(pv_t_list, dim=0)
+                batch["image_grid_thw_teacher"] = torch.cat(gt_t_list, dim=0)
+            else:
+                batch["pixel_values_teacher"] = None
+                batch["image_grid_thw_teacher"] = None
 
         return batch
 
@@ -1510,6 +1650,25 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
 # ---------------------------------------------------------------------------
 class Qwen2VLTrainer(transformers.Trainer):
 
+    # ---- Keys that are DAT-/trainer-specific and must be stripped before
+    # feeding the pure base VLM teacher model ----
+    _TEACHER_DROP_KEYS = (
+        'pixel_values_hd', 'image_grid_thw_hd',
+        'image_hd_features', 'image_range_list',
+        'image_paths',
+    )
+
+    def __init__(self, *args, kd_teacher: Optional[torch.nn.Module] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kd_teacher = kd_teacher
+        if self.kd_teacher is not None:
+            try:
+                device = next(self.model.parameters()).device
+                self.kd_teacher.to(device)
+                rank0_print(f"[KD] Teacher moved to device {device}")
+            except Exception as e:
+                rank0_print(f"[KD] Failed to move teacher: {e}")
+
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
         image_paths = inputs.pop('image_paths', None)
         if image_paths is not None:
@@ -1711,6 +1870,276 @@ class Qwen2VLTrainer(transformers.Trainer):
         optimizer_cls, optimizer_kwargs = transformers.Trainer.get_optimizer_cls_and_kwargs(self.args)
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
         return self.optimizer
+
+    # ------------------------------------------------------------------
+    # Online layer-wise Knowledge Distillation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_output_embeddings_unwrapped(m):
+        """Fetch ``lm_head`` from a possibly DDP/Accelerate/PEFT-wrapped model.
+
+        PeftModel forwards get_output_embeddings() to the underlying base model,
+        so for most cases a single call is enough.  We still drill through
+        ``.module`` / ``.get_base_model()`` defensively for older wrappers.
+        """
+        cur = m
+        for _ in range(6):
+            if hasattr(cur, 'get_output_embeddings'):
+                try:
+                    head = cur.get_output_embeddings()
+                    if head is not None:
+                        return head
+                except Exception:
+                    pass
+            if hasattr(cur, 'get_base_model'):
+                try:
+                    cur = cur.get_base_model()
+                    continue
+                except Exception:
+                    pass
+            if hasattr(cur, 'base_model'):
+                inner = cur.base_model
+                if hasattr(inner, 'model'):
+                    cur = inner.model
+                else:
+                    cur = inner
+                continue
+            if hasattr(cur, 'module'):
+                cur = cur.module
+                continue
+            break
+        return None
+
+    def _compute_layerwise_kd_loss(
+        self,
+        student_hidden_states,
+        teacher_hidden_states,
+        student_lm_head,
+        teacher_lm_head,
+        student_labels,
+        teacher_labels,
+        temperature: float,
+        layer_stride: int,
+    ):
+        """Compute layer-wise KL(p_teacher || p_student) on **answer tokens only**,
+        with correct alignment when student and teacher sequences have *different*
+        lengths (e.g. when teacher consumes HR resolution while student consumes LR,
+        so the ``<|image_pad|>`` count differs).
+
+        Because (a) student/teacher share the same chat-template text and tokenizer,
+        and (b) ``_apply_label_mask`` only unmasks assistant response tokens, the
+        *number* and *content* of ``labels != IGNORE_INDEX`` tokens are identical
+        per sample across student/teacher -- only their absolute indices differ.
+        We therefore:
+
+          1. Shift both labels for next-token alignment.
+          2. Flatten answer-only hidden states via boolean indexing (batch-major,
+             seq-major) on each side -> shape ``(N_answer, H)``.
+          3. Per-sample count check: abort KD for this step if counts mismatch
+             (safeguard against truncation or tokenizer drift).
+          4. Project only the extracted answer tokens through each side's
+             ``lm_head`` -> ``(N_answer, V)`` logits, which is drastically cheaper
+             than projecting the entire ``(B, seq, H)`` tensor.
+          5. Compute KL(p_teacher || p_student) in fp32 and mean over tokens/layers.
+        """
+        if student_hidden_states is None or teacher_hidden_states is None:
+            return None
+        if student_labels is None or teacher_labels is None:
+            return None
+
+        num_layers = min(len(student_hidden_states), len(teacher_hidden_states))
+        if num_layers == 0:
+            return None
+
+        stride = max(1, int(layer_stride))
+        layer_indices = list(range(0, num_layers, stride))
+        last_idx = num_layers - 1
+        if last_idx not in layer_indices:
+            layer_indices.append(last_idx)
+
+        T = float(temperature) if temperature and temperature > 1e-6 else 1.0
+
+        # ---- Per-side shifted masks (bool) for answer-only positions ----
+        s_shift = student_labels[..., 1:]
+        t_shift = teacher_labels[..., 1:]
+        s_mask = (s_shift != IGNORE_INDEX)
+        t_mask = (t_shift != IGNORE_INDEX)
+
+        s_counts = s_mask.sum(dim=-1)  # (B,)
+        t_counts = t_mask.sum(dim=-1)  # (B,)
+        if not torch.equal(s_counts, t_counts):
+            # Token-count mismatch typically indicates truncation on one side only
+            # (student's LR input is shorter so rarely truncated, but teacher HR
+            # input may exceed model_max_length). Fallback to no-KD for this step.
+            try:
+                rank0_print(
+                    f"[KD] answer-token count mismatch (student={s_counts.tolist()} "
+                    f"vs teacher={t_counts.tolist()}); skipping KD this step"
+                )
+            except Exception:
+                pass
+            return None
+
+        total_answer_tokens = int(s_counts.sum().item())
+        if total_answer_tokens == 0:
+            return None
+
+        device = student_hidden_states[0].device
+        kd_loss = torch.zeros((), device=device, dtype=torch.float32)
+        valid_layers = 0
+        for i in layer_indices:
+            s_h = student_hidden_states[i]
+            t_h = teacher_hidden_states[i]
+            if s_h.shape[-1] != t_h.shape[-1]:
+                # hidden_size mismatch: architectures don't line up; skip layer
+                continue
+
+            # Shift hidden states (skip last position)
+            s_h = s_h[..., :-1, :]
+            t_h = t_h[..., :-1, :]
+
+            # Extract answer-only tokens: result is (N, H), batch-major + seq-major,
+            # so order on both sides lines up as long as per-sample counts matched.
+            s_ans = s_h[s_mask]
+            t_ans = t_h[t_mask]
+
+            # Project just the extracted tokens (cheap compared to full-seq proj).
+            s_logits = student_lm_head(s_ans).float()
+            t_logits = teacher_lm_head(t_ans).float()
+
+            log_p_s = F.log_softmax(s_logits / T, dim=-1)
+            log_p_t = F.log_softmax(t_logits / T, dim=-1)
+
+            per_elem_kl = F.kl_div(log_p_s, log_p_t, log_target=True, reduction='none')
+            per_token_kl = per_elem_kl.sum(dim=-1)  # (N,)
+            layer_kl = per_token_kl.mean()
+
+            kd_loss = kd_loss + layer_kl
+            valid_layers += 1
+
+            del s_logits, t_logits, log_p_s, log_p_t, per_elem_kl, per_token_kl, s_ans, t_ans
+
+        if valid_layers == 0:
+            return None
+        kd_loss = kd_loss / valid_layers * (T * T)
+        return kd_loss
+
+    @staticmethod
+    def _split_student_teacher_inputs(inputs):
+        """Split a collated batch into student / teacher input dicts.
+
+        The dataset may emit a set of keys suffixed with ``_teacher`` that carry
+        a separately-processed (typically higher-resolution) copy of the sample
+        for the KD teacher.  Everything else belongs to the student.
+        """
+        teacher_extras = {}
+        student_inputs = {}
+        for k, v in inputs.items():
+            if k.endswith('_teacher'):
+                base_k = k[:-len('_teacher')]
+                teacher_extras[base_k] = v
+            else:
+                student_inputs[k] = v
+        return student_inputs, teacher_extras
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+        """Override HF default compute_loss to optionally inject online KD from a
+        pure base-VLM teacher (``self.kd_teacher``).  If KD is disabled, the
+        behavior is identical to transformers.Trainer.compute_loss aside from
+        harmless stripping of any ``_teacher`` suffixed fields the dataset may
+        have produced.
+        """
+        # Always strip teacher fields before the student sees inputs, regardless
+        # of kd_on -- otherwise unknown kwargs would crash model.forward().
+        student_inputs, teacher_extras = self._split_student_teacher_inputs(inputs)
+
+        kd_on = getattr(self.args, 'kd_on', False)
+        if (not kd_on) or (self.kd_teacher is None):
+            try:
+                return super().compute_loss(
+                    model, student_inputs,
+                    return_outputs=return_outputs,
+                    num_items_in_batch=num_items_in_batch,
+                )
+            except TypeError:
+                return super().compute_loss(
+                    model, student_inputs,
+                    return_outputs=return_outputs,
+                )
+
+        # ---------- KD path ----------
+        # Student forward: accepts all DAT-specific kwargs (pixel_values_hd, etc.)
+        student_outputs = model(
+            **student_inputs,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        ce_loss = student_outputs.loss
+        if ce_loss is None:
+            zero = torch.zeros((), device=next(model.parameters()).device)
+            return (zero, student_outputs) if return_outputs else zero
+
+        student_hidden_states = student_outputs.hidden_states
+        student_labels = student_inputs.get('labels', None)
+
+        # Build teacher inputs.  Preferred path: dataset emitted ``_teacher``
+        # fields (HR images processed with teacher's min/max pixels).
+        # Fallback path: reuse the LR student inputs (stripped of DAT extras)
+        # so KD still runs on batches/samples that didn't carry a teacher copy
+        # (e.g. text-only, or datasets not updated to emit teacher fields).
+        if teacher_extras:
+            teacher_inputs = dict(teacher_extras)
+            teacher_labels = teacher_inputs.pop('labels', None)
+        else:
+            teacher_inputs = {
+                k: v for k, v in student_inputs.items()
+                if k not in self._TEACHER_DROP_KEYS and k != 'labels'
+            }
+            teacher_labels = student_labels
+
+        with torch.no_grad():
+            teacher_outputs = self.kd_teacher(
+                **teacher_inputs,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        teacher_hidden_states = teacher_outputs.hidden_states
+
+        student_lm_head = self._get_output_embeddings_unwrapped(model)
+        teacher_lm_head = self._get_output_embeddings_unwrapped(self.kd_teacher)
+        if student_lm_head is None or teacher_lm_head is None:
+            rank0_print("[KD] lm_head unavailable on one side; skipping KD this step.")
+            return (ce_loss, student_outputs) if return_outputs else ce_loss
+
+        kd_loss = self._compute_layerwise_kd_loss(
+            student_hidden_states=student_hidden_states,
+            teacher_hidden_states=teacher_hidden_states,
+            student_lm_head=student_lm_head,
+            teacher_lm_head=teacher_lm_head,
+            student_labels=student_labels,
+            teacher_labels=teacher_labels,
+            temperature=float(getattr(self.args, 'kd_temperature', 1.0)),
+            layer_stride=int(getattr(self.args, 'kd_layer_stride', 1)),
+        )
+
+        if kd_loss is None:
+            total_loss = ce_loss
+        else:
+            kd_w = float(getattr(self.args, 'kd_loss_weight', 1.0))
+            total_loss = ce_loss + kd_w * kd_loss.to(ce_loss.dtype)
+
+        # Lightweight rank-0 logging; avoid touching the HF log_history pipeline.
+        try:
+            step = getattr(self.state, 'global_step', 0) if self.state is not None else 0
+            log_every = max(1, int(getattr(self.args, 'logging_steps', 1) or 1))
+            if step % log_every == 0 and local_rank in (0, -1):
+                ce_val = float(ce_loss.detach().float().mean().cpu().item())
+                kd_val = float(kd_loss.detach().float().mean().cpu().item()) if kd_loss is not None else 0.0
+                rank0_print(f"[KD] step={step} ce_loss={ce_val:.4f} kd_loss={kd_val:.4f}")
+        except Exception:
+            pass
+
+        return (total_loss, student_outputs) if return_outputs else total_loss
 
 
 # ---------------------------------------------------------------------------
@@ -1923,9 +2352,48 @@ def train():
 
         print_trainable_parameters(model)
 
+    # ----- KD teacher (pure base VLM, no DAT, no LoRA) -----
+    kd_teacher = None
+    if getattr(training_args, 'kd_on', False):
+        teacher_path = getattr(training_args, 'kd_base_model_path', None) or model_args.model_name_or_path
+        rank0_print(
+            f"[KD] kd_on=True | loss_weight={training_args.kd_loss_weight} | "
+            f"T={training_args.kd_temperature} | layer_stride={training_args.kd_layer_stride}"
+        )
+        rank0_print(f"[KD] Loading pure base VLM as teacher from: {teacher_path}")
+        if is_qwen2_5:
+            from transformers import Qwen2_5_VLForConditionalGeneration as _KD_TeacherCls
+        else:
+            from transformers import Qwen2VLForConditionalGeneration as _KD_TeacherCls
+        kd_teacher = _KD_TeacherCls.from_pretrained(
+            teacher_path,
+            torch_dtype=compute_dtype,
+            attn_implementation="sdpa",
+        )
+        kd_teacher.eval()
+        for p in kd_teacher.parameters():
+            p.requires_grad_(False)
+        try:
+            kd_teacher.config.use_cache = False
+        except Exception:
+            pass
+        try:
+            if hasattr(kd_teacher, 'gradient_checkpointing_disable'):
+                kd_teacher.gradient_checkpointing_disable()
+        except Exception:
+            pass
+        try:
+            t_dtype = next(kd_teacher.parameters()).dtype
+            rank0_print(
+                f"[KD] Teacher ready | type={type(kd_teacher).__name__} | dtype={t_dtype}"
+            )
+        except Exception:
+            pass
+
     # ----- Dataset -----
     coord_format = model_args.model_family  # "qwen2_vl" or "qwen2_5_vl"
     rank0_print(f"Bbox coordinate format: {coord_format}")
+    _kd_enabled_for_dataset = bool(getattr(training_args, 'kd_on', False)) and (kd_teacher is not None)
     if model_args.use_dat:
         train_dataset = Qwen2VLCoupledDATDataset(
             data_path=data_args.data_path,
@@ -1934,6 +2402,9 @@ def train():
             model_args=model_args,
             model_max_length=training_args.model_max_length,
             coord_format=coord_format,
+            kd_enabled=_kd_enabled_for_dataset,
+            kd_teacher_min_pixels=getattr(training_args, 'kd_teacher_min_pixels', None),
+            kd_teacher_max_pixels=getattr(training_args, 'kd_teacher_max_pixels', None),
         )
     else:
         train_dataset = Qwen2VLSupervisedDataset(
@@ -1942,6 +2413,9 @@ def train():
             data_args=data_args,
             model_max_length=training_args.model_max_length,
             coord_format=coord_format,
+            kd_enabled=_kd_enabled_for_dataset,
+            kd_teacher_min_pixels=getattr(training_args, 'kd_teacher_min_pixels', None),
+            kd_teacher_max_pixels=getattr(training_args, 'kd_teacher_max_pixels', None),
         )
     data_collator = Qwen2VLDataCollator(pad_token_id=ENDOFTEXT_ID)
 
@@ -1968,6 +2442,7 @@ def train():
         eval_dataset=None,
         data_collator=data_collator,
         callbacks=callbacks if callbacks else None,
+        kd_teacher=kd_teacher,
     )
     trainer._dat_monitor_callback = dat_monitor
 
