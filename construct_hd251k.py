@@ -59,7 +59,10 @@ def _stable_hash(s: str) -> int:
 Image.MAX_IMAGE_PIXELS = None
 
 # ===================== Paths =====================
-SFT_DIR = "/cluster/data3/wzy/sft_data"
+# NOTE: these globals are the *defaults*. They can be overridden at runtime via
+# --sft_dir on the command line (see main()). Any helper that references these
+# names picks up the updated value because main() rebinds them before use.
+SFT_DIR = "/cluster/nvme6/xzf/sft_data"
 TRAIN_SPLIT = os.path.join(SFT_DIR, "train_split")
 CACHE_DIR = os.path.join(SFT_DIR, "cache")          # per-dataset sample jsonl caches
 OUTPUT_JSON = os.path.join(SFT_DIR, "llava_hd251k.json")
@@ -68,7 +71,9 @@ SEED = 42
 # How often to flush the per-dataset jsonl cache while streaming from HF.
 CACHE_FLUSH_EVERY = 500
 
-# These are kept for --skip_downloads mode only
+# These are kept for --skip_downloads mode only. They are re-derived from the
+# chosen SFT_DIR inside main() once --sft_dir has been parsed, so don't rely on
+# these module-level values after startup.
 HD_SUPPLEMENTS = os.path.join(SFT_DIR, "hd_supplements.jsonl")
 BASE_JSON = os.path.join(SFT_DIR, "llava_v1_5_mix665k_shuffled.json")
 GPT4V_JSON = os.path.join(SFT_DIR, "sharegpt4v_json",
@@ -844,10 +849,23 @@ def _print_resume_state():
 
 
 def main():
+    # All module-level names that main() mutates must be declared `global`
+    # BEFORE they are first referenced (Python enforces this at compile time).
+    global SFT_DIR, TRAIN_SPLIT, CACHE_DIR, OUTPUT_JSON
+    global HD_SUPPLEMENTS, BASE_JSON, GPT4V_JSON
+    global FORCE_REFRESH, TRUST_EXISTING_IMAGES
+
     parser = argparse.ArgumentParser(description="Construct HD-251K SFT dataset")
+    parser.add_argument("--sft_dir", type=str, default=SFT_DIR,
+                        help="Root directory for SFT data. Images will live under "
+                             "<sft_dir>/train_split/, per-dataset jsonl caches under "
+                             "<sft_dir>/cache/, and the final merged JSON at "
+                             "<sft_dir>/llava_hd251k.json (unless --output overrides it).")
     parser.add_argument("--synthdog_ratio", type=float, default=0.5,
                         help="SynthDoG proportion in final dataset (default 0.5)")
-    parser.add_argument("--output", type=str, default=OUTPUT_JSON)
+    parser.add_argument("--output", type=str, default=None,
+                        help="Path for the merged LLaVA-format JSON. Defaults to "
+                             "<sft_dir>/llava_hd251k.json when omitted.")
     parser.add_argument("--skip_downloads", action="store_true",
                         help="Skip HuggingFace downloads, use only existing local data")
     parser.add_argument("--from_hf", action="store_true", default=True,
@@ -860,10 +878,40 @@ def main():
                              "on disk should be reused (only the jsonl cache is rebuilt). "
                              "WARNING: image-QA alignment is NOT guaranteed if the old "
                              "images came from a previous run with a different hash seed.")
+    parser.add_argument("--hf_mirror", action="store_true",
+                        help="Route all HuggingFace traffic through https://hf-mirror.com "
+                             "(useful when the official huggingface.co is unreachable). "
+                             "Equivalent to `export HF_ENDPOINT=https://hf-mirror.com` before running. "
+                             "An already-set HF_ENDPOINT env var is respected and not overwritten.")
     args = parser.parse_args()
 
+    # Honor --hf_mirror as early as possible. `datasets` / `huggingface_hub` / the
+    # `hf` and `huggingface-cli` subprocesses we spawn all read HF_ENDPOINT at
+    # call time, and we haven't imported any of them yet, so setting it here is safe.
+    if args.hf_mirror and not os.environ.get("HF_ENDPOINT"):
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+    # Rebind the path globals so every helper in this module picks up --sft_dir.
+    SFT_DIR = os.path.abspath(args.sft_dir)
+    TRAIN_SPLIT = os.path.join(SFT_DIR, "train_split")
+    CACHE_DIR = os.path.join(SFT_DIR, "cache")
+    OUTPUT_JSON = os.path.join(SFT_DIR, "llava_hd251k.json")
+    HD_SUPPLEMENTS = os.path.join(SFT_DIR, "hd_supplements.jsonl")
+    BASE_JSON = os.path.join(SFT_DIR, "llava_v1_5_mix665k_shuffled.json")
+    GPT4V_JSON = os.path.join(SFT_DIR, "sharegpt4v_json",
+                              "sharegpt4v_instruct_gpt4-vision_cap100k.json")
+    if args.output is None:
+        args.output = OUTPUT_JSON
+    os.makedirs(SFT_DIR, exist_ok=True)
+    os.makedirs(TRAIN_SPLIT, exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    print(f"\n  SFT_DIR          = {SFT_DIR}")
+    print(f"  TRAIN_SPLIT      = {TRAIN_SPLIT}")
+    print(f"  CACHE_DIR        = {CACHE_DIR}")
+    print(f"  OUTPUT_JSON      = {args.output}")
+    print(f"  HF_ENDPOINT      = {os.environ.get('HF_ENDPOINT', 'https://huggingface.co (default)')}")
+
     random.seed(SEED)
-    global FORCE_REFRESH, TRUST_EXISTING_IMAGES
     FORCE_REFRESH = {n.strip() for n in args.force_refresh.split(",") if n.strip()}
     TRUST_EXISTING_IMAGES = {n.strip() for n in args.trust_existing_images.split(",") if n.strip()}
 

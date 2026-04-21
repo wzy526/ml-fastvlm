@@ -67,7 +67,7 @@ from transformers.cache_utils import Cache
 #   "fa2"  — flash_attn 2.x   (flash_attn.flash_attn_func)
 #   "fa3"  — flash_attn 3 / Hopper  (flash_attn_interface)
 #   "fa4"  — flash_attn 4 / Cute    (flash_attn.cute)
-_FA_BACKEND = "fa2"
+_FA_BACKEND = "fa4"
 # ─────────────────────────────────────────────────────────────────────
 
 _flash_attn_func = None

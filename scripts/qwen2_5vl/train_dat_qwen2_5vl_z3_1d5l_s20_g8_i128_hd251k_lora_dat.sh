@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 
 export WANDB_PROJECT="vldat_experiments"
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# node06 RTX PRO 6000 — only 4 GPUs available.
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-CKPT_ROOT="/mnt/ephemeral/vldat_experiments"
-EXP_NAME="train_dat_qwen2_5vl_z3_1d5l_s20_g8_i128_hd251k_lora_dat"
+# Checkpoints go on nvme6a (separate disk from training data to avoid IO contention).
+CKPT_ROOT="/cluster/nvme6a/xzf/vldat_experiments"
+EXP_NAME="dat_qwen2_5vl_z3_1d5l_s20_g8_i128_hd251k_lora_dat"
 mkdir -p $CKPT_ROOT/$EXP_NAME
+
+# Training data lives on nvme6.
+DATA_ROOT="/cluster/nvme6/xzf/sft_data"
+MODEL_PATH="/cluster/nvme6/xzf/base_models/Qwen2.5-VL-3B-Instruct"
 
 # 36-layer Qwen2.5-VL-3B: 1D5L pattern, DAT on layers 0, 6, 12, 18, 24, 30 (0-indexed)
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
-torchrun --nproc_per_node=8 --master_port 40010 llava/train/train_qwen_dat.py \
-    --model_name_or_path /home/coder/downloaded_data/base_models/Qwen2.5-VL-3B-Instruct \
+# 4 GPUs × per_device_batch 8 × grad_accum 2  →  effective batch 64 (same as the original 8-GPU recipe).
+torchrun --nproc_per_node=4 --master_port 40010 llava/train/train_qwen_dat.py \
+    --model_name_or_path $MODEL_PATH \
     --model_family qwen2_5_vl \
-    --data_path /home/coder/downloaded_data/sft_data/llava_hd251k.json \
-    --image_folder /home/coder/downloaded_data/sft_data/train_split \
+    --data_path $DATA_ROOT/llava_hd251k.json \
+    --image_folder $DATA_ROOT/train_split \
     --use_dat True \
     --dat_layers "$DAT_LAYERS" \
     --dat_grid_size 20 \
@@ -41,7 +48,7 @@ torchrun --nproc_per_node=8 --master_port 40010 llava/train/train_qwen_dat.py \
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 2 \
     --eval_strategy "no" \
     --save_strategy "steps" \
     --save_steps 500 \
