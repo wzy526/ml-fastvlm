@@ -614,26 +614,25 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 'l g c h w -> (l g) c h w',
             )
 
-            if self.use_spatial_attn_guide:
-                q_lr_flat = query_states[b_idx, image_range_index]    # [lr_h*lr_w, C]
-                q_int_flat = query_states[b_idx, intention_indices]   # [Lp, C]
-                spatial_attn = torch.matmul(
-                    q_int_flat.float(), q_lr_flat.float().transpose(0, 1),
-                ) / math.sqrt(q_lr_flat.shape[-1])                    # [Lp, lr_h*lr_w]
-                spatial_attn = spatial_attn.softmax(dim=-1).view(Lp, 1, lr_h, lr_w)
-                spatial_attn_guide = F.adaptive_avg_pool2d(
-                    spatial_attn, (self.grid_size, self.grid_size),
-                ) * (lr_h * lr_w)  # normalize so uniform attention ≈ 1.0
-
-        embed_lr_rep = einops.rearrange(
-            einops.repeat(embed_lr, 'g c h w -> l g c h w', l=Lp),
-            'l g c h w -> (l g) c h w',
+        embed_lr_rep = einops.repeat(
+            embed_lr, 'g c h w -> (l g) c h w', l=Lp,
         )
 
+        # Spatial attention guide: Q_intention × Q_lr → spatial saliency map,
+        # applied as a multiplicative bias on LR features so offset prediction
         if self.use_intention_branch and self.use_spatial_attn_guide:
-            spatial_guide_rep = spatial_attn_guide.repeat_interleave(
-                self.off_grps, dim=0,
-            ).to(embed_lr_rep.dtype)  # [(Lp*G), 1, gs, gs] — broadcasts over channels
+            q_lr_flat = query_states[b_idx, image_range_index]    # [lr_h*lr_w, C]
+            q_int_flat = query_states[b_idx, intention_indices]   # [Lp, C]
+            spatial_attn = torch.matmul(
+                q_int_flat.float(), q_lr_flat.float().transpose(0, 1),
+            ) / math.sqrt(q_lr_flat.shape[-1])                    # [Lp, lr_h*lr_w]
+            spatial_attn = spatial_attn.softmax(dim=-1).view(Lp, 1, lr_h, lr_w)
+            spatial_attn_guide = F.adaptive_avg_pool2d(
+                spatial_attn, (self.grid_size, self.grid_size),
+            ) * (lr_h * lr_w)  # normalize: uniform attention ≈ 1.0
+            spatial_guide_rep = einops.repeat(
+                spatial_attn_guide, 'l 1 h w -> (l g) 1 h w', g=self.off_grps,
+            ).to(embed_lr_rep.dtype)
             embed_lr_rep = embed_lr_rep * spatial_guide_rep
 
         if self.use_intention_branch:
