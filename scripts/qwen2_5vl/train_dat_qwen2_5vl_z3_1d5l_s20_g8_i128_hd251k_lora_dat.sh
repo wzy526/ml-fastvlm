@@ -3,6 +3,19 @@
 export WANDB_PROJECT="vldat_experiments"
 # node06 RTX PRO 6000 — only 4 GPUs available.
 export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1
+
+# --- Keep compile/autotune caches OFF the NFS-mounted $HOME ---
+# /cluster/home1/xzf lives on NFS, so the defaults (~/.triton, ~/.cache/...)
+# cause DeepSpeed to warn about autotune hangs on process exit. Redirect
+# every compilation cache to node06-local /tmp instead.
+LOCAL_CACHE_ROOT="/tmp/${USER:-xzf}/vldat_cache"
+export TRITON_CACHE_DIR="$LOCAL_CACHE_ROOT/triton"
+export TORCHINDUCTOR_CACHE_DIR="$LOCAL_CACHE_ROOT/torchinductor"
+export CUDA_CACHE_PATH="$LOCAL_CACHE_ROOT/cuda"
+export XDG_CACHE_HOME="$LOCAL_CACHE_ROOT/xdg"
+mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$CUDA_CACHE_PATH" "$XDG_CACHE_HOME"
 
 # Checkpoints go on nvme6a (separate disk from training data to avoid IO contention).
 CKPT_ROOT="/cluster/nvme6a/xzf/vldat_experiments"
@@ -17,6 +30,11 @@ MODEL_PATH="/cluster/nvme6/xzf/base_models/Qwen2.5-VL-3B-Instruct"
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
 # 4 GPUs × per_device_batch 8 × grad_accum 2  →  effective batch 64 (same as the original 8-GPU recipe).
+# ddp_find_unused_parameters=True is REQUIRED under LoRA+DAT: DAT layers conditionally
+# skip k_proj_hd/v_proj_hd/off-conv/proj_intention/hd_gate when a sample has no image
+# (see modeling_qwen2_5vl_dat.py forward), so the set of params contributing gradients
+# differs across ranks / micro-steps. Default DDP static bucket layout deadlocks at
+# the first NCCL AllReduce → 100% GPU util hang.
 torchrun --nproc_per_node=4 --master_port 40010 llava/train/train_qwen_dat.py \
     --model_name_or_path $MODEL_PATH \
     --model_family qwen2_5_vl \
