@@ -67,7 +67,7 @@ from transformers.cache_utils import Cache
 #   "fa2"  — flash_attn 2.x   (flash_attn.flash_attn_func)
 #   "fa3"  — flash_attn 3 / Hopper  (flash_attn_interface)
 #   "fa4"  — flash_attn 4 / Cute    (flash_attn.cute)
-_FA_BACKEND = "fa4"
+_FA_BACKEND = "fa2"
 # ─────────────────────────────────────────────────────────────────────
 
 _flash_attn_func = None
@@ -264,7 +264,7 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
             'intention_as_gate': True,
             'hd_gate_init': None,      # Learnable HD gate init value (e.g. -10.0); None = disabled
             'use_fused_vit': False,    # Fuse LR+HD into one ViT call (saves kernel launch; costs ~2× activation memory)
-            'use_spatial_attn_guide': True,  # Q_intention × Q_lr spatial attention for offset guidance
+            'use_spatial_attn_guide': False,  # Q_intention × Q_lr spatial attention for offset guidance
         }
 
 
