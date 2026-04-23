@@ -1144,12 +1144,23 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
         # === Step 3: Pre-compute 3D mRoPE position IDs for DAT layers ===
         # DAT layers need [3, B, seq_len] positions (temporal, height, width).
-        # In transformers 5.x, get_rope_index returns [4, B, seq_len] where
-        # dim-0 is text position; strip it so DAT always works with 3D.
+        # transformers 5.5+ requires mm_token_type_ids (0=text,1=image,2=video) and
+        # get_rope_index now returns [3, B, seq_len]. Older 5.x used [4, B, seq_len]
+        # (dim-0 = text); we tolerate both by stripping the leading text dim.
         mrope_position_ids = None
         if image_hd_features is not None and position_ids is None and input_ids is not None:
+            # Build mm_token_type_ids from input_ids (processor-side helper isn't
+            # available here since the data pipeline doesn't emit it).
+            mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
+            image_token_id = getattr(self.config, 'image_token_id', None)
+            if image_token_id is not None:
+                mm_token_type_ids[input_ids == image_token_id] = 1
+            video_token_id = getattr(self.config, 'video_token_id', None)
+            if video_token_id is not None:
+                mm_token_type_ids[input_ids == video_token_id] = 2
             position_ids, rope_deltas = self.model.get_rope_index(
                 input_ids,
+                mm_token_type_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
                 second_per_grid_ts=second_per_grid_ts,
