@@ -149,6 +149,10 @@ class ModelArguments:
     dat_hd_proj: bool = field(default=True)
     dat_use_intention_branch: bool = field(default=True)
     dat_intention_as_gate: bool = field(default=True)
+    dat_use_spatial_attn_guide: bool = field(
+        default=True,
+        metadata={"help": "Enable Q_intention x Q_lr spatial attention guidance when predicting DAT offsets."}
+    )
     dat_insert_kvhd_offset: int = field(
         default=6,
         metadata={"help": "DEPRECATED: intention token position is now computed dynamically"}
@@ -2109,6 +2113,10 @@ class Qwen2VLTrainer(transformers.Trainer):
         device = student_hidden_states[0].device
         kd_loss = torch.zeros((), device=device, dtype=torch.float32)
         valid_layers = 0
+        s_head_w = getattr(student_lm_head, 'weight', None)
+        t_head_w = getattr(teacher_lm_head, 'weight', None)
+        s_proj_dtype = s_head_w.dtype if isinstance(s_head_w, torch.Tensor) else student_hidden_states[0].dtype
+        t_proj_dtype = t_head_w.dtype if isinstance(t_head_w, torch.Tensor) else teacher_hidden_states[0].dtype
         for i in layer_indices:
             s_h = student_hidden_states[i]
             t_h = teacher_hidden_states[i]
@@ -2126,6 +2134,10 @@ class Qwen2VLTrainer(transformers.Trainer):
             t_ans = t_h[t_mask]
 
             # Project just the extracted tokens (cheap compared to full-seq proj).
+            if s_ans.dtype != s_proj_dtype:
+                s_ans = s_ans.to(s_proj_dtype)
+            if t_ans.dtype != t_proj_dtype:
+                t_ans = t_ans.to(t_proj_dtype)
             s_logits = student_lm_head(s_ans).float()
             t_logits = teacher_lm_head(t_ans).float()
 
@@ -2320,6 +2332,7 @@ def train():
             'layers': model_args.dat_layers,
             'use_intention_branch': model_args.dat_use_intention_branch,
             'intention_as_gate': model_args.dat_intention_as_gate,
+            'use_spatial_attn_guide': model_args.dat_use_spatial_attn_guide,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'use_fused_vit': model_args.dat_fused_vit,
             'use_shared_vit': model_args.dat_shared_vit,
