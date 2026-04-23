@@ -19,6 +19,7 @@ The output can be loaded directly with:
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -108,6 +109,21 @@ def main():
 
     processor = AutoProcessor.from_pretrained(args.model_base, trust_remote_code=True, use_fast=False)
     processor.save_pretrained(args.output_dir)
+
+    # Newer transformers' ProcessorMixin.save_pretrained() only writes a unified
+    # `processor_config.json` + `chat_template.jinja` and tokenizer files, skipping
+    # per-component configs. Persist legacy-format files so downstream tooling that
+    # still looks for `preprocessor_config.json` / `video_preprocessor_config.json`
+    # / `chat_template.json` (e.g. evaluation scripts) works without silently
+    # falling back to the base model on the hub.
+    for attr_name in ("image_processor", "video_processor", "feature_extractor"):
+        sub = getattr(processor, attr_name, None)
+        if sub is not None and hasattr(sub, "save_pretrained"):
+            sub.save_pretrained(args.output_dir)
+
+    if isinstance(getattr(processor, "chat_template", None), str):
+        with open(os.path.join(args.output_dir, "chat_template.json"), "w", encoding="utf-8") as f:
+            json.dump({"chat_template": processor.chat_template}, f, ensure_ascii=False, indent=2)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nDone! Saved merged model ({total_params:,} params) to {args.output_dir}")

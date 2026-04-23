@@ -264,6 +264,9 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
             'intention_as_gate': True,
             'hd_gate_init': None,      # Learnable HD gate init value (e.g. -10.0); None = disabled
             'use_fused_vit': False,    # Fuse LR+HD into one ViT call (saves kernel launch; costs ~2× activation memory)
+            'use_shared_vit': False,   # Single HD ViT call; LR tokens are adaptive-pooled from HD features
+                                       # (no LR ViT at all). Overrides use_fused_vit when True.
+                                       # Semantics differ from the baseline LR ViT path → requires retraining.
             'use_spatial_attn_guide': True,  # Q_intention × Q_lr spatial attention for offset guidance
         }
 
@@ -1226,6 +1229,84 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
         return inputs_embeds, image_hd_features
 
+    def _shared_vit_forward(
+        self,
+        pixel_values_hd: torch.Tensor,
+        image_grid_thw_hd: torch.LongTensor,
+        image_grid_thw: torch.LongTensor,
+        input_ids: torch.LongTensor,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Shared-ViT path: one HD ViT call, LR tokens are pooled from HD features.
+
+        Trades one ViT forward for ``adaptive_avg_pool2d`` — the theoretical lower
+        bound for LR+HD encoding cost (≈ HD-only ViT baseline).
+
+        Semantics:
+          - LR tokens come from ``F.adaptive_avg_pool2d(hd_feat, (lr_h, lr_w))``.
+            Different from running the LR image through the ViT separately
+            (the baseline path), so models trained with ``use_shared_vit=False``
+            are not compatible — retraining is required.
+
+        Gradient handling:
+          Entire ViT call is wrapped in ``torch.no_grad()`` — identical to the
+          ``_generate_hd_features`` convention. ViT is treated as frozen
+          feature extractor; neither LR pool nor DAT grid_sample can back-prop
+          into ViT weights. Pool / LLM still train normally on top of the
+          frozen HD features.
+
+        Args:
+            pixel_values_hd:   HD pixel values.
+            image_grid_thw_hd: HD grid dims (drives cu_seqlens inside ViT).
+            image_grid_thw:    LR grid dims. Only used to derive the pool target
+                               (lr_h_merged, lr_w_merged) and to validate token
+                               counts in ``get_placeholder_mask``. pixel_values (LR)
+                               is never touched.
+            input_ids:         token IDs, used to scatter LR tokens into
+                               ``inputs_embeds``.
+
+        Returns:
+            inputs_embeds:     [B, seq_len, C] with pooled LR tokens scattered in.
+            image_hd_features: List[[H_hd, W_hd, C]] — HD features for DAT layers.
+        """
+        spatial_merge = self.config.vision_config.spatial_merge_size
+        vit_dtype = self.model.visual.dtype
+
+        with torch.no_grad():
+            hd_embeds = self.model.visual(
+                pixel_values_hd.to(vit_dtype),
+                grid_thw=image_grid_thw_hd,
+                return_dict=True,
+            ).pooler_output
+            image_hd_features = self._parse_hd_embeds(hd_embeds, image_grid_thw_hd)
+
+            lr_feats: List[torch.Tensor] = []
+            for i, hd_feat in enumerate(image_hd_features):
+                thw_lr = image_grid_thw[i]
+                lr_h = int(thw_lr[1].item()) // spatial_merge
+                lr_w = int(thw_lr[2].item()) // spatial_merge
+
+                hd_chw = hd_feat.permute(2, 0, 1).unsqueeze(0)  # [1, C, H_hd, W_hd]
+                # adaptive_avg_pool2d is more robust than fixed kernel: LR / HD dims
+                # are independently derived from the processor (not strictly hr_scale×).
+                # Upcast to fp32 when in bf16/fp16 to avoid accumulation drift.
+                pool_dtype = hd_chw.dtype
+                pooled = F.adaptive_avg_pool2d(
+                    hd_chw.float() if pool_dtype in (torch.bfloat16, torch.float16) else hd_chw,
+                    (lr_h, lr_w),
+                ).to(pool_dtype)
+                lr_feats.append(pooled.squeeze(0).permute(1, 2, 0).reshape(lr_h * lr_w, -1))
+
+            lr_embeds = torch.cat(lr_feats, dim=0)  # [sum(lr_h*lr_w), C]
+
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        lr_embeds = lr_embeds.to(inputs_embeds.dtype)
+        image_mask, _ = self.model.get_placeholder_mask(
+            input_ids, inputs_embeds=inputs_embeds, image_features=lr_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, lr_embeds)
+
+        return inputs_embeds, image_hd_features
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1267,20 +1348,39 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # === Step 1: ViT feature extraction ===
-        # Fast path: fuse LR + HD into a single ViT call and build inputs_embeds here,
-        # so self.model() receives inputs_embeds directly (pixel_values=None) and skips
-        # its internal ViT call.  Falls back to separate calls when inputs_embeds is
-        # already provided or when pixel_values / input_ids are unavailable.
-        _pixel_values_for_model = pixel_values       # passed to self.model(); set to None when fused
-        _image_grid_thw_for_model = image_grid_thw   # same: None when fused (position_ids pre-computed)
+        # Three-way dispatch (priority: shared > fused > separate):
+        #   · shared : single HD ViT call; LR tokens = adaptive_avg_pool2d(HD features).
+        #              ViT cost ≈ HD-only baseline. Requires retraining (new LR semantics).
+        #   · fused  : one ViT call on cat([LR, HD]). Mathematically identical to the
+        #              separate path (ViT is block-diagonal via cu_seqlens). Saves kernel
+        #              launches; costs ~2× activation memory when ViT is trainable.
+        #   · separate: legacy path, LR ViT + HD ViT in two calls.
+        _pixel_values_for_model = pixel_values       # passed to self.model(); set to None when ViT bypassed
+        _image_grid_thw_for_model = image_grid_thw   # same
 
+        _use_shared_vit = self.config.dat_extra_args.get('use_shared_vit', False)
         _use_fused_vit = self.config.dat_extra_args.get('use_fused_vit', False)
 
-        if (_use_fused_vit
-                and image_hd_features is None
-                and pixel_values is not None and image_grid_thw is not None
-                and pixel_values_hd is not None and image_grid_thw_hd is not None
-                and input_ids is not None and inputs_embeds is None):
+        _have_full_vit_inputs = (
+            image_hd_features is None
+            and pixel_values_hd is not None and image_grid_thw_hd is not None
+            and image_grid_thw is not None
+            and input_ids is not None and inputs_embeds is None
+        )
+
+        if _use_shared_vit and _have_full_vit_inputs:
+            # Shared path: one HD ViT call; LR tokens are pooled from HD features.
+            # pixel_values (LR) is intentionally ignored — LR semantics come from HD.
+            inputs_embeds, image_hd_features = self._shared_vit_forward(
+                pixel_values_hd, image_grid_thw_hd,
+                image_grid_thw,
+                input_ids,
+            )
+            _pixel_values_for_model = None
+            _image_grid_thw_for_model = None
+        elif (_use_fused_vit
+                and _have_full_vit_inputs
+                and pixel_values is not None):
             # Fused path: one ViT call covers both LR and HD (saves kernel launches;
             # costs ~2× activation memory vs separate calls — enable only when VRAM allows).
             inputs_embeds, image_hd_features = self._fused_vit_forward(

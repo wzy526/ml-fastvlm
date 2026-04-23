@@ -1,5 +1,5 @@
 """
-test_dat_full_speed.py  (v3)
+test_dat_full_speed.py  (v4)
 
 Qwen2.5-VL-DAT 端到端测速脚本（与训练配置对齐）。
 
@@ -9,14 +9,15 @@ Qwen2.5-VL-DAT 端到端测速脚本（与训练配置对齐）。
        DAT 路径（含 HD cross-attention）vs LR-only（无 HD，退化为标准 causal attention）。
        flash_attn vs manual SDPA 对比。
 
-  B) 全模型 Prefill 延迟（DAT vs Fair-HD vs LR-only）
-       三路公平对比（均携带相同视觉信息量）：
-         · DAT       : pixel_values_hd → HD ViT + LR ViT + LLM(Nq_lr) + HD cross-attn
-         · Fair-HD   : HD 图像直接作为输入 tokens → HD ViT + LLM(Nq_hd) 纯因果 attn
-                       与 DAT 信息量对等，是 naive 高分辨率基线
-         · LR-only   : pixel_values_hd=None → 仅 LR ViT + LLM(Nq_lr)，无 HD 信息（参考下界）
+  B) 全模型 Prefill 延迟（ViT 路径对比：separate / fused / shared vs baselines）
+       同一模型 × 五路公平对比（运行时切换 dat_extra_args.use_{fused,shared}_vit）：
+         · DAT-Sep   : LR ViT + HD ViT（分两次调用，原始 DAT 路径）
+         · DAT-Fused : cat([LR,HD]) 一次 ViT（与 Sep 数学等价；省 kernel launch）
+         · DAT-Shared: 仅 HD ViT + adaptive_pool 得到 LR tokens（无 LR ViT；需重训）
+         · Fair-HD   : HD 图像直接作为输入 tokens（Nq_hd，标准因果 attn，naive 基线）
+         · LR-only   : 仅 LR ViT + LLM(Nq_lr)，无 HD 信息（速度下界参考）
 
-  C) 逐层耗时分布（CUDA event hook）
+  C) 逐层耗时分布（CUDA event hook） 
        DAT(Nq_lr) vs Fair-HD(Nq_hd)：逐层对比，展示两种 HD 集成方案的每层开销差异。
 
 配置与训练脚本对齐：
@@ -67,7 +68,9 @@ DAT_EXTRA_ARGS = {
     'use_intention_branch': True,
     'intention_as_gate':   True,
     'layers':           DAT_LAYERS,
-    'use_fused_vit':       False,  # 关闭：LR 和 HD 走独立 ViT 调用（省显存）；True 合并为一次调用
+    # ViT 路径标志在 Part B 内按样本动态切换，这里给的是初始默认值。
+    'use_fused_vit':       False,
+    'use_shared_vit':      False,
 }
 
 PATCH_SIZE = 14
@@ -319,31 +322,37 @@ def run_layer_benchmark(dat_model, sample_sizes, device=DEVICE, dtype=DTYPE):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# Part B：全模型 Prefill 延迟（DAT vs Baseline）
+# Part B：全模型 Prefill 延迟（三种 ViT 路径 × 两条 baseline）
 # ════════════════════════════════════════════════════════════════════════════════
+def _set_vit_path(dat_model, mode: str):
+    """运行时切换 DAT ViT 路径。forward() 每次都从 config 读 flag，立即生效。
+
+    mode: 'separate' | 'fused' | 'shared'
+    """
+    cfg = dat_model.config.dat_extra_args
+    cfg['use_fused_vit']  = (mode == 'fused')
+    cfg['use_shared_vit'] = (mode == 'shared')
+
+
 def run_full_model_benchmark(dat_model, processor, vstar_samples,
                              device=DEVICE, dtype=DTYPE):
     """
-    三路公平对比（均使用相同视觉信息量）：
-      · DAT       : pixel_values + pixel_values_hd → LR ViT + HD ViT + LLM(Nq_lr, cross-attn)
-      · Fair-HD   : pixel_values=HD, pixel_values_hd=None → HD ViT + LLM(Nq_hd, causal attn)
-                    与 DAT 信息量对等，naive 高分辨率基线
-      · LR-only   : pixel_values=LR, pixel_values_hd=None → LR ViT + LLM(Nq_lr)，无 HD（参考）
-
-    额外拆分（DAT 专项）：
-      · HD 视觉编码（_generate_hd_features，含 ViT forward）
-      · LLM-only DAT（预计算 HD features，仅测 LLM forward）
-      · flash vs manual SDPA 加速比
+    五路公平对比（同一模型，运行时切换 ViT 路径）：
+      · DAT-Sep    : LR ViT + HD ViT（两次 ViT 调用，原始 DAT 路径）
+      · DAT-Fused  : cat([LR,HD]) 一次 ViT（与 Sep 数学等价，省 kernel launch）
+      · DAT-Shared : 仅 HD ViT + adaptive_pool 得到 LR tokens（无 LR ViT，需重训）
+      · Fair-HD    : HD 图像作为输入 tokens（Nq_hd，标准因果 attn，naive 基线）
+      · LR-only    : 仅 LR ViT + LLM(Nq_lr)，无 HD 信息（速度下界参考）
     """
-    print(f"\n{'═'*116}")
-    print("Part B — 全模型 Prefill 延迟（DAT vs Fair-HD vs LR-only，真实 vstar 图像）")
+    print(f"\n{'═'*130}")
+    print("Part B — 全模型 Prefill 延迟（ViT 路径对比：Sep / Fused / Shared vs Fair-HD / LR-only）")
     print(f"  Fair-HD = 同模型，HD 图像作为普通输入 token（Nq 更长，标准因果 attn）")
     print(f"  LR-only = 同模型，pixel_values_hd=None（无 HD 信息，速度下界参考）")
-    print(f"{'═'*116}")
+    print(f"{'═'*130}")
     print(f"  {'#':>3}  {'Nq-LR':>5}  {'Nq-HD':>5}  {'LR':>6}  {'HD feat':>8}"
-          f"  {'DAT':>8}  {'Fair-HD':>8}  {'LR-only':>8}"
-          f"  {'DAT/FairHD':>10}  {'LLM开销(DAT)':>12}  {'LLM开销(FairHD)':>15}")
-    print(f"  {'─'*113}")
+          f"  {'Sep':>7}  {'Fused':>7}  {'Shared':>7}  {'Fair-HD':>8}  {'LR-only':>8}"
+          f"  {'Shared/Sep':>10}  {'Shared/HD基线':>13}")
+    print(f"  {'─'*127}")
 
     results  = defaultdict(list)
     nq_lrs   = []
@@ -363,12 +372,17 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
             iids   = wi_lr['input_ids'];                   amask   = wi_lr.get('attention_mask')
             pv_hdf = wi_hd_full['pixel_values'].to(dtype); thw_hdf = wi_hd_full['image_grid_thw']
             iids_hdf = wi_hd_full['input_ids'];            amask_hdf = wi_hd_full.get('attention_mask')
-            for _ in range(3):
+            for mode in ('separate', 'fused', 'shared'):
+                _set_vit_path(dat_model, mode)
+                for _ in range(2):
+                    with torch.no_grad():
+                        dat_model(input_ids=iids, attention_mask=amask,
+                                  pixel_values=pv_lr, image_grid_thw=thw_lr,
+                                  pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
+                                  use_cache=False)
+            _set_vit_path(dat_model, 'separate')
+            for _ in range(2):
                 with torch.no_grad():
-                    dat_model(input_ids=iids, attention_mask=amask,
-                              pixel_values=pv_lr, image_grid_thw=thw_lr,
-                              pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
-                              use_cache=False)
                     dat_model(input_ids=iids_hdf, attention_mask=amask_hdf,
                               pixel_values=pv_hdf, image_grid_thw=thw_hdf,
                               pixel_values_hd=None, image_grid_thw_hd=None,
@@ -411,7 +425,7 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
         iids_hdf = inputs_hd_full['input_ids']
         amask_hdf = inputs_hd_full.get('attention_mask')
 
-        # 预计算 HD features（排除 ViT 编码时间来单独测 LLM-DAT forward）
+        # 预计算 HD features（单独测 HD ViT 编码耗时 = HD-only baseline 参考）
         with torch.no_grad():
             hd_feats = dat_model._generate_hd_features(pv_hd, thw_hd)
 
@@ -419,20 +433,18 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
             with torch.no_grad():
                 dat_model._generate_hd_features(pv_hd, thw_hd)
 
-        def fwd_llm_dat():
-            with torch.no_grad():
-                dat_model(input_ids=iids, attention_mask=amask,
-                          pixel_values=pv_lr, image_grid_thw=thw_lr,
-                          image_hd_features=hd_feats, use_cache=False)
-
-        def fwd_dat():
-            with torch.no_grad():
-                dat_model(input_ids=iids, attention_mask=amask,
-                          pixel_values=pv_lr, image_grid_thw=thw_lr,
-                          pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
-                          use_cache=False)
+        def make_fwd_dat(mode):
+            def _f():
+                _set_vit_path(dat_model, mode)
+                with torch.no_grad():
+                    dat_model(input_ids=iids, attention_mask=amask,
+                              pixel_values=pv_lr, image_grid_thw=thw_lr,
+                              pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
+                              use_cache=False)
+            return _f
 
         def fwd_fair_hd():
+            _set_vit_path(dat_model, 'separate')  # baseline 不触发 shared/fused 分支
             with torch.no_grad():
                 dat_model(input_ids=iids_hdf, attention_mask=amask_hdf,
                           pixel_values=pv_hdf, image_grid_thw=thw_hdf,
@@ -440,85 +452,87 @@ def run_full_model_benchmark(dat_model, processor, vstar_samples,
                           use_cache=False)
 
         def fwd_lr_only():
+            _set_vit_path(dat_model, 'separate')
             with torch.no_grad():
                 dat_model(input_ids=iids, attention_mask=amask,
                           pixel_values=pv_lr, image_grid_thw=thw_lr,
                           pixel_values_hd=None, image_grid_thw_hd=None,
                           use_cache=False)
 
-        t_hd_enc  = benchmark_fn(fwd_hd_enc,  warmup=2, iters=5)
-        t_llm_dat = benchmark_fn(fwd_llm_dat, warmup=2, iters=5)
-        t_dat     = benchmark_fn(fwd_dat,     warmup=2, iters=5)
-        t_fair    = benchmark_fn(fwd_fair_hd, warmup=2, iters=5)
-        t_lr      = benchmark_fn(fwd_lr_only, warmup=2, iters=5)
+        t_hd_enc   = benchmark_fn(fwd_hd_enc,               warmup=2, iters=5)
+        t_sep      = benchmark_fn(make_fwd_dat('separate'), warmup=2, iters=5)
+        t_fused    = benchmark_fn(make_fwd_dat('fused'),    warmup=2, iters=5)
+        t_shared   = benchmark_fn(make_fwd_dat('shared'),   warmup=2, iters=5)
+        t_fair     = benchmark_fn(fwd_fair_hd,              warmup=2, iters=5)
+        t_lr       = benchmark_fn(fwd_lr_only,              warmup=2, iters=5)
 
-        llm_dat_ovhd  = t_llm_dat - t_lr   # DAT LLM-only 净开销 vs LR-only
-        llm_fair_ovhd = t_fair - t_lr       # Fair-HD 净开销 vs LR-only
-        dat_vs_fair   = t_dat / t_fair      # DAT E2E vs Fair-HD E2E
+        # Fair-HD 的 ViT 部分就是 HD ViT（Nq 用 HD tokens 作 naive baseline），
+        # 所以 (Fair-HD - HD_ViT) ≈ Fair-HD 的 LLM(Nq_hd) 部分。
+        # Shared 的 ViT 部分也是单次 HD ViT（+ 微量 pool 开销），作为"HD-only ViT 基线"参考。
+        shared_over_sep = t_shared / t_sep
+        shared_over_hd_enc = t_shared / t_hd_enc  # 越接近 1 说明 Shared 接近纯 HD ViT 代价
 
-        results['dat'].append(t_dat)
+        results['sep'].append(t_sep)
+        results['fused'].append(t_fused)
+        results['shared'].append(t_shared)
         results['fair'].append(t_fair)
         results['lr'].append(t_lr)
         results['hd_enc'].append(t_hd_enc)
-        results['llm_dat'].append(t_llm_dat)
 
         hd_h_feat, hd_w_feat = hd_hw
         print(f"  [{i:02d}] {Nq:5d}  {Nq_hd:5d}  {lr_hw[0]}×{lr_hw[1]:<3d}  "
               f"{hd_h_feat}×{hd_w_feat:<4d}"
-              f"  {t_dat:>8.1f}  {t_fair:>8.1f}  {t_lr:>8.1f}"
-              f"  {dat_vs_fair:>9.2f}x"
-              f"  {llm_dat_ovhd:>+11.1f}  {llm_fair_ovhd:>+14.1f}")
+              f"  {t_sep:>7.1f}  {t_fused:>7.1f}  {t_shared:>7.1f}"
+              f"  {t_fair:>8.1f}  {t_lr:>8.1f}"
+              f"  {shared_over_sep:>9.2f}x  {shared_over_hd_enc:>12.2f}x")
 
-    if not results['dat']:
+    # 测完恢复到 separate，避免影响后续 Part C
+    _set_vit_path(dat_model, 'separate')
+
+    if not results['sep']:
         print("  没有成功处理的样本，跳过 Part B")
         return
 
     def avg(k): return sum(results[k]) / len(results[k])
-    aN       = len(results['dat'])
-    a_dat    = avg('dat');  a_fair = avg('fair');  a_lr = avg('lr')
-    a_hd     = avg('hd_enc')
-    a_llm_dat = avg('llm_dat')
-    a_nq_lr  = sum(nq_lrs) / aN
-    a_nq_hd  = sum(nq_hds) / aN
+    aN        = len(results['sep'])
+    a_sep     = avg('sep')
+    a_fused   = avg('fused')
+    a_shared  = avg('shared')
+    a_fair    = avg('fair')
+    a_lr      = avg('lr')
+    a_hd_enc  = avg('hd_enc')
+    a_nq_lr   = sum(nq_lrs) / aN
+    a_nq_hd   = sum(nq_hds) / aN
 
     # 时间分解：
-    #   LR-only  E2E = LR ViT + LLM(Nq_lr)
-    #   Fair-HD  E2E = HD ViT + LLM(Nq_hd)
-    #   DAT      E2E = LR ViT + HD ViT + LLM-DAT(Nq_lr, cross-attn)
-    #   LR ViT 估算 = DAT E2E - HD ViT - LLM-DAT-only
-    vit_lr_est    = a_dat - a_hd - a_llm_dat   # LR ViT 时间估算
-    llm_lr_est    = a_lr - vit_lr_est           # LLM-only LR 时间估算
-    llm_fair_only = a_fair - a_hd               # LLM-only Fair-HD（≈ Fair-HD - HD ViT）
+    #   HD ViT (单独测量)        = a_hd_enc
+    #   DAT-Sep     = LR ViT + HD ViT + LLM-DAT(Nq_lr)
+    #   DAT-Shared  = HD ViT  + pool + LLM-DAT(Nq_lr)   （无 LR ViT）
+    #   ⇒ LR ViT 代价估算 ≈ DAT-Sep − DAT-Shared（如果 pool 开销可忽略）
+    lr_vit_est = a_sep - a_shared
 
-    print(f"\n{'─'*116}")
+    print(f"\n{'─'*130}")
     print(f"  样本数: {aN}  平均 Nq-LR={a_nq_lr:.0f}  Nq-HD={a_nq_hd:.0f}"
-          f"  (HD序列比LR长 {(a_nq_hd/a_nq_lr - 1)*100:.0f}%，"
-          f"HD token数比LR多 {(a_nq_hd - a_nq_lr):.0f})")
+          f"  (HD序列比LR长 {(a_nq_hd/a_nq_lr - 1)*100:.0f}%)")
     print()
-    print(f"  ┌─── E2E Prefill 延迟（含 ViT 编码）───────────────────────────")
-    print(f"  │  LR-only  : {a_lr:>7.1f} ms  (LR ViT + LLM Nq={a_nq_lr:.0f}，无 HD，速度下界)")
-    print(f"  │  Fair-HD  : {a_fair:>7.1f} ms  (HD ViT + LLM Nq={a_nq_hd:.0f}，HD 直接作为 tokens）")
-    print(f"  │  DAT      : {a_dat:>7.1f} ms  (LR ViT + HD ViT + LLM Nq={a_nq_lr:.0f}，cross-attn)")
-    print(f"  │  Fair-HD vs LR-only : {a_fair - a_lr:>+7.1f} ms  ({(a_fair/a_lr - 1)*100:+.1f}%)")
-    print(f"  │  DAT      vs LR-only: {a_dat  - a_lr:>+7.1f} ms  ({(a_dat /a_lr - 1)*100:+.1f}%)")
-    print(f"  │  DAT      vs Fair-HD: {a_dat/a_fair:.2f}x  "
-          f"({'慢' if a_dat > a_fair else '快'} {abs(a_dat - a_fair):.1f} ms)")
+    print(f"  ┌─── E2E Prefill 延迟 ──────────────────────────────────────────────────")
+    print(f"  │  LR-only      : {a_lr:>7.1f} ms   (LR ViT + LLM Nq={a_nq_lr:.0f}，速度下界)")
+    print(f"  │  Fair-HD      : {a_fair:>7.1f} ms   (HD ViT + LLM Nq={a_nq_hd:.0f}，naive HD baseline)")
+    print(f"  │  DAT-Sep      : {a_sep:>7.1f} ms   (LR ViT + HD ViT + LLM-DAT，原始路径)")
+    print(f"  │  DAT-Fused    : {a_fused:>7.1f} ms   (cat LR+HD 一次 ViT + LLM-DAT)")
+    print(f"  │  DAT-Shared   : {a_shared:>7.1f} ms   (仅 HD ViT + pool + LLM-DAT，无 LR ViT)")
     print(f"  │")
-    print(f"  ├─── ViT 编码拆分 ──────────────────────────────────────────────")
-    print(f"  │  HD ViT (单独测量)  : {a_hd:>7.1f} ms")
-    print(f"  │  LR ViT (估算)      : {vit_lr_est:>7.1f} ms  (DAT E2E - HD ViT - LLM-DAT)")
-    print(f"  │  HD/LR ViT 比       : {a_hd/vit_lr_est:.2f}x")
+    print(f"  ├─── Shared vs 其他路径（方案2 效果）─────────────────────────────────")
+    print(f"  │  Shared vs Sep     : {a_shared - a_sep:>+7.1f} ms  "
+          f"({(a_shared/a_sep - 1)*100:+.1f}%)   ← 省下整个 LR ViT")
+    print(f"  │  Shared vs Fused   : {a_shared - a_fused:>+7.1f} ms  "
+          f"({(a_shared/a_fused - 1)*100:+.1f}%)")
+    print(f"  │  Shared vs HD-ViT  : {a_shared - a_hd_enc:>+7.1f} ms  (Shared 理论下界 ≈ HD-only ViT)")
+    print(f"  │  LR ViT 代价估算   : {lr_vit_est:>7.1f} ms  (= DAT-Sep − DAT-Shared)")
     print(f"  │")
-    print(f"  └─── LLM-only 开销对比（排除 ViT）────────────────────────────")
-    print(f"       LLM LR-only  (Nq={a_nq_lr:.0f}): {llm_lr_est:>7.1f} ms  (参考，估算)")
-    print(f"       LLM Fair-HD  (Nq={a_nq_hd:.0f}): {llm_fair_only:>7.1f} ms  (≈ Fair-HD - HD ViT，估算)")
-    print(f"       LLM DAT-only (Nq={a_nq_lr:.0f}): {a_llm_dat:>7.1f} ms  (cross-attn，直接测量)")
-    print(f"       LLM Fair-HD vs LR-only : {llm_fair_only - llm_lr_est:>+7.1f} ms"
-          f"  ({(llm_fair_only/llm_lr_est - 1)*100:+.1f}%，序列长 {a_nq_hd/a_nq_lr:.1f}x)")
-    print(f"       LLM DAT     vs LR-only : {a_llm_dat - llm_lr_est:>+7.1f} ms"
-          f"  ({(a_llm_dat/llm_lr_est - 1)*100:+.1f}%，DAT cross-attn 开销)")
-    print(f"       DAT LLM 效率优势        : {llm_fair_only / a_llm_dat:.1f}x  (Fair-HD LLM / DAT LLM)")
-    print(f"{'─'*116}")
+    print(f"  └─── 参考：纯 ViT 拆分 ────────────────────────────────────────────────")
+    print(f"       HD ViT (单独)  : {a_hd_enc:>7.1f} ms   (方案2 的 ViT 代价下界)")
+    print(f"{'─'*130}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════

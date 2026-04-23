@@ -50,6 +50,54 @@ def rank0_print(*args):
 
 
 # ---------------------------------------------------------------------------
+# Model unwrapping helper
+# ---------------------------------------------------------------------------
+def _unwrap_to_base_dat_model(model):
+    """Peel back DDP / DeepSpeed / PEFT / LoRA wrappers to reach the raw
+    ``Qwen2VLForConditionalGeneration`` / ``Qwen2_5_VLForConditionalGenerationDAT``
+    instance that hosts the ``model.language_model.layers`` tree and receives
+    attribute writes such as ``_batch_image_paths`` / ``_dat_vis_input_ids``.
+
+    Handles (in order) the typical wrapping chain::
+
+        DistributedDataParallel / DeepSpeedEngine   →  .module
+        PeftModel (peft)                            →  .base_model
+        LoraModel (peft)                            →  .model
+
+    Stops when the chain stabilises (no more recognised wrappers).  Always
+    returns a non-None module (the input itself if no wrapper found).
+    """
+    if model is None:
+        return None
+    seen = set()
+    cur = model
+    while id(cur) not in seen:
+        seen.add(id(cur))
+        # DDP / DeepSpeed / Accelerator wrap the module as .module
+        if hasattr(cur, 'module') and isinstance(
+            getattr(cur, 'module', None), torch.nn.Module,
+        ) and type(cur).__name__ in (
+            'DistributedDataParallel', 'DataParallel', 'DeepSpeedEngine',
+            'FullyShardedDataParallel',
+        ):
+            cur = cur.module
+            continue
+        # PEFT's PeftModel  →  .base_model  (which is a LoraModel / LycorisModel / etc.)
+        if type(cur).__name__.startswith('Peft') and hasattr(cur, 'base_model'):
+            cur = cur.base_model
+            continue
+        # peft.tuners.lora.LoraModel (and siblings) keep the real model at .model
+        if type(cur).__name__ in (
+            'LoraModel', 'LycorisModel', 'AdaLoraModel', 'IA3Model',
+            'BoneModel', 'OFTModel',
+        ) and hasattr(cur, 'model'):
+            cur = cur.model
+            continue
+        break
+    return cur
+
+
+# ---------------------------------------------------------------------------
 # Token IDs (Qwen2-VL tokenizer, verified)
 # ---------------------------------------------------------------------------
 IM_START_TOKEN_ID = 151644  # <|im_start|>
@@ -125,6 +173,13 @@ class ModelArguments:
         default=False,
         metadata={"help": "Fuse LR+HD into one ViT call (saves kernel launches; "
                   "costs ~2× activation memory). Default False = separate ViT calls."}
+    )
+    dat_shared_vit: bool = field(
+        default=False,
+        metadata={"help": "Shared-ViT path: single HD ViT call; LR tokens are "
+                  "adaptive-pooled from HD features (no LR ViT at all). ViT cost "
+                  "≈ HD-only baseline. Overrides dat_fused_vit when True. "
+                  "Semantics differ from the LR-ViT baseline → requires retraining."}
     )
     dat_manual_attn: bool = field(
         default=False,
@@ -1269,13 +1324,31 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         self._kvhd_step_cnt = 0
 
     def _harvest_forward_diagnostics(self, model):
-        """Collect offset / gate stats stashed by DAT attention layers during forward."""
+        """Collect offset / gate stats stashed by DAT attention layers during forward.
+
+        ``model`` may be DDP- / PEFT- / LoRA-wrapped.  We always traverse
+        ``model.modules()`` (which recurses through every wrapper) *and* also
+        explicitly walk the unwrapped base model — iterating both yields the
+        same module set but gives us a reliable fallback in pathological
+        wrapper scenarios.
+        """
         if model is None or local_rank != 0:
             return
+
+        # ``model.modules()`` recurses through every submodule including
+        # wrappers — this is the primary traversal path.  We also unwrap
+        # for diagnostics so we can report the exact DAT-attention count.
+        base_model = _unwrap_to_base_dat_model(model)
+
         off_means, off_stds = [], []
         gate_means, gate_stds = [], []
         hd_gate_vals = []
+
+        dat_attn_count = 0
         for module in model.modules():
+            is_dat_attn = 'DAT' in type(module).__name__
+            if is_dat_attn:
+                dat_attn_count += 1
             if hasattr(module, '_dat_offset_stats'):
                 m, s = module._dat_offset_stats
                 off_means.append(m)
@@ -1289,11 +1362,35 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             if hasattr(module, '_dat_hd_gate_value'):
                 hd_gate_vals.append(module._dat_hd_gate_value)
                 del module._dat_hd_gate_value
+
+        # One-time diagnostic: report what the callback sees on its very
+        # first harvest call.  Helps pin down wrapper / training-mode issues
+        # (e.g. zero DAT-attn modules found → wrapper hides them; modules
+        # found but no stats → forward never set them, meaning self.training
+        # was False or the DAT path was skipped).
+        if not getattr(self, '_harvest_diag_logged', False):
+            rank0_print(
+                f"[DATMonitor] _harvest_forward_diagnostics first call: "
+                f"modules traversed via model={type(model).__name__} "
+                f"(base={type(base_model).__name__}), "
+                f"DAT-attention modules found={dat_attn_count}, "
+                f"offset_stats={len(off_means)}, "
+                f"gate_stats={len(gate_means)}, "
+                f"hd_gate_stats={len(hd_gate_vals)}"
+            )
+            self._harvest_diag_logged = True
+
         if hd_gate_vals:
             self._hd_gate_buf.append(sum(hd_gate_vals) / len(hd_gate_vals))
         if off_means:
             self._offset_mean_buf.append(sum(off_means) / len(off_means))
             self._offset_std_buf.append(sum(off_stds) / len(off_stds))
+            if not getattr(self, '_harvest_offset_confirmed', False):
+                rank0_print(
+                    f"[DATMonitor] First successful harvest of offset/gate "
+                    f"stats (#offset={len(off_means)}, #gate={len(gate_means)})"
+                )
+                self._harvest_offset_confirmed = True
         if gate_means:
             self._gate_mean_buf.append(sum(gate_means) / len(gate_means))
             self._gate_std_buf.append(sum(gate_stds) / len(gate_stds))
@@ -1475,6 +1572,8 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
         if model is not None:
             self._model = model
             vis_pick = random.randint(0, 2**31)
+            # ``model.modules()`` recurses through DDP / PEFT / LoRA wrappers
+            # and finds the DAT attention instances regardless.
             for m in model.modules():
                 if hasattr(m, 'grid_size'):
                     m._dat_request_vis = True
@@ -1505,13 +1604,23 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
             except Exception as e:
                 rank0_print(f"[SamplingVis] Error: {e}")
 
-        # Cleanup stored vis data on ALL ranks
+        # Cleanup stored vis data on ALL ranks.  Per-layer flags live on
+        # the DAT attention submodules (found via modules()); the vis
+        # metadata (_dat_vis_input_ids / _dat_vis_image_path /
+        # _batch_image_paths) is written onto the *base* DAT model by
+        # forward(), so we must unwrap wrappers (DDP / PEFT / LoRA) to
+        # locate and delete them.
         if _model is not None:
             for m in _model.modules():
                 if hasattr(m, '_dat_vis_data'):
                     del m._dat_vis_data
+            base_model = _unwrap_to_base_dat_model(_model)
             for _attr in ('_dat_vis_input_ids', '_dat_vis_image_path',
                           '_batch_image_paths'):
+                if base_model is not None and hasattr(base_model, _attr):
+                    delattr(base_model, _attr)
+                # Also clean up on the outer wrapper in case an older code
+                # path set it there (safety net, keeps state consistent).
                 if hasattr(_model, _attr):
                     delattr(_model, _attr)
 
@@ -1552,12 +1661,20 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
         if not layer_data:
             return {}
 
+        # ``_dat_vis_input_ids`` / ``_dat_vis_image_path`` are set by the
+        # *base* DAT model's forward on ``self``.  Under DDP/PEFT/LoRA the
+        # outer ``model`` is a wrapper and does not carry those attrs, so
+        # unwrap before reading.
+        attr_host = _unwrap_to_base_dat_model(model)
+        if attr_host is None:
+            attr_host = model
+
         # --- Decode question text ---
         conv_text = ''
-        if tokenizer is not None and hasattr(model, '_dat_vis_input_ids'):
+        if tokenizer is not None and hasattr(attr_host, '_dat_vis_input_ids'):
             try:
                 full = tokenizer.decode(
-                    model._dat_vis_input_ids, skip_special_tokens=True,
+                    attr_host._dat_vis_input_ids, skip_special_tokens=True,
                 )
                 if 'user\n' in full:
                     question = full.split('user\n')[-1].split('assistant')[0].strip()
@@ -1569,9 +1686,9 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
 
         # --- Load original image ---
         bg_img = None
-        if hasattr(model, '_dat_vis_image_path') and model._dat_vis_image_path:
+        if hasattr(attr_host, '_dat_vis_image_path') and attr_host._dat_vis_image_path:
             try:
-                bg_img = np.asarray(Image.open(model._dat_vis_image_path).convert('RGB'))
+                bg_img = np.asarray(Image.open(attr_host._dat_vis_image_path).convert('RGB'))
             except Exception:
                 pass
 
@@ -1672,7 +1789,12 @@ class Qwen2VLTrainer(transformers.Trainer):
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
         image_paths = inputs.pop('image_paths', None)
         if image_paths is not None:
-            inner = model.module if hasattr(model, 'module') else model
+            # Must store on the innermost base DAT model so that
+            # Qwen2_5_VLDATForConditionalGeneration.forward (which accesses
+            # self._batch_image_paths) can find it under LoRA/PEFT wrapping.
+            # Peeling only one .module level is correct for DDP but leaves
+            # PeftModel/LoraModel in front, hiding the attribute.
+            inner = _unwrap_to_base_dat_model(model)
             inner._batch_image_paths = image_paths
         result = super().training_step(model, inputs, num_items_in_batch, **kwargs)
 
@@ -2200,6 +2322,7 @@ def train():
             'intention_as_gate': model_args.dat_intention_as_gate,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'use_fused_vit': model_args.dat_fused_vit,
+            'use_shared_vit': model_args.dat_shared_vit,
         }
 
         rank0_print(f"Loading DAT model ({model_args.model_family}) from {model_args.model_name_or_path}...")
@@ -2427,7 +2550,13 @@ def train():
     if model_args.use_dat:
         dat_monitor = WandbDATMonitorCallback(use_kvhd=model_args.dat_hd_proj)
         callbacks.append(dat_monitor)
-    if training_args.visualization_every_n_steps > 0 and model_args.dat_manual_attn:
+    # Both the LSE two-pass path (modeling_qwen2_5vl_dat.py) and the manual-
+    # attention path (modeling_qwen2_5vl_dat_manual.py) store _dat_vis_data on
+    # DAT attention modules when _dat_request_vis=True.  The LSE path omits
+    # the per-point attention map but still yields sampling locations — fine
+    # for the viz.  Hence we register the callback whenever DAT is enabled
+    # and visualisation is requested, regardless of the attention backend.
+    if model_args.use_dat and training_args.visualization_every_n_steps > 0:
         callbacks.append(
             WandbSamplingVisCallback(
                 tokenizer=processor.tokenizer, vis_every_n_logs=training_args.visualization_every_n_steps,
