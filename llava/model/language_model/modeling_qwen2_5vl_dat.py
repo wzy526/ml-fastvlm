@@ -251,6 +251,17 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
     model_type = "qwen2_5_vl_dat"
 
     def __init__(self, dat_extra_args=None, **kwargs):
+        # Critical: strip ``model_type`` from kwargs so ``base_config.to_dict()``
+        # (which carries ``model_type='qwen2_5_vl'``) cannot pollute the instance
+        # attribute. Without this the instance ends up with
+        # ``self.model_type='qwen2_5_vl'`` even though the CLASS attribute
+        # (used by ``to_dict()`` / ``config.json``) is ``'qwen2_5_vl_dat'`` —
+        # producing an asymmetric save/load where ``save_pretrained`` applies
+        # the qwen2_vl key-remap (``model.language_model → model``, ``visual
+        # → model.visual`` reverse), but ``from_pretrained`` later queries the
+        # mapping by ``'qwen2_5_vl_dat'`` (no remap registered) and fails to
+        # translate the flat on-disk keys back to the hierarchical param names.
+        kwargs.pop("model_type", None)
         super().__init__(**kwargs)
         self.dat_extra_args = dat_extra_args or {
             'grid_size': 6,            # DAT sampling grid size
@@ -1587,3 +1598,46 @@ def get_lora_target_modules(dat_layers_str, target_layers="all"):
         return rf"model\.language_model\.layers\.({layer_pattern})\.self_attn\.{qkvo}"
     else:
         return rf"model\.language_model\.layers\.\d+\.self_attn\.{qkvo}"
+
+
+# ============================================================================
+# Checkpoint conversion mapping
+# ============================================================================
+# transformers ≥ 5.x uses a *model_type-keyed* conversion table to translate
+# between the flat on-disk layout (``model.layers.*``, ``visual.*``) used by
+# the official Qwen2.5-VL checkpoints and the hierarchical in-memory layout
+# (``model.language_model.layers.*``, ``model.visual.*``) used by the
+# ``Qwen2_5_VLForConditionalGeneration`` class.
+#
+# ``qwen2_5_vl`` is registered as an alias of ``qwen2_vl`` in
+# ``transformers/conversion_mapping.py``, but our DAT subclass advertises
+# ``model_type='qwen2_5_vl_dat'`` which has NO entry, producing an asymmetric
+# save/load:
+#
+#   save_pretrained()  → flat keys on disk (pollution path, see the note in
+#                        ``Qwen2_5_VLDATConfig.__init__``)
+#   from_pretrained()  → no remap → flat keys never translated to hierarchical
+#                        names → every parameter is "unexpected" / "missing".
+#
+# Registering the DAT ``model_type`` to reuse the qwen2_5_vl rules makes the
+# save/load path fully symmetric and also lets freshly-saved merged DAT
+# checkpoints load cleanly via ``Qwen2_5_VLDATForConditionalGeneration
+# .from_pretrained``.
+try:
+    from transformers.conversion_mapping import (
+        get_checkpoint_conversion_mapping as _get_ckpt_mapping,
+        register_checkpoint_conversion_mapping as _register_ckpt_mapping,
+    )
+
+    _qwen25vl_mapping = _get_ckpt_mapping("qwen2_5_vl")
+    if _qwen25vl_mapping is not None and _get_ckpt_mapping("qwen2_5_vl_dat") is None:
+        try:
+            _register_ckpt_mapping("qwen2_5_vl_dat", _qwen25vl_mapping, overwrite=False)
+        except ValueError:
+            # Already registered by another import path — fine.
+            pass
+except ImportError:
+    # Older transformers versions don't expose the conversion_mapping module;
+    # nothing to do (those versions also don't apply the remap in the first
+    # place, so the flat/hierarchical mismatch never arises).
+    pass

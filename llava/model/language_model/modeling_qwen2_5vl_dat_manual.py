@@ -71,6 +71,10 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
     model_type = "qwen2_5_vl_dat"
 
     def __init__(self, dat_extra_args=None, **kwargs):
+        # Strip ``model_type`` so ``base_config.to_dict()`` (which carries
+        # ``model_type='qwen2_5_vl'``) cannot pollute the instance attribute.
+        # See the matching note in modeling_qwen2_5vl_dat.py.
+        kwargs.pop("model_type", None)
         super().__init__(**kwargs)
         self.dat_extra_args = dat_extra_args or {
             'grid_size': 6,            # DAT sampling grid size
@@ -1300,3 +1304,25 @@ def freeze_base_unfreeze_dat(model):
         else:
             param.requires_grad = False
     logger.info(f"Frozen: {total - trainable}/{total} params. Trainable (DAT): {trainable}/{total}")
+
+
+# ============================================================================
+# Checkpoint conversion mapping
+# ============================================================================
+# Register ``qwen2_5_vl_dat`` as an alias of the ``qwen2_5_vl`` key-remap so
+# save/load are symmetric (flat on-disk keys ↔ hierarchical in-memory names).
+# See the detailed note in ``modeling_qwen2_5vl_dat.py``.
+try:
+    from transformers.conversion_mapping import (
+        get_checkpoint_conversion_mapping as _get_ckpt_mapping,
+        register_checkpoint_conversion_mapping as _register_ckpt_mapping,
+    )
+
+    _qwen25vl_mapping = _get_ckpt_mapping("qwen2_5_vl")
+    if _qwen25vl_mapping is not None and _get_ckpt_mapping("qwen2_5_vl_dat") is None:
+        try:
+            _register_ckpt_mapping("qwen2_5_vl_dat", _qwen25vl_mapping, overwrite=False)
+        except ValueError:
+            pass
+except ImportError:
+    pass
