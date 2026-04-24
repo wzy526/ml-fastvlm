@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Single-node 8-GPU recipe for Qwen2.5-VL DAT (shared-ViT), no-KD.
+# Single-node 8-GPU recipe for Qwen2.5-VL DAT (shared-ViT) + merger tuning.
 # This script is for running independently on a1 or a2 (NO cross-node launch).
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
@@ -18,7 +18,7 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-dat_qwen2_5vl_z3_1d5l_s20_g8_i128_hd251k_lora_dat_svit_online_kd}"
+EXP_NAME="${EXP_NAME:-dat_qwen2_5vl_z3_1d5l_s20_g8_i128_hd251k_lora_dat_svit_merger_online_kd}"
 
 # Basic sanity checks to fail fast when paths are wrong.
 if [[ ! -f "$DATA_ROOT/llava_hd251k.json" ]]; then
@@ -77,7 +77,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40110}" llava/train/tr
     --lora_target_layers "dat" \
     --lora_lr 2e-5 \
     --tune_mm_vision False \
-    --tune_mm_mlp False \
+    --tune_mm_mlp True \
     --tune_mm_llm False \
     --kd_on True \
     --kd_loss_weight "${KD_LOSS_WEIGHT:-0.05}" \

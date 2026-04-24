@@ -263,8 +263,13 @@ class Qwen2VLTrainingArguments(transformers.TrainingArguments):
     )
     kd_layer_stride: int = field(
         default=1,
-        metadata={"help": "Stride over decoder hidden states for KD (1 = every layer). "
-                  "The final layer is always included. Use >1 to reduce memory/compute."}
+        metadata={"help": "Deprecated for current KD implementation. Kept for CLI "
+                  "backward compatibility; final-logit KD always uses the last layer."}
+    )
+    kd_last_layer_only: bool = field(
+        default=True,
+        metadata={"help": "Deprecated for current KD implementation. Kept for CLI "
+                  "backward compatibility; final-logit KD always uses the last layer."}
     )
     kd_base_model_path: Optional[str] = field(
         default=None,
@@ -457,6 +462,20 @@ def set_model(model, model_args):
         for n, p in lang.named_parameters():
             p.requires_grad = False
         model.lm_head.requires_grad_(False)
+
+
+def _set_merger_trainable_after_lora(model, trainable: bool) -> int:
+    """Set ``visual.merger`` trainability on a PEFT-wrapped model.
+
+    In LoRA mode, PEFT freezes all base parameters. We selectively re-enable
+    merger params when ``tune_mm_mlp=True`` so projector tuning still works.
+    """
+    touched = 0
+    for name, param in model.named_parameters():
+        if "visual.merger" in name:
+            param.requires_grad = trainable
+            touched += 1
+    return touched
 
 
 def print_trainable_parameters(model):
@@ -2047,7 +2066,7 @@ class Qwen2VLTrainer(transformers.Trainer):
         temperature: float,
         layer_stride: int,
     ):
-        """Compute layer-wise KL(p_teacher || p_student) on **answer tokens only**,
+        """Compute final-logit KL(p_teacher || p_student) on **answer tokens only**,
         with correct alignment when student and teacher sequences have *different*
         lengths (e.g. when teacher consumes HR resolution while student consumes LR,
         so the ``<|image_pad|>`` count differs).
@@ -2066,7 +2085,8 @@ class Qwen2VLTrainer(transformers.Trainer):
           4. Project only the extracted answer tokens through each side's
              ``lm_head`` -> ``(N_answer, V)`` logits, which is drastically cheaper
              than projecting the entire ``(B, seq, H)`` tensor.
-          5. Compute KL(p_teacher || p_student) in fp32 and mean over tokens/layers.
+          5. Project only the last decoder layer through each side's ``lm_head``.
+          6. Compute KL(p_teacher || p_student) in fp32 and mean over answer tokens.
         """
         if student_hidden_states is None or teacher_hidden_states is None:
             return None
@@ -2077,11 +2097,7 @@ class Qwen2VLTrainer(transformers.Trainer):
         if num_layers == 0:
             return None
 
-        stride = max(1, int(layer_stride))
-        layer_indices = list(range(0, num_layers, stride))
         last_idx = num_layers - 1
-        if last_idx not in layer_indices:
-            layer_indices.append(last_idx)
 
         T = float(temperature) if temperature and temperature > 1e-6 else 1.0
 
@@ -2110,52 +2126,37 @@ class Qwen2VLTrainer(transformers.Trainer):
         if total_answer_tokens == 0:
             return None
 
-        device = student_hidden_states[0].device
-        kd_loss = torch.zeros((), device=device, dtype=torch.float32)
-        valid_layers = 0
         s_head_w = getattr(student_lm_head, 'weight', None)
         t_head_w = getattr(teacher_lm_head, 'weight', None)
         s_proj_dtype = s_head_w.dtype if isinstance(s_head_w, torch.Tensor) else student_hidden_states[0].dtype
         t_proj_dtype = t_head_w.dtype if isinstance(t_head_w, torch.Tensor) else teacher_hidden_states[0].dtype
-        for i in layer_indices:
-            s_h = student_hidden_states[i]
-            t_h = teacher_hidden_states[i]
-            if s_h.shape[-1] != t_h.shape[-1]:
-                # hidden_size mismatch: architectures don't line up; skip layer
-                continue
-
-            # Shift hidden states (skip last position)
-            s_h = s_h[..., :-1, :]
-            t_h = t_h[..., :-1, :]
-
-            # Extract answer-only tokens: result is (N, H), batch-major + seq-major,
-            # so order on both sides lines up as long as per-sample counts matched.
-            s_ans = s_h[s_mask]
-            t_ans = t_h[t_mask]
-
-            # Project just the extracted tokens (cheap compared to full-seq proj).
-            if s_ans.dtype != s_proj_dtype:
-                s_ans = s_ans.to(s_proj_dtype)
-            if t_ans.dtype != t_proj_dtype:
-                t_ans = t_ans.to(t_proj_dtype)
-            s_logits = student_lm_head(s_ans).float()
-            t_logits = teacher_lm_head(t_ans).float()
-
-            log_p_s = F.log_softmax(s_logits / T, dim=-1)
-            log_p_t = F.log_softmax(t_logits / T, dim=-1)
-
-            per_elem_kl = F.kl_div(log_p_s, log_p_t, log_target=True, reduction='none')
-            per_token_kl = per_elem_kl.sum(dim=-1)  # (N,)
-            layer_kl = per_token_kl.mean()
-
-            kd_loss = kd_loss + layer_kl
-            valid_layers += 1
-
-            del s_logits, t_logits, log_p_s, log_p_t, per_elem_kl, per_token_kl, s_ans, t_ans
-
-        if valid_layers == 0:
+        s_h = student_hidden_states[last_idx]
+        t_h = teacher_hidden_states[last_idx]
+        if s_h.shape[-1] != t_h.shape[-1]:
             return None
-        kd_loss = kd_loss / valid_layers * (T * T)
+
+        # Shift hidden states (skip last position)
+        s_h = s_h[..., :-1, :]
+        t_h = t_h[..., :-1, :]
+
+        # Extract answer-only tokens: result is (N, H), batch-major + seq-major.
+        s_ans = s_h[s_mask]
+        t_ans = t_h[t_mask]
+
+        if s_ans.dtype != s_proj_dtype:
+            s_ans = s_ans.to(s_proj_dtype)
+        if t_ans.dtype != t_proj_dtype:
+            t_ans = t_ans.to(t_proj_dtype)
+
+        s_logits = student_lm_head(s_ans).float()
+        t_logits = teacher_lm_head(t_ans).float()
+        log_p_s = F.log_softmax(s_logits / T, dim=-1)
+        log_p_t = F.log_softmax(t_logits / T, dim=-1)
+        per_elem_kl = F.kl_div(log_p_s, log_p_t, log_target=True, reduction='none')
+        per_token_kl = per_elem_kl.sum(dim=-1)  # (N,)
+        kd_loss = per_token_kl.mean() * (T * T)
+
+        del s_logits, t_logits, log_p_s, log_p_t, per_elem_kl, per_token_kl, s_ans, t_ans
         return kd_loss
 
     @staticmethod
@@ -2269,6 +2270,13 @@ class Qwen2VLTrainer(transformers.Trainer):
             if step % log_every == 0 and local_rank in (0, -1):
                 ce_val = float(ce_loss.detach().float().mean().cpu().item())
                 kd_val = float(kd_loss.detach().float().mean().cpu().item()) if kd_loss is not None else 0.0
+                total_val = float(total_loss.detach().float().mean().cpu().item())
+                self.log({
+                    "ce_loss": ce_val,
+                    "kd_loss": kd_val,
+                    "total_loss": total_val,
+                    "kd_applied": 1.0 if kd_loss is not None else 0.0,
+                })
                 rank0_print(f"[KD] step={step} ce_loss={ce_val:.4f} kd_loss={kd_val:.4f}")
         except Exception:
             pass
@@ -2476,8 +2484,8 @@ def train():
         model = get_peft_model(model, lora_config)
         rank0_print(f"LoRA target modules pattern: {target_modules}")
 
-        # After PEFT wrapping (which freezes all base params), unfreeze DAT-specific
-        # parameters so they remain fully trainable with their own learning rate.
+        # After PEFT wrapping (which freezes all base params), explicitly restore
+        # selected non-LoRA trainables controlled by tune flags / DAT logic.
         if model_args.use_dat:
             dat_unfrozen = 0
             for name, param in model.named_parameters():
@@ -2485,6 +2493,17 @@ def train():
                     param.requires_grad = True
                     dat_unfrozen += 1
             rank0_print(f"Unfroze {dat_unfrozen} DAT parameters after LoRA wrapping")
+
+        # Respect tune_mm_mlp under LoRA: merger/projector should remain trainable
+        # when requested, and stay frozen otherwise.
+        merger_touched = _set_merger_trainable_after_lora(
+            model, trainable=bool(getattr(model_args, "tune_mm_mlp", False))
+        )
+        rank0_print(
+            f"LoRA + tune_mm_mlp={bool(getattr(model_args, 'tune_mm_mlp', False))}: "
+            f"{'unfroze' if bool(getattr(model_args, 'tune_mm_mlp', False)) else 'kept frozen'} "
+            f"{merger_touched} merger parameters"
+        )
 
         print_trainable_parameters(model)
 
