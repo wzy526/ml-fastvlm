@@ -32,6 +32,45 @@ try:
 except ImportError:
     wandb = None
 
+
+# Module-level guard so that ``wandb.define_metric`` is called at most once per
+# process even if multiple callbacks try to register it independently.
+_WANDB_STEP_METRIC_DEFINED = False
+
+
+def _define_wandb_step_metric() -> None:
+    """Idempotently register ``train/global_step`` as the common step metric.
+
+    Without this, HF's own ``WandbCallback.on_log`` calls ``wandb.log`` *without*
+    a ``step=`` argument, which makes wandb auto-increment its internal
+    ``run.step`` on every log. Our custom DAT callbacks, on the other hand,
+    call ``wandb.log(..., step=state.global_step)`` using HF's global_step.
+    The two step sequences drift apart — one optimization step triggers
+    ``on_log`` 2-3 times (``compute_loss`` self.log + ``_maybe_log_save_evaluate``
+    self.log + sub-step callbacks), so wandb's internal step advances 2-3× per
+    global_step. Eventually our callbacks try to log at a ``step`` below
+    ``run.step``, producing::
+
+        wandb: WARNING Tried to log to step 1 that is less than the current step 5.
+
+    The wandb-recommended fix (see https://wandb.me/define-metric) is to let
+    wandb keep auto-incrementing its internal step *and* tell it to use a
+    specific data field as the X-axis for every metric.
+    """
+    global _WANDB_STEP_METRIC_DEFINED
+    if _WANDB_STEP_METRIC_DEFINED:
+        return
+    if wandb is None or wandb.run is None:
+        return
+    try:
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("*", step_metric="train/global_step")
+        _WANDB_STEP_METRIC_DEFINED = True
+    except Exception:
+        # Best-effort; if it fails we just keep the wandb auto step.
+        pass
+
+
 IGNORE_INDEX = -100
 
 local_rank = None
@@ -1563,7 +1602,16 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             return
 
         if wandb is not None and wandb.run is not None:
-            wandb.log(metrics, step=state.global_step, commit=False)
+            _define_wandb_step_metric()
+            # Don't pass ``step=`` here; HF's own WandbCallback logs without a
+            # step argument, letting wandb auto-increment its internal step.
+            # We piggyback ``train/global_step`` as a data field so the
+            # previously-registered step_metric lines up our curves with the
+            # real training step in the wandb UI.
+            wandb.log(
+                {**metrics, "train/global_step": state.global_step},
+                commit=False,
+            )
         parts = [f"{k}={v:.6g}" for k, v in sorted(metrics.items())]
         rank0_print(f"[DATMonitor] step {state.global_step}: {', '.join(parts)}")
 
@@ -1617,11 +1665,16 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
         if is_vis_step:
             try:
                 import matplotlib.pyplot as plt
+                _define_wandb_step_metric()
                 figs = self._create_sampling_vis(_model, self._tokenizer)
                 for key, fig in figs.items():
+                    # No ``step=`` — the registered step_metric
+                    # (``train/global_step`` in the payload) is what wandb
+                    # will use as the X-axis for this image panel.
                     wandb.log(
-                        {key: wandb.Image(fig)},
-                        step=state.global_step, commit=False,
+                        {key: wandb.Image(fig),
+                         "train/global_step": state.global_step},
+                        commit=False,
                     )
                     plt.close(fig)
             except Exception as e:
