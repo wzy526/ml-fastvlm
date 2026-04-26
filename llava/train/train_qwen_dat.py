@@ -237,15 +237,40 @@ class DataArguments:
     system_message: str = field(default="You are a helpful assistant.")
     hd_max_pixels: int = field(
         default=3211264,
-        metadata={"help": "Hard cap on HD pixel count to prevent OOM (default ~4096 HD tokens)"}
+        metadata={"help": "[Legacy LR-first mode] Hard cap on HD pixel count "
+                  "(default ~4096 HD tokens). Ignored when use_hr_first_resize=True."}
     )
     coupled_lr_hd: bool = field(
         default=True,
         metadata={"help": "DEPRECATED: coupled LR-HD is now the default for DAT. Kept for backward compat."}
     )
-    # LR: 比默认略低但仍在 pretrained 合理范围
-    lr_min_pixels: int = field(default=200704)    # 256*28*28 (默认)
+    # [Legacy LR-first mode] LR pixel range used by the LR processor.
+    lr_min_pixels: int = field(default=200704)    # 256*28*28
     lr_max_pixels: int = field(default=501760)    # 640*28*28 (~640 tokens)
+
+    # ---- HR-first resize (aligned with lmms-eval qwen2_5_dat_vl.py inference) ----
+    # When True, HR is the anchor: HR processor smart_resizes to [hr_min, hr_max] first,
+    # then LR_thw is derived as floor(HR_thw / dat_hr_scale) aligned to spatial_merge=2,
+    # and the LR processor is forced to that exact size (min_pixels=max_pixels=lr_pixels).
+    # This matches the test-time semantics so shared-ViT / DAT geometry is identical
+    # between training and inference.
+    use_hr_first_resize: bool = field(
+        default=False,
+        metadata={"help": "If True, use HR-anchored resize: LR=HR/hr_scale strict ratio. "
+                  "Recommended for shared_vit and aligned with lmms-eval default."}
+    )
+    hr_min_pixels: int = field(
+        default=28224,
+        metadata={"help": "Minimum HR pixel count when use_hr_first_resize=True. "
+                  "Default 28224 matches lmms-eval qwen2_5_dat_vl.py default."}
+    )
+    hr_max_pixels: int = field(
+        default=9031680,
+        metadata={"help": "Maximum HR pixel count when use_hr_first_resize=True. "
+                  "Default 9031680 matches lmms-eval qwen2_5_dat_vl.py default; "
+                  "yields LR<=1280 tokens at hr_scale=3 (LR<=2880 at hr_scale=2)."}
+    )
+
     
 @dataclass
 class Qwen2VLTrainingArguments(transformers.TrainingArguments):
@@ -705,6 +730,69 @@ def compute_coupled_sizes(orig_h, orig_w, lr_pixels, hr_scale,
 
 
 # ---------------------------------------------------------------------------
+# HR-first geometry helpers (aligned with lmms-eval qwen2_5_dat_vl.py)
+# ---------------------------------------------------------------------------
+PATCH_SIZE = 14
+SPATIAL_MERGE = 2
+
+
+def _derive_lr_geometry_from_hr_thw(hd_h_patches: int, hd_w_patches: int, hr_scale: int):
+    """Derive LR (h, w) in 14-px patches as floor(HR / hr_scale) aligned to SPATIAL_MERGE.
+
+    Output guarantees:
+        lr_h_patches and lr_w_patches are multiples of SPATIAL_MERGE (= 2),
+        so that after spatial-merge they yield integer merged-token counts and
+        ``adaptive_avg_pool2d`` in shared-ViT path has a well-defined target.
+
+    Returns (lr_h_patches, lr_w_patches, lr_pixels).
+    ``lr_pixels = lr_h_patches * lr_w_patches * PATCH_SIZE * PATCH_SIZE`` is
+    always a multiple of (SPATIAL_MERGE * PATCH_SIZE)^2 = 28^2 so the
+    Qwen2.5-VL processor's smart_resize will round-trip exactly.
+    """
+    lr_h_patches = max(SPATIAL_MERGE, (hd_h_patches // hr_scale // SPATIAL_MERGE) * SPATIAL_MERGE)
+    lr_w_patches = max(SPATIAL_MERGE, (hd_w_patches // hr_scale // SPATIAL_MERGE) * SPATIAL_MERGE)
+    lr_pixels = lr_h_patches * lr_w_patches * PATCH_SIZE * PATCH_SIZE
+    return lr_h_patches, lr_w_patches, lr_pixels
+
+
+def hr_first_lr_resize(img: Image.Image, processor, hr_scale: int,
+                       hr_min_pixels: int, hr_max_pixels: int):
+    """HR-anchored LR/HR pair, identical semantics to lmms-eval inference.
+
+    Pipeline:
+        1. Run HR processor on the original PIL image with ``[hr_min, hr_max]``
+           to get ``hd_thw`` (in 14-px patches).
+        2. Derive ``lr_h_patches, lr_w_patches = floor(hd_thw / hr_scale)``,
+           snapped to SPATIAL_MERGE multiples.
+        3. Pre-resize the PIL image to ``(lr_w_patches*14, lr_h_patches*14)``
+           with LANCZOS so the LR processor's smart_resize is a no-op.
+        4. Return the pre-resized LR PIL image plus the exact lr_pixels target.
+
+    The caller is expected to feed ``(img_lr_resized, min_pixels=lr_pixels,
+    max_pixels=lr_pixels)`` to the processor for the LR forward, and to use
+    ``inputs_hr`` (returned here) directly as the HD input.
+
+    Returns (img_lr_resized, lr_pixels, inputs_hr, hd_thw).
+    """
+    inputs_hr = processor(
+        images=[img], text=["<|im_start|>"],
+        return_tensors="pt", padding=False,
+        min_pixels=hr_min_pixels, max_pixels=hr_max_pixels,
+    )
+    hd_thw = inputs_hr["image_grid_thw"][0]
+    hd_h_patches = int(hd_thw[1].item())
+    hd_w_patches = int(hd_thw[2].item())
+
+    lr_h_patches, lr_w_patches, lr_pixels = _derive_lr_geometry_from_hr_thw(
+        hd_h_patches, hd_w_patches, hr_scale,
+    )
+    target_h_px = lr_h_patches * PATCH_SIZE
+    target_w_px = lr_w_patches * PATCH_SIZE
+    img_lr_resized = img.resize((target_w_px, target_h_px), Image.Resampling.LANCZOS)
+    return img_lr_resized, lr_pixels, inputs_hr, hd_thw
+
+
+# ---------------------------------------------------------------------------
 # Coupled LR-HD Dataset for DAT
 # ---------------------------------------------------------------------------
 class Qwen2VLCoupledDATDataset(Dataset):
@@ -797,45 +885,62 @@ class Qwen2VLCoupledDATDataset(Dataset):
 
         inputs_hd = None
         if has_image and img is not None:
-            # Step 1: LR — processor 默认（不覆盖 min/max）
-            inputs = self.processor(
-                images=[img],
-                text=[text],
-                return_tensors="pt",
-                padding=False,
-                min_pixels=self.data_args.lr_min_pixels,
-                max_pixels=self.data_args.lr_max_pixels,
-            )
+            if getattr(self.data_args, "use_hr_first_resize", False):
+                # ---- HR-first mode (matches lmms-eval inference) ---------------
+                # HR drives the geometry: we smart_resize the original image to
+                # [hr_min, hr_max], then derive LR_thw = floor(HR_thw / hr_scale)
+                # and force the LR processor to that exact size. ``shared_vit``
+                # then sees the same pool ratio at train and at test time.
+                img_lr, lr_pixels, inputs_hd, _hd_thw = hr_first_lr_resize(
+                    img, self.processor, self.hr_scale,
+                    self.data_args.hr_min_pixels, self.data_args.hr_max_pixels,
+                )
+                inputs = self.processor(
+                    images=[img_lr], text=[text],
+                    return_tensors="pt", padding=False,
+                    min_pixels=lr_pixels, max_pixels=lr_pixels,
+                )
+            else:
+                # ---- Legacy LR-first mode (kept for backward compat) -----------
+                # Step 1: LR — processor 默认（不覆盖 min/max）
+                inputs = self.processor(
+                    images=[img],
+                    text=[text],
+                    return_tensors="pt",
+                    padding=False,
+                    min_pixels=self.data_args.lr_min_pixels,
+                    max_pixels=self.data_args.lr_max_pixels,
+                )
 
-            # Step 2: HD — 尽可能高，但有上限
-            orig_pixels = img.width * img.height
-            thw = inputs["image_grid_thw"][0]
-            lr_h = thw[1].item() * self.FACTOR
-            lr_w = thw[2].item() * self.FACTOR
-            lr_pixels = lr_h * lr_w
+                # Step 2: HD — 尽可能高，但有上限
+                orig_pixels = img.width * img.height
+                thw = inputs["image_grid_thw"][0]
+                lr_h = thw[1].item() * self.FACTOR
+                lr_w = thw[2].item() * self.FACTOR
+                lr_pixels = lr_h * lr_w
 
-            # HD 目标：LR 的 hr_scale² 倍，但不超过原图，也不超过显存上限
-            hd_target = lr_pixels * (self.hr_scale ** 2)
-            hd_target = min(hd_target, orig_pixels)     # 不超过原图
-            hd_target = min(hd_target, self.hd_max_pixels)  # 显存上限
+                # HD 目标：LR 的 hr_scale² 倍，但不超过原图，也不超过显存上限
+                hd_target = lr_pixels * (self.hr_scale ** 2)
+                hd_target = min(hd_target, orig_pixels)     # 不超过原图
+                hd_target = min(hd_target, self.hd_max_pixels)  # 显存上限
 
-            # 保持宽高比，对齐到 FACTOR
-            aspect = img.width / img.height
-            hd_h = int(math.sqrt(hd_target / aspect))
-            hd_w = int(hd_h * aspect)
-            hd_h = max(self.FACTOR, (hd_h // self.FACTOR) * self.FACTOR)
-            hd_w = max(self.FACTOR, (hd_w // self.FACTOR) * self.FACTOR)
-            hd_total = hd_h * hd_w
+                # 保持宽高比，对齐到 FACTOR
+                aspect = img.width / img.height
+                hd_h = int(math.sqrt(hd_target / aspect))
+                hd_w = int(hd_h * aspect)
+                hd_h = max(self.FACTOR, (hd_h // self.FACTOR) * self.FACTOR)
+                hd_w = max(self.FACTOR, (hd_w // self.FACTOR) * self.FACTOR)
+                hd_total = hd_h * hd_w
 
-            # Step 3: HD processing
-            inputs_hd = self.processor(
-                images=[img],
-                text=["<|im_start|>"],
-                return_tensors="pt",
-                padding=False,
-                min_pixels=hd_total,
-                max_pixels=hd_total,
-            )
+                # Step 3: HD processing
+                inputs_hd = self.processor(
+                    images=[img],
+                    text=["<|im_start|>"],
+                    return_tensors="pt",
+                    padding=False,
+                    min_pixels=hd_total,
+                    max_pixels=hd_total,
+                )
         else:
             inputs = self.processor(
                 text=[text],
@@ -964,13 +1069,23 @@ class Qwen2VLSupervisedDataset(Dataset):
         )
 
         if images:
+            # In non-DAT baseline, LR == HR (LLM sees the full-resolution view).
+            # When use_hr_first_resize=True, we use [hr_min, hr_max] so the
+            # baseline sees the same resolution band as the DAT student would
+            # encode at HR-first inference time (single-tower fairness).
+            if getattr(self.data_args, "use_hr_first_resize", False):
+                _min_p = self.data_args.hr_min_pixels
+                _max_p = self.data_args.hr_max_pixels
+            else:
+                _min_p = self.data_args.lr_min_pixels
+                _max_p = self.data_args.lr_max_pixels
             inputs = self.processor(
                 images=images,
                 text=[text],
                 return_tensors="pt",
                 padding=False,
-                min_pixels=self.data_args.lr_min_pixels,
-                max_pixels=self.data_args.lr_max_pixels,
+                min_pixels=_min_p,
+                max_pixels=_max_p,
             )
         else:
             inputs = self.processor(
