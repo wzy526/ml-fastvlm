@@ -10,8 +10,10 @@ export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 ADL_TMP="/root/autodl-tmp"
 
 # Avoid numexpr thread-limit errors on high-core machines.
-export NUMEXPR_MAX_THREADS=256
-export NUMEXPR_NUM_THREADS=64
+export NUMEXPR_MAX_THREADS=4
+export NUMEXPR_NUM_THREADS=4
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
 
 # -------- Path config (override by exporting env vars before running) --------
 DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"

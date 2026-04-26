@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Single-node 8-GPU recipe for Qwen2.5-VL DAT (shared-ViT), no-KD.
+# Single-node 8-GPU recipe for Qwen2.5-VL DAT, zoom ratio 2, no-KD.
+# Baseline ablation point: shared_vit=True, tune_mm_mlp=False.
 # This script is for running independently on a1 or a2 (NO cross-node launch).
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
@@ -20,7 +21,7 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-dat_qwen2_5vl_z3_1d5l_s20_g8_i128_hd251k_lora_dat_svit_online_kd}"
+EXP_NAME="${EXP_NAME:-dat_qwen2_5vl_z2_1d5l_s20_g8_i128_hd251k_lora_dat_svit_online}"
 
 # Basic sanity checks to fail fast when paths are wrong.
 if [[ ! -f "$DATA_ROOT/llava_hd251k.json" ]]; then
@@ -54,8 +55,6 @@ export NCCL_P2P_DISABLE=0
 
 # 36-layer Qwen2.5-VL-3B: 1D5L pattern, DAT on layers 0, 6, 12, 18, 24, 30.
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
-KD_BASE_MODEL_PATH="${KD_BASE_MODEL_PATH:-$MODEL_PATH}"
-
 torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40110}" llava/train/train_qwen_dat.py \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
@@ -66,7 +65,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40110}" llava/train/tr
     --dat_grid_size 20 \
     --dat_off_grps 8 \
     --dat_inter_size 128 \
-    --dat_hr_scale 3 \
+    --dat_hr_scale 2 \
     --dat_hd_proj True \
     --dat_use_intention_branch True \
     --dat_intention_as_gate True \
@@ -81,12 +80,6 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40110}" llava/train/tr
     --tune_mm_vision False \
     --tune_mm_mlp False \
     --tune_mm_llm False \
-    --kd_on True \
-    --kd_loss_weight "${KD_LOSS_WEIGHT:-0.05}" \
-    --kd_temperature "${KD_TEMPERATURE:-2.0}" \
-    --kd_layer_stride "${KD_LAYER_STRIDE:-6}" \
-    --kd_last_layer_only "${KD_LAST_LAYER_ONLY:-True}" \
-    --kd_base_model_path "$KD_BASE_MODEL_PATH" \
     --bf16 True \
     --tf32 True \
     --max_grad_norm 1.0 \
