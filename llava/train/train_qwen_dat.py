@@ -248,27 +248,41 @@ class DataArguments:
     lr_min_pixels: int = field(default=200704)    # 256*28*28
     lr_max_pixels: int = field(default=501760)    # 640*28*28 (~640 tokens)
 
-    # ---- HR-first resize (aligned with lmms-eval qwen2_5_dat_vl.py inference) ----
+    # ---- HR-first resize (DEPRECATED: kept for ablation but not recommended) ----
     # When True, HR is the anchor: HR processor smart_resizes to [hr_min, hr_max] first,
     # then LR_thw is derived as floor(HR_thw / dat_hr_scale) aligned to spatial_merge=2,
-    # and the LR processor is forced to that exact size (min_pixels=max_pixels=lr_pixels).
-    # This matches the test-time semantics so shared-ViT / DAT geometry is identical
-    # between training and inference.
+    # and the LR processor is forced to that exact size.
+    # NOTE: this couples LR seq length to HR_max via the hr_scale^2 ratio, which
+    # defeats DAT's "short-LLM-seq + long-HD-pool" efficiency goal. Use
+    # use_decoupled_hr_lr=True instead for the main route.
     use_hr_first_resize: bool = field(
         default=False,
-        metadata={"help": "If True, use HR-anchored resize: LR=HR/hr_scale strict ratio. "
-                  "Recommended for shared_vit and aligned with lmms-eval default."}
+        metadata={"help": "[Deprecated] Use HR-anchored resize: LR=HR/hr_scale strict ratio."}
     )
+
+    # ---- Decoupled LR / HR mode (the DAT efficiency-aligned route) -------------
+    # LR runs the legacy [lr_min, lr_max] band so the LLM sees a base-VLM-compatible
+    # short sequence (~640 tokens). HR independently smart_resizes to [hr_min, hr_max],
+    # which can be much larger (e.g. 11520 HD tokens) without lengthening the LLM
+    # sequence. The DAT path consumes HD features only via deformable cross-attention,
+    # so HD/LR ratio is unconstrained -- LR/HR are decoupled.
+    use_decoupled_hr_lr: bool = field(
+        default=False,
+        metadata={"help": "DAT-canonical mode: LR uses [lr_min,lr_max] (short LLM seq, "
+                  "base-VLM-compatible). HR independently uses [hr_min,hr_max] (high-fidelity "
+                  "HD features for DAT cross-attention). LR/HR ratio is not constrained "
+                  "by hr_scale; deformable grid_sample handles arbitrary ratios."}
+    )
+
     hr_min_pixels: int = field(
         default=28224,
-        metadata={"help": "Minimum HR pixel count when use_hr_first_resize=True. "
+        metadata={"help": "Minimum HR pixel count for use_hr_first_resize / use_decoupled_hr_lr. "
                   "Default 28224 matches lmms-eval qwen2_5_dat_vl.py default."}
     )
     hr_max_pixels: int = field(
         default=9031680,
-        metadata={"help": "Maximum HR pixel count when use_hr_first_resize=True. "
-                  "Default 9031680 matches lmms-eval qwen2_5_dat_vl.py default; "
-                  "yields LR<=1280 tokens at hr_scale=3 (LR<=2880 at hr_scale=2)."}
+        metadata={"help": "Maximum HR pixel count for use_hr_first_resize / use_decoupled_hr_lr. "
+                  "Default 9031680 (~11520 HD tokens) matches lmms-eval qwen2_5_dat_vl.py default."}
     )
 
     
@@ -890,15 +904,30 @@ class Qwen2VLCoupledDATDataset(Dataset):
 
         inputs_hd = None
         if has_image and img is not None:
-            if getattr(self.data_args, "use_hr_first_resize", False):
-                # ---- HR-first mode (matches lmms-eval inference) ---------------
-                # HR drives the geometry: we smart_resize the original image to
-                # [hr_min, hr_max], then derive LR_thw = floor(HR_thw / hr_scale)
-                # and force the LR processor to that exact size. ``shared_vit``
-                # then sees the same pool ratio at train and at test time.
-                # Note: pass the original PIL to the LR processor (NOT a
-                # pre-resized one) so smart_resize uses BICUBIC matching
-                # base Qwen2.5-VL pretraining. See hr_first_lr_resize docstring.
+            if getattr(self.data_args, "use_decoupled_hr_lr", False):
+                # ---- Decoupled mode (DAT-canonical) -----------------------------
+                # LR uses [lr_min, lr_max] -- short LLM seq, base-VLM-compatible.
+                # HR uses [hr_min, hr_max] independently -- high-fidelity feature
+                # pool for DAT deformable cross-attention. No hr_scale ratio
+                # constraint between the two; ``adaptive_avg_pool2d`` and
+                # ``grid_sample`` (deformable) handle arbitrary LR/HR ratios.
+                inputs = self.processor(
+                    images=[img], text=[text],
+                    return_tensors="pt", padding=False,
+                    min_pixels=self.data_args.lr_min_pixels,
+                    max_pixels=self.data_args.lr_max_pixels,
+                )
+                inputs_hd = self.processor(
+                    images=[img], text=["<|im_start|>"],
+                    return_tensors="pt", padding=False,
+                    min_pixels=self.data_args.hr_min_pixels,
+                    max_pixels=self.data_args.hr_max_pixels,
+                )
+            elif getattr(self.data_args, "use_hr_first_resize", False):
+                # ---- [Deprecated] HR-first mode --------------------------------
+                # HR-anchored: LR_thw = floor(HR_thw / hr_scale) strict ratio.
+                # Couples LR seq to HR via hr_scale^2 -- defeats DAT efficiency.
+                # Kept for ablation; use_decoupled_hr_lr is preferred.
                 lr_pixels, inputs_hd, _hd_thw = hr_first_lr_resize(
                     img, self.processor, self.hr_scale,
                     self.data_args.hr_min_pixels, self.data_args.hr_max_pixels,

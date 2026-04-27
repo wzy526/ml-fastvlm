@@ -1,24 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Single-node 8-GPU recipe: same as svit_z3_hrfirst_no_kd, but with
-# tune_mm_mlp=True so visual.merger is unfrozen during LoRA training.
-#
-# Goal: ablation pair to measure whether tuning the merger / projector helps
-#       under shared_vit. In shared_vit mode the LR tokens come from
-#       adaptive_avg_pool2d(HD features), so the merger MLP only sees HD
-#       features (not pooled LR features) -- this experiment tests whether
-#       letting the merger adapt to the new HR-first regime improves
-#       end-task accuracy.
-#
-# Trainable params under LoRA + tune_mm_mlp=True:
-#   - LoRA adapters on DAT layers' q/k/v/o (lora_target_layers=dat)
-#   - DAT module params (always trainable)
-#   - visual.merger.* (unfrozen by _set_merger_trainable_after_lora)
-# Frozen: visual.blocks (vision encoder body), base LLM, lm_head.
-#
-# Compare against train_dat_qwen2_5vl_svit_z3_hrfirst_8gpu_adl.sh
-# (identical config except tune_mm_mlp=False).
+# Same as sepvit_z3_decoupled.sh, but with tune_mm_mlp=True so visual.merger
+# is unfrozen. Ablation pair to measure whether the merger benefits from
+# adapting to DAT-injected HD features under the decoupled LR/HR setup.
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
@@ -36,25 +21,22 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0427_q25vl_svit_z3_hrfirst_tunemlp_no_kd}"
+EXP_NAME="${EXP_NAME:-0427_q25vl_sepvit_z3_decoupled_tunemlp_no_kd}"
 
-# Basic sanity checks to fail fast when paths are wrong.
+# Basic sanity checks.
 if [[ ! -f "$DATA_ROOT/llava_hd251k.json" ]]; then
-    echo "[ERROR] Missing data file: $DATA_ROOT/llava_hd251k.json" >&2
-    exit 1
+    echo "[ERROR] Missing data file: $DATA_ROOT/llava_hd251k.json" >&2; exit 1
 fi
 if [[ ! -d "$DATA_ROOT/train_split" ]]; then
-    echo "[ERROR] Missing image folder: $DATA_ROOT/train_split" >&2
-    exit 1
+    echo "[ERROR] Missing image folder: $DATA_ROOT/train_split" >&2; exit 1
 fi
 if [[ ! -d "$MODEL_PATH" ]]; then
-    echo "[ERROR] Missing model path: $MODEL_PATH" >&2
-    exit 1
+    echo "[ERROR] Missing model path: $MODEL_PATH" >&2; exit 1
 fi
 
 mkdir -p "$CKPT_ROOT/$EXP_NAME"
 
-# Put all compile/autotune caches on large local disk.
+# Compile / autotune caches on large local disk.
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$CACHE_ROOT/triton}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$CACHE_ROOT/torchinductor}"
 export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-$CACHE_ROOT/cuda}"
@@ -63,28 +45,30 @@ mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$CUDA_CACHE_PATH" "$XDG
 
 # -------- Single-node 8 GPU launch config --------
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-# Single-node only: IB is not needed.
 export NCCL_IB_DISABLE=1
-# Keep P2P enabled by default; if your machine hangs, set NCCL_P2P_DISABLE=1.
 export NCCL_P2P_DISABLE=0
 
 # 36-layer Qwen2.5-VL-3B: 1D5L pattern, DAT on layers 0, 6, 12, 18, 24, 30.
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
-# -------- HR-first resize parameters (lmms-eval aligned) ---------------------
-USE_HR_FIRST="${USE_HR_FIRST:-True}"
+# -------- Decoupled LR/HR resize parameters ----------------------------------
+LR_MIN_PIXELS="${LR_MIN_PIXELS:-200704}"
+LR_MAX_PIXELS="${LR_MAX_PIXELS:-501760}"
 HR_MIN_PIXELS="${HR_MIN_PIXELS:-28224}"
 HR_MAX_PIXELS="${HR_MAX_PIXELS:-9031680}"
 
 # Optional dedicated LR for merger params; default reuses base learning_rate.
 MM_PROJECTOR_LR="${MM_PROJECTOR_LR:-2e-5}"
 
-torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40330}" llava/train/train_qwen_dat.py \
+torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40620}" llava/train/train_qwen_dat.py \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_ROOT/llava_hd251k.json" \
     --image_folder "$DATA_ROOT/train_split" \
-    --use_hr_first_resize "$USE_HR_FIRST" \
+    --use_decoupled_hr_lr True \
+    --use_hr_first_resize False \
+    --lr_min_pixels "$LR_MIN_PIXELS" \
+    --lr_max_pixels "$LR_MAX_PIXELS" \
     --hr_min_pixels "$HR_MIN_PIXELS" \
     --hr_max_pixels "$HR_MAX_PIXELS" \
     --use_dat True \
@@ -96,7 +80,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40330}" llava/train/tr
     --dat_hd_proj True \
     --dat_use_intention_branch True \
     --dat_intention_as_gate True \
-    --dat_shared_vit True \
+    --dat_shared_vit False \
     --dat_freeze_base False \
     --dat_lr 1e-4 \
     --lora_enable True \
@@ -114,9 +98,9 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40330}" llava/train/tr
     --max_grad_norm 1.0 \
     --output_dir "$CKPT_ROOT/$EXP_NAME" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS:-1}" \
-    --per_device_train_batch_size "${PER_DEVICE_BATCH:-2}" \
+    --per_device_train_batch_size "${PER_DEVICE_BATCH:-4}" \
     --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps "${GRAD_ACCUM:-4}" \
+    --gradient_accumulation_steps "${GRAD_ACCUM:-2}" \
     --eval_strategy "no" \
     --save_strategy "steps" \
     --save_steps "${SAVE_STEPS:-500}" \
