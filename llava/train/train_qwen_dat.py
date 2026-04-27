@@ -764,15 +764,23 @@ def hr_first_lr_resize(img: Image.Image, processor, hr_scale: int,
            to get ``hd_thw`` (in 14-px patches).
         2. Derive ``lr_h_patches, lr_w_patches = floor(hd_thw / hr_scale)``,
            snapped to SPATIAL_MERGE multiples.
-        3. Pre-resize the PIL image to ``(lr_w_patches*14, lr_h_patches*14)``
-           with LANCZOS so the LR processor's smart_resize is a no-op.
-        4. Return the pre-resized LR PIL image plus the exact lr_pixels target.
+        3. Compute ``lr_pixels = lr_h_patches * lr_w_patches * PATCH_SIZE^2``;
+           since this is exactly a multiple of ``(SPATIAL_MERGE * PATCH_SIZE)^2 = 28^2``,
+           the processor's ``smart_resize`` will round-trip to the exact target
+           size when called with ``min_pixels = max_pixels = lr_pixels``.
 
-    The caller is expected to feed ``(img_lr_resized, min_pixels=lr_pixels,
-    max_pixels=lr_pixels)`` to the processor for the LR forward, and to use
-    ``inputs_hr`` (returned here) directly as the HD input.
+    Critical: we do **not** pre-resize the PIL image ourselves. The image
+    processor's ``smart_resize`` uses ``BICUBIC`` interpolation by default
+    (PILImageResampling.BICUBIC), which is what base Qwen2.5-VL was
+    pretrained on. Pre-resizing here with PIL/LANCZOS would produce a
+    sharper-than-pretrained signal and shift the ViT input distribution
+    (loss climbs from ~0.2 to ~0.7 when this happens).
 
-    Returns (img_lr_resized, lr_pixels, inputs_hr, hd_thw).
+    The caller is expected to feed ``(img, min_pixels=lr_pixels,
+    max_pixels=lr_pixels)`` directly to the processor for the LR forward,
+    and to use ``inputs_hr`` (returned here) directly as the HD input.
+
+    Returns (lr_pixels, inputs_hr, hd_thw).
     """
     inputs_hr = processor(
         images=[img], text=["<|im_start|>"],
@@ -783,13 +791,10 @@ def hr_first_lr_resize(img: Image.Image, processor, hr_scale: int,
     hd_h_patches = int(hd_thw[1].item())
     hd_w_patches = int(hd_thw[2].item())
 
-    lr_h_patches, lr_w_patches, lr_pixels = _derive_lr_geometry_from_hr_thw(
+    _, _, lr_pixels = _derive_lr_geometry_from_hr_thw(
         hd_h_patches, hd_w_patches, hr_scale,
     )
-    target_h_px = lr_h_patches * PATCH_SIZE
-    target_w_px = lr_w_patches * PATCH_SIZE
-    img_lr_resized = img.resize((target_w_px, target_h_px), Image.Resampling.LANCZOS)
-    return img_lr_resized, lr_pixels, inputs_hr, hd_thw
+    return lr_pixels, inputs_hr, hd_thw
 
 
 # ---------------------------------------------------------------------------
@@ -891,12 +896,15 @@ class Qwen2VLCoupledDATDataset(Dataset):
                 # [hr_min, hr_max], then derive LR_thw = floor(HR_thw / hr_scale)
                 # and force the LR processor to that exact size. ``shared_vit``
                 # then sees the same pool ratio at train and at test time.
-                img_lr, lr_pixels, inputs_hd, _hd_thw = hr_first_lr_resize(
+                # Note: pass the original PIL to the LR processor (NOT a
+                # pre-resized one) so smart_resize uses BICUBIC matching
+                # base Qwen2.5-VL pretraining. See hr_first_lr_resize docstring.
+                lr_pixels, inputs_hd, _hd_thw = hr_first_lr_resize(
                     img, self.processor, self.hr_scale,
                     self.data_args.hr_min_pixels, self.data_args.hr_max_pixels,
                 )
                 inputs = self.processor(
-                    images=[img_lr], text=[text],
+                    images=[img], text=[text],
                     return_tensors="pt", padding=False,
                     min_pixels=lr_pixels, max_pixels=lr_pixels,
                 )
