@@ -174,3 +174,6 @@ test_output/
 
 # bench logs
 bench_logs/
+
+# bench outputs
+bench_outputs/

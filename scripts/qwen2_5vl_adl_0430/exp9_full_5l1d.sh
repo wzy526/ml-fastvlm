@@ -5,7 +5,7 @@ set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate vldat
 
-# Exp 8: Same as exp6 (back 1D5L) but with SA-1B mixed data
+# Exp 9: Full 5L1D (6 DAT layers)
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
@@ -21,9 +21,9 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0501_back_1d5l_sa1b_mix}"
+EXP_NAME="${EXP_NAME:-0501_full_5l1d}"
 
-DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_mix.json}"
+DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_350k.json}"
 
 if [[ ! -f "$DATA_JSON" ]]; then
     echo "[ERROR] Missing data file: $DATA_JSON" >&2; exit 1
@@ -48,10 +48,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
-# Front 18 = L, Back 18 = DLLLLLDLLLLLDLLLLL (same as exp6)
-DAT_LAYERS="LLLLLLLLLLLLLLLLLLDLLLLLDLLLLLDLLLLL"
+# 5L1D x 6
+DAT_LAYERS="LLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLLD"
 
-torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40608}" llava/train/train_qwen_dat.py \
+torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40607}" llava/train/train_qwen_dat.py \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
