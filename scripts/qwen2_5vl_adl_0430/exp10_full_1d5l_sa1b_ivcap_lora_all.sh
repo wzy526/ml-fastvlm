@@ -5,7 +5,21 @@ set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate vldat
 
-# Exp 9: Full 5L1D (6 DAT layers)
+# Exp 10: same as exp 9 (Full 1D5L + IV-only SA-1B mix, 369K),
+# but extends LoRA target from "dat" (only DAT-layer QKVO) to "all"
+# (every decoder layer's QKVO).
+#
+# Why: exp 8 / exp 9 only insert LoRA on the 6 D-positioned layers
+# (indices 0,6,12,18,24,30), with the other 30 LLM layers fully frozen.
+# That gives ~0.4 M LoRA params and limits how much the language pathway
+# can adapt to the new SA-1B caption style (long-form, single-paragraph
+# descriptions) without disturbing the base HR-essential tasks.
+#
+# This run keeps everything else identical to exp 9 and only varies the
+# LoRA scope, so the delta is attributable to LoRA capacity.
+#
+# Data prep:
+#   python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py --no_as_core
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
@@ -21,15 +35,22 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0501_full_5l1d}"
+EXP_NAME="${EXP_NAME:-0512_full_1d5l_sa1b_ivcap_lora_all}"
 
-DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_350k.json}"
+DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_ivcap.json}"
 
 if [[ ! -f "$DATA_JSON" ]]; then
-    echo "[ERROR] Missing data file: $DATA_JSON" >&2; exit 1
+    echo "[ERROR] Missing data file: $DATA_JSON" >&2
+    echo "        Run: python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py --no_as_core" >&2
+    exit 1
 fi
 if [[ ! -d "$DATA_ROOT/train_split" ]]; then
     echo "[ERROR] Missing image folder: $DATA_ROOT/train_split" >&2; exit 1
+fi
+if [[ ! -e "$DATA_ROOT/train_split/sa1b" ]]; then
+    echo "[ERROR] Missing sa1b symlink: $DATA_ROOT/train_split/sa1b" >&2
+    echo "        Run: python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py --no_as_core" >&2
+    exit 1
 fi
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "[ERROR] Missing model path: $MODEL_PATH" >&2; exit 1
@@ -48,10 +69,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
-# 5L1D x 6
-DAT_LAYERS="LLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLLD"
+# Full 1D5L pattern (identical to exp 9)
+DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
-torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40607}" llava/train/train_qwen_dat.py \
+torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40610}" llava/train/train_qwen_dat.py \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
@@ -74,7 +95,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40607}" llava/train/tr
     --lora_enable True \
     --lora_r 8 \
     --lora_alpha 16 \
-    --lora_target_layers "dat" \
+    --lora_target_layers "all" \
     --lora_lr 2e-5 \
     --tune_mm_vision False \
     --tune_mm_mlp False \

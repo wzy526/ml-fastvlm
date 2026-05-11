@@ -5,7 +5,23 @@ set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate vldat
 
-# Exp 11: 1D3L full pattern + SA-1B mixed data (469K) — D every 4 layers, 9D total
+# Exp 9: Full 1D5L pattern + cleaned SA-1B mix (IV caption only, 369K)
+#
+# Motivation: Exp 8 used llava_hr_essential_sa1b_mix.json (469K) which mixed
+# in 100K AS-Core region_caption + region_vqa samples. Sample audit showed
+# AS-Core answers are LLM-paraphrased from region VQA and frequently
+#   (a) describe the whole image instead of the bbox region, and
+#   (b) emit generic LLM filler answers ("...is a great way to manage..."),
+# acting as noise on top of the cleaner vg / coco_ground grounding already
+# present in the HR-essential base.
+#
+# Exp 9 isolates the data variable: same exp 8 model config (1D5L + LoRA on
+# DAT-layer QKVO only), but trains on llava_hr_essential_sa1b_ivcap.json,
+# which keeps only the 50K InternVL single-image captions on top of the
+# 320K HR-essential base.
+#
+# Data prep:
+#   python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py --no_as_core
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
@@ -21,15 +37,22 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0501_full_1d3l_sa1b_mix}"
+EXP_NAME="${EXP_NAME:-0512_full_1d5l_sa1b_ivcap}"
 
-DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_mix.json}"
+DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_ivcap.json}"
 
 if [[ ! -f "$DATA_JSON" ]]; then
-    echo "[ERROR] Missing data file: $DATA_JSON" >&2; exit 1
+    echo "[ERROR] Missing data file: $DATA_JSON" >&2
+    echo "        Run: python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py --no_as_core" >&2
+    exit 1
 fi
 if [[ ! -d "$DATA_ROOT/train_split" ]]; then
     echo "[ERROR] Missing image folder: $DATA_ROOT/train_split" >&2; exit 1
+fi
+if [[ ! -e "$DATA_ROOT/train_split/sa1b" ]]; then
+    echo "[ERROR] Missing sa1b symlink: $DATA_ROOT/train_split/sa1b" >&2
+    echo "        Run: python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py --no_as_core" >&2
+    exit 1
 fi
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "[ERROR] Missing model path: $MODEL_PATH" >&2; exit 1
@@ -48,10 +71,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
-# 1D3L: D at layers 0,4,8,12,16,20,24,28,32 (9 DAT layers)
-DAT_LAYERS="DLLLDLLLDLLLDLLLDLLLDLLLDLLLDLLLDLLL"
+# Full 1D5L pattern (same as exp 8 / baseline_hr_essential)
+DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
-torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40611}" llava/train/train_qwen_dat.py \
+torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40609}" llava/train/train_qwen_dat.py \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \

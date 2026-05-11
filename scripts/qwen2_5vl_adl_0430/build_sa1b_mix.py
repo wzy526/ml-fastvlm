@@ -6,14 +6,19 @@ existing HR-essential 350K mix. Also verifies which images exist on disk
 and outputs a ready-to-train JSON.
 
 Usage:
+    # Full mix (HR-essential + InternVL caption + AS-Core region cap + region VQA):
+    python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py \
+        --sa1b_image_dir /root/autodl-tmp/models_data/sa1b_images
+
+    # IV-caption-only (RECOMMENDED): drop noisy AS-Core region annotations.
+    # Outputs llava_hr_essential_sa1b_ivcap.json by default.
     python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py \
         --sa1b_image_dir /root/autodl-tmp/models_data/sa1b_images \
-        --output_json /root/autodl-tmp/models_data/sft_data/llava_hr_essential_sa1b_mix.json
+        --no_as_core
 
     # To also pack sa1b images for transfer to other machines:
     python scripts/qwen2_5vl_adl_0430/build_sa1b_mix.py \
         --sa1b_image_dir /root/autodl-tmp/models_data/sa1b_images \
-        --output_json /root/autodl-tmp/models_data/sft_data/llava_hr_essential_sa1b_mix.json \
         --pack_dir /root/autodl-tmp/packed_sa1b
 """
 
@@ -126,15 +131,32 @@ def main():
                         default="/root/autodl-tmp/models_data/InternVL-SA-1B-Caption")
     parser.add_argument("--hr_essential_json", type=str,
                         default="/root/autodl-tmp/models_data/sft_data/llava_hr_essential_350k.json")
-    parser.add_argument("--output_json", type=str,
-                        default="/root/autodl-tmp/models_data/sft_data/llava_hr_essential_sa1b_mix.json")
+    parser.add_argument("--output_json", type=str, default=None,
+                        help="Output JSON path. If unset, defaults to "
+                             "llava_hr_essential_sa1b_mix.json (full mix) or "
+                             "llava_hr_essential_sa1b_ivcap.json (--no_as_core).")
     parser.add_argument("--max_internvl_caption", type=int, default=50000)
     parser.add_argument("--max_region_caption", type=int, default=50000)
     parser.add_argument("--max_region_vqa", type=int, default=50000)
+    parser.add_argument("--no_as_core", action="store_true",
+                        help="Skip AS-Core region_caption + region_vqa entirely. "
+                             "Only InternVL single-image captions will be added on top of the "
+                             "HR-essential base. Recommended because AS-Core answers are paraphrased "
+                             "from VQA and frequently mismatch the bbox region (see review notes).")
     parser.add_argument("--pack_dir", type=str, default=None,
                         help="If set, copy only used SA-1B images here for easy transfer")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if args.no_as_core:
+        args.max_region_caption = 0
+        args.max_region_vqa = 0
+
+    if args.output_json is None:
+        if args.no_as_core:
+            args.output_json = "/root/autodl-tmp/models_data/sft_data/llava_hr_essential_sa1b_ivcap.json"
+        else:
+            args.output_json = "/root/autodl-tmp/models_data/sft_data/llava_hr_essential_sa1b_mix.json"
 
     random.seed(args.seed)
 
@@ -167,23 +189,32 @@ def main():
     iv_converted = convert_internvl_caption(iv_samples, args.max_internvl_caption, args.seed)
     print(f"  Selected: {len(iv_converted)}")
 
-    # 3. Load and convert AS-Core region caption
-    rc_path = os.path.join(args.as_core_dir, "region_caption_400k.jsonl")
-    print(f"\nLoading AS-Core region captions: {rc_path}")
-    rc_samples = [s for s in load_jsonl(rc_path) if s["image"].split("/")[0] in available_shards]
-    print(f"  Region caption in available shards: {len(rc_samples)}")
+    # 3. AS-Core region caption + region VQA
+    # Skipped under --no_as_core because the AS-Core answers are LLM-paraphrased
+    # from region VQA and frequently (a) describe the whole image instead of the
+    # bbox region, or (b) emit generic LLM filler answers; this acts as noise on
+    # top of the cleaner vg / coco_ground in the HR-essential base.
+    if args.no_as_core:
+        print("\n[--no_as_core] Skipping AS-Core region_caption + region_vqa entirely.")
+        rc_converted = []
+        vqa_converted = []
+    else:
+        rc_path = os.path.join(args.as_core_dir, "region_caption_400k.jsonl")
+        print(f"\nLoading AS-Core region captions: {rc_path}")
+        rc_samples = [s for s in load_jsonl(rc_path) if s["image"].split("/")[0] in available_shards]
+        print(f"  Region caption in available shards: {len(rc_samples)}")
 
-    rc_converted = convert_as_core_region_caption(rc_samples, args.max_region_caption, args.seed)
-    print(f"  Selected: {len(rc_converted)}")
+        rc_converted = convert_as_core_region_caption(rc_samples, args.max_region_caption, args.seed)
+        print(f"  Selected: {len(rc_converted)}")
 
-    # 4. Load and convert AS-Core region VQA
-    vqa_path = os.path.join(args.as_core_dir, "region_vqa_1m.jsonl")
-    print(f"\nLoading AS-Core region VQA: {vqa_path}")
-    vqa_samples = [s for s in load_jsonl(vqa_path) if s["image"].split("/")[0] in available_shards]
-    print(f"  Region VQA in available shards: {len(vqa_samples)}")
+        # 4. Load and convert AS-Core region VQA
+        vqa_path = os.path.join(args.as_core_dir, "region_vqa_1m.jsonl")
+        print(f"\nLoading AS-Core region VQA: {vqa_path}")
+        vqa_samples = [s for s in load_jsonl(vqa_path) if s["image"].split("/")[0] in available_shards]
+        print(f"  Region VQA in available shards: {len(vqa_samples)}")
 
-    vqa_converted = convert_as_core_region_vqa(vqa_samples, args.max_region_vqa, args.seed)
-    print(f"  Selected: {len(vqa_converted)}")
+        vqa_converted = convert_as_core_region_vqa(vqa_samples, args.max_region_vqa, args.seed)
+        print(f"  Selected: {len(vqa_converted)}")
 
     # 5. Merge all
     # Tag SA-1B samples with sa1b_images prefix so image_folder logic works
