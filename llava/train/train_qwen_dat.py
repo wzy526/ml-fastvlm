@@ -88,6 +88,31 @@ def rank0_print(*args):
         print(*args)
 
 
+def _apply_hd_gate_freeze(model, model_args) -> None:
+    """Force every ``hd_gate`` parameter to ``requires_grad=False``.
+
+    Must be invoked **after** any setup pass that has set DAT-param
+    ``requires_grad`` (``freeze_base_unfreeze_dat``, the per-branch DAT
+    unfreeze loops, and the LoRA post-wrap unfreeze loop), since those
+    paths uniformly flip all DAT params (including ``hd_gate``) back to
+    ``True`` by matching ``DAT_KEYS_MATCH``. Idempotent — safe to call
+    multiple times.
+
+    No-op when ``dat_hd_gate_freeze`` is False or unset.
+    """
+    if not getattr(model_args, 'dat_hd_gate_freeze', False):
+        return
+    frozen = 0
+    for name, param in model.named_parameters():
+        if 'hd_gate' in name:
+            param.requires_grad = False
+            frozen += 1
+    rank0_print(
+        f"[dat_hd_gate_freeze=True] froze {frozen} hd_gate parameter(s) "
+        f"(stays at dat_hd_gate_init for the entire run)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Model unwrapping helper
 # ---------------------------------------------------------------------------
@@ -211,6 +236,14 @@ class ModelArguments:
                   "lse2 += log(sigmoid(hd_gate)). Use e.g. -10.0 so sigmoid ≈ 0 "
                   "at the start, preventing HD from dominating before offset modules "
                   "learn meaningful sampling. None = disabled."}
+    )
+    dat_hd_gate_freeze: bool = field(
+        default=False,
+        metadata={"help": "If True, hd_gate is created with requires_grad=False and "
+                  "stays at dat_hd_gate_init forever. Useful as a diagnostic against "
+                  "the zero-init-V cold-start: with the gate locked, v_proj_hd has "
+                  "no 'close the door' escape route and must learn useful HD content. "
+                  "Requires dat_hd_gate_init to be set."}
     )
     dat_fused_vit: bool = field(
         default=False,
@@ -2535,6 +2568,14 @@ def train():
                 DAT_KEYS_MATCH as _DAT_KEYS,
             )
 
+        # hd_gate_freeze=True only makes sense when hd_gate is actually
+        # instantiated, which requires hd_gate_init to be set.
+        if model_args.dat_hd_gate_freeze and model_args.dat_hd_gate_init is None:
+            raise ValueError(
+                "dat_hd_gate_freeze=True requires dat_hd_gate_init to be set "
+                "(otherwise hd_gate is None and there is nothing to freeze)."
+            )
+
         dat_extra_args = {
             'grid_size': model_args.dat_grid_size,
             'off_ksize': model_args.dat_off_ksize,
@@ -2547,6 +2588,7 @@ def train():
             'intention_as_gate': model_args.dat_intention_as_gate,
             'use_spatial_attn_guide': model_args.dat_use_spatial_attn_guide,
             'hd_gate_init': model_args.dat_hd_gate_init,
+            'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'use_fused_vit': model_args.dat_fused_vit,
             'use_shared_vit': model_args.dat_shared_vit,
         }
@@ -2603,6 +2645,14 @@ def train():
                     f"dat_layers length ({len(model_args.dat_layers)}) "
                     f"!= num_hidden_layers ({num_layers})"
                 )
+
+        # Apply dat_hd_gate_freeze AFTER the per-branch DAT unfreeze loops
+        # above (they each flip every DAT_KEYS_MATCH param — including
+        # hd_gate — back to requires_grad=True via the broad pattern match).
+        # The LoRA path is handled separately further below, after PEFT
+        # wraps the model and runs its own DAT unfreeze loop.
+        if not training_args.lora_enable:
+            _apply_hd_gate_freeze(model, model_args)
     else:
         rank0_print(f"Loading model ({model_args.model_family}) from {model_args.model_name_or_path}...")
         if is_qwen2_5:
@@ -2698,6 +2748,8 @@ def train():
                     param.requires_grad = True
                     dat_unfrozen += 1
             rank0_print(f"Unfroze {dat_unfrozen} DAT parameters after LoRA wrapping")
+            # Re-apply hd_gate freeze (the loop above just flipped it back on).
+            _apply_hd_gate_freeze(model, model_args)
 
         # Respect tune_mm_mlp under LoRA: merger/projector should remain trainable
         # when requested, and stay frozen otherwise.

@@ -274,6 +274,7 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
             'use_intention_branch': True,
             'intention_as_gate': True,
             'hd_gate_init': None,      # Learnable HD gate init value (e.g. -10.0); None = disabled
+            'hd_gate_freeze': False,   # If True, hd_gate is created with requires_grad=False (diagnostic mode)
             'use_fused_vit': False,    # Fuse LR+HD into one ViT call (saves kernel launch; costs ~2× activation memory)
             'use_shared_vit': False,   # Single HD ViT call; LR tokens are adaptive-pooled from HD features
                                        # (no LR ViT at all). Overrides use_fused_vit when True.
@@ -476,11 +477,23 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         # Init to a large negative value (e.g. -10) so sigmoid ≈ 0 at the start,
         # preventing HD features from dominating before the offset/sampling modules
         # have learned meaningful representations.
+        #
+        # When ``hd_gate_freeze=True`` the parameter is created but
+        # ``requires_grad`` is left False, so the gate stays at its init value
+        # for the entire run. This is a diagnostic mode for the zero-init-V
+        # cold start: with the gate locked, v_proj_hd cannot escape via
+        # "close the door" and must learn useful HD content.
         hd_gate_init = dat.get('hd_gate_init', None)
+        hd_gate_freeze = bool(dat.get('hd_gate_freeze', False))
         if hd_gate_init is not None:
-            self.hd_gate = nn.Parameter(torch.tensor(float(hd_gate_init)))
+            self.hd_gate = nn.Parameter(
+                torch.tensor(float(hd_gate_init)),
+                requires_grad=not hd_gate_freeze,
+            )
+            self._hd_gate_freeze = hd_gate_freeze
         else:
             self.hd_gate = None
+            self._hd_gate_freeze = False
 
         self._init_dat_weights()
 
@@ -528,22 +541,54 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             nn.init.xavier_uniform_(self.proj_intention.weight)
             if self.proj_intention.bias is not None:
                 nn.init.zeros_(self.proj_intention.bias)
-        # HD KV projections: copy from base k_proj / v_proj so HD path
-        # starts identical to the standard KV path (pretrained weights
-        # are copied again after from_pretrained via init_hd_proj_from_kv).
-        if self.k_proj_hd is not None:
-            self.k_proj_hd.weight.copy_(self.k_proj.weight)
-            self.v_proj_hd.weight.copy_(self.v_proj.weight)
-            if self.k_proj_hd.bias is not None:
-                if self.k_proj.bias is not None:
-                    self.k_proj_hd.bias.copy_(self.k_proj.bias)
-                else:
-                    nn.init.zeros_(self.k_proj_hd.bias)
-            if self.v_proj_hd.bias is not None:
-                if self.v_proj.bias is not None:
-                    self.v_proj_hd.bias.copy_(self.v_proj.bias)
-                else:
-                    nn.init.zeros_(self.v_proj_hd.bias)
+        # HD KV projections: zero-init adapter pattern (K=Kaiming, V=0).
+        #
+        # Previously we copied k_proj / v_proj into k_proj_hd / v_proj_hd to
+        # "reuse pretrained weights", but this is an OOD initialization:
+        # k_proj was trained to project layer-L *hidden states* into layer-L
+        # K-space, while k_proj_hd is applied to image_hd_features = the
+        # visual merger's pooler_output, which lives in layer-0 input
+        # embedding space. For a deep DAT layer (e.g. L=30) this is a 30-
+        # layer domain mismatch — Q · K_hd^T has no geometric meaning, out2
+        # is pure noise, and CE pushes hd_gate to close every time the gate
+        # opens enough to register the noise (verified empirically: starting
+        # hd_gate at -2 produces a monotone descent over the first 100 steps).
+        #
+        # Fix: zero-init V so out2 = softmax(Q·K_hd^T) · 0 ≡ 0 at step 0
+        # (HD path is a strict no-op, no noise to fight off). Kaiming-normal
+        # K with nonlinearity='linear' provides symmetry-breaking for the
+        # first backward pass (V's gradient is shaped by a non-uniform
+        # attention pattern from step 1 onward, avoiding the rank-1
+        # transient that would occur with K=V=0). This is the same pattern
+        # as LoRA's (A=Kaiming, B=0).
+        self._init_hd_proj_weights()
+
+    @torch.no_grad()
+    def _init_hd_proj_weights(self):
+        """Init k_proj_hd / v_proj_hd with the zero-init adapter pattern.
+
+        K_hd ← Kaiming normal (nonlinearity='linear'): provides symmetry-
+        breaking statistics so attention is non-uniform from step 1 onward.
+
+        V_hd ← 0: guarantees ``out2 = softmax(Q·K_hd^T) · 0 ≡ 0`` at step 0,
+        so the HD path is a strict no-op until V_hd has learned useful
+        directions. ``v_proj_hd`` still receives non-zero gradients through
+        the LSE merge (``dL/dV_hd ∝ softmax(...) · w₂ · dL/dout_merged``),
+        so the path can only grow toward directions that reduce loss.
+
+        Biases (if present) are zeroed in both projections.
+
+        See the matching prose in ``_init_dat_weights`` for the architectural
+        motivation (OOD copy-from-k_proj problem).
+        """
+        if self.k_proj_hd is None:
+            return
+        nn.init.kaiming_normal_(self.k_proj_hd.weight, nonlinearity='linear')
+        nn.init.zeros_(self.v_proj_hd.weight)
+        if self.k_proj_hd.bias is not None:
+            nn.init.zeros_(self.k_proj_hd.bias)
+        if self.v_proj_hd.bias is not None:
+            nn.init.zeros_(self.v_proj_hd.bias)
 
     def _grid_generate(self, h, w, n_repeats, device):
         """Generate reference sampling grid in [-1, 1]."""
@@ -1128,12 +1173,18 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         text_model_cls = type(text_model)
         cls_init_weights = text_model_cls._init_weights
         hd_gate_init = self.config.dat_extra_args.get('hd_gate_init', None)
+        hd_gate_freeze = bool(self.config.dat_extra_args.get('hd_gate_freeze', False))
 
         def _dat_init_weights(text_self, module):
             cls_init_weights(text_self, module)
             if isinstance(module, Qwen2_5_VLAttentionDAT):
                 if module.hd_gate is not None and hd_gate_init is not None:
                     module.hd_gate.data.fill_(float(hd_gate_init))
+                    # smart_apply on a MISSING key re-instantiates the
+                    # parameter with default requires_grad=True, so we have
+                    # to re-apply the freeze flag here too.
+                    if hd_gate_freeze:
+                        module.hd_gate.requires_grad = False
                 nn.init.kaiming_normal_(module.conv_lr_dw.weight)
                 nn.init.kaiming_normal_(module.conv_lr_proj.weight)
                 nn.init.kaiming_normal_(module.conv_off_proj.weight)
@@ -1143,27 +1194,52 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                     nn.init.xavier_uniform_(module.proj_intention.weight)
                     if module.proj_intention.bias is not None:
                         nn.init.zeros_(module.proj_intention.bias)
+                # HD KV projections must also be re-set here: HF's default
+                # _init_weights treats k_proj_hd / v_proj_hd as ordinary
+                # nn.Linear and overwrites them with normal_(std=0.02), which
+                # would break V_hd=0. Apply the zero-init adapter pattern
+                # (K=Kaiming, V=0) so out2 ≡ 0 at step 0.
+                module._init_hd_proj_weights()
 
         text_model._init_weights = types.MethodType(_dat_init_weights, text_model)
 
     @torch.no_grad()
     def init_hd_proj_from_kv(self):
-        """Copy pretrained k_proj/v_proj weights into k_proj_hd/v_proj_hd.
+        """Init k_proj_hd / v_proj_hd with the zero-init adapter pattern.
 
-        Must be called AFTER from_pretrained() so that k_proj/v_proj hold the
-        pretrained weights (not the random init present during __init__).
+        Historically this method copied pretrained k_proj / v_proj weights
+        into k_proj_hd / v_proj_hd, but that was an OOD initialization:
+        k_proj at DAT layer L was trained to map *layer-L hidden states*
+        into K-space, while k_proj_hd is applied to image_hd_features =
+        visual.pooler_output ≈ layer-0 input embedding space. For deep DAT
+        layers (L=30) this is a 30-layer domain mismatch — Q · K_hd^T has
+        no geometric meaning, out2 is pure noise, and CE consistently
+        pushes hd_gate down (empirically verified: hd_gate_init=-2 → 100
+        steps of monotone descent toward -inf).
+
+        New scheme:
+            K_hd ← Kaiming normal (nonlinearity='linear')
+            V_hd ← 0
+            biases zeroed
+
+        Math: ``out2 = softmax(Q·K_hd^T) · 0 ≡ 0`` at step 0, so HD path is
+        a strict no-op. V_hd still receives non-zero gradients via the LSE
+        merge, so it grows only toward loss-reducing directions. Equivalent
+        to LoRA's (A=Kaiming, B=0) adapter pattern.
+
+        The method name is kept (``init_hd_proj_from_kv``) for compatibility
+        with existing training scripts that call it after ``from_pretrained``;
+        the "_from_kv" suffix is now historical.
         """
         n = 0
         for m in self.modules():
             if isinstance(m, Qwen2_5_VLAttentionDAT) and m.k_proj_hd is not None:
-                m.k_proj_hd.weight.copy_(m.k_proj.weight)
-                m.v_proj_hd.weight.copy_(m.v_proj.weight)
-                if m.k_proj_hd.bias is not None and m.k_proj.bias is not None:
-                    m.k_proj_hd.bias.copy_(m.k_proj.bias)
-                if m.v_proj_hd.bias is not None and m.v_proj.bias is not None:
-                    m.v_proj_hd.bias.copy_(m.v_proj.bias)
+                m._init_hd_proj_weights()
                 n += 1
-        logger.info(f"Copied k_proj/v_proj → k_proj_hd/v_proj_hd for {n} DAT layers")
+        logger.info(
+            f"Zero-init adapter pattern (K=Kaiming, V=0) applied to "
+            f"k_proj_hd / v_proj_hd for {n} DAT layers"
+        )
 
     def prepare_inputs_for_generation(
         self,
