@@ -484,6 +484,37 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         self._init_dat_weights()
 
+    def _apply(self, fn, recurse=True):
+        """Run base ``_apply`` then force ``hd_gate`` back to fp32.
+
+        ``hd_gate`` is a single scalar nn.Parameter used as a log-σ bias
+        in the LSE merge (``lse2 += log σ(g)``). When the wrapping training
+        script does ``model.to(torch.bfloat16)`` (e.g. exp9.sh's
+        ``--lora_enable True --bf16 True`` path), this scalar gets cast to
+        bf16. The bf16 representational gap at |g|≈8 is
+
+            2^(exponent − mantissa_bits) = 2^(3 − 7) = 0.0625 ,
+
+        whereas AdamW's per-step update on ``hd_gate`` with ``dat_lr=1e-4``
+        is on the order of 1e-4 — three orders of magnitude below the bf16
+        grid. The update is silently rounded back to -8.0 and ``hd_gate``
+        appears frozen even though gradients flow correctly (other DAT
+        params and ``dat/grad_norm`` keep moving). Verified in
+        ``scripts/qwen2_5vl_adl_0514/_verify_hd_gate_bf16_roundoff.py``:
+        1000 bf16 Adam steps with grad ≈ 1.4 produce zero motion; the same
+        loop in fp32 walks cleanly from -8.0 to -8.09.
+
+        Overriding ``_apply`` here is the canonical PyTorch hook for "this
+        param has a fixed dtype" — any future ``.to(...)``, ``.cuda()``,
+        ``.bfloat16()``, ``.half()`` call routes through ``_apply``, so the
+        scalar is restored to fp32 unconditionally.
+        """
+        result = super()._apply(fn, recurse=recurse)
+        if self.hd_gate is not None and self.hd_gate.dtype != torch.float32:
+            with torch.no_grad():
+                self.hd_gate.data = self.hd_gate.data.to(torch.float32)
+        return result
+
     @torch.no_grad()
     def _init_dat_weights(self):
         # Conv layers: Kaiming normal
@@ -620,12 +651,13 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 g=self.off_grps, c=self.off_dim,
             )
             embed_intention = self.proj_intention(intention_per_group)
+            # Keep singleton spatial dims; broadcasting handles the
+            # grid_size × grid_size expansion at use sites (gate-multiply
+            # path is pure broadcast; cat path expands at the cat call).
+            # Avoids a Lp·off_grps·inter_size·grid_size² fp32 memcpy and
+            # the ~400× sigmoid blow-up.
             embed_intention = einops.rearrange(
-                einops.repeat(
-                    embed_intention, 'l g c -> l g c h w',
-                    h=self.grid_size, w=self.grid_size,
-                ),
-                'l g c h w -> (l g) c h w',
+                embed_intention, 'l g c -> (l g) c 1 1',
             )
 
         embed_lr_rep = einops.repeat(
@@ -659,7 +691,12 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                         gate.detach().std().item(),
                     )
             else:
-                off_guide = torch.cat([embed_lr_rep, embed_intention], dim=1)
+                # cat does not broadcast — expand the singleton spatial dims
+                # added above to match embed_lr_rep before concatenation.
+                off_guide = torch.cat([
+                    embed_lr_rep,
+                    embed_intention.expand(-1, -1, self.grid_size, self.grid_size),
+                ], dim=1)
         else:
             off_guide = embed_lr_rep
 
@@ -1063,6 +1100,51 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             dat_count = sum(1 for c in layers_str if c == 'D')
             logger.info(f"Qwen2.5VL-DAT: {dat_count} DAT layers, "
                         f"{text_config.num_hidden_layers - dat_count} standard layers")
+
+        self._patch_text_model_init_weights()
+
+    def _patch_text_model_init_weights(self):
+        """Make smart_apply use DAT-aware ``_init_weights`` for the inner text model.
+
+        HF's ``smart_apply`` (called by ``_finalize_model_loading`` →
+        ``_initialize_missing_keys``) dispatches each ``PreTrainedModel`` child
+        to use its own ``_init_weights``, not the top-level wrapper's. Since the
+        DAT attention modules live inside ``self.model.language_model``
+        (``Qwen2_5_VLTextModel``), the active ``_init_weights`` for them is
+        ``Qwen2_5_VLPreTrainedModel._init_weights`` — which only handles
+        Linear / Conv / Embedding / LayerNorm-named modules. The standalone
+        ``hd_gate`` ``nn.Parameter`` and the Kaiming / Xavier inits from
+        ``_init_dat_weights`` are therefore never restored after
+        ``from_pretrained`` blew them away under ``torch.device("meta")`` /
+        ``deepspeed.zero.Init()``.
+
+        We monkey-patch the text-model instance's ``_init_weights`` to wrap the
+        original implementation and add the DAT-specific handling. ``smart_apply``
+        does ``module._initialize_weights`` which calls ``self._init_weights``,
+        so an instance-level attribute is enough — no class-wide patching.
+        """
+        import types
+        text_model = self.model.language_model
+        text_model_cls = type(text_model)
+        cls_init_weights = text_model_cls._init_weights
+        hd_gate_init = self.config.dat_extra_args.get('hd_gate_init', None)
+
+        def _dat_init_weights(text_self, module):
+            cls_init_weights(text_self, module)
+            if isinstance(module, Qwen2_5_VLAttentionDAT):
+                if module.hd_gate is not None and hd_gate_init is not None:
+                    module.hd_gate.data.fill_(float(hd_gate_init))
+                nn.init.kaiming_normal_(module.conv_lr_dw.weight)
+                nn.init.kaiming_normal_(module.conv_lr_proj.weight)
+                nn.init.kaiming_normal_(module.conv_off_proj.weight)
+                if module.conv_lr_proj.bias is not None:
+                    nn.init.zeros_(module.conv_lr_proj.bias)
+                if isinstance(module.proj_intention, nn.Linear):
+                    nn.init.xavier_uniform_(module.proj_intention.weight)
+                    if module.proj_intention.bias is not None:
+                        nn.init.zeros_(module.proj_intention.bias)
+
+        text_model._init_weights = types.MethodType(_dat_init_weights, text_model)
 
     @torch.no_grad()
     def init_hd_proj_from_kv(self):
