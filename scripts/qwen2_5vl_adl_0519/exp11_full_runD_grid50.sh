@@ -5,66 +5,54 @@ set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate vldat
 
-# Exp 11 (0519): Run D = Run C + finer reference grid (20×20 → 50×50).
+# Exp 11 (0519): Run D = Run C (no-warmup variant) + grid 50×50.
 #
-# Background
-# ----------
-# Run B/C inherits ``dat_grid_size=20``. Combined with the per-image HR
-# feature map of ~75×75 patches (lr_max_pixels=501760 × hr_scale²=9, then
-# spatial_merge=2 -> patch grid ≈ 75 × 75), each of the 400 reference
-# cells covered roughly 75/20 ≈ 3.75 HR patches. Offset's normalized [-1,1]
-# range maps to the *whole image*, so the "identity reference + local
-# perturbation" inductive bias from plain-ViT DAT (where cell spacing is
-# ≈ 1 patch) is structurally weakened: a 5-patch shift in offset is
-# 5×28 px ≈ 140 px in image space, i.e. a large fraction of the image, not
-# a "local" perturbation at all. Cf. _diagnose_offsets analysis in chat.
+# Iteration history of this script
+# --------------------------------
+# v1: Run D = Run C v1 (F1 + F3 + F4 + bf16 fix) + dat_grid_size=50.
+#     Run D trained ~650 steps and showed hd_gate decreasing FASTER than
+#     Run C v1 (~1.7× slope), suggesting that with HD still uncalibrated,
+#     a finer grid (2500 anchors vs 400) just inflates noise per HD token.
+#     Stopped early.
 #
-# Hypothesis: raising grid_size to 50 brings cell spacing back to ~1.5
-# patches per cell, which:
-#   • restores the "small offset = small shift" inductive bias the offset
-#     network was designed around;
-#   • increases sampled HD token count from 400 to 2500 per query (6.25×
-#     more HD evidence per answer token), which should make the HD path
-#     actually useful in the LSE merge.
+# v2 (CURRENT): align with Run C v2 by dropping F3 (warmup callback);
+#     keep grid=50, F1, F4, and bf16 fix.
 #
-# Cost estimate
-# -------------
+# Rationale
+# ---------
+# The hd_gate monotonic-decline diagnosis points at warmup callback as the
+# primary suspect (LoRA frozen during Phase 1 -> no positive feedback to
+# integrate HD_out -> hd_gate gradient stays negative throughout). With
+# warmup off, LoRA learns to consume HD_out as v_proj_hd ramps from 0.
+# Once HD path can become useful end-to-end, a finer reference grid has
+# a chance to actually help (more HD tokens per query = more evidence).
+#
+# Cost (unchanged from v1)
+# ------------------------
 # HD KV memory per DAT layer per sample:
 #   400 -> 2500 tokens × kv_dim (256 for Qwen-3B) × 2 bytes (bf16)
 #   ≈ 200 KB -> 1.3 MB per DAT layer
 #   × 6 DAT layers × bs 4 × 8 GPUs ≈ 256 MB extra activation/KV memory.
-# HD attention FLOPs per DAT layer per sample:
-#   O(Nq × Ns × head_dim) where Ns goes 400 -> 2500 (6.25× HD attn ops)
-#   but HD attn is only one of several costs (LR attn, MLP, ViT) -> total
-#   step time expected to grow by ~15-25% (Run C ~14h -> Run D ~16-18h).
-# If we OOM, knock PER_DEVICE_BATCH down to 2 (export PER_DEVICE_BATCH=2)
-# and bump GRAD_ACCUM=4 to preserve effective batch.
+# Step time grows ~15-25% over Run C (~14h -> ~16-18h).
+# If OOM, set PER_DEVICE_BATCH=2 and GRAD_ACCUM=4 to preserve eff. batch.
 #
-# Inherits all other Run C changes:
-#   • offset-path fp32 storage protection (modeling code)
-#   • F1 spatial_attn_guide=True
-#   • F3 DAT-only warmup 500 steps
-#   • F4 hd_input_layernorm RMSNorm fp32
+# What this run keeps the same as Run C v2:
+#   • Data mix
+#   • F1 (--dat_use_spatial_attn_guide True)
+#   • F4 (hd_input_layernorm RMSNorm fp32)
+#   • bf16 round-off fix (modeling code)
+#   • F3 OFF (--dat_warmup_steps 0)
 #
-# What this run validates
-# -----------------------
-# Is the offset network's failure to be useful in Run B/C primarily a
-# resolution issue (20-cell grid too coarse) or a fundamentally
-# architectural one (offset can't condition on prompt)?
-#   • If grid 50 + bf16 fix yields a clear HR-Bench bump over Run C, the
-#     resolution argument is correct and we should keep pushing on the
-#     reference-density side.
-#   • If grid 50 also flatlines vs Run C, density isn't the bottleneck and
-#     we must address the prompt-conditioning problem (text-token
-#     cross-attn into off_guide).
+# What this run changes vs. Run C v2:
+#   • --dat_grid_size 50 (was 20)
 #
-# Diagnostic comparison after this run:
-#   scripts/qwen2_5vl_adl_0515/_diagnose_offsets*.py against:
-#     /root/autodl-tmp/diag_offsets_random/             (kaiming init)
-#     /root/autodl-tmp/diag_offsets_runB/               (Run B, no bf16 fix)
-#     /root/autodl-tmp/diag_offsets_smoke_fp32/         (200-step smoke)
-#     /root/autodl-tmp/diag_offsets_runC/               (Run C, expect from earlier)
-#     /root/autodl-tmp/diag_offsets_runD/               (this run)
+# Validation question
+# -------------------
+# Conditional on Run C v2 recovering the V-shape hd_gate (i.e. warmup was
+# the cause), does grid=50 push HR-Bench further than grid=20?
+#   • Yes -> reference-density and warmup are both meaningful axes.
+#   • No  -> density isn't the lever; next round must address prompt-
+#            conditioning (text-token cross-attn into off_guide).
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
@@ -80,7 +68,7 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0519_full_runD_grid50_bf16fix_F1F3F4}"
+EXP_NAME="${EXP_NAME:-0519_full_runD_grid50_no_warmup_F1F4_bf16fix}"
 
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_ivcap.json}"
 
@@ -113,7 +101,7 @@ export NCCL_P2P_DISABLE=0
 # Full 1D5L pattern (same as Run B/C)
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
-torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40621}" llava/train/train_qwen_dat.py \
+torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40625}" llava/train/train_qwen_dat.py \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
@@ -133,7 +121,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40621}" llava/train/tr
     --dat_shared_vit False \
     --dat_freeze_base False \
     --dat_hd_gate_init -1.0 \
-    --dat_warmup_steps 500 \
+    --dat_warmup_steps 0 \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \

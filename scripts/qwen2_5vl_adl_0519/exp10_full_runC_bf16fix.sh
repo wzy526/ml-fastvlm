@@ -5,73 +5,73 @@ set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate vldat
 
-# Exp 10 (0519): Run C = Run B config + offset-path bf16 round-off fix.
+# Exp 10 (0519): Run C = bf16 round-off fix + F1 + F4, NO F3 (warmup callback).
 #
-# Background
-# ----------
-# Run B (0515) added F1 (spatial_attn_guide) + F3 (DAT-only warmup 500 steps)
-# + F4 (hd_input_layernorm RMSNorm before k/v_proj_hd) on top of the
-# zero-init baseline. Eval after Run B showed essentially no improvement
-# over the prior zero-init run, even though structural changes were sound.
+# Iteration history of this script
+# --------------------------------
+# v1: Run C = Run B config + offset-path bf16 round-off fix (F1 + F3 + F4).
+#     Run C trained ~1000 steps and showed hd_gate monotonically decreasing
+#     throughout (no V-shape recovery), even past step 500 where F3's Phase
+#     1 -> Phase 2 transition was expected to flip hd_gate's gradient sign.
+#     Compared to the earlier zero-init-only experiment, which showed a
+#     down-then-up hd_gate trajectory, the only differing variables here
+#     are F1 + F3 + F4 + bf16-fix.
 #
-# Diagnosis (scripts/qwen2_5vl_adl_0515/_diagnose_offsets*.py):
-#   • Offset behavior in Run B was virtually identical to a kaiming-random
-#     init DAT (built via _build_random_dat_ckpt.py).
-#   • Cause: ``conv_off_proj.weight`` (≈ 0.05), ``ln_2.weight`` (= 1.0),
-#     ``ln_1.weight`` (= 1.0), ``proj_intention.weight``, ``conv_lr_*.weight``
-#     are all stored in bf16. AdamW per-step update at dat_lr=1e-4 is ≈ 1e-4,
-#     which is at or below the bf16 grid spacing at these weight magnitudes
-#     (2⁻⁷ ≈ 7.8e-3 at weight ≈ 1.0; 2⁻¹¹ ≈ 5e-4 at weight ≈ 0.05). The bf16
-#     downcast silently rounded every update back to the same value -> offset
-#     network never actually learned across 1 full epoch of Run B.
+# v2 (CURRENT): drop F3 to isolate whether warmup callback is the cause of
+#     the monotonic hd_gate decline. Keep F1 + F4 + bf16 fix.
+#
+# Hypothesis for v2
+# -----------------
+# During Phase 1 (LoRA frozen) of F3:
+#   • v_proj_hd starts zero-init, k_proj_hd kaiming. HD_out = 0 initially.
+#   • k_proj_hd still siphons attention mass via the LSE merge -> "wasted"
+#     attention on V=0 -> loss wants smaller w_HD -> hd_gate gradient
+#     negative -> hd_gate falls.
+#   • LoRA is frozen, so the LLM cannot adapt to integrate HD_out as
+#     v_proj_hd starts learning a non-zero direction. The HD signal stays
+#     in "noise" from the LLM's perspective. There is no positive feedback
+#     to flip hd_gate's gradient sign.
+#   • By the time Phase 2 unfreezes LoRA, hd_gate has already trained
+#     into a "HD is bad" prior; the trajectory continues downward.
+#
+# Without F3 (this run): LoRA trains alongside DAT from step 0. v_proj_hd
+# learning a useful direction + LoRA learning to consume it form a positive
+# feedback loop, mirroring the original zero-init experiment's down-then-
+# up pattern.
+#
+# Background on the bf16 fix (kept from Run C v1)
+# -----------------------------------------------
+# In Run B, ``conv_off_proj.weight`` (≈ 0.05), ``ln_2.weight`` (= 1.0),
+# ``ln_1.weight`` (= 1.0), ``proj_intention.weight``, ``conv_lr_*.weight``
+# were stored in bf16. AdamW per-step update at dat_lr=1e-4 is ≈ 1e-4,
+# at or below the bf16 grid spacing at these magnitudes (2⁻⁷ ≈ 7.8e-3 at
+# weight ≈ 1.0; 2⁻¹¹ ≈ 5e-4 at weight ≈ 0.05). bf16 downcast silently
+# rounded every update back -> offset network never learned across 1 full
+# Run B epoch.
 #
 # Fix (in llava/model/language_model/modeling_qwen2_5vl_dat.py):
 #   • New _FP32WeightLayerNorm2d / _FP32WeightConv2d / _FP32WeightLinear
-#     subclasses store ``weight`` (and ``bias``) in fp32. Forward downcasts
-#     to input dtype, so compute remains bf16-cheap; storage retains
-#     full-precision update accumulation.
-#   • Qwen2_5_VLAttentionDAT._apply and convert_qwen2_5vl_to_dat now
-#     explicitly enforce fp32 storage on every conv_lr_dw, ln_1,
-#     conv_lr_proj, proj_intention, ln_2, conv_off_proj parameter (plus
-#     the existing hd_gate and hd_input_layernorm.weight protections).
-#
-# Validation (200-step smoke run, 0519_smoke_offset_fp32_runB_cfg_200steps):
-#   • _diagnose_offsets shows L6 magn_mean_avg goes from 0.192 (Run B,
-#     1 epoch) -> 0.476 (smoke, 200 steps) — i.e. 200 steps of properly-
-#     stored training did MORE to offset weights than 1 full Run B epoch.
-#   • Cross-sample std L6/L18/L30 jumped by +60% / +225% / +150% vs
-#     random init — offset network is genuinely learning, no longer just
-#     drifting around init.
-#   • _verify_offset_fp32.py confirms AdamW |Δw| ≈ 2e-4 per step on the
-#     target params (was ≈ 0 under bf16 storage).
-#
-# Caveat (still TODO):
-#   • Prompt-conditional diagnostic shows offsets still don't follow prompt
-#     direction (agree = 1/4 across all layers). F1's spatial_attn_guide is
-#     image-saliency-only; question/prompt info is not reaching the offset
-#     predictor in a directional way. If Run C's HR-Bench eval is still
-#     flat vs. Run B, the next iteration should replace F1 with explicit
-#     text-token cross-attention into the offset predictor.
+#     store ``weight`` (and ``bias``) in fp32; forward downcasts to input
+#     dtype.
+#   • Qwen2_5_VLAttentionDAT._apply and convert_qwen2_5vl_to_dat enforce
+#     fp32 on conv_lr_dw, ln_1, conv_lr_proj, proj_intention, ln_2,
+#     conv_off_proj, plus the existing hd_gate / hd_input_layernorm.weight.
 #
 # What this run keeps the same as Run B:
 #   • Data mix (llava_hr_essential_sa1b_ivcap.json)
 #   • F1 (--dat_use_spatial_attn_guide True)
-#   • F3 (--dat_warmup_steps 500, two-phase DAT-then-LoRA schedule)
 #   • F4 (hd_input_layernorm RMSNorm, now fp32 + actually trains)
 #   • All optim / LoRA / data hyperparams
 #
-# What this run changes:
-#   • Picks up the offset-path fp32 protection in modeling code
-#   • New EXP_NAME / output_dir / master_port
+# What this run changes vs. Run C v1:
+#   • F3 disabled (--dat_warmup_steps 0). LoRA trains from step 0
+#     alongside DAT.
 #
-# Expected wandb signatures (vs. Run B 0515):
-#   • dat/grad_norm comparable to Run B (the gradients were always there;
-#     it was the storage that was discarding them).
-#   • dat/kvhd_weight_norm should keep climbing — same as Run B.
-#   • offset stats logged inside _generate_offsets_and_sample (offset.mean
-#     /.std) should show meaningfully larger drift over training than Run B.
-#   • train/loss curve should be roughly comparable to Run B early on, then
-#     diverge as the HD path actually contributes.
+# Expected wandb signatures (vs. Run C v1)
+# ----------------------------------------
+# Primary: dat/hd_gate_raw should show a V-shape (decrease early, then
+# recover). The recovery slope is the key signal — if it materializes,
+# warmup callback was the cause of the prior monotonic decline.
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
@@ -87,7 +87,7 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0519_full_runC_bf16fix_F1F3F4}"
+EXP_NAME="${EXP_NAME:-0519_full_runC_no_warmup_F1F4_bf16fix}"
 
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_ivcap.json}"
 
@@ -120,7 +120,7 @@ export NCCL_P2P_DISABLE=0
 # Full 1D5L pattern (same as Run B)
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
-torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40619}" llava/train/train_qwen_dat.py \
+torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40623}" llava/train/train_qwen_dat.py \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
@@ -140,7 +140,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40619}" llava/train/tr
     --dat_shared_vit False \
     --dat_freeze_base False \
     --dat_hd_gate_init -1.0 \
-    --dat_warmup_steps 500 \
+    --dat_warmup_steps 0 \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \
