@@ -40,12 +40,45 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,
     Qwen2_5_VLDecoderLayer,
     Qwen2_5_VLAttention,
+    Qwen2_5_VLRMSNorm,
     Qwen2_5_VLRotaryEmbedding,
     Qwen2_5_VLCausalLMOutputWithPast,
     apply_multimodal_rotary_pos_emb,
     rotate_half,
     repeat_kv,
 )
+
+
+class _FP32WeightRMSNorm(Qwen2_5_VLRMSNorm):
+    """RMSNorm that keeps ``weight`` in fp32 to avoid bf16 round-off near unity.
+
+    The stock ``Qwen2_5_VLRMSNorm`` ends its forward with
+    ``self.weight * hidden_states.to(input_dtype)``. If ``input_dtype`` is
+    bf16 and ``self.weight`` is also bf16, the gradient updates to
+    ``weight`` (massyo ≈ 1.0) are rounded out by the bf16 grid (resolution
+    2⁻⁷ ≈ 7.8e-3 vs. AdamW per-step update ≈ 1e-4 at dat_lr=1e-4) and the
+    scale never learns.
+
+    Fix: keep ``weight`` in fp32 storage, multiply in fp32 (PyTorch
+    promotes ``fp32_weight * bf16_h`` to fp32), then cast the result back
+    to ``input_dtype`` so downstream ``k_proj_hd`` / ``v_proj_hd`` still
+    receive bf16. ``Qwen2_5_VLAttentionDAT._apply`` enforces the fp32
+    storage on every ``.to(...)``/``.bfloat16()`` call.
+
+    Empirical evidence (0515 Run B ckpt-500): with the stock bf16 weight,
+    ``hd_input_layernorm.weight`` stayed at exactly 1.000000 (std=0) after
+    500 steps. With this subclass + ``_apply`` override, the weight is
+    free to drift.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        h = hidden_states.to(torch.float32)
+        variance = h.pow(2).mean(-1, keepdim=True)
+        h = h * torch.rsqrt(variance + self.variance_epsilon)
+        # fp32_weight * fp32_h → fp32; cast back to bf16 (or whatever input
+        # dtype is) so downstream Linear ops stay dtype-consistent.
+        return (self.weight * h).to(input_dtype)
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 from transformers.cache_utils import Cache
 
@@ -303,6 +336,67 @@ class LayerNorm2d(nn.Module):
         return x
 
 
+class _FP32WeightLayerNorm2d(LayerNorm2d):
+    """LayerNorm2d that keeps ``weight`` (≈1.0) and ``bias`` (≈0.0) in fp32.
+
+    Same bf16 round-off problem as ``_FP32WeightRMSNorm``: weight initialized
+    at exactly 1.0, bf16 grid spacing at unity is 2⁻⁷ ≈ 7.8e-3, and AdamW
+    updates at lr≈1e-4 silently round to zero. Empirically observed on the
+    DAT offset path's ``ln_1`` / ``ln_2`` after Run B (no fp32 protection).
+
+    Storage is fp32; forward runs entirely in fp32 then casts back to the
+    input dtype. The compute is small (off_dim or inter_size ≤ 128, grid ≤
+    20×20) so the fp32 overhead is negligible.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        h = x.to(torch.float32)
+        u = h.mean(1, keepdim=True)
+        s = (h - u).pow(2).mean(1, keepdim=True)
+        h = (h - u) / torch.sqrt(s + self.eps)
+        h = self.weight[None, :, None, None] * h + self.bias[None, :, None, None]
+        return h.to(input_dtype)
+
+
+class _FP32WeightConv2d(nn.Conv2d):
+    """Conv2d whose ``weight``/``bias`` are stored in fp32 to avoid bf16
+    round-off on AdamW updates.
+
+    Forward casts the fp32 weight back to the input dtype, so the conv math
+    itself runs at the surrounding (typically bf16) precision and remains
+    cheap. Storage in fp32 is what matters: it lets small AdamW updates
+    (``lr * m / sqrt(v)`` ≈ 1e-4) accumulate without being silently rounded
+    out by the bf16 grid (which at weight magnitude ≈ 0.05 has spacing
+    ≈ 4e-4, comparable to the per-step update).
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight.dtype != x.dtype:
+            w = self.weight.to(x.dtype)
+            b = self.bias.to(x.dtype) if self.bias is not None else None
+            return F.conv2d(
+                x, w, b, self.stride, self.padding, self.dilation, self.groups,
+            )
+        return super().forward(x)
+
+
+class _FP32WeightLinear(nn.Linear):
+    """Linear with fp32 master weight/bias; forward downcasts to input dtype.
+
+    Same motivation as ``_FP32WeightConv2d``. Used for ``proj_intention``
+    (≤ 128 × 128 = 16K params) where the storage cost of fp32 is trivial
+    and bf16 round-off on small kaiming-initialized weights is a real risk.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight.dtype != x.dtype:
+            w = self.weight.to(x.dtype)
+            b = self.bias.to(x.dtype) if self.bias is not None else None
+            return F.linear(x, w, b)
+        return super().forward(x)
+
+
 def apply_multimodal_rotary_pos_emb_single(x, cos, sin, mrope_section, unsqueeze_dim=1):
     """Apply mRoPE to a single tensor (Q or K separately).
 
@@ -432,32 +526,41 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         self.off_dim = self.hidden_size // self.off_grps
 
         # --- Offset generation pipeline ---
-        self.conv_lr_dw = nn.Conv2d(
+        # All offset-path params use fp32-storage subclasses (see
+        # _FP32Weight{LayerNorm2d, Conv2d, Linear}). The bf16 round-off that
+        # froze ``hd_input_layernorm.weight`` and ``hd_gate`` at init also
+        # applies to these: ``ln_*.weight`` init at 1.0 (bf16 spacing 2⁻⁷ ≈
+        # 7.8e-3), ``conv_*.weight`` kaiming-init magnitude ≈ 0.05–0.13 (bf16
+        # spacing ≈ 4e-4 — comparable to per-step AdamW update lr*grad ≈
+        # 1e-4). Empirically Run B's trained offset behavior is virtually
+        # identical to a kaiming-random-init DAT (see
+        # scripts/qwen2_5vl_adl_0515/_diagnose_offsets*.py).
+        self.conv_lr_dw = _FP32WeightConv2d(
             self.off_dim, self.off_dim,
             kernel_size=self.off_ksize, stride=1, padding=self.off_ksize // 2,
             groups=self.off_dim, bias=False,
         )
-        self.ln_1 = LayerNorm2d(self.off_dim)
-        self.conv_lr_proj = nn.Conv2d(
+        self.ln_1 = _FP32WeightLayerNorm2d(self.off_dim)
+        self.conv_lr_proj = _FP32WeightConv2d(
             self.off_dim, self.inter_size,
             kernel_size=1, stride=1, padding=0,
         )
 
         # Intention branch
         if self.use_intention_branch:
-            self.proj_intention = nn.Linear(self.off_dim, self.inter_size)
+            self.proj_intention = _FP32WeightLinear(self.off_dim, self.inter_size)
         else:
             self.proj_intention = nn.Identity()
 
         # Offset prediction
         if self.intention_as_gate:
-            self.ln_2 = LayerNorm2d(self.inter_size)
-            self.conv_off_proj = nn.Conv2d(
+            self.ln_2 = _FP32WeightLayerNorm2d(self.inter_size)
+            self.conv_off_proj = _FP32WeightConv2d(
                 self.inter_size, 2, kernel_size=1, stride=1, padding=0, bias=False,
             )
         else:
-            self.ln_2 = LayerNorm2d(self.inter_size * 2)
-            self.conv_off_proj = nn.Conv2d(
+            self.ln_2 = _FP32WeightLayerNorm2d(self.inter_size * 2)
+            self.conv_off_proj = _FP32WeightConv2d(
                 self.inter_size * 2, 2, kernel_size=1, stride=1, padding=0, bias=False,
             )
 
@@ -466,9 +569,34 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             kv_dim = self.num_key_value_heads * self.head_dim
             self.k_proj_hd = nn.Linear(self.hidden_size, kv_dim)
             self.v_proj_hd = nn.Linear(self.hidden_size, kv_dim)
+            # RMSNorm applied to ``sampled_hr`` before k_proj_hd / v_proj_hd
+            # (F4 from the Run B fix).
+            #
+            # Motivation: q_proj / k_proj / v_proj on the LR path see
+            # ``self.input_layernorm(hidden_states)`` (RMSNormed layer-L
+            # hidden states), so their output value vectors are in the
+            # "RMSNormed layer-L value-space". But k_proj_hd / v_proj_hd
+            # see raw ``sampled_hr`` = pooler_output from the visual
+            # merger, which is *not* RMSNormed. Without this norm, the
+            # statistical distribution of value_hd cannot match value, and
+            # the LSE merge ``out = (1 − w₂)·out₁ + w₂·out₂`` injects a
+            # distribution-shifted signal at each DAT layer — accumulating
+            # to a ~3% per-layer corruption of the residual stream at
+            # inference time.
+            #
+            # Adding a learnable Qwen2_5_VLRMSNorm here is the cheapest fix:
+            # weight initializes to ones (acts as a pure normalization at
+            # step 0), the model can then learn a per-channel rescaling if
+            # the LR/HD distributions need different shaping.
+            # Use a fp32-weight subclass to avoid bf16 round-off near 1.0
+            # (see _FP32WeightRMSNorm docstring + Qwen2_5_VLAttentionDAT._apply).
+            self.hd_input_layernorm = _FP32WeightRMSNorm(
+                self.hidden_size, eps=config.rms_norm_eps
+            )
         else:
             self.k_proj_hd = None
             self.v_proj_hd = None
+            self.hd_input_layernorm = None
 
         # Rotary embedding for extended KV (Qwen2.5-VL Attention doesn't have one)
         self._dat_rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
@@ -526,6 +654,40 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         if self.hd_gate is not None and self.hd_gate.dtype != torch.float32:
             with torch.no_grad():
                 self.hd_gate.data = self.hd_gate.data.to(torch.float32)
+        # Same bf16 round-off problem for ``hd_input_layernorm.weight``: the
+        # RMSNorm scale lives near 1.0, where bf16 resolution is 2^-7 ≈ 7.8e-3,
+        # while AdamW's per-step update at dat_lr=1e-4 is ≈ 1e-4. After 500
+        # steps the cumulative update (≈ 5e-3) is *still* below the bf16
+        # grid → the scale stays at exactly 1.000000 forever (empirically
+        # verified on ckpt-500 of the 0515 Run B). RMSNorm Forward still
+        # normalises sampled_hr to RMS=1, but the per-channel adaptation
+        # never learns. Force fp32 storage like hd_gate; ``Qwen2_5_VLRMSNorm.forward``
+        # type-promotes ``fp32_weight * bf16_hidden_state`` to fp32 then
+        # casts back to ``input_dtype`` on the final return, so downstream
+        # ``k_proj_hd`` still receives bf16 (no compute-dtype regression).
+        if (
+            self.hd_input_layernorm is not None
+            and self.hd_input_layernorm.weight.dtype != torch.float32
+        ):
+            with torch.no_grad():
+                self.hd_input_layernorm.weight.data = (
+                    self.hd_input_layernorm.weight.data.to(torch.float32)
+                )
+        # Offset-path bf16 round-off protection. See
+        # _FP32Weight{LayerNorm2d, Conv2d, Linear} docstrings: ln_*.weight
+        # init at 1.0 has bf16 grid 2⁻⁷ ≈ 7.8e-3; conv_*.weight kaiming-init
+        # magnitude ≈ 0.05–0.13 has bf16 grid ≈ 4e-4, both comparable to or
+        # larger than AdamW per-step update ≈ 1e-4 → updates round off to
+        # zero and the offset network stays at init (cf. Run B vs random-init
+        # offset diagnostic: virtually identical statistics).
+        for sub in (self.conv_lr_dw, self.ln_1, self.conv_lr_proj,
+                    self.proj_intention, self.ln_2, self.conv_off_proj):
+            if not isinstance(sub, nn.Module):
+                continue
+            for p in sub.parameters(recurse=False):
+                if p.dtype != torch.float32:
+                    with torch.no_grad():
+                        p.data = p.data.to(torch.float32)
         return result
 
     @torch.no_grad()
@@ -777,6 +939,13 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         # 6. Project to KV
         if self.hd_proj:
+            # Normalize sampled_hr to match the RMSNormed distribution that
+            # k_proj / v_proj see on the LR path (Qwen attention always
+            # consumes ``self.input_layernorm(hidden_states)``). Without
+            # this norm, value_hd has a different magnitude than value, and
+            # the LSE merge injects a distribution-shifted signal at every
+            # DAT layer.
+            sampled_hr = self.hd_input_layernorm(sampled_hr)
             key_hd = self.k_proj_hd(sampled_hr)
             value_hd = self.v_proj_hd(sampled_hr)
         else:
@@ -1719,6 +1888,45 @@ def convert_qwen2_5vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=Non
 
     # Now that pretrained weights are loaded, copy k_proj/v_proj → k_proj_hd/v_proj_hd
     dat_model.init_hd_proj_from_kv()
+
+    # Force fp32 storage for DAT scalar / near-unity-weight params.
+    # ``from_pretrained(torch_dtype=bf16)`` casts the *weights* of missing
+    # submodules (such as ``hd_input_layernorm``) to bf16 directly via
+    # ``state_dict`` rewriting, bypassing the module's ``_apply`` chain.
+    # ``Qwen2_5_VLAttentionDAT._apply`` will re-protect these on every later
+    # ``.to(...)``/``.cuda()`` call, but we still need an explicit pass
+    # immediately after load to fix the initial bf16 cast.
+    n_fixed = 0
+    for m in dat_model.modules():
+        if isinstance(m, Qwen2_5_VLAttentionDAT):
+            if m.hd_gate is not None and m.hd_gate.dtype != torch.float32:
+                with torch.no_grad():
+                    m.hd_gate.data = m.hd_gate.data.to(torch.float32)
+                n_fixed += 1
+            if (
+                m.hd_input_layernorm is not None
+                and m.hd_input_layernorm.weight.dtype != torch.float32
+            ):
+                with torch.no_grad():
+                    m.hd_input_layernorm.weight.data = (
+                        m.hd_input_layernorm.weight.data.to(torch.float32)
+                    )
+                n_fixed += 1
+            # Offset-path fp32 protection (see Qwen2_5_VLAttentionDAT._apply).
+            for sub in (m.conv_lr_dw, m.ln_1, m.conv_lr_proj,
+                        m.proj_intention, m.ln_2, m.conv_off_proj):
+                if not isinstance(sub, nn.Module):
+                    continue
+                for p in sub.parameters(recurse=False):
+                    if p.dtype != torch.float32:
+                        with torch.no_grad():
+                            p.data = p.data.to(torch.float32)
+                        n_fixed += 1
+    if n_fixed > 0:
+        logger.info(
+            f"[DAT] Forced {n_fixed} DAT scalar/near-unity params back to fp32 "
+            f"after from_pretrained (anti-bf16-roundoff)."
+        )
 
     return dat_model
 

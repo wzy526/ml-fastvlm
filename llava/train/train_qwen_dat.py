@@ -79,7 +79,7 @@ local_rank = None
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
-    'hd_gate',
+    'hd_gate', 'hd_input_layernorm',
 ]
 
 
@@ -1371,47 +1371,139 @@ class LengthGroupedSampler(torch.utils.data.Sampler):
 class DATWarmupCallback(transformers.TrainerCallback):
     """Two-phase DAT training schedule.
 
-    Phase 1 (steps 0 .. warmup_steps-1): only DAT parameters are trainable.
-    Phase 2 (steps warmup_steps .. end):  DAT + LLM are trainable.
+    Phase 1 (steps 0 .. warmup_steps-1): only DAT modules learn.
+    Phase 2 (steps warmup_steps .. end):  DAT + LLM-adaptation both learn.
     ViT and connector stay frozen throughout.
 
-    Trick: before Trainer creation, DAT + LLM are all set requires_grad=True
-    so that create_optimizer() includes both in param groups.  Then on_train_begin
-    freezes LLM (params stay in optimizer but get no gradients), and on_step_begin
-    unfreezes LLM at the transition point.
+    Two operating modes:
+
+    * ``lora_mode=False`` (full-LLM tuning) — Phase 1 freezes the base LLM
+      hidden layers and ``lm_head``; Phase 2 thaws them.
+    * ``lora_mode=True``  (LoRA adapter)    — Phase 1 freezes every LoRA
+      adapter parameter (``lora_A`` / ``lora_B`` / ``lora_*``); Phase 2 thaws
+      them.  The base LLM weights remain frozen in either phase, since
+      PEFT keeps them that way.
+
+    Trick: before Trainer creation, all params we plan to (eventually) train
+    must be set ``requires_grad=True`` so that ``create_optimizer()``
+    includes them in param groups.  Then ``on_train_begin`` freezes the
+    Phase-2-only params (they stay in the optimizer but receive zero
+    gradient), and ``on_step_begin`` unfreezes them at the transition.
     """
 
-    def __init__(self, warmup_steps: int, dat_keys: list):
+    def __init__(self, warmup_steps: int, dat_keys: list, lora_mode: bool = False):
         self.warmup_steps = warmup_steps
         self.dat_keys = dat_keys
+        self.lora_mode = lora_mode
         self.phase1_active = True
 
+    @staticmethod
+    def _is_lora_param(name: str) -> bool:
+        # PEFT names LoRA params with ``lora_A`` / ``lora_B`` / ``lora_embedding_*``
+        # / ``lora_magnitude_vector``.  Matching the bare ``"lora_"`` substring
+        # covers all of them and excludes the (frozen) ``base_layer`` weights.
+        return 'lora_' in name
+
+    @staticmethod
+    def _flush_print(msg: str) -> None:
+        """Force stdout flush for diagnostic prints (multi-proc may buffer)."""
+        if local_rank == 0:
+            print(msg, flush=True)
+
+    def _freeze_phase2_params(self, model):
+        if self.lora_mode:
+            n = 0
+            for name, p in model.named_parameters():
+                if self._is_lora_param(name):
+                    p.requires_grad = False
+                    n += 1
+            self._flush_print(f"[DATWarmup] Phase 1 (LoRA mode): froze {n} LoRA adapter params")
+        else:
+            lang = _get_language_module(model)
+            for p in lang.parameters():
+                p.requires_grad = False
+            model.lm_head.requires_grad_(False)
+
+    def _unfreeze_phase2_params(self, model):
+        if self.lora_mode:
+            n = 0
+            for name, p in model.named_parameters():
+                if self._is_lora_param(name):
+                    p.requires_grad = True
+                    n += 1
+            self._flush_print(f"[DATWarmup] Phase 2 (LoRA mode): unfroze {n} LoRA adapter params")
+        else:
+            lang = _get_language_module(model)
+            for p in lang.parameters():
+                p.requires_grad = True
+            model.lm_head.requires_grad_(True)
+
+    def _verify_lora_frozen(self, model, label: str) -> None:
+        """Diagnostic: count LoRA params with requires_grad=True vs False.
+
+        Logged at train_begin and at phase 2 transition. The 0515 Run B run
+        showed lora_B drifting from 0 to std≈0.002 in 500 phase-1 steps,
+        suggesting Accelerate/DDP doesn't honor mid-train requires_grad
+        flips. This log lets us see immediately whether the freeze stuck.
+        """
+        if not self.lora_mode:
+            return
+        lora_frozen = lora_trainable = 0
+        for name, p in model.named_parameters():
+            if self._is_lora_param(name):
+                if p.requires_grad:
+                    lora_trainable += 1
+                else:
+                    lora_frozen += 1
+        self._flush_print(
+            f"[DATWarmup] {label}: LoRA params trainable={lora_trainable}, frozen={lora_frozen}"
+        )
+
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        self._flush_print(
+            f"[DATWarmup] on_train_begin invoked (model is None: {model is None}, "
+            f"warmup_steps={self.warmup_steps}, lora_mode={self.lora_mode})"
+        )
         if model is None:
             return
-        # Phase 1: freeze LLM, keep only DAT trainable
-        lang = _get_language_module(model)
-        for p in lang.parameters():
-            p.requires_grad = False
-        model.lm_head.requires_grad_(False)
+        self._freeze_phase2_params(model)
         # Ensure DAT params stay unfrozen
         for name, param in model.named_parameters():
             if any(k in name for k in self.dat_keys):
                 param.requires_grad = True
-        rank0_print(f"[DATWarmup] Phase 1: DAT-only for {self.warmup_steps} steps")
+        mode = "LoRA" if self.lora_mode else "full-LLM"
+        self._flush_print(f"[DATWarmup] Phase 1 [{mode}]: DAT-only for {self.warmup_steps} steps")
+        self._verify_lora_frozen(model, "after on_train_begin freeze")
         print_trainable_parameters(model)
 
     def on_step_begin(self, args, state, control, model=None, **kwargs):
         if not self.phase1_active or model is None:
             return
+        # Belt-and-suspenders: re-freeze every step in phase 1. The 0515 Run B
+        # run showed lora_B drifted from 0 to std≈0.002 in 500 phase-1 steps
+        # even though the one-shot on_train_begin freeze passed the dry-run.
+        # The plausible explanation is that Accelerate / HF Trainer (or the
+        # model wrap chain) flips ``requires_grad`` back to True somewhere
+        # between callback fires; doing this idempotent re-freeze every step
+        # closes that window.
+        if self.lora_mode:
+            for name, p in model.named_parameters():
+                if self._is_lora_param(name) and p.requires_grad:
+                    p.requires_grad = False
+        # Log only occasionally during phase 1 (e.g. step 1 and every 100 steps)
+        # to confirm freeze is still in effect.
+        if state.global_step in (1, 50, 100, 200, 300, 400, 499):
+            self._verify_lora_frozen(model, f"phase 1, step {state.global_step}")
         if state.global_step >= self.warmup_steps:
-            # Phase 2: unfreeze LLM
-            lang = _get_language_module(model)
-            for p in lang.parameters():
-                p.requires_grad = True
-            model.lm_head.requires_grad_(True)
+            self._unfreeze_phase2_params(model)
             self.phase1_active = False
-            rank0_print(f"[DATWarmup] Step {state.global_step}: Phase 2 — unfroze LLM + DAT")
+            mode = "LoRA" if self.lora_mode else "full-LLM"
+            self._flush_print(
+                f"[DATWarmup] Step {state.global_step}: Phase 2 [{mode}] — "
+                f"unfroze {'LoRA adapters' if self.lora_mode else 'LLM + lm_head'} "
+                f"+ DAT stays unfrozen"
+            )
+            self._verify_lora_frozen(model, "after on_step_begin phase 2 unfreeze")
             print_trainable_parameters(model)
 
 
@@ -2750,6 +2842,24 @@ def train():
             rank0_print(f"Unfroze {dat_unfrozen} DAT parameters after LoRA wrapping")
             # Re-apply hd_gate freeze (the loop above just flipped it back on).
             _apply_hd_gate_freeze(model, model_args)
+
+            # LoRA + DAT warmup: register the two-phase callback here (after
+            # PEFT wrapping, so LoRA adapter params are present in the
+            # parameter graph and can be flipped between phases). At this
+            # point both DAT params and LoRA adapter params are
+            # requires_grad=True, so create_optimizer() will see both — the
+            # callback then freezes LoRA adapters in Phase 1 and thaws them
+            # in Phase 2.
+            if model_args.dat_warmup_steps > 0:
+                rank0_print(
+                    f"LoRA + DAT two-phase training: DAT-only for "
+                    f"{model_args.dat_warmup_steps} steps, then DAT+LoRA"
+                )
+                dat_warmup_callback = DATWarmupCallback(
+                    warmup_steps=model_args.dat_warmup_steps,
+                    dat_keys=DAT_KEYS_MATCH,
+                    lora_mode=True,
+                )
 
         # Respect tune_mm_mlp under LoRA: merger/projector should remain trainable
         # when requested, and stay frozen otherwise.
