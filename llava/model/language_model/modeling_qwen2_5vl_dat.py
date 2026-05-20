@@ -623,6 +623,36 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             self.hd_gate = None
             self._hd_gate_freeze = False
 
+        # D1+D3 switches (May 2026 architecture refresh)
+        # ----------------------------------------------------------------
+        # D3 (use_residual_merge): replace LSE-merge with additive residual
+        # injection ``out += sigmoid(hd_gate) * hd_out_proj(out2)``.
+        #   - LSE merge weights HD vs LR by ``lse2 / (lse1 + lse2_gated)``,
+        #     so the layers where ``lse2`` happens to be large dominate even
+        #     when their HD attention is uniform (verified on
+        #     scripts/qwen2_5vl_adl_0519/_diagnose_attn_per_dat_layer.py:
+        #     L6/L12 have w_HD≈0.7 with HD_top10≈0.32, while L24 has
+        #     w_HD≈0.08 with HD_top10≈0.41 — merge is anti-correlated with
+        #     attention quality).
+        #   - Residual merge decouples w_HD from lse magnitude: hd_gate +
+        #     hd_out_proj jointly learn whether/where HD adds value.
+        # D1 (inject_lr_image): in addition to the existing answer-span Q,
+        # also feed lr_image-position Q into the HD cross-attention. This
+        # lets HD info enter the residual stream via lr_image tokens (the
+        # path actually used by Qwen2.5-VL: image → qa_prefix tokens →
+        # answer query, verified via scripts/qwen2_5vl_adl_0519/_diagnose_baseline_attn.py).
+        self.dat_use_residual_merge = bool(dat.get('use_residual_merge', False))
+        self.dat_inject_lr_image = bool(dat.get('inject_lr_image', False))
+        if self.dat_use_residual_merge:
+            # Zero-init projection (LoRA-style adapter): contribution is
+            # identically 0 at step 0 → strict baseline preservation.
+            # Gradient still flows through ``hd_out_proj.weight`` because
+            # ``dL/dW ∝ sigmoid(hd_gate) * out2`` and out2 is non-zero.
+            # ``hd_gate`` itself stays at the loaded value until W learns.
+            self.hd_out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        else:
+            self.hd_out_proj = None
+
         self._init_dat_weights()
 
     def _apply(self, fn, recurse=True):
@@ -703,6 +733,12 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             nn.init.xavier_uniform_(self.proj_intention.weight)
             if self.proj_intention.bias is not None:
                 nn.init.zeros_(self.proj_intention.bias)
+        # D3 residual-merge projection: zero-init so HD contribution is
+        # exactly 0 at step 0. Pairs with the LoRA-style trick: gradient
+        # flows through W because dL/dW = dL/dout * sigmoid(hd_gate) * out2,
+        # so W escapes 0 within the first optimizer step.
+        if getattr(self, 'hd_out_proj', None) is not None:
+            nn.init.zeros_(self.hd_out_proj.weight)
         # HD KV projections: zero-init adapter pattern (K=Kaiming, V=0).
         #
         # Previously we copied k_proj / v_proj into k_proj_hd / v_proj_hd to
@@ -1023,6 +1059,45 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         return out
 
+    def _merge_residual(
+        self,
+        out_b: torch.Tensor,
+        out2: torch.Tensor,
+        q_start: int,
+        q_end: int,
+    ) -> torch.Tensor:
+        """Additive residual merge (D3 alternative to ``_merge_two_pass_lse``).
+
+        Writes:
+            out_b[:, q_start:q_end] += sigmoid(hd_gate) * hd_out_proj(out2)
+
+        ``hd_out_proj`` is zero-initialized, so at step 0 the update is
+        identically 0 → baseline preservation. Unlike LSE merge, the
+        contribution magnitude is controlled by ``W`` (learned freely) and
+        ``hd_gate`` (gates direction-by-direction strength), NOT by the
+        relative ``lse2 / lse1`` magnitudes — which fixes the "merge picks
+        layers with high lse2, not layers with peaked HD attn" misalignment
+        documented in scripts/qwen2_5vl_adl_0519/_diagnose_attn_per_dat_layer.py.
+
+        Args:
+            out_b: [1, Nq, H, D]   — LR pass-1 output for this batch elem
+            out2:  [1, Nseg, H, D] — HD pass-2 output for the q_start:q_end slice
+            q_start, q_end: where in Nq to inject (matches a seg_meta entry)
+
+        Returns:
+            out: [1, Nq, H, D] with q_start:q_end residually updated
+        """
+        out = out_b.clone()
+        B_, Nseg_, H_, D_ = out2.shape
+        proj_flat = self.hd_out_proj(out2.reshape(B_, Nseg_, H_ * D_))
+        proj = proj_flat.view(B_, Nseg_, H_, D_)
+        if self.hd_gate is not None:
+            proj = proj * torch.sigmoid(self.hd_gate).to(proj.dtype)
+        out[:, q_start:q_end, :, :] = (
+            out[:, q_start:q_end, :, :] + proj.to(out.dtype)
+        )
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1172,6 +1247,13 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             if _want_vis and _dat_vis_entry is None:
                 _dat_vis_entry = (b_idx, _slocs)
 
+            # ----- Track the FIRST answer's prepped K/V for D1 reuse ------
+            # D1 lr_image segment shares HD K/V with answer 0 (single offset
+            # prediction per b_idx, conditioned on the FIRST answer's
+            # intention token).
+            k_hd_l_first: Optional[torch.Tensor] = None
+            v_hd_l_first: Optional[torch.Tensor] = None
+
             for l_idx, answer_range in enumerate(image_range_list[b_idx][1:]):
                 ans_start     = answer_range[0]
                 ans_end       = answer_range[1]
@@ -1211,10 +1293,36 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 v_hd_l = repeat_kv(v_hd_l, self.num_key_value_groups)
 
                 # [1, H, Ns, D] → [Ns, H, D]
-                seg_k_list.append(k_hd_l.squeeze(0).transpose(0, 1).contiguous())
-                seg_v_list.append(v_hd_l.squeeze(0).transpose(0, 1).contiguous())
+                k_seg = k_hd_l.squeeze(0).transpose(0, 1).contiguous()
+                v_seg = v_hd_l.squeeze(0).transpose(0, 1).contiguous()
+                seg_k_list.append(k_seg)
+                seg_v_list.append(v_seg)
                 seg_q_list.append(q_seg)
                 seg_meta.append((b_idx, q_ans_start, Nans))
+
+                if l_idx == 0:
+                    k_hd_l_first = k_seg
+                    v_hd_l_first = v_seg
+
+            # ----- D1: also inject HD info at lr_image positions ----------
+            # The base Qwen2.5-VL pathway carries image info via:
+            #   image tokens → qa_prefix tokens → answer query.
+            # The original DAT only injected HD into the answer-span Q,
+            # which (per the baseline diag) gets only ~5% of total attention
+            # in the LR pass. Routing HD through lr_image positions lets
+            # HD enter the residual stream where it can be picked up by
+            # later layers' qa_prefix-conditioned attention.
+            if (self.dat_inject_lr_image
+                    and k_hd_l_first is not None
+                    and v_hd_l_first is not None):
+                Nlr = lr_end - lr_start
+                if Nlr > 0:
+                    q_lr = query_bhnc[b_idx, :, lr_start:lr_end, :] \
+                        .transpose(0, 1).contiguous()    # [Nlr, H, D]
+                    seg_q_list.append(q_lr)
+                    seg_k_list.append(k_hd_l_first)
+                    seg_v_list.append(v_hd_l_first)
+                    seg_meta.append((b_idx, lr_start, Nlr))
 
         # Phase 2b: Batched cross-attention — ONE kernel for all segments
         if seg_q_list:
@@ -1224,19 +1332,26 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         else:
             out2_list, lse2_list = [], []
 
-        # Phase 2c: LSE merge — assemble per-batch outputs
+        # Phase 2c: Merge — LSE merge (legacy) OR residual injection (D3).
         out_parts: List[torch.Tensor] = []
         seg_iter = 0
         for b_idx in range(B):
             out_b = out1[b_idx:b_idx + 1]  # [1, Nq, H, D]
 
             while seg_iter < len(seg_meta) and seg_meta[seg_iter][0] == b_idx:
-                _, q_ans_start, Nans = seg_meta[seg_iter]
-                out_b = self._merge_two_pass_lse(
-                    out_b, lse1[b_idx:b_idx + 1],
-                    out2_list[seg_iter], lse2_list[seg_iter],
-                    q_ans_start, q_ans_start + Nans,
-                )
+                _, q_start, Nseg = seg_meta[seg_iter]
+                if self.dat_use_residual_merge:
+                    out_b = self._merge_residual(
+                        out_b,
+                        out2_list[seg_iter],
+                        q_start, q_start + Nseg,
+                    )
+                else:
+                    out_b = self._merge_two_pass_lse(
+                        out_b, lse1[b_idx:b_idx + 1],
+                        out2_list[seg_iter], lse2_list[seg_iter],
+                        q_start, q_start + Nseg,
+                    )
                 seg_iter += 1
 
             out_parts.append(out_b)
@@ -1316,6 +1431,92 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                         f"{text_config.num_hidden_layers - dat_count} standard layers")
 
         self._patch_text_model_init_weights()
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        """Override to post-fix raw nn.Parameter loading for ``hd_gate``.
+
+        HF's checkpoint key remapping (``model.layers.X`` ↔
+        ``model.language_model.layers.X`` for the Qwen2.5-VL Module/TextModel
+        split) handles submodule parameters (``k_proj_hd.weight``,
+        ``conv_off_proj.weight`` …) correctly, but silently drops raw
+        ``nn.Parameter`` attributes such as ``hd_gate``. Result: every
+        ``hd_gate`` was being reset to ``hd_gate_init`` at inference time even
+        when the merged ckpt stored a properly trained value.
+
+        After the standard ``from_pretrained`` returns, we scan the ckpt
+        directory for any ``*hd_gate*`` keys in safetensors / pytorch_model.bin
+        and write them into the corresponding ``model.language_model.layers[i]
+        .self_attn.hd_gate`` parameter. No-op when loading from the base Qwen
+        ckpt (it contains no ``hd_gate`` keys) or when the path is a Hub id.
+        """
+        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        cls._manual_load_dat_raw_params(model, pretrained_model_name_or_path)
+        return model
+
+    @staticmethod
+    def _manual_load_dat_raw_params(model, path):
+        """Post-load fix for raw nn.Parameter attributes not covered by HF
+        key remapping (currently only ``hd_gate``)."""
+        import os
+        if not isinstance(path, str) or not os.path.isdir(path):
+            return
+
+        weights: dict[str, torch.Tensor] = {}
+        try:
+            from safetensors import safe_open  # type: ignore
+        except ImportError:
+            safe_open = None  # type: ignore
+
+        for fn in sorted(os.listdir(path)):
+            full = os.path.join(path, fn)
+            if fn.endswith('.safetensors') and safe_open is not None:
+                with safe_open(full, framework='pt') as st:
+                    for k in st.keys():
+                        if 'hd_gate' in k:
+                            weights[k] = st.get_tensor(k)
+            elif fn in ('pytorch_model.bin', 'model.bin'):
+                sd = torch.load(full, map_location='cpu')
+                for k, v in sd.items():
+                    if 'hd_gate' in k:
+                        weights[k] = v
+
+        if not weights:
+            return
+
+        if hasattr(model.model, 'language_model'):
+            text_model = model.model.language_model
+        else:
+            text_model = model.model
+
+        n_loaded = 0
+        for k, v in weights.items():
+            if not k.endswith('.self_attn.hd_gate'):
+                continue
+            parts = k.split('.')
+            try:
+                layer_idx = int(parts[parts.index('layers') + 1])
+            except (ValueError, IndexError):
+                continue
+            if layer_idx >= len(text_model.layers):
+                continue
+            attn = text_model.layers[layer_idx].self_attn
+            if hasattr(attn, 'hd_gate') and attn.hd_gate is not None:
+                with torch.no_grad():
+                    attn.hd_gate.data.copy_(
+                        v.to(attn.hd_gate.dtype).to(attn.hd_gate.device)
+                    )
+                n_loaded += 1
+
+        if n_loaded > 0:
+            try:
+                logger.info(
+                    f"[DAT post-load] manually loaded hd_gate for {n_loaded} DAT layers"
+                )
+            except NameError:
+                print(
+                    f"[DAT post-load] manually loaded hd_gate for {n_loaded} DAT layers"
+                )
 
     def _patch_text_model_init_weights(self):
         """Make smart_apply use DAT-aware ``_init_weights`` for the inner text model.
