@@ -2063,6 +2063,43 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
             except Exception:
                 pass
 
+        # --- Figure size: match original image aspect ratio ---------------
+        # bg_img shape = [H, W, 3] (PIL → numpy). We draw at the image's
+        # native pixel aspect ratio so e.g. a 4096x3072 image is rendered
+        # 4:3, not stretched into the previous fixed 5x5 square. The
+        # longer side is capped at ``MAX_FIG_IN`` to keep wandb uploads
+        # bounded (HR-Bench images can be 8K wide → otherwise figsize
+        # would be 80in).
+        MAX_FIG_IN = 8.0
+        if bg_img is not None:
+            H_pix, W_pix = bg_img.shape[:2]
+            ar = W_pix / max(H_pix, 1)
+            if ar >= 1:
+                fig_w = MAX_FIG_IN
+                fig_h = MAX_FIG_IN / ar
+            else:
+                fig_h = MAX_FIG_IN
+                fig_w = MAX_FIG_IN * ar
+            # Pixel-space extent + sampling-loc mapping.
+            x_extent = [0, W_pix]
+            y_extent = [H_pix, 0]              # PIL: y grows downward
+            def _to_xy(x_norm, y_norm):        # [-1, 1] → pixel
+                return (
+                    (x_norm + 1.0) * 0.5 * W_pix,
+                    (y_norm + 1.0) * 0.5 * H_pix,
+                )
+            xlim = (-0.02 * W_pix, 1.02 * W_pix)
+            ylim = (1.02 * H_pix, -0.02 * H_pix)
+        else:
+            # No image: keep legacy [-1, 1] coord system, 5x5 square.
+            fig_w = fig_h = 5.0
+            x_extent = [-1, 1]
+            y_extent = [1, -1]
+            def _to_xy(x_norm, y_norm):
+                return x_norm, y_norm
+            xlim = (-1.05, 1.05)
+            ylim = (1.05, -1.05)
+
         # --- One figure per layer ---
         figs = {}
         for name, (locs, attn) in layer_data:
@@ -2073,18 +2110,23 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
             attn_0 = attn[lp_idx].cpu().numpy() if attn is not None else None
             n_grps, gh, gw = locs_0.shape[0], locs_0.shape[1], locs_0.shape[2]
 
-            fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+            fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
 
             if bg_img is not None:
-                ax.imshow(bg_img, extent=[-1, 1, 1, -1], aspect='auto', alpha=0.85)
+                ax.imshow(
+                    bg_img,
+                    extent=[x_extent[0], x_extent[1], y_extent[0], y_extent[1]],
+                    aspect='equal', alpha=0.85,
+                )
             else:
                 ax.set_facecolor('#f0f0f0')
 
             for g in range(n_grps):
                 hue = g / max(n_grps, 1)
                 pts = locs_0[g]               # [gh, gw, 2]
-                x_all = pts[:, :, 0].flatten()
-                y_all = pts[:, :, 1].flatten()
+                x_norm_all = pts[:, :, 0].flatten()
+                y_norm_all = pts[:, :, 1].flatten()
+                x_all, y_all = _to_xy(x_norm_all, y_norm_all)
 
                 if attn_0 is not None:
                     a_all = attn_0.flatten()
@@ -2110,8 +2152,8 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
                     edgecolors='white', linewidths=0.8, zorder=3,
                 )
 
-            ax.set_xlim(-1.05, 1.05)
-            ax.set_ylim(1.05, -1.05)
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
             ax.set_aspect('equal')
             ax.tick_params(labelsize=6)
 
