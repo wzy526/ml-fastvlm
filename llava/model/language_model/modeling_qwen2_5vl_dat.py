@@ -722,12 +722,13 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
     @torch.no_grad()
     def _init_dat_weights(self):
-        # Conv layers: Kaiming normal
+        # Conv layers: Kaiming normal for the LR feature extractors.
         nn.init.kaiming_normal_(self.conv_lr_dw.weight)
         nn.init.kaiming_normal_(self.conv_lr_proj.weight)
-        nn.init.kaiming_normal_(self.conv_off_proj.weight)
         if self.conv_lr_proj.bias is not None:
             nn.init.zeros_(self.conv_lr_proj.bias)
+        # uninformative-but-safe reference grid.
+        nn.init.zeros_(self.conv_off_proj.weight)
         # Linear layers: Xavier uniform
         if isinstance(self.proj_intention, nn.Linear):
             nn.init.xavier_uniform_(self.proj_intention.weight)
@@ -789,9 +790,37 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             nn.init.zeros_(self.v_proj_hd.bias)
 
     def _grid_generate(self, h, w, n_repeats, device):
-        """Generate reference sampling grid in [-1, 1]."""
-        grid_y = torch.linspace(-1, 1, h, device=device, dtype=torch.float32)
-        grid_x = torch.linspace(-1, 1, w, device=device, dtype=torch.float32)
+        """Generate reference sampling grid with a half-cell margin from
+        the [-1, 1] clamp boundary.
+
+        Why the margin (not just ``linspace(-1, 1, h)``):
+            The original DAT layout put reference points at exactly ±1 at
+            the four edges of the grid. Combined with the downstream
+            ``sample_locs = (reference + offset).clamp(-1, 1)``, the
+            edge cells were single-side dead-locked: a negative offset
+            at ref_x=-1 is clipped to -1, the clamp gradient is zero
+            outside [-1, 1], so the network never receives a learning
+            signal "your edge cell should move further left". Edge cells
+            (4*(G-1) ≈ 19% of the grid for G=20) could only learn to
+            move INWARD, never outward.
+
+            We solve this by inset-ing the reference grid by half a cell
+            on every side (``align_corners=False``-style cell-center
+            convention):
+                margin_y = 1/(h-1),  margin_x = 1/(w-1)
+                grid_y ∈ [-1+m_y, 1-m_y]
+                grid_x ∈ [-1+m_x, 1-m_x]
+            Now every cell — interior and edge — has at least a
+            half-cell of bidirectional offset freedom before hitting the
+            clamp boundary. The 5% strip of HD feature near the literal
+            image borders becomes reachable only via positive offsets,
+            which is the correct learning signal ("reach further out for
+            corner content").
+        """
+        m_y = 1.0 / max(h - 1, 1)
+        m_x = 1.0 / max(w - 1, 1)
+        grid_y = torch.linspace(-1.0 + m_y, 1.0 - m_y, h, device=device, dtype=torch.float32)
+        grid_x = torch.linspace(-1.0 + m_x, 1.0 - m_x, w, device=device, dtype=torch.float32)
         grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
         grid = torch.stack([grid_x, grid_y], dim=0)  # [2, H, W]
         return grid.unsqueeze(0).repeat(n_repeats * self.off_grps, 1, 1, 1)
