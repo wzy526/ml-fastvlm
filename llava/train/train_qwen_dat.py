@@ -80,9 +80,6 @@ DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
-    # D3 residual-merge projection (only present when
-    # dat_use_residual_merge=True; harmless string match otherwise).
-    'hd_out_proj',
 ]
 
 
@@ -247,14 +244,6 @@ class ModelArguments:
                   "the zero-init-V cold-start: with the gate locked, v_proj_hd has "
                   "no 'close the door' escape route and must learn useful HD content. "
                   "Requires dat_hd_gate_init to be set."}
-    )
-    dat_use_residual_merge: bool = field(
-        default=False,
-        metadata={"help": "D3: replace LSE merge with additive residual injection "
-                  "out += sigmoid(hd_gate) * hd_out_proj(out2). Decouples merge "
-                  "weight from lse2 magnitude (the per-DAT-layer attention diag "
-                  "shows LSE merge weights are anti-correlated with HD attention "
-                  "peakedness in our DAT runs)."}
     )
     dat_inject_lr_image: bool = field(
         default=False,
@@ -2741,7 +2730,6 @@ def train():
             'use_spatial_attn_guide': model_args.dat_use_spatial_attn_guide,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
-            'use_residual_merge': model_args.dat_use_residual_merge,
             'inject_lr_image': model_args.dat_inject_lr_image,
             'use_fused_vit': model_args.dat_fused_vit,
             'use_shared_vit': model_args.dat_shared_vit,

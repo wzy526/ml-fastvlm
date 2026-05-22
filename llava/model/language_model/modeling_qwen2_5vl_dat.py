@@ -623,35 +623,12 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             self.hd_gate = None
             self._hd_gate_freeze = False
 
-        # D1+D3 switches (May 2026 architecture refresh)
-        # ----------------------------------------------------------------
-        # D3 (use_residual_merge): replace LSE-merge with additive residual
-        # injection ``out += sigmoid(hd_gate) * hd_out_proj(out2)``.
-        #   - LSE merge weights HD vs LR by ``lse2 / (lse1 + lse2_gated)``,
-        #     so the layers where ``lse2`` happens to be large dominate even
-        #     when their HD attention is uniform (verified on
-        #     scripts/qwen2_5vl_adl_0519/_diagnose_attn_per_dat_layer.py:
-        #     L6/L12 have w_HD≈0.7 with HD_top10≈0.32, while L24 has
-        #     w_HD≈0.08 with HD_top10≈0.41 — merge is anti-correlated with
-        #     attention quality).
-        #   - Residual merge decouples w_HD from lse magnitude: hd_gate +
-        #     hd_out_proj jointly learn whether/where HD adds value.
         # D1 (inject_lr_image): in addition to the existing answer-span Q,
         # also feed lr_image-position Q into the HD cross-attention. This
         # lets HD info enter the residual stream via lr_image tokens (the
         # path actually used by Qwen2.5-VL: image → qa_prefix tokens →
         # answer query, verified via scripts/qwen2_5vl_adl_0519/_diagnose_baseline_attn.py).
-        self.dat_use_residual_merge = bool(dat.get('use_residual_merge', False))
         self.dat_inject_lr_image = bool(dat.get('inject_lr_image', False))
-        if self.dat_use_residual_merge:
-            # Zero-init projection (LoRA-style adapter): contribution is
-            # identically 0 at step 0 → strict baseline preservation.
-            # Gradient still flows through ``hd_out_proj.weight`` because
-            # ``dL/dW ∝ sigmoid(hd_gate) * out2`` and out2 is non-zero.
-            # ``hd_gate`` itself stays at the loaded value until W learns.
-            self.hd_out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        else:
-            self.hd_out_proj = None
 
         self._init_dat_weights()
 
@@ -734,12 +711,6 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             nn.init.xavier_uniform_(self.proj_intention.weight)
             if self.proj_intention.bias is not None:
                 nn.init.zeros_(self.proj_intention.bias)
-        # D3 residual-merge projection: zero-init so HD contribution is
-        # exactly 0 at step 0. Pairs with the LoRA-style trick: gradient
-        # flows through W because dL/dW = dL/dout * sigmoid(hd_gate) * out2,
-        # so W escapes 0 within the first optimizer step.
-        if getattr(self, 'hd_out_proj', None) is not None:
-            nn.init.zeros_(self.hd_out_proj.weight)
         # HD KV projections: zero-init adapter pattern (K=Kaiming, V=0).
         #
         # Previously we copied k_proj / v_proj into k_proj_hd / v_proj_hd to
@@ -1088,45 +1059,6 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         return out
 
-    def _merge_residual(
-        self,
-        out_b: torch.Tensor,
-        out2: torch.Tensor,
-        q_start: int,
-        q_end: int,
-    ) -> torch.Tensor:
-        """Additive residual merge (D3 alternative to ``_merge_two_pass_lse``).
-
-        Writes:
-            out_b[:, q_start:q_end] += sigmoid(hd_gate) * hd_out_proj(out2)
-
-        ``hd_out_proj`` is zero-initialized, so at step 0 the update is
-        identically 0 → baseline preservation. Unlike LSE merge, the
-        contribution magnitude is controlled by ``W`` (learned freely) and
-        ``hd_gate`` (gates direction-by-direction strength), NOT by the
-        relative ``lse2 / lse1`` magnitudes — which fixes the "merge picks
-        layers with high lse2, not layers with peaked HD attn" misalignment
-        documented in scripts/qwen2_5vl_adl_0519/_diagnose_attn_per_dat_layer.py.
-
-        Args:
-            out_b: [1, Nq, H, D]   — LR pass-1 output for this batch elem
-            out2:  [1, Nseg, H, D] — HD pass-2 output for the q_start:q_end slice
-            q_start, q_end: where in Nq to inject (matches a seg_meta entry)
-
-        Returns:
-            out: [1, Nq, H, D] with q_start:q_end residually updated
-        """
-        out = out_b.clone()
-        B_, Nseg_, H_, D_ = out2.shape
-        proj_flat = self.hd_out_proj(out2.reshape(B_, Nseg_, H_ * D_))
-        proj = proj_flat.view(B_, Nseg_, H_, D_)
-        if self.hd_gate is not None:
-            proj = proj * torch.sigmoid(self.hd_gate).to(proj.dtype)
-        out[:, q_start:q_end, :, :] = (
-            out[:, q_start:q_end, :, :] + proj.to(out.dtype)
-        )
-        return out
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1361,7 +1293,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         else:
             out2_list, lse2_list = [], []
 
-        # Phase 2c: Merge — LSE merge (legacy) OR residual injection (D3).
+        # Phase 2c: LSE merge.
         out_parts: List[torch.Tensor] = []
         seg_iter = 0
         for b_idx in range(B):
@@ -1369,18 +1301,11 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
             while seg_iter < len(seg_meta) and seg_meta[seg_iter][0] == b_idx:
                 _, q_start, Nseg = seg_meta[seg_iter]
-                if self.dat_use_residual_merge:
-                    out_b = self._merge_residual(
-                        out_b,
-                        out2_list[seg_iter],
-                        q_start, q_start + Nseg,
-                    )
-                else:
-                    out_b = self._merge_two_pass_lse(
-                        out_b, lse1[b_idx:b_idx + 1],
-                        out2_list[seg_iter], lse2_list[seg_iter],
-                        q_start, q_start + Nseg,
-                    )
+                out_b = self._merge_two_pass_lse(
+                    out_b, lse1[b_idx:b_idx + 1],
+                    out2_list[seg_iter], lse2_list[seg_iter],
+                    q_start, q_start + Nseg,
+                )
                 seg_iter += 1
 
             out_parts.append(out_b)

@@ -4,17 +4,22 @@ set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate vldat
 
-# Exp G (0521): DENSE DAT (all 36 layers D) + wide LoRA on all 36 QKVO.
+# Exp G (0522): DENSE DAT (all 36 layers D) + wide LoRA on all 36 QKVO, LSE merge.
 # ============================================================================
 #
-# Changes vs. exp12_full_runE.sh:
+# Architecture choice: LSE merge (NOT D3 residual merge). The residual-merge
+# / hd_out_proj code path has been deleted from modeling_qwen2_5vl_dat.py
+# (commit "remove D3 residual gating"), so this run is structurally a
+# 0514-style hd_gate-controlled LSE merge applied at every single layer.
+#
+# Changes vs. exp9_full_1d5l_sa1b_ivcap_hdgate-2.sh (0514 LSE baseline):
 #   dat_layers      DLLLLL... (6 D)   ->   DDDD...DDDD (36 D)
 #   lora_target_layers   "dat"        ->   "all"   (= 144 adapters with all-D)
 #   dat_lr          1e-4              ->   5e-5    (safety: never trained all-D before)
 #
 # Hypothesis being tested
 # -----------------------
-# Even with the wider LoRA (Run F), DAT might still be neutral because HD
+# Even with wider LoRA (Run F), LSE-DAT might still be neutral because HD
 # is injected at 6 sparse layers only -- 5 vanilla Qwen layers between
 # each DAT injection wash out the HD perturbation via standard attention,
 # leaving the LM head to never "see" HD content. Run G makes HD injection
@@ -23,20 +28,22 @@ conda activate vldat
 #
 # Decision table (read alongside Run F)
 # -------------------------------------
-# F → 0.65, G > F          DAT helps when both LR scope and HD density are
-#                          fixed. Recovery path: more density, longer
+# F → 0.65, G > F          LSE-DAT helps when both LR scope and HD density
+#                          are fixed. Recovery path: more density, longer
 #                          training, possibly larger hr_scale.
-# F → 0.65, G ≈ F          DAT is structurally neutral at any density;
+# F → 0.65, G ≈ F          LSE-DAT is structurally neutral at any density;
 #                          HD path projects orthogonal to LM head. Need a
 #                          new HD-to-LM-head bridge (e.g., HD as prefix
-#                          vision tokens à la LLaVA-NeXT tiling).
+#                          vision tokens à la LLaVA-NeXT tiling, or fix
+#                          the offset-drift bug that pins HD sampling to
+#                          image edges).
 # F → 0.65, G < F          Dense DAT introduces a tax that outweighs HD
 #                          contribution -- the original 6 D sparsity was
 #                          right. Need cheaper-per-layer DAT (smaller
 #                          inter_size / dropping intention branch / etc.).
-# Both F, G ≈ 0.58         Wider LoRA can't recover anything; DAT actively
-#                          poisons LR regardless of density or scope.
-#                          Time to throw out current DAT and redesign.
+# Both F, G ≈ 0.58         Wider LoRA can't recover anything; LSE-DAT
+#                          actively poisons LR regardless of density or
+#                          scope. Time to throw out current DAT and redesign.
 #
 # Risk notes
 # ----------
@@ -68,7 +75,7 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0521_expG_dense_dat_widelora}"
+EXP_NAME="${EXP_NAME:-0522_expG_dense_widelora_lse}"
 
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_ivcap.json}"
 
@@ -117,10 +124,9 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40751}" llava/train/tr
     --dat_use_spatial_attn_guide False \
     --dat_shared_vit False \
     --dat_freeze_base False \
-    --dat_hd_gate_init -1.0 \
+    --dat_hd_gate_init -2.0 \
     --dat_warmup_steps 0 \
-    --dat_use_residual_merge True \
-    --dat_inject_lr_image True \
+    --dat_inject_lr_image False \
     --dat_lr 5e-5 \
     --lora_enable True \
     --lora_r 8 \

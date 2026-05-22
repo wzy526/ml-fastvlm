@@ -4,42 +4,47 @@ set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate vldat
 
-# Exp F (0521): Run E config + WIDE LoRA on ALL 36 layers' QKVO.
+# Exp F (0522): 0514-style LSE-merge DAT + WIDE LoRA on ALL 36 layers' QKVO.
 # ============================================================================
 #
-# Single-variable change vs. exp12_full_runE.sh:
+# Architecture choice: LSE merge (NOT D3 residual merge). The residual-merge
+# / hd_out_proj code path has been deleted from modeling_qwen2_5vl_dat.py
+# (commit "remove D3 residual gating"), so this run is structurally a
+# 0514-style hd_gate-controlled LSE merge.
+#
+# Single-variable change vs. exp9_full_1d5l_sa1b_ivcap_hdgate-2.sh (0514):
 #   --lora_target_layers "dat"  -->  --lora_target_layers "all"
 #
 # get_lora_target_modules() in train_qwen_dat.py:
-#   "dat" + dat_layers="DLLLLLDLLLLL..." (6 D)  ->   6 layers ×  4 proj =  24 LoRA adapters (Run E)
-#   "all"                                          -> 36 layers ×  4 proj = 144 LoRA adapters (this Run)
+#   "dat" + dat_layers="DLLLLL..." (6 D)  ->   6 layers ×  4 proj =  24 LoRA adapters (0514 runs)
+#   "all"                                  -> 36 layers ×  4 proj = 144 LoRA adapters (this Run)
 #
 # Hypothesis being tested
 # -----------------------
-# All 0514+ DAT variants stuck at hrbench4k ≈ 0.58 share one invariant: the
-# only LR-path-affecting trainable params are the 24-adapter LoRA on 6 DAT-layer
-# QKVO. A' (LoRA all linear, no DAT) reached 0.6538 with the SAME data,
-# meaning a wider LR-side LoRA scope alone buys +6 pt.
+# Every LSE-DAT variant since 0514 plateaued at hrbench4k ≈ 0.58. They share
+# one invariant: the only LR-path-affecting trainable params are the
+# 24-adapter LoRA on 6 DAT-layer QKVO. A' (LoRA all linear, no DAT) reached
+# 0.6538 with the SAME data, meaning a wider LR-side LoRA scope alone buys
+# +6 pt over base.
 #
-# Run F isolates "wider LoRA scope" without touching anything else: DAT
-# structure, DAT params (D1 + D3 + intention), HD pipeline, data, all
-# learning rates, all warmup are identical to Run E. Only the LoRA pattern
-# string changes.
+# Run F isolates "wider LoRA scope" within the 0514 LSE architecture: DAT
+# structure, DAT params, HD pipeline, data, all learning rates, all warmup
+# are identical to the 0514 hdgate-2 run. Only the LoRA pattern changes
+# from "dat" to "all".
 #
 # Decision table for hrbench4k avg
 # --------------------------------
-# F ≈ A' (~0.65)     -> LR scope was the entire story; DAT structure is
-#                       neutral (no help, no hurt). Recovery path: pair
-#                       wider LoRA with structural fixes that connect HD
-#                       to LM head (next: Run G or dense-DAT redesign).
+# F ≈ A' (~0.65)     -> LR scope was the entire story; LSE-DAT is
+#                       neutral (no help, no hurt). Next: Run G (dense
+#                       injection) to see if HD ever helps under LSE.
 # F ≈ base (~0.62)   -> Wider LoRA recovered most, but DAT forward graph
-#                       still imposes a ~3 pt structural tax. Recovery
-#                       path: identify the tax source (hd_input_layernorm
-#                       numeric drift, intention_branch gate at init, ...).
-# F ≈ Run E (~0.58)  -> Wider LoRA didn't help; DAT actively eats LR
-#                       gains regardless of LoRA scope. Recovery path:
-#                       full structural rework (HD as prefix tokens,
-#                       dense injection, decoupled HD-LM-head bridge).
+#                       still imposes a ~3 pt structural tax. Diagnose
+#                       tax source (offset drift / hd_input_layernorm
+#                       numeric drift / intention gate at init).
+# F ≈ 0514 (~0.58)   -> Wider LoRA didn't help; LSE-DAT actively eats
+#                       LR gains regardless of LoRA scope. Recovery path
+#                       requires a structural redesign of the HD path
+#                       (offset L2 regularization, or HD-as-prefix tokens).
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
@@ -54,7 +59,7 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0521_expF_runE_widelora_all36qkvo}"
+EXP_NAME="${EXP_NAME:-0522_expF_widelora_lse}"
 
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_ivcap.json}"
 
@@ -97,10 +102,9 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40741}" llava/train/tr
     --dat_use_spatial_attn_guide False \
     --dat_shared_vit False \
     --dat_freeze_base False \
-    --dat_hd_gate_init -1.0 \
+    --dat_hd_gate_init -2.0 \
     --dat_warmup_steps 0 \
-    --dat_use_residual_merge True \
-    --dat_inject_lr_image True \
+    --dat_inject_lr_image False \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \
