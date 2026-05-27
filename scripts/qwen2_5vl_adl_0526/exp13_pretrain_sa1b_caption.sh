@@ -5,7 +5,7 @@ set -euo pipefail
 eval "$(conda shell.bash hook)"
 conda activate vldat
 
-# Exp 13 (0520): Pretrain stage on SA-1B captions.
+# Exp 13 (0526): Pretrain stage on SA-1B captions.
 # ============================================================================
 #
 # Goal
@@ -39,16 +39,35 @@ conda activate vldat
 # 2. then loops over all params, re-enabling every DAT_KEYS_MATCH-tagged one.
 # That gives us the exact (visual.merger + DAT) trainable surface above.
 #
-# Architecture / regularization (inherits Run E1 setup, see exp12_full_runE.sh)
-# ----------------------------------------------------------------------------
-# - D1 (--dat_inject_lr_image True): HD KV is also injected at lr_image
-#   positions in pass-2. This is the path that actually carries HD content
-#   into the LLM residual stream (see Run E1 motivation comment).
-# - D3 (--dat_use_residual_merge True): replaces LSE merge with
-#       out[q_start:q_end] += sigmoid(hd_gate) * hd_out_proj(out2)
-#   where hd_out_proj is zero-initialized => contribution is identically 0
-#   at step 0 regardless of dat_hd_gate_init (LoRA-style adapter).
-# - F1 OFF (--dat_use_spatial_attn_guide False) and intention_branch ON.
+# Architecture / regularization (post D3 + STE)
+# ----------------------------------------------
+# The codebase has been simplified since the original Run E1 D1+D3 era:
+#   * D3 removed: ``dat_use_residual_merge`` / ``hd_out_proj`` no longer
+#     exist anywhere (verified: 0 hits in modeling_qwen2_5vl_dat.py /
+#     train_qwen_dat.py, also dropped from DAT_KEYS_MATCH). Merge is back
+#     to the standard LSE form (modeling_qwen2_5vl_dat.py:999-1060):
+#         lse = logaddexp(lse1_ans, lse2)
+#         w1 = exp(lse1_ans - lse),  w2 = exp(lse2 - lse)
+#         out[ans] = w1·out1_ans + w2·out2
+#     gated optionally by ``hd_gate`` (lse2 += log σ(hd_gate)) — disabled
+#     here, see below.
+#   * sample_locs uses a Straight-Through Estimator on clamp
+#     (modeling_qwen2_5vl_dat.py:955-956):
+#         x = references + offsets
+#         sample_locs = (x + (x.clamp(-1, 1) - x).detach())
+#     Forward is physically valid for F.grid_sample (always in [-1, 1]);
+#     backward is identity, so offsets that drift past ±1 keep getting
+#     gradient pointing back to the clamp surface — no dead zone (plain
+#     clamp) and no center-collapse from gradient decay (tanh).
+#   * D1 OFF here (--dat_inject_lr_image False). The original answer-span-
+#     only injection is in effect. Pretrain stage; we keep the surface
+#     minimal and let D1 be re-enabled by the SFT recipe if desired.
+#   * F1 OFF (--dat_use_spatial_attn_guide False), intention_branch ON.
+#   * hd_gate: parameter NOT created (omit --dat_hd_gate_init entirely
+#     => hd_gate_init=None => modeling line 622-624 sets
+#     self.hd_gate=None => merge skips the log σ(g) bias). With LSE merge
+#     and no gate, w2 is purely driven by the cross-attn lse — projector
+#     and DAT/HD KV projections learn freely from step 0, no cold-start.
 #
 # Pretrain-specific changes vs. Run E1
 # ------------------------------------
@@ -57,11 +76,6 @@ conda activate vldat
 #                scripts/qwen2_5vl_adl_0430/build_sa1b_caption_pretrain.py.
 # - LoRA:        --lora_enable False (LLM truly untouched).
 # - Projector:   --tune_mm_mlp True + --mm_projector_lr 1e-4.
-# - hd_gate:     --dat_hd_gate_init 0.0 (sigma=0.5 neutral) instead of -1.0
-#                used in Run E1. The zero-init hd_out_proj still keeps the
-#                step-0 contribution at exactly 0, but as soon as
-#                hd_out_proj escapes 0 the gate is at a more useful operating
-#                point for pretrain-time exploration of HD utility.
 # - LR sched:    Cosine, warmup 100 (vs. 50 in Run E1) since the projector
 #                starts from a checkpointed but distribution-shifted state.
 # - Grouping:    --group_by_modality_length False; SA-1B is uniformly
@@ -80,13 +94,12 @@ conda activate vldat
 # Expected wandb signatures
 # -------------------------
 # - train/loss: starts higher than Run E1 (captions are much more diverse
-#   than HR-essential SFT), drops monotonically. Should plateau in
-#   2 epoch range; longer doesn't help without unfreezing LLM.
-# - dat/grad_norm: non-zero on hd_out_proj.* from step 1 (same as Run E1).
+#   than HR-essential SFT), drops monotonically. Should plateau within
+#   1-2 epochs; longer doesn't help without unfreezing LLM.
 # - visual.merger grad: should be sizable; if it stays at machine epsilon
 #   something's wrong with tune_mm_mlp wiring.
-# - dat/hd_gate_raw: starts at 0.0; expected to drift, sign indicating
-#   whether HD content is helping (positive) or being suppressed (negative).
+# - DAT grads: conv_off_proj / k_proj_hd / v_proj_hd / hd_input_layernorm
+#   should all be non-zero. No hd_gate to watch (omitted on purpose).
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
@@ -102,7 +115,7 @@ DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
 MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
 CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
-EXP_NAME="${EXP_NAME:-0520_pretrain_sa1b_caption_D1D3}"
+EXP_NAME="${EXP_NAME:-0526_pretrain_sa1b_caption_lse_ste}"
 
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_sa1b_caption_pretrain.json}"
 
@@ -157,10 +170,8 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40631}" llava/train/tr
     --dat_use_spatial_attn_guide False \
     --dat_shared_vit False \
     --dat_freeze_base False \
-    --dat_hd_gate_init 0.0 \
     --dat_warmup_steps 0 \
-    --dat_use_residual_merge True \
-    --dat_inject_lr_image True \
+    --dat_inject_lr_image False \
     --dat_lr 1e-4 \
     --lora_enable False \
     --tune_mm_vision False \

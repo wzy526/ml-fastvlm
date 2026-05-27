@@ -306,7 +306,13 @@ class Qwen2VLAttentionDAT(Qwen2VLAttention):
         # Conv layers: Kaiming normal
         nn.init.kaiming_normal_(self.conv_lr_dw.weight)
         nn.init.kaiming_normal_(self.conv_lr_proj.weight)
-        nn.init.kaiming_normal_(self.conv_off_proj.weight)
+        # Zero init for conv_off_proj: offsets must start at exactly 0 so
+        # sample_locs = reference_grid at step 0 (uninformative-but-safe).
+        # Kaiming would give offsets std ≈ √2 → ~50% of sample_locs already
+        # past the ±1 clamp boundary at init; with STE there's no restoring
+        # force and offsets stay pinned at the image border (verified in
+        # the matching fix in modeling_qwen2_5vl_dat.py:_dat_init_weights).
+        nn.init.zeros_(self.conv_off_proj.weight)
         if self.conv_lr_proj.bias is not None:
             nn.init.zeros_(self.conv_lr_proj.bias)
         # Linear layers: Xavier uniform

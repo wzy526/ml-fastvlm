@@ -114,15 +114,27 @@ for i in $(seq "$START_SHARD" "$END_SHARD"); do
     fi
 
     echo "[$shard_name] Extracting images (skipping .json mask files)..."
+    # CRITICAL: SA-1B tar files contain BARE jpg entries (no sa_NNNNNN/
+    # prefix). Combined with -C path-ordering quirks in GNU tar, the
+    # previous form silently dropped all jpgs into the script's cwd.
+    # Force-cd into the shard subdir so jpgs land in $SA1B_DIR/$shard_name/
+    # regardless of tar/-C parsing.
     mkdir -p "$SA1B_DIR/$shard_name"
-    # Only extract .jpg files, skip the large .json mask annotations
-    tar xf "$tar_path" --wildcards '*.jpg' -C "$SA1B_DIR/" 2>/dev/null || \
-    tar xf "$tar_path" -C "$SA1B_DIR/" --exclude='*.json' 2>/dev/null || \
-    tar xf "$tar_path" -C "$SA1B_DIR/"
+    (
+        cd "$SA1B_DIR/$shard_name" && \
+        ( tar xf "$tar_path" --wildcards '*.jpg' 2>/dev/null || \
+          tar xf "$tar_path" --exclude='*.json' 2>/dev/null || \
+          tar xf "$tar_path" )
+    )
 
-    # Clean up tar to save space
+    extracted=$(ls "$SA1B_DIR/$shard_name"/*.jpg 2>/dev/null | wc -l)
+    if [[ "$extracted" -lt 100 ]]; then
+        echo "[$shard_name] EXTRACTION FAILED ($extracted images). Tar kept at $tar_path for inspection." >&2
+        continue
+    fi
+
     rm -f "$tar_path"
-    echo "[$shard_name] Done ($(ls "$SA1B_DIR/$shard_name"/*.jpg 2>/dev/null | wc -l) images)"
+    echo "[$shard_name] Done ($extracted images)"
     echo ""
 done
 

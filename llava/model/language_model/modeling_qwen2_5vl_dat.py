@@ -951,7 +951,9 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 offsets.detach().std().item(),
             )
         references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device) # fp32 grid
-        sample_locs = (references + offsets).clamp(-1., 1.).permute(0, 2, 3, 1) # fp32 sample_locs
+
+        x = references + offsets
+        sample_locs = (x + (x.clamp(-1, 1) - x).detach()).permute(0, 2, 3, 1) # fp32 sample_locs
         
         # 5. Grid sample from HD features
         hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
@@ -1511,7 +1513,18 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                         module.hd_gate.requires_grad = False
                 nn.init.kaiming_normal_(module.conv_lr_dw.weight)
                 nn.init.kaiming_normal_(module.conv_lr_proj.weight)
-                nn.init.kaiming_normal_(module.conv_off_proj.weight)
+                # CRITICAL: must match `_init_dat_weights` line 708 — zero init,
+                # NOT Kaiming. Kaiming gives offsets std ≈ √(in_channels) · √(2/in_channels)
+                # = √2 (for inter_size=128, in=256 → std ≈ 1.4 per channel) at
+                # the conv_off_proj output. Adding that to the reference grid
+                # already saturates ~50% of sample_locs to the ±1 clamp surface
+                # at step 0; with STE there's no restoring force and (especially
+                # for caption pretrain where loss signal on sampling precision
+                # is weak) those offsets stay pinned on the boundary. Empirically
+                # this manifested in 0526_pretrain_sa1b_caption_lse_ste as deep
+                # DAT layers (L18, L24, L30) sampling exclusively on the image
+                # border, healthy dat/grad_norm + weight_norm notwithstanding.
+                nn.init.zeros_(module.conv_off_proj.weight)
                 if module.conv_lr_proj.bias is not None:
                     nn.init.zeros_(module.conv_lr_proj.bias)
                 if isinstance(module.proj_intention, nn.Linear):
