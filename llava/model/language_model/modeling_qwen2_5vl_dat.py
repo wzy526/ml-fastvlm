@@ -845,8 +845,119 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         return torch.stack([t_grid, h_grid, w_grid])  # [3, Ns]
 
+    def _sample_hd_from_off_guide(self, off_guide, image_hd_features, hd_feat_idx, Lp, device):
+        """Core deformable sampling: off_guide -> offsets -> grid_sample -> KV.
+
+        Shared by the intention-conditioned (answer) path
+        (``_generate_offsets_and_sample``) and the image-conditioned
+        (question) path (``_gen_hd_image``). ``off_guide`` must already encode
+        whatever conditioning is desired; this routine only predicts offsets,
+        samples HD features at the resulting locations, and projects to K/V.
+
+        Returns:
+            key_hd:        [Lp, Ns, kv_dim]
+            value_hd:      [Lp, Ns, kv_dim]
+            sampling_locs: [Lp, off_grps, grid_size, grid_size, 2]
+        """
+        # 4. Predict offsets
+        offsets = self.conv_off_proj(F.silu(self.ln_2(off_guide))).float()  # fp32 offsets
+        if self.training:
+            self._dat_offset_stats = (
+                offsets.detach().mean().item(),
+                offsets.detach().std().item(),
+            )
+        references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device)  # fp32 grid
+
+        x = references + offsets
+        sample_locs = (x + (x.clamp(-1, 1) - x).detach()).permute(0, 2, 3, 1)  # fp32 sample_locs
+
+        # 5. Grid sample from HD features
+        hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
+        img_hr = einops.rearrange(
+            hd_feat, 'h w (g c) -> g c h w',
+            g=self.off_grps, c=self.off_dim,
+        )
+        img_hr = einops.repeat(img_hr, 'g c h w -> (l g) c h w', l=Lp)
+
+        orig_dtype = img_hr.dtype
+        sampled_hr = F.grid_sample(
+            img_hr.float(), sample_locs[..., (1, 0)],
+            mode='bilinear', align_corners=True,
+        ).to(orig_dtype)  # bf16 sampled_hr
+
+        sampled_hr = einops.rearrange(
+            sampled_hr,
+            '(l g) c h w -> l (h w) (g c)',
+            l=Lp, g=self.off_grps, c=self.off_dim,
+        )
+
+        # 6. Project to KV
+        if self.hd_proj:
+            # Normalize sampled_hr to match the RMSNormed distribution that
+            # k_proj / v_proj see on the LR path (Qwen attention always
+            # consumes ``self.input_layernorm(hidden_states)``). Without
+            # this norm, value_hd has a different magnitude than value, and
+            # the LSE merge injects a distribution-shifted signal at every
+            # DAT layer.
+            sampled_hr = self.hd_input_layernorm(sampled_hr)
+            key_hd = self.k_proj_hd(sampled_hr)
+            value_hd = self.v_proj_hd(sampled_hr)
+        else:
+            key_hd = self.k_proj(sampled_hr)
+            value_hd = self.v_proj(sampled_hr)
+
+        sampling_locs_out = sample_locs.reshape(
+            Lp, self.off_grps, self.grid_size, self.grid_size, 2
+        ).clone().detach()
+
+        return key_hd, value_hd, sampling_locs_out
+
+    def _gen_hd_image(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx):
+        """Image-conditioned HD (Direction A): offset depends ONLY on the LR
+        image, NOT on any intention/answer token.
+
+        One shared HD K/V per image (Lp=1), causally safe for every token at
+        position >= lr_end (i.e. all question tokens), because the sampling
+        location is a pure function of the image, which precedes the whole
+        prompt. Consumed by all question segments via cross-attention.
+
+        Returns key_hd/value_hd shaped [1, Ns, kv_dim].
+        """
+        device = query_states.device
+        lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0]
+
+        # Reuse the same LR-embedding pipeline as the answer path, but DROP the
+        # intention branch + spatial-attn-guide entirely → off_guide is the bare
+        # LR embed. Requires intention_as_gate=True (gate is multiplicative, so
+        # conv_off_proj in-channels match) or no intention branch at all; the
+        # cat path (intention_as_gate=False) is not supported here.
+        assert not (self.use_intention_branch and not self.intention_as_gate), (
+            "image-conditioned HD requires intention_as_gate=True "
+            "(or use_intention_branch=False)"
+        )
+        image_range_index = torch.arange(lr_start, lr_end, device=device)
+        img_lr = einops.rearrange(
+            query_states[b_idx, image_range_index],
+            '(h w) (g c) -> g c h w',
+            g=self.off_grps, c=self.off_dim, h=lr_h, w=lr_w,
+        )
+        local_embed_lr = self.conv_lr_dw(img_lr)
+        local_embed_lr = F.silu(self.ln_1(local_embed_lr))
+        embed_lr = self.conv_lr_proj(local_embed_lr)
+        embed_lr = F.adaptive_avg_pool2d(embed_lr, (self.grid_size, self.grid_size))
+
+        off_guide = einops.repeat(embed_lr, 'g c h w -> (l g) c h w', l=1)
+        return self._sample_hd_from_off_guide(
+            off_guide, image_hd_features, hd_feat_idx, 1, device,
+        )
+
     def _generate_offsets_and_sample(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx):
-        """Generate sampling offsets from LR queries and sample from HD features.
+        """Generate intention-conditioned sampling offsets and sample HD K/V.
+
+        This is the ANSWER path: offsets are conditioned on both the LR image
+        and the per-answer intention token. See ``_sample_hd_from_off_guide``
+        for the shared sampling core and ``_gen_hd_image`` for the
+        image-conditioned (question) path.
 
         Args:
             query_states: [B, Nq, hidden_size]
@@ -943,58 +1054,60 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         else:
             off_guide = embed_lr_rep
 
-        # 4. Predict offsets
-        offsets = self.conv_off_proj(F.silu(self.ln_2(off_guide))).float() # fp32 offsets
-        if self.training:
-            self._dat_offset_stats = (
-                offsets.detach().mean().item(),
-                offsets.detach().std().item(),
-            )
-        references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device) # fp32 grid
+        # NOTE(direction-A refactor): the original inline sampling core below
+        # was extracted verbatim into `_sample_hd_from_off_guide` (shared with
+        # the new image-conditioned `_gen_hd_image` path). Kept commented for
+        # easy revert — uncomment this block and delete the call to restore.
+        # # 4. Predict offsets
+        # offsets = self.conv_off_proj(F.silu(self.ln_2(off_guide))).float() # fp32 offsets
+        # if self.training:
+        #     self._dat_offset_stats = (
+        #         offsets.detach().mean().item(),
+        #         offsets.detach().std().item(),
+        #     )
+        # references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device) # fp32 grid
+        #
+        # x = references + offsets
+        # sample_locs = (x + (x.clamp(-1, 1) - x).detach()).permute(0, 2, 3, 1) # fp32 sample_locs
+        #
+        # # 5. Grid sample from HD features
+        # hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
+        # img_hr = einops.rearrange(
+        #     hd_feat, 'h w (g c) -> g c h w',
+        #     g=self.off_grps, c=self.off_dim,
+        # )
+        # img_hr = einops.repeat(img_hr, 'g c h w -> (l g) c h w', l=Lp)
+        #
+        # orig_dtype = img_hr.dtype
+        # sampled_hr = F.grid_sample(
+        #     img_hr.float(), sample_locs[..., (1, 0)],
+        #     mode='bilinear', align_corners=True,
+        # ).to(orig_dtype) # bf16 sampled_hr
+        #
+        # sampled_hr = einops.rearrange(
+        #     sampled_hr,
+        #     '(l g) c h w -> l (h w) (g c)',
+        #     l=Lp, g=self.off_grps, c=self.off_dim,
+        # )
+        #
+        # # 6. Project to KV
+        # if self.hd_proj:
+        #     sampled_hr = self.hd_input_layernorm(sampled_hr)
+        #     key_hd = self.k_proj_hd(sampled_hr)
+        #     value_hd = self.v_proj_hd(sampled_hr)
+        # else:
+        #     key_hd = self.k_proj(sampled_hr)
+        #     value_hd = self.v_proj(sampled_hr)
+        #
+        # sampling_locs_out = sample_locs.reshape(
+        #     Lp, self.off_grps, self.grid_size, self.grid_size, 2
+        # ).clone().detach()
+        #
+        # return key_hd, value_hd, sampling_locs_out
 
-        x = references + offsets
-        sample_locs = (x + (x.clamp(-1, 1) - x).detach()).permute(0, 2, 3, 1) # fp32 sample_locs
-        
-        # 5. Grid sample from HD features
-        hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
-        img_hr = einops.rearrange(
-            hd_feat, 'h w (g c) -> g c h w',
-            g=self.off_grps, c=self.off_dim,
+        return self._sample_hd_from_off_guide(
+            off_guide, image_hd_features, hd_feat_idx, Lp, device,
         )
-        img_hr = einops.repeat(img_hr, 'g c h w -> (l g) c h w', l=Lp)
-
-        orig_dtype = img_hr.dtype
-        sampled_hr = F.grid_sample(
-            img_hr.float(), sample_locs[..., (1, 0)],
-            mode='bilinear', align_corners=True,
-        ).to(orig_dtype) # bf16 sampled_hr
-
-        sampled_hr = einops.rearrange(
-            sampled_hr,
-            '(l g) c h w -> l (h w) (g c)',
-            l=Lp, g=self.off_grps, c=self.off_dim,
-        )
-
-        # 6. Project to KV
-        if self.hd_proj:
-            # Normalize sampled_hr to match the RMSNormed distribution that
-            # k_proj / v_proj see on the LR path (Qwen attention always
-            # consumes ``self.input_layernorm(hidden_states)``). Without
-            # this norm, value_hd has a different magnitude than value, and
-            # the LSE merge injects a distribution-shifted signal at every
-            # DAT layer.
-            sampled_hr = self.hd_input_layernorm(sampled_hr)
-            key_hd = self.k_proj_hd(sampled_hr)
-            value_hd = self.v_proj_hd(sampled_hr)
-        else:
-            key_hd = self.k_proj(sampled_hr)
-            value_hd = self.v_proj(sampled_hr)
-
-        sampling_locs_out = sample_locs.reshape(
-            Lp, self.off_grps, self.grid_size, self.grid_size, 2
-        ).clone().detach()
-
-        return key_hd, value_hd, sampling_locs_out
 
     def _merge_two_pass_lse(
         self,
@@ -1209,6 +1322,58 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
             if _want_vis and _dat_vis_entry is None:
                 _dat_vis_entry = (b_idx, _slocs)
+
+            # ===== Direction A: image-conditioned HD for question tokens =====
+            # Derive question segments = prompt spans that precede each answer
+            # query, disjoint from the answer ranges so the LSE merge never
+            # double-counts a position. Offsets here depend ONLY on the image
+            # (via _gen_hd_image), so these segments are causally safe for all
+            # question tokens. One shared image-HD K/V serves every segment.
+            question_segs: List[Tuple[int, int]] = []
+            _q_prev_end = lr_end
+            for _ar in image_range_list[b_idx][1:]:
+                _a_s, _a_e, _a_int = _ar
+                if _a_e > 0:
+                    _q_ans_start = _a_s
+                    _next_prev = _a_e
+                else:
+                    _q_ans_start = _a_int + 1
+                    _next_prev = Nq
+                if _q_ans_start > _q_prev_end:
+                    question_segs.append((_q_prev_end, _q_ans_start))
+                _q_prev_end = _next_prev
+
+            if question_segs:
+                k_img_all, v_img_all, _ = self._gen_hd_image(
+                    query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx,
+                )
+                # RoPE the single shared image-HD K/V (same HD grid positions
+                # as the answer path, so reuse hd_pos_ids_batched).
+                k_img = (k_img_all[0]
+                         .view(Ns, self.num_key_value_heads, self.head_dim)
+                         .unsqueeze(0).transpose(1, 2))   # [1, H_kv, Ns, D]
+                v_img = (v_img_all[0]
+                         .view(Ns, self.num_key_value_heads, self.head_dim)
+                         .unsqueeze(0).transpose(1, 2))
+                cos_img, sin_img = self._dat_rotary_emb(k_img, hd_pos_ids_batched)
+                k_img = apply_multimodal_rotary_pos_emb_single(
+                    k_img, cos_img, sin_img, mrope_section,
+                )
+                k_img = repeat_kv(k_img, self.num_key_value_groups)   # [1, H, Ns, D]
+                v_img = repeat_kv(v_img, self.num_key_value_groups)
+                k_img_seg = k_img.squeeze(0).transpose(0, 1).contiguous()   # [Ns, H, D]
+                v_img_seg = v_img.squeeze(0).transpose(0, 1).contiguous()
+
+                for (_qs, _qe) in question_segs:
+                    _nq_seg = _qe - _qs
+                    if _nq_seg <= 0:
+                        continue
+                    q_seg = query_bhnc[b_idx, :, _qs:_qe, :] \
+                        .transpose(0, 1).contiguous()   # [Nq_seg, H, D]
+                    seg_q_list.append(q_seg)
+                    seg_k_list.append(k_img_seg)
+                    seg_v_list.append(v_img_seg)
+                    seg_meta.append((b_idx, _qs, _nq_seg))
 
             # ----- Track the FIRST answer's prepped K/V for D1 reuse ------
             # D1 lr_image segment shares HD K/V with answer 0 (single offset

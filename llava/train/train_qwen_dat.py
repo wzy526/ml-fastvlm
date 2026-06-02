@@ -3012,9 +3012,19 @@ def train():
             )
         )
 
+    # processing_class=processor (full processor, NOT processor.tokenizer):
+    # HF Trainer.save_model() calls processing_class.save_pretrained(), and
+    # only a full Qwen2_5_VLProcessor writes both the tokenizer files AND
+    # preprocessor_config.json. Passing just the tokenizer silently drops
+    # the image processor config, so the saved ckpt fails to load via
+    # AutoProcessor.from_pretrained() under HF_OFFLINE (preprocessor_config
+    # missing → it tries to fetch from HuggingFace and errors out).
+    # Observed in 0526_pretrain_sa1b_caption_lse_ste — required manual cp
+    # of preprocessor_config.json / merges.txt / vocab.json from the base
+    # model dir to make lmms-eval load.
     trainer = Qwen2VLTrainer(
         model=model,
-        processing_class=processor.tokenizer,
+        processing_class=processor,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=None,
