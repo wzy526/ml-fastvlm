@@ -313,6 +313,10 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
                                        # (no LR ViT at all). Overrides use_fused_vit when True.
                                        # Semantics differ from the baseline LR ViT path → requires retraining.
             'use_spatial_attn_guide': True,  # Q_intention × Q_lr spatial attention for offset guidance
+            'image_hd_for_question': False,  # Direction A: also inject image-conditioned HD into
+                                             # question tokens (offset depends ONLY on the image, so
+                                             # causally safe for all question positions). Default off
+                                             # reproduces the answer-only injection.
         }
 
 
@@ -629,6 +633,11 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         # path actually used by Qwen2.5-VL: image → qa_prefix tokens →
         # answer query, verified via scripts/qwen2_5vl_adl_0519/_diagnose_baseline_attn.py).
         self.dat_inject_lr_image = bool(dat.get('inject_lr_image', False))
+
+        # Direction A: image-conditioned HD for question tokens. Offsets are a
+        # pure function of the LR image (see _gen_hd_image), so the resulting
+        # HD K/V is causally available to every question position. Default off.
+        self.dat_image_hd_for_question = bool(dat.get('image_hd_for_question', False))
 
         self._init_dat_weights()
 
@@ -1329,19 +1338,23 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             # double-counts a position. Offsets here depend ONLY on the image
             # (via _gen_hd_image), so these segments are causally safe for all
             # question tokens. One shared image-HD K/V serves every segment.
+            # Gated by config: flag off -> question_segs stays empty -> the
+            # _gen_hd_image block below (guarded by `if question_segs`) is
+            # skipped, exactly reproducing the answer-only injection baseline.
             question_segs: List[Tuple[int, int]] = []
-            _q_prev_end = lr_end
-            for _ar in image_range_list[b_idx][1:]:
-                _a_s, _a_e, _a_int = _ar
-                if _a_e > 0:
-                    _q_ans_start = _a_s
-                    _next_prev = _a_e
-                else:
-                    _q_ans_start = _a_int + 1
-                    _next_prev = Nq
-                if _q_ans_start > _q_prev_end:
-                    question_segs.append((_q_prev_end, _q_ans_start))
-                _q_prev_end = _next_prev
+            if self.dat_image_hd_for_question:
+                _q_prev_end = lr_end
+                for _ar in image_range_list[b_idx][1:]:
+                    _a_s, _a_e, _a_int = _ar
+                    if _a_e > 0:
+                        _q_ans_start = _a_s
+                        _next_prev = _a_e
+                    else:
+                        _q_ans_start = _a_int + 1
+                        _next_prev = Nq
+                    if _q_ans_start > _q_prev_end:
+                        question_segs.append((_q_prev_end, _q_ans_start))
+                    _q_prev_end = _next_prev
 
             if question_segs:
                 k_img_all, v_img_all, _ = self._gen_hd_image(

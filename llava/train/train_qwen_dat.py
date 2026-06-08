@@ -252,6 +252,14 @@ class ModelArguments:
                   "the residual stream via lr_image tokens — the path Qwen2.5-VL "
                   "actually uses to propagate image info to the answer."}
     )
+    dat_image_hd_for_question: bool = field(
+        default=False,
+        metadata={"help": "Direction A: also inject image-conditioned HD into question "
+                  "tokens. Offsets there depend ONLY on the LR image (not the intention "
+                  "token), so the HD K/V is causally available to every question position. "
+                  "Targets the HRBench-single regression (question tokens otherwise never "
+                  "see HD). Default off reproduces answer-only injection."}
+    )
     dat_fused_vit: bool = field(
         default=False,
         metadata={"help": "Fuse LR+HD into one ViT call (saves kernel launches; "
@@ -2731,6 +2739,7 @@ def train():
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'inject_lr_image': model_args.dat_inject_lr_image,
+            'image_hd_for_question': model_args.dat_image_hd_for_question,
             'use_fused_vit': model_args.dat_fused_vit,
             'use_shared_vit': model_args.dat_shared_vit,
         }
