@@ -28,6 +28,7 @@ Attention mechanism: Two-pass + LSE merge (GC-safe, shape-static):
 
 import logging
 import math
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -444,8 +445,10 @@ def compute_image_range_list(input_ids, labels, image_token_id,
 
     Returns:
         List per batch of:
-            [(lr_start, lr_end, lr_h, lr_w), [ans1_start, ans1_end, intention_idx], ...]
-        Empty list for batch items without images.
+            [[(lr_start, lr_end, lr_h, lr_w), ...per image...],
+             [ans1_start, ans1_end, intention_idx], ...]
+        Index 0 is ALWAYS a list of per-image LR tuples (len ≥ 1 when images
+        are present). Empty list for batch items without images.
     """
     batch_size = input_ids.shape[0]
     result = []
@@ -461,20 +464,36 @@ def compute_image_range_list(input_ids, labels, image_token_id,
             continue
 
         image_indices = torch.where(image_mask)[0]
-        lr_start = image_indices[0].item()
-        lr_end = image_indices[-1].item() + 1
 
-        if image_grid_thw is not None and img_idx < len(image_grid_thw):
-            thw = image_grid_thw[img_idx]
-            t, h, w = thw[0].item(), thw[1].item(), thw[2].item()
-            lr_h = h // spatial_merge_size
-            lr_w = w // spatial_merge_size
-            img_idx += 1
-        else:
-            lr_len = lr_end - lr_start
-            lr_h = lr_w = int(lr_len ** 0.5)
+        # Split image tokens into contiguous runs — one run per image. Interleaved
+        # multi-image samples (e.g. MMMU) place several images separated by text in
+        # a single sequence; each run is a distinct image with its own grid_thw.
+        # Single-image is just the 1-run case → a 1-element list.
+        runs = []
+        run_start = image_indices[0].item()
+        prev = run_start
+        for idx in image_indices[1:].tolist():
+            if idx != prev + 1:
+                runs.append((run_start, prev + 1))
+                run_start = idx
+            prev = idx
+        runs.append((run_start, prev + 1))
 
-        ranges.append((lr_start, lr_end, lr_h, lr_w))
+        lr_tuples = []
+        for (r_start, r_end) in runs:
+            if image_grid_thw is not None and img_idx < len(image_grid_thw):
+                thw = image_grid_thw[img_idx]
+                h, w = thw[1].item(), thw[2].item()
+                lr_h = h // spatial_merge_size
+                lr_w = w // spatial_merge_size
+                img_idx += 1  # advance per image → no desync on multi-image samples
+            else:
+                lr_len = r_end - r_start
+                lr_h = lr_w = int(lr_len ** 0.5)
+            lr_tuples.append((r_start, r_end, lr_h, lr_w))
+
+        # index 0 is ALWAYS a list of per-image LR tuples (len ≥ 1).
+        ranges.append(lr_tuples)
 
         if labels is not None:
             lab = labels[b]
@@ -638,6 +657,20 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         # pure function of the LR image (see _gen_hd_image), so the resulting
         # HD K/V is causally available to every question position. Default off.
         self.dat_image_hd_for_question = bool(dat.get('image_hd_for_question', False))
+
+        # Multi-image (e.g. MMMU interleaved): when True, each image in a sample
+        # is sampled independently and the per-image HD K/V are concatenated so
+        # answers attend across all images (the cross-attn softmax self-selects
+        # the relevant image — no hard routing). When False (default), any
+        # multi-image sample falls back to plain causal attention (no HD), so the
+        # untrained multi-image HD path is never exercised. Single-image behaviour
+        # is bit-identical regardless of this flag.
+        # Env override (DAT_MULTI_IMAGE=1) enables it at eval time without
+        # re-saving the checkpoint config (dat_extra_args is loaded from disk).
+        self.dat_multi_image = (
+            bool(dat.get('multi_image', False))
+            or os.environ.get('DAT_MULTI_IMAGE', '0') == '1'
+        )
 
         self._init_dat_weights()
 
@@ -922,12 +955,20 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         return key_hd, value_hd, sampling_locs_out
 
-    def _generate_offsets_and_sample(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idx, want_image=False):
+    def _generate_offsets_and_sample(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idxs, want_image=False):
         """Generate intention-conditioned sampling offsets and sample HD K/V.
 
         This is the ANSWER path: offsets are conditioned on both the LR image
         and the per-answer intention token. See ``_sample_hd_from_off_guide``
         for the shared sampling core.
+
+        Multi-image: ``image_range_list[b_idx][0]`` is a list of per-image LR
+        tuples and ``hd_feat_idxs`` the matching HD-feature indices. Each image
+        is sampled independently (its own embed_lr / spatial guide / grid_sample)
+        and the resulting K/V are concatenated along the HD-token axis, so one
+        answer attends across all M images (M·Ns HD tokens) and the Pass-2 softmax
+        self-selects the relevant image — no hard routing. For a single image
+        (M=1) the loop runs once and the result is bit-identical to before.
 
         When ``want_image=True`` it ALSO produces the image-conditioned
         (Direction A) HD K/V used by question tokens, in the SAME sampling
@@ -937,50 +978,33 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         Every op in that core (conv / LayerNorm2d-over-channels / grid_sample /
         RMSNorm / k_proj_hd / v_proj_hd) is per-sample independent, so row 0 is
         bit-equivalent to the old standalone ``_gen_hd_image`` and rows 1: to
-        the old answer-only call — this only removes the duplicated ``embed_lr``
-        pipeline and a second grid_sample/projection launch.
+        the old answer-only call.
 
         Args:
             query_states: [B, Nq, hidden_size]
             image_hd_features: list of [H_hr, W_hr, C] per image
             image_range_list: per-batch range info
             b_idx: batch index
-            hd_feat_idx: index into image_hd_features
+            hd_feat_idxs: list of indices into image_hd_features (one per image)
             want_image: if True, also return image-conditioned HD K/V (Lp=1)
 
         Returns:
-            key_hd:       [Lp, Ns, kv_dim]
-            value_hd:     [Lp, Ns, kv_dim]
-            sampling_locs:[Lp, off_grps, grid_h, grid_w, 2]  (answer portion)
-            key_img:      [1, Ns, kv_dim] or None
-            value_img:    [1, Ns, kv_dim] or None
+            key_hd:       [Lp, M*Ns, kv_dim]
+            value_hd:     [Lp, M*Ns, kv_dim]
+            sampling_locs:[Lp, off_grps, grid_h, grid_w, 2]  (first image, vis only)
+            key_img:      [1, M*Ns, kv_dim] or None
+            value_img:    [1, M*Ns, kv_dim] or None
         """
         device = query_states.device
-        Ns = self.grid_size * self.grid_size
 
-        # 1. Extract LR image region from Q
-        lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0]
-        lr_len = lr_end - lr_start
-        assert lr_h * lr_w == lr_len, (
-            f"LR dimensions mismatch: {lr_h}*{lr_w}={lr_h * lr_w} != {lr_len} tokens"
-        )
-
-        image_range_index = torch.arange(lr_start, lr_end, device=device)
-        img_lr = einops.rearrange(
-            query_states[b_idx, image_range_index],
-            '(h w) (g c) -> g c h w',
-            g=self.off_grps, c=self.off_dim, h=lr_h, w=lr_w,
-        )
-        # 2. Offset generation: DW Conv -> LN -> SiLU -> Conv1x1 -> Pool
-        local_embed_lr = self.conv_lr_dw(img_lr)
-        local_embed_lr = F.silu(self.ln_1(local_embed_lr))
-        embed_lr = self.conv_lr_proj(local_embed_lr)
-        embed_lr = F.adaptive_avg_pool2d(embed_lr, (self.grid_size, self.grid_size))
-
-        # 3. Per-answer offset prediction
+        lr_list = image_range_list[b_idx][0]
         answer_ranges = image_range_list[b_idx][1:]
         Lp = len(answer_ranges)
 
+        # Intention embedding is image-independent (depends only on the per-answer
+        # intention tokens) → compute once and reuse across all images.
+        intention_indices = None
+        embed_intention = None
         if self.use_intention_branch:
             intention_indices = [ar[2] for ar in answer_ranges]
             intention_tokens = query_states[b_idx, intention_indices]
@@ -992,57 +1016,10 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             # Keep singleton spatial dims; broadcasting handles the
             # grid_size × grid_size expansion at use sites (gate-multiply
             # path is pure broadcast; cat path expands at the cat call).
-            # Avoids a Lp·off_grps·inter_size·grid_size² fp32 memcpy and
-            # the ~400× sigmoid blow-up.
             embed_intention = einops.rearrange(
                 embed_intention, 'l g c -> (l g) c 1 1',
             )
 
-        embed_lr_rep = einops.repeat(
-            embed_lr, 'g c h w -> (l g) c h w', l=Lp,
-        )
-
-        # Spatial attention guide: Q_intention × Q_lr → spatial saliency map,
-        # applied as a multiplicative bias on LR features so offset prediction
-        if self.use_intention_branch and self.use_spatial_attn_guide:
-            q_lr_flat = query_states[b_idx, image_range_index]    # [lr_h*lr_w, C]
-            q_int_flat = query_states[b_idx, intention_indices]   # [Lp, C]
-            spatial_attn = torch.matmul(
-                q_int_flat.float(), q_lr_flat.float().transpose(0, 1),
-            ) / math.sqrt(q_lr_flat.shape[-1])                    # [Lp, lr_h*lr_w]
-            spatial_attn = spatial_attn.softmax(dim=-1).view(Lp, 1, lr_h, lr_w)
-            spatial_attn_guide = F.adaptive_avg_pool2d(
-                spatial_attn, (self.grid_size, self.grid_size),
-            ) * (lr_h * lr_w)  # normalize: uniform attention ≈ 1.0
-            spatial_guide_rep = einops.repeat(
-                spatial_attn_guide, 'l 1 h w -> (l g) 1 h w', g=self.off_grps,
-            ).to(embed_lr_rep.dtype)
-            embed_lr_rep = embed_lr_rep * spatial_guide_rep
-
-        if self.use_intention_branch:
-            if self.intention_as_gate:
-                gate = embed_intention.sigmoid()
-                off_guide = embed_lr_rep * (gate * 2.0)
-                if self.training:
-                    self._dat_gate_stats = (
-                        gate.detach().mean().item(),
-                        gate.detach().std().item(),
-                    )
-            else:
-                # cat does not broadcast — expand the singleton spatial dims
-                # added above to match embed_lr_rep before concatenation.
-                off_guide = torch.cat([
-                    embed_lr_rep,
-                    embed_intention.expand(-1, -1, self.grid_size, self.grid_size),
-                ], dim=1)
-        else:
-            off_guide = embed_lr_rep
-
-        # ===== Direction A merge: fuse the image-conditioned (question) path =====
-        # Prepend a bare-``embed_lr`` off_guide (l=1, gate≡1, no spatial guide —
-        # i.e. exactly the old ``_gen_hd_image`` off_guide) in front of the Lp
-        # answer off_guides and run ONE shared sampling core over l=Lp+1. Row 0
-        # is the image-conditioned HD K/V, rows 1: are the per-answer K/V.
         if want_image:
             # Image-conditioned HD requires the multiplicative-gate config (or
             # no intention branch); the cat path can't share the off_guide.
@@ -1050,20 +1027,109 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 "image-conditioned HD requires intention_as_gate=True "
                 "(or use_intention_branch=False)"
             )
-            off_guide_img = einops.repeat(embed_lr, 'g c h w -> (l g) c h w', l=1)
-            off_guide_all = torch.cat([off_guide_img, off_guide], dim=0)
-            key_all, value_all, slocs_all = self._sample_hd_from_off_guide(
-                off_guide_all, image_hd_features, hd_feat_idx, Lp + 1, device,
-            )
-            return (
-                key_all[1:], value_all[1:], slocs_all[1:],
-                key_all[0:1], value_all[0:1],
+
+        key_parts, value_parts = [], []
+        kimg_parts, vimg_parts = [], []
+        slocs_first = None
+
+        # ----- Per-image deformable sampling (single image = one iteration) -----
+        for m, (lr_start, lr_end, lr_h, lr_w) in enumerate(lr_list):
+            hd_feat_idx = hd_feat_idxs[m]
+            lr_len = lr_end - lr_start
+            assert lr_h * lr_w == lr_len, (
+                f"LR dimensions mismatch: {lr_h}*{lr_w}={lr_h * lr_w} != {lr_len} tokens"
             )
 
-        key_hd, value_hd, slocs = self._sample_hd_from_off_guide(
-            off_guide, image_hd_features, hd_feat_idx, Lp, device,
-        )
-        return key_hd, value_hd, slocs, None, None
+            # 1. Extract LR image region from Q
+            image_range_index = torch.arange(lr_start, lr_end, device=device)
+            img_lr = einops.rearrange(
+                query_states[b_idx, image_range_index],
+                '(h w) (g c) -> g c h w',
+                g=self.off_grps, c=self.off_dim, h=lr_h, w=lr_w,
+            )
+            # 2. Offset generation: DW Conv -> LN -> SiLU -> Conv1x1 -> Pool
+            local_embed_lr = self.conv_lr_dw(img_lr)
+            local_embed_lr = F.silu(self.ln_1(local_embed_lr))
+            embed_lr = self.conv_lr_proj(local_embed_lr)
+            embed_lr = F.adaptive_avg_pool2d(embed_lr, (self.grid_size, self.grid_size))
+
+            # 3. Per-answer offset prediction
+            embed_lr_rep = einops.repeat(
+                embed_lr, 'g c h w -> (l g) c h w', l=Lp,
+            )
+
+            # Spatial attention guide: Q_intention × Q_lr → spatial saliency map,
+            # applied as a multiplicative bias on LR features so offset prediction
+            if self.use_intention_branch and self.use_spatial_attn_guide:
+                q_lr_flat = query_states[b_idx, image_range_index]    # [lr_h*lr_w, C]
+                q_int_flat = query_states[b_idx, intention_indices]   # [Lp, C]
+                spatial_attn = torch.matmul(
+                    q_int_flat.float(), q_lr_flat.float().transpose(0, 1),
+                ) / math.sqrt(q_lr_flat.shape[-1])                    # [Lp, lr_h*lr_w]
+                spatial_attn = spatial_attn.softmax(dim=-1).view(Lp, 1, lr_h, lr_w)
+                spatial_attn_guide = F.adaptive_avg_pool2d(
+                    spatial_attn, (self.grid_size, self.grid_size),
+                ) * (lr_h * lr_w)  # normalize: uniform attention ≈ 1.0
+                spatial_guide_rep = einops.repeat(
+                    spatial_attn_guide, 'l 1 h w -> (l g) 1 h w', g=self.off_grps,
+                ).to(embed_lr_rep.dtype)
+                embed_lr_rep = embed_lr_rep * spatial_guide_rep
+
+            if self.use_intention_branch:
+                if self.intention_as_gate:
+                    gate = embed_intention.sigmoid()
+                    off_guide = embed_lr_rep * (gate * 2.0)
+                    if self.training:
+                        self._dat_gate_stats = (
+                            gate.detach().mean().item(),
+                            gate.detach().std().item(),
+                        )
+                else:
+                    # cat does not broadcast — expand the singleton spatial dims
+                    # added above to match embed_lr_rep before concatenation.
+                    off_guide = torch.cat([
+                        embed_lr_rep,
+                        embed_intention.expand(-1, -1, self.grid_size, self.grid_size),
+                    ], dim=1)
+            else:
+                off_guide = embed_lr_rep
+
+            # ===== Direction A merge: fuse the image-conditioned (question) path =====
+            # Prepend a bare-``embed_lr`` off_guide (l=1, gate≡1, no spatial guide —
+            # i.e. exactly the old ``_gen_hd_image`` off_guide) in front of the Lp
+            # answer off_guides and run ONE shared sampling core over l=Lp+1. Row 0
+            # is the image-conditioned HD K/V, rows 1: are the per-answer K/V.
+            if want_image:
+                off_guide_img = einops.repeat(embed_lr, 'g c h w -> (l g) c h w', l=1)
+                off_guide_all = torch.cat([off_guide_img, off_guide], dim=0)
+                key_all, value_all, slocs_all = self._sample_hd_from_off_guide(
+                    off_guide_all, image_hd_features, hd_feat_idx, Lp + 1, device,
+                )
+                kimg_parts.append(key_all[0:1])
+                vimg_parts.append(value_all[0:1])
+                key_parts.append(key_all[1:])
+                value_parts.append(value_all[1:])
+                if slocs_first is None:
+                    slocs_first = slocs_all[1:]
+            else:
+                key_hd, value_hd, slocs = self._sample_hd_from_off_guide(
+                    off_guide, image_hd_features, hd_feat_idx, Lp, device,
+                )
+                key_parts.append(key_hd)
+                value_parts.append(value_hd)
+                if slocs_first is None:
+                    slocs_first = slocs
+
+        # Concatenate per-image K/V along the HD-token axis → [Lp, M*Ns, kv].
+        key_hd = torch.cat(key_parts, dim=1)
+        value_hd = torch.cat(value_parts, dim=1)
+
+        if want_image:
+            key_img = torch.cat(kimg_parts, dim=1)
+            value_img = torch.cat(vimg_parts, dim=1)
+            return key_hd, value_hd, slocs_first, key_img, value_img
+
+        return key_hd, value_hd, slocs_first, None, None
 
     def _merge_two_pass_lse(
         self,
@@ -1208,13 +1274,18 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 if len(image_range_list[b]) == 1:
                     image_range_list[b].append([Nq, -1, max(0, Nq - 3)])
 
-        # Build mapping from batch index to image_hd_features index
-        b_idx_to_hd_idx: Dict[int, int] = {}
+        # Build mapping from batch index to image_hd_features indices. Each sample
+        # may carry several images (image_range_list[b][0] is the per-image LR
+        # list), so map to a LIST of HD indices and advance by the image count.
+        # This stays aligned with image_hd_features even when a multi-image sample
+        # later falls back to causal-only (the counter still advances correctly).
+        b_idx_to_hd_idxs: Dict[int, List[int]] = {}
         hd_idx = 0
         for b in range(B):
             if len(image_range_list[b]) > 0:
-                b_idx_to_hd_idx[b] = hd_idx
-                hd_idx += 1
+                n_img = len(image_range_list[b][0])
+                b_idx_to_hd_idxs[b] = list(range(hd_idx, hd_idx + n_img))
+                hd_idx += n_img
 
         # === Pass 1: standard causal attention (full sequence, shape static) ===
         # mRoPE — same as the non-DAT path (position_embeddings are Nq-length)
@@ -1259,17 +1330,29 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             if len(image_range_list[b_idx]) <= 1:
                 continue
 
-            hd_feat_idx = b_idx_to_hd_idx[b_idx]
-            lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0]
+            lr_list = image_range_list[b_idx][0]   # list of per-image LR tuples
+            M = len(lr_list)
+            # Multi-image fallback: when the flag is off, leave multi-image
+            # samples to plain causal attention (Pass 1 only) — the untrained
+            # multi-image HD path is never exercised. hd_feat counter already
+            # advanced for these images, so alignment is preserved.
+            if M > 1 and not self.dat_multi_image:
+                continue
+
+            hd_feat_idxs = b_idx_to_hd_idxs[b_idx]
+            Ns_total = Ns * M
 
             if mrope_position_ids is not None:
                 orig_pos_b = mrope_position_ids[:, b_idx, :]
             else:
                 orig_pos_b = torch.arange(Nq, device=device, dtype=torch.long).unsqueeze(0).expand(3, -1)
 
-            hd_pos_ids = self._construct_hd_position_ids(
-                orig_pos_b, lr_start, lr_end, lr_h, lr_w, device,
-            )
+            # Per-image HD positions, concatenated → [3, M*Ns]. Each image's HD
+            # tokens map into that image's own LR coordinate range.
+            hd_pos_ids = torch.cat([
+                self._construct_hd_position_ids(orig_pos_b, _s, _e, _h, _w, device)
+                for (_s, _e, _h, _w) in lr_list
+            ], dim=1)
             hd_pos_ids_batched = hd_pos_ids.unsqueeze(1)
 
             # ===== Direction A: image-conditioned HD for question tokens =====
@@ -1283,9 +1366,13 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             # Gated by config: flag off -> question_segs stays empty -> want_image
             # is False and the block below is skipped, exactly reproducing the
             # answer-only injection baseline.
+            # Direction A is only causally well-defined for a single image at
+            # the start of the prompt (every question token can see it). With
+            # interleaved multi-image, a question token may precede some images,
+            # so the all-image HD K/V would leak future images → disabled (M>1).
             question_segs: List[Tuple[int, int]] = []
-            if self.dat_image_hd_for_question:
-                _q_prev_end = lr_end
+            if self.dat_image_hd_for_question and M == 1:
+                _q_prev_end = lr_list[0][1]   # lr_end of the single image
                 for _ar in image_range_list[b_idx][1:]:
                     _a_s, _a_e, _a_int = _ar
                     if _a_e > 0:
@@ -1303,7 +1390,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             key_hd_all, value_hd_all, _slocs, k_img_all, v_img_all = \
                 self._generate_offsets_and_sample(
                     query_states, image_hd_features, image_range_list,
-                    b_idx, hd_feat_idx, want_image=bool(question_segs),
+                    b_idx, hd_feat_idxs, want_image=bool(question_segs),
                 )
 
             if _want_vis and _dat_vis_entry is None:
@@ -1313,10 +1400,10 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                 # RoPE the single shared image-HD K/V (same HD grid positions
                 # as the answer path, so reuse hd_pos_ids_batched).
                 k_img = (k_img_all[0]
-                         .view(Ns, self.num_key_value_heads, self.head_dim)
-                         .unsqueeze(0).transpose(1, 2))   # [1, H_kv, Ns, D]
+                         .view(Ns_total, self.num_key_value_heads, self.head_dim)
+                         .unsqueeze(0).transpose(1, 2))   # [1, H_kv, Ns_total, D]
                 v_img = (v_img_all[0]
-                         .view(Ns, self.num_key_value_heads, self.head_dim)
+                         .view(Ns_total, self.num_key_value_heads, self.head_dim)
                          .unsqueeze(0).transpose(1, 2))
                 cos_img, sin_img = self._dat_rotary_emb(k_img, hd_pos_ids_batched)
                 k_img = apply_multimodal_rotary_pos_emb_single(
@@ -1365,15 +1452,15 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
                     .transpose(0, 1).contiguous()   # [Nans, H, D]
 
                 k_hd_l = (key_hd_all[l_idx]
-                          .view(Ns, self.num_key_value_heads, self.head_dim)
-                          .unsqueeze(0).unsqueeze(0))  # [1, 1, Ns, D_kv]
+                          .view(Ns_total, self.num_key_value_heads, self.head_dim)
+                          .unsqueeze(0).unsqueeze(0))  # [1, 1, M*Ns, D_kv]
                 v_hd_l = (value_hd_all[l_idx]
-                          .view(Ns, self.num_key_value_heads, self.head_dim)
-                          .unsqueeze(0).unsqueeze(0))  # [1, 1, Ns, D_kv]
+                          .view(Ns_total, self.num_key_value_heads, self.head_dim)
+                          .unsqueeze(0).unsqueeze(0))  # [1, 1, M*Ns, D_kv]
 
-                # Reshape for RoPE: [1, H_kv, Ns, D]
-                k_hd_l = k_hd_l.view(1, Ns, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-                v_hd_l = v_hd_l.view(1, Ns, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                # Reshape for RoPE: [1, H_kv, M*Ns, D]
+                k_hd_l = k_hd_l.view(1, Ns_total, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                v_hd_l = v_hd_l.view(1, Ns_total, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
                 cos_hd, sin_hd = self._dat_rotary_emb(k_hd_l, hd_pos_ids_batched)
                 k_hd_l = apply_multimodal_rotary_pos_emb_single(
@@ -1406,14 +1493,18 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             if (self.dat_inject_lr_image
                     and k_hd_l_first is not None
                     and v_hd_l_first is not None):
-                Nlr = lr_end - lr_start
-                if Nlr > 0:
-                    q_lr = query_bhnc[b_idx, :, lr_start:lr_end, :] \
+                # Per image: inject that image's own HD slice into its own LR
+                # span (causally safe — an LR token never sees a later image).
+                for _m, (_s, _e, _h, _w) in enumerate(lr_list):
+                    Nlr = _e - _s
+                    if Nlr <= 0:
+                        continue
+                    q_lr = query_bhnc[b_idx, :, _s:_e, :] \
                         .transpose(0, 1).contiguous()    # [Nlr, H, D]
                     seg_q_list.append(q_lr)
-                    seg_k_list.append(k_hd_l_first)
-                    seg_v_list.append(v_hd_l_first)
-                    seg_meta.append((b_idx, lr_start, Nlr))
+                    seg_k_list.append(k_hd_l_first[_m * Ns:(_m + 1) * Ns])
+                    seg_v_list.append(v_hd_l_first[_m * Ns:(_m + 1) * Ns])
+                    seg_meta.append((b_idx, _s, Nlr))
 
         # Phase 2b: Batched cross-attention — ONE kernel for all segments
         if seg_q_list:

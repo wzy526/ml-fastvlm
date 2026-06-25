@@ -32,7 +32,10 @@
 #   BASE_REF    base model to source preprocessor_config.json from when a DAT ckpt lacks it
 #               (default: /root/autodl-tmp/models_data/Qwen2.5-VL-3B-Instruct)
 
-set -euo pipefail
+# NOTE: intentionally NOT using `-e`: a single failing pixel point (OOM, flaky
+# dataset download, etc.) must not abort the rest of the sweep. Each point is
+# guarded individually below.
+set -uo pipefail
 
 MODEL_TYPE="${1:?usage: $0 <dat|base> CKPT TASK [TAG]}"
 CKPT="${2:?usage: $0 <dat|base> CKPT TASK [TAG]}"
@@ -74,9 +77,11 @@ if [[ "$MODEL_TYPE" == "dat" && ! -f "$CKPT/preprocessor_config.json" ]]; then
 fi
 
 # This box can't reach huggingface.co; use the mirror for dataset downloads.
-# Keep TRANSFORMERS_OFFLINE so the (local) model never touches the network.
+# IMPORTANT: do NOT set TRANSFORMERS_OFFLINE / HF_HUB_OFFLINE — recent
+# huggingface_hub treats them as a global offline switch that ALSO blocks
+# `datasets` from downloading uncached benchmarks. The model loads from a local
+# dir path (no hub call needed), so offline mode buys nothing here.
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-export TRANSFORMERS_OFFLINE=1
 export HF_HUB_DOWNLOAD_TIMEOUT=1200
 export NUMEXPR_MAX_THREADS=64
 export CUDA_VISIBLE_DEVICES="$GPUS"
@@ -103,14 +108,17 @@ for px in $PIXELS; do
     echo "------------------------------------------------------------------"
     echo "[$tag] $TASK  px=$px  (~$tok LLM tokens)"
     echo "------------------------------------------------------------------"
-    accelerate launch --num_processes "$NPROC" --main_process_port $((PORT++)) -m lmms_eval \
+    if accelerate launch --num_processes "$NPROC" --main_process_port $((PORT++)) -m lmms_eval \
         --model "$MODEL" \
         --model_args "$margs" \
         --tasks "$TASK" \
         --batch_size 1 \
         --log_samples \
-        --output_path "$out"
-    touch "$out/done"
+        --output_path "$out"; then
+        touch "$out/done"
+    else
+        echo "[FAIL] $tag (px=$px) exited non-zero — continuing to next point" >&2
+    fi
 done
 
 # ---- summary: dump every numeric metric for $TASK, sorted by token count ----
