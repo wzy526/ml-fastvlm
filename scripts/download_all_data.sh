@@ -38,7 +38,9 @@ SFT_DATA="$MODELS_DATA/sft_data"
 TRAIN_SPLIT="$SFT_DATA/train_split"
 SA1B_DIR="$MODELS_DATA/sa1b_images"
 INTERNVL_DIR="$MODELS_DATA/InternVL-SA-1B-Caption"
-LINKS_FILE="${LINKS_FILE:-$MODELS_DATA/sa1b_links.txt}"
+# Meta presigned links for SA-1B (valid until ~2026-08-01). Lives in the repo
+# so it ships with the code; override with LINKS_FILE=/path if you refresh it.
+LINKS_FILE="${LINKS_FILE:-$REPO/sa1b_links_0803.txt}"
 MARK_DIR="$DATA_BASE/.download_markers"
 TMP_DIR="${TMP_DIR:-$DATA_BASE/_dl_tmp}"
 
@@ -126,11 +128,17 @@ fi
 
 # =============================================================================
 # STEP 3: SA-1B image shards  (pretrain images + sft sa1b subset)
-#   reuses the repo's downloader; auto meta-links or HF mirror fallback.
+#   Uses the repo's downloader forced to the Meta presigned-links channel
+#   ($LINKS_FILE). The HF mirror (sailvideo/SA-1B) returns 404, so meta only.
+#   NOTE: the links in sa1b_links_0803.txt expire ~2026-08-01 — refresh from
+#   https://ai.meta.com/datasets/segment-anything-downloads/ if they lapse.
 # =============================================================================
 if want sa1b && ! done_ok sa1b; then
-    log "STEP 3/6  SA-1B shards -> $SA1B_DIR"
-    if SA1B_DIR="$SA1B_DIR" LINKS_FILE="$LINKS_FILE" TMP_DIR="$TMP_DIR/sa1b" \
+    log "STEP 3/6  SA-1B shards -> $SA1B_DIR  (SOURCE=meta, links=$LINKS_FILE)"
+    if [[ ! -f "$LINKS_FILE" ]]; then
+        err "  LINKS_FILE not found: $LINKS_FILE"
+        err "  -> copy sa1b_links_0803.txt into the repo, or set LINKS_FILE=/path, then re-run."
+    elif SA1B_DIR="$SA1B_DIR" LINKS_FILE="$LINKS_FILE" TMP_DIR="$TMP_DIR/sa1b" SOURCE=meta \
        START_SHARD="$SA1B_START_SHARD" END_SHARD="$SA1B_END_SHARD" \
        bash "$REPO/scripts/qwen2_5vl_adl_0430/download_sa1b_shards.sh" ; then
         mark sa1b
