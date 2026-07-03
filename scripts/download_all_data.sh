@@ -88,7 +88,9 @@ echo
 # =============================================================================
 if want llava665k && ! done_ok llava665k; then
     log "STEP 1/6  LLaVA-1.5-665K bundle -> $SFT_DATA"
-    if "$HF_CLI" download --repo-type dataset kaiyuyue/llava-1.5-665k-instructions \
+    if [[ -z "$HF_CLI" ]]; then
+        err "  STEP 1 skipped: no huggingface CLI. Run: pip install -U 'huggingface_hub[cli]', then re-run."
+    elif "$HF_CLI" download --repo-type dataset kaiyuyue/llava-1.5-665k-instructions \
             --local-dir "$SFT_DATA" ; then
         log "  extracting train_split/*.tar.gz ..."
         shopt -s nullglob
@@ -115,7 +117,9 @@ fi
 # =============================================================================
 if want internvl && ! done_ok internvl; then
     log "STEP 2/6  InternVL-SA-1B-Caption (en 11M jsonl) -> $INTERNVL_DIR"
-    if "$HF_CLI" download --repo-type dataset OpenGVLab/InternVL-SA-1B-Caption \
+    if [[ -z "$HF_CLI" ]]; then
+        err "  STEP 2 skipped: no huggingface CLI. Run: pip install -U 'huggingface_hub[cli]', then re-run."
+    elif "$HF_CLI" download --repo-type dataset OpenGVLab/InternVL-SA-1B-Caption \
             internvl_sa1b_caption_11m_single_image_en.jsonl \
             --local-dir "$INTERNVL_DIR" ; then
         mark internvl
