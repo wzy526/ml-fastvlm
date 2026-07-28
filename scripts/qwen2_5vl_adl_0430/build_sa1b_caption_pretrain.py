@@ -47,8 +47,9 @@ Usage
     python scripts/qwen2_5vl_adl_0430/build_sa1b_caption_pretrain.py \
         --max_total 500000
 
-Output: /root/autodl-tmp/models_data/sft_data/llava_sa1b_caption_pretrain.json
-        (path can be overridden with --output_json)
+Output: $MODELS_DATA/sft_data/llava_sa1b_caption_pretrain.json
+        (MODELS_DATA defaults to /data/oss_bucket_0/wangziyi/models_data;
+         override the base with env MODELS_DATA, or the file with --output_json)
 
 Also (re)creates the symlink ``train_split/sa1b -> sa1b_images`` so the
 training script's ``--image_folder $DATA_ROOT/train_split`` finds the SA-1B
@@ -62,19 +63,24 @@ import random
 from collections import Counter
 from pathlib import Path
 
+# Base dir holding all datasets. Override with env MODELS_DATA to move machines.
+# New cluster (alibaba): /data/oss_bucket_0/wangziyi/models_data
+# Old host (autodl):     /root/autodl-tmp/models_data
+_MODELS_DATA = os.environ.get("MODELS_DATA", "/data/oss_bucket_0/wangziyi/models_data")
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--sa1b_image_dir",
         type=str,
-        default="/root/autodl-tmp/models_data/sa1b_images",
+        default=os.path.join(_MODELS_DATA, "sa1b_images"),
         help="Root dir holding sa_NNNNNN/ subdirs of JPEGs.",
     )
     parser.add_argument(
         "--internvl_dir",
         type=str,
-        default="/root/autodl-tmp/models_data/InternVL-SA-1B-Caption",
+        default=os.path.join(_MODELS_DATA, "InternVL-SA-1B-Caption"),
         help="Dir holding internvl_sa1b_caption_11m_single_image_en.jsonl.",
     )
     parser.add_argument(
@@ -88,12 +94,12 @@ def main():
     parser.add_argument(
         "--output_json",
         type=str,
-        default="/root/autodl-tmp/models_data/sft_data/llava_sa1b_caption_pretrain.json",
+        default=os.path.join(_MODELS_DATA, "sft_data", "llava_sa1b_caption_pretrain.json"),
     )
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/root/autodl-tmp/models_data/sft_data",
+        default=os.path.join(_MODELS_DATA, "sft_data"),
         help="Used to (re)create the symlink train_split/sa1b -> sa1b_image_dir.",
     )
     parser.add_argument(
