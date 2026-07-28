@@ -2,7 +2,7 @@
 set -euo pipefail
 
 eval "$(conda shell.bash hook)"
-conda activate vldat
+conda activate "${CONDA_ENV:-fastvlm}"
 
 # 0701 Stage-1 pretrain: SA-1B caption, 0528 backbone, NO hd_gate.
 # ============================================================================
@@ -45,18 +45,22 @@ conda activate vldat
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
-ADL_TMP="/root/autodl-tmp"
-
 export NUMEXPR_MAX_THREADS=4
 export NUMEXPR_NUM_THREADS=4
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 
-# -------- Path config --------
-DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
-MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
-CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
-CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
+# -------- Path config (new cluster) --------
+# Data lives on the OSS mount (read-only heavy); checkpoints + compile caches
+# go to LOCAL fast disk (OSS FUSE is slow and breaks on the many small
+# writes/renames a training checkpoint does). Copy the final ckpt back to OSS.
+OSS_DATA="${OSS_DATA:-/data/oss_bucket_0/wangziyi/models_data}"
+LOCAL_ROOT="${LOCAL_ROOT:-/home/pingping.wzy}"
+
+DATA_ROOT="${DATA_ROOT:-$OSS_DATA/sft_data}"
+MODEL_PATH="${MODEL_PATH:-$OSS_DATA/Qwen2.5-VL-3B-Instruct}"
+CKPT_ROOT="${CKPT_ROOT:-$LOCAL_ROOT/vldat_experiments}"
+CACHE_ROOT="${CACHE_ROOT:-$LOCAL_ROOT/cache/vldat}"
 EXP_NAME="${EXP_NAME:-0701_pretrain_sa1b_caption_fixinit_nogate}"
 
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_sa1b_caption_pretrain.json}"
