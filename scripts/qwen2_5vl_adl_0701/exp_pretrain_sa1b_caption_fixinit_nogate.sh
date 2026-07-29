@@ -63,6 +63,14 @@ CKPT_ROOT="${CKPT_ROOT:-$LOCAL_ROOT/vldat_experiments}"
 CACHE_ROOT="${CACHE_ROOT:-$LOCAL_ROOT/cache/vldat}"
 EXP_NAME="${EXP_NAME:-0701_pretrain_sa1b_caption_fixinit_nogate}"
 
+# train_split is a SYMLINK FARM (sa1b -> sa1b_images, etc). OSS FUSE cannot
+# create symlinks (errno 38 ENOSYS), so it must live on a symlink-capable LOCAL
+# fs. The heavy JPEGs stay on OSS and are reached THROUGH these symlinks (reads
+# on OSS are fine). The JSON manifest can stay on OSS (DATA_ROOT).
+#   mkdir -p $IMAGE_ROOT/train_split
+#   ln -sfn $OSS_DATA/sa1b_images $IMAGE_ROOT/train_split/sa1b
+IMAGE_ROOT="${IMAGE_ROOT:-$LOCAL_ROOT/sft_data}"
+
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_sa1b_caption_pretrain.json}"
 
 if [[ ! -f "$DATA_JSON" ]]; then
@@ -71,8 +79,8 @@ if [[ ! -f "$DATA_JSON" ]]; then
     echo "          python scripts/qwen2_5vl_adl_0430/build_sa1b_caption_pretrain.py" >&2
     exit 1
 fi
-if [[ ! -d "$DATA_ROOT/train_split" ]]; then echo "[ERROR] Missing $DATA_ROOT/train_split" >&2; exit 1; fi
-if [[ ! -e "$DATA_ROOT/train_split/sa1b" ]]; then echo "[ERROR] Missing sa1b symlink" >&2; exit 1; fi
+if [[ ! -d "$IMAGE_ROOT/train_split" ]]; then echo "[ERROR] Missing $IMAGE_ROOT/train_split (create it on LOCAL disk; OSS can't hold symlinks)" >&2; exit 1; fi
+if [[ ! -e "$IMAGE_ROOT/train_split/sa1b" ]]; then echo "[ERROR] Missing sa1b symlink: ln -sfn $OSS_DATA/sa1b_images $IMAGE_ROOT/train_split/sa1b" >&2; exit 1; fi
 if [[ ! -d "$MODEL_PATH" ]]; then echo "[ERROR] Missing $MODEL_PATH" >&2; exit 1; fi
 
 mkdir -p "$CKPT_ROOT/$EXP_NAME"
@@ -95,7 +103,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40851}" llava/train/tr
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
-    --image_folder "$DATA_ROOT/train_split" \
+    --image_folder "$IMAGE_ROOT/train_split" \
     --use_hr_first_resize False \
     --hd_max_pixels 5017600 \
     --use_dat True \

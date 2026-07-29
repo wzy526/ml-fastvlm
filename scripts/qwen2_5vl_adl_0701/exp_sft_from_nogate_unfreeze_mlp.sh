@@ -63,11 +63,15 @@ MODEL_PATH="${MODEL_PATH:-$CKPT_ROOT/0701_pretrain_sa1b_caption_fixinit_nogate}"
 CACHE_ROOT="${CACHE_ROOT:-$LOCAL_ROOT/cache/vldat}"
 EXP_NAME="${EXP_NAME:-0701_expL_sft_from_fixinit_nogate_unfreeze_mlp}"
 
+# train_split is a SYMLINK FARM on a LOCAL fs (OSS FUSE can't create symlinks,
+# errno 38). JPEGs stay on OSS, reached through the symlinks. JSON stays on OSS.
+IMAGE_ROOT="${IMAGE_ROOT:-$LOCAL_ROOT/sft_data}"
+
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_ivcap.json}"
 
 if [[ ! -f "$DATA_JSON" ]]; then echo "[ERROR] Missing $DATA_JSON" >&2; exit 1; fi
-if [[ ! -d "$DATA_ROOT/train_split" ]]; then echo "[ERROR] Missing $DATA_ROOT/train_split" >&2; exit 1; fi
-if [[ ! -e "$DATA_ROOT/train_split/sa1b" ]]; then echo "[ERROR] Missing sa1b symlink" >&2; exit 1; fi
+if [[ ! -d "$IMAGE_ROOT/train_split" ]]; then echo "[ERROR] Missing $IMAGE_ROOT/train_split (create it on LOCAL disk; OSS can't hold symlinks)" >&2; exit 1; fi
+if [[ ! -e "$IMAGE_ROOT/train_split/sa1b" ]]; then echo "[ERROR] Missing sa1b symlink: ln -sfn $OSS_DATA/sa1b_images $IMAGE_ROOT/train_split/sa1b" >&2; exit 1; fi
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "[ERROR] Missing pretrain ckpt: $MODEL_PATH" >&2
     echo "        Run exp_pretrain_sa1b_caption_fixinit_nogate.sh first." >&2
@@ -96,7 +100,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40951}" llava/train/tr
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
-    --image_folder "$DATA_ROOT/train_split" \
+    --image_folder "$IMAGE_ROOT/train_split" \
     --use_hr_first_resize False \
     --hd_max_pixels 5017600 \
     --use_dat True \
