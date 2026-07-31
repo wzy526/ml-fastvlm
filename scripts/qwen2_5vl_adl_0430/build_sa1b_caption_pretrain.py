@@ -47,8 +47,9 @@ Usage
     python scripts/qwen2_5vl_adl_0430/build_sa1b_caption_pretrain.py \
         --max_total 500000
 
-Output: /root/autodl-tmp/models_data/sft_data/llava_sa1b_caption_pretrain.json
-        (path can be overridden with --output_json)
+Output: $MODELS_DATA/sft_data/llava_sa1b_caption_pretrain.json
+        (MODELS_DATA defaults to /data/oss_bucket_0/wangziyi/models_data;
+         override the base with env MODELS_DATA, or the file with --output_json)
 
 Also (re)creates the symlink ``train_split/sa1b -> sa1b_images`` so the
 training script's ``--image_folder $DATA_ROOT/train_split`` finds the SA-1B
@@ -62,19 +63,24 @@ import random
 from collections import Counter
 from pathlib import Path
 
+# Base dir holding all datasets. Override with env MODELS_DATA to move machines.
+# New cluster (alibaba): /data/oss_bucket_0/wangziyi/models_data
+# Old host (autodl):     /root/autodl-tmp/models_data
+_MODELS_DATA = os.environ.get("MODELS_DATA", "/data/oss_bucket_0/wangziyi/models_data")
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--sa1b_image_dir",
         type=str,
-        default="/root/autodl-tmp/models_data/sa1b_images",
+        default=os.path.join(_MODELS_DATA, "sa1b_images"),
         help="Root dir holding sa_NNNNNN/ subdirs of JPEGs.",
     )
     parser.add_argument(
         "--internvl_dir",
         type=str,
-        default="/root/autodl-tmp/models_data/InternVL-SA-1B-Caption",
+        default=os.path.join(_MODELS_DATA, "InternVL-SA-1B-Caption"),
         help="Dir holding internvl_sa1b_caption_11m_single_image_en.jsonl.",
     )
     parser.add_argument(
@@ -88,12 +94,12 @@ def main():
     parser.add_argument(
         "--output_json",
         type=str,
-        default="/root/autodl-tmp/models_data/sft_data/llava_sa1b_caption_pretrain.json",
+        default=os.path.join(_MODELS_DATA, "sft_data", "llava_sa1b_caption_pretrain.json"),
     )
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/root/autodl-tmp/models_data/sft_data",
+        default=os.path.join(_MODELS_DATA, "sft_data"),
         help="Used to (re)create the symlink train_split/sa1b -> sa1b_image_dir.",
     )
     parser.add_argument(
@@ -174,22 +180,38 @@ def main():
         json.dump(verified, f)
     print(f"\nSaved {len(verified):,} samples to: {args.output_json}")
 
+    # NOTE: the JSON above is already saved; the symlink below is best-effort.
+    # Object-storage FUSE mounts (OSS / S3 / goofys) do NOT implement symlink()
+    # and raise OSError(errno=38, ENOSYS). In that case put train_split on a
+    # symlink-capable LOCAL fs via --data_root and let training point its
+    # --image_folder there. Never let a symlink failure abort a successful build.
     train_split = os.path.join(args.data_root, "train_split")
-    os.makedirs(train_split, exist_ok=True)
     symlink_path = os.path.join(train_split, "sa1b")
-    if os.path.islink(symlink_path) or os.path.exists(symlink_path):
-        current_target = os.readlink(symlink_path) if os.path.islink(symlink_path) else None
-        if current_target == args.sa1b_image_dir:
-            print(f"Symlink already correct: {symlink_path} -> {current_target}")
+    try:
+        os.makedirs(train_split, exist_ok=True)
+        if os.path.islink(symlink_path) or os.path.exists(symlink_path):
+            current_target = os.readlink(symlink_path) if os.path.islink(symlink_path) else None
+            if current_target == args.sa1b_image_dir:
+                print(f"Symlink already correct: {symlink_path} -> {current_target}")
+            else:
+                print(
+                    f"WARN: {symlink_path} exists but points to {current_target} "
+                    f"(want {args.sa1b_image_dir}). Leaving unchanged; remove "
+                    f"manually if you want this builder to recreate it."
+                )
         else:
-            print(
-                f"WARN: {symlink_path} exists but points to {current_target} "
-                f"(want {args.sa1b_image_dir}). Leaving unchanged; remove "
-                f"manually if you want this builder to recreate it."
-            )
-    else:
-        os.symlink(args.sa1b_image_dir, symlink_path)
-        print(f"Created symlink: {symlink_path} -> {args.sa1b_image_dir}")
+            os.symlink(args.sa1b_image_dir, symlink_path)
+            print(f"Created symlink: {symlink_path} -> {args.sa1b_image_dir}")
+    except OSError as e:
+        print(
+            f"WARN: could not create symlink {symlink_path} -> "
+            f"{args.sa1b_image_dir} ({e}).\n"
+            f"      The JSON is already saved OK; only the symlink failed.\n"
+            f"      Object-storage FUSE mounts don't support symlinks (errno 38).\n"
+            f"      Create it on a LOCAL fs and point training --image_folder there:\n"
+            f"        mkdir -p <LOCAL>/sft_data/train_split\n"
+            f"        ln -sfn {args.sa1b_image_dir} <LOCAL>/sft_data/train_split/sa1b"
+        )
 
     print("\n" + "=" * 60)
     print("Pretrain dataset summary")

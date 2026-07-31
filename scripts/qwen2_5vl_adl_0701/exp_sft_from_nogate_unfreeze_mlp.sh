@@ -2,7 +2,7 @@
 set -euo pipefail
 
 eval "$(conda shell.bash hook)"
-conda activate vldat
+conda activate "${CONDA_ENV:-fastvlm}"
 
 # 0701 Stage-2 SFT: on top of the 0701 nogate pretrain ckpt.
 # ============================================================================
@@ -44,26 +44,34 @@ conda activate vldat
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
 
-ADL_TMP="/root/autodl-tmp"
-
 export NUMEXPR_MAX_THREADS=4
 export NUMEXPR_NUM_THREADS=4
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 
-# -------- Path config --------
-DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
-# Source = the 0701 nogate pretrain ckpt.
-MODEL_PATH="${MODEL_PATH:-$ADL_TMP/vldat_experiments/0701_pretrain_sa1b_caption_fixinit_nogate}"
-CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
-CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
+# -------- Path config (new cluster) --------
+# Data on OSS; checkpoints + caches on LOCAL fast disk. MODEL_PATH (the pretrain
+# source ckpt) is derived from CKPT_ROOT so it always matches where the pretrain
+# stage wrote its output.
+OSS_DATA="${OSS_DATA:-/data/oss_bucket_0/wangziyi/models_data}"
+LOCAL_ROOT="${LOCAL_ROOT:-/home/pingping.wzy}"
+
+DATA_ROOT="${DATA_ROOT:-$OSS_DATA/sft_data}"
+CKPT_ROOT="${CKPT_ROOT:-$LOCAL_ROOT/vldat_experiments}"
+# Source = the 0701 nogate pretrain ckpt (written by the pretrain script).
+MODEL_PATH="${MODEL_PATH:-$CKPT_ROOT/0701_pretrain_sa1b_caption_fixinit_nogate}"
+CACHE_ROOT="${CACHE_ROOT:-$LOCAL_ROOT/cache/vldat}"
 EXP_NAME="${EXP_NAME:-0701_expL_sft_from_fixinit_nogate_unfreeze_mlp}"
+
+# train_split is a SYMLINK FARM on a LOCAL fs (OSS FUSE can't create symlinks,
+# errno 38). JPEGs stay on OSS, reached through the symlinks. JSON stays on OSS.
+IMAGE_ROOT="${IMAGE_ROOT:-$LOCAL_ROOT/sft_data}"
 
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_hr_essential_sa1b_ivcap.json}"
 
 if [[ ! -f "$DATA_JSON" ]]; then echo "[ERROR] Missing $DATA_JSON" >&2; exit 1; fi
-if [[ ! -d "$DATA_ROOT/train_split" ]]; then echo "[ERROR] Missing $DATA_ROOT/train_split" >&2; exit 1; fi
-if [[ ! -e "$DATA_ROOT/train_split/sa1b" ]]; then echo "[ERROR] Missing sa1b symlink" >&2; exit 1; fi
+if [[ ! -d "$IMAGE_ROOT/train_split" ]]; then echo "[ERROR] Missing $IMAGE_ROOT/train_split (create it on LOCAL disk; OSS can't hold symlinks)" >&2; exit 1; fi
+if [[ ! -e "$IMAGE_ROOT/train_split/sa1b" ]]; then echo "[ERROR] Missing sa1b symlink: ln -sfn $OSS_DATA/sa1b_images $IMAGE_ROOT/train_split/sa1b" >&2; exit 1; fi
 if [[ ! -d "$MODEL_PATH" ]]; then
     echo "[ERROR] Missing pretrain ckpt: $MODEL_PATH" >&2
     echo "        Run exp_pretrain_sa1b_caption_fixinit_nogate.sh first." >&2
@@ -88,11 +96,21 @@ export NCCL_P2P_DISABLE=0
 
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
+# HD gate: MUST match the pretrain ckpt's architecture. If the pretrain ran
+# with DAT_HD_GATE_INIT=-4.0, pass the same value here, otherwise the gate
+# param in the ckpt is silently dropped and the merge behaves differently.
+HD_GATE_ARG=()
+if [[ -n "${DAT_HD_GATE_INIT:-}" ]]; then
+    HD_GATE_ARG=(--dat_hd_gate_init "${DAT_HD_GATE_INIT}")
+    echo "[gate] enabling hd_gate_init=${DAT_HD_GATE_INIT}"
+fi
+
 torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40951}" llava/train/train_qwen_dat.py \
+    "${HD_GATE_ARG[@]}" \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
-    --image_folder "$DATA_ROOT/train_split" \
+    --image_folder "$IMAGE_ROOT/train_split" \
     --use_hr_first_resize False \
     --hd_max_pixels 5017600 \
     --use_dat True \

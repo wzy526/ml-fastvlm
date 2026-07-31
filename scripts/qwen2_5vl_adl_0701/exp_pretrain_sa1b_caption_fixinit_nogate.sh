@@ -2,7 +2,7 @@
 set -euo pipefail
 
 eval "$(conda shell.bash hook)"
-conda activate vldat
+conda activate "${CONDA_ENV:-fastvlm}"
 
 # 0701 Stage-1 pretrain: SA-1B caption, 0528 backbone, NO hd_gate.
 # ============================================================================
@@ -44,20 +44,34 @@ conda activate vldat
 # Data: llava_sa1b_caption_pretrain.json (503k SA-1B captions from InternVL).
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
-
-ADL_TMP="/root/autodl-tmp"
+# Online by default (respects `wandb login`). If you ever need to run without
+# wandb auth, launch with WANDB_MODE=offline (or =disabled) on the command line.
 
 export NUMEXPR_MAX_THREADS=4
 export NUMEXPR_NUM_THREADS=4
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 
-# -------- Path config --------
-DATA_ROOT="${DATA_ROOT:-$ADL_TMP/models_data/sft_data}"
-MODEL_PATH="${MODEL_PATH:-$ADL_TMP/models_data/Qwen2.5-VL-3B-Instruct}"
-CKPT_ROOT="${CKPT_ROOT:-$ADL_TMP/vldat_experiments}"
-CACHE_ROOT="${CACHE_ROOT:-$ADL_TMP/cache/vldat}"
+# -------- Path config (new cluster) --------
+# Data lives on the OSS mount (read-only heavy); checkpoints + compile caches
+# go to LOCAL fast disk (OSS FUSE is slow and breaks on the many small
+# writes/renames a training checkpoint does). Copy the final ckpt back to OSS.
+OSS_DATA="${OSS_DATA:-/data/oss_bucket_0/wangziyi/models_data}"
+LOCAL_ROOT="${LOCAL_ROOT:-/home/pingping.wzy}"
+
+DATA_ROOT="${DATA_ROOT:-$OSS_DATA/sft_data}"
+MODEL_PATH="${MODEL_PATH:-$OSS_DATA/Qwen2.5-VL-3B-Instruct}"
+CKPT_ROOT="${CKPT_ROOT:-$LOCAL_ROOT/vldat_experiments}"
+CACHE_ROOT="${CACHE_ROOT:-$LOCAL_ROOT/cache/vldat}"
 EXP_NAME="${EXP_NAME:-0701_pretrain_sa1b_caption_fixinit_nogate}"
+
+# train_split is a SYMLINK FARM (sa1b -> sa1b_images, etc). OSS FUSE cannot
+# create symlinks (errno 38 ENOSYS), so it must live on a symlink-capable LOCAL
+# fs. The heavy JPEGs stay on OSS and are reached THROUGH these symlinks (reads
+# on OSS are fine). The JSON manifest can stay on OSS (DATA_ROOT).
+#   mkdir -p $IMAGE_ROOT/train_split
+#   ln -sfn $OSS_DATA/sa1b_images $IMAGE_ROOT/train_split/sa1b
+IMAGE_ROOT="${IMAGE_ROOT:-$LOCAL_ROOT/sft_data}"
 
 DATA_JSON="${DATA_JSON:-$DATA_ROOT/llava_sa1b_caption_pretrain.json}"
 
@@ -67,8 +81,8 @@ if [[ ! -f "$DATA_JSON" ]]; then
     echo "          python scripts/qwen2_5vl_adl_0430/build_sa1b_caption_pretrain.py" >&2
     exit 1
 fi
-if [[ ! -d "$DATA_ROOT/train_split" ]]; then echo "[ERROR] Missing $DATA_ROOT/train_split" >&2; exit 1; fi
-if [[ ! -e "$DATA_ROOT/train_split/sa1b" ]]; then echo "[ERROR] Missing sa1b symlink" >&2; exit 1; fi
+if [[ ! -d "$IMAGE_ROOT/train_split" ]]; then echo "[ERROR] Missing $IMAGE_ROOT/train_split (create it on LOCAL disk; OSS can't hold symlinks)" >&2; exit 1; fi
+if [[ ! -e "$IMAGE_ROOT/train_split/sa1b" ]]; then echo "[ERROR] Missing sa1b symlink: ln -sfn $OSS_DATA/sa1b_images $IMAGE_ROOT/train_split/sa1b" >&2; exit 1; fi
 if [[ ! -d "$MODEL_PATH" ]]; then echo "[ERROR] Missing $MODEL_PATH" >&2; exit 1; fi
 
 mkdir -p "$CKPT_ROOT/$EXP_NAME"
@@ -87,11 +101,21 @@ export NCCL_P2P_DISABLE=0
 # Sparse 1D-per-6 layer pattern (same as 0528).
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
+# HD gate: nogate by default (this experiment's whole point). For the A/B test
+# against the proven 0528 recipe, set DAT_HD_GATE_INIT=-4.0 on the command line
+# and the --dat_hd_gate_init flag is injected automatically.
+HD_GATE_ARG=()
+if [[ -n "${DAT_HD_GATE_INIT:-}" ]]; then
+    HD_GATE_ARG=(--dat_hd_gate_init "${DAT_HD_GATE_INIT}")
+    echo "[gate] enabling hd_gate_init=${DAT_HD_GATE_INIT}"
+fi
+
 torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40851}" llava/train/train_qwen_dat.py \
+    "${HD_GATE_ARG[@]}" \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
-    --image_folder "$DATA_ROOT/train_split" \
+    --image_folder "$IMAGE_ROOT/train_split" \
     --use_hr_first_resize False \
     --hd_max_pixels 5017600 \
     --use_dat True \
