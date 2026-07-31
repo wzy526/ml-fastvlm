@@ -44,6 +44,8 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # Data: llava_sa1b_caption_pretrain.json (503k SA-1B captions from InternVL).
 
 export WANDB_PROJECT="${WANDB_PROJECT:-vldat_experiments}"
+# Online by default (respects `wandb login`). If you ever need to run without
+# wandb auth, launch with WANDB_MODE=offline (or =disabled) on the command line.
 
 export NUMEXPR_MAX_THREADS=4
 export NUMEXPR_NUM_THREADS=4
@@ -99,7 +101,17 @@ export NCCL_P2P_DISABLE=0
 # Sparse 1D-per-6 layer pattern (same as 0528).
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
+# HD gate: nogate by default (this experiment's whole point). For the A/B test
+# against the proven 0528 recipe, set DAT_HD_GATE_INIT=-4.0 on the command line
+# and the --dat_hd_gate_init flag is injected automatically.
+HD_GATE_ARG=()
+if [[ -n "${DAT_HD_GATE_INIT:-}" ]]; then
+    HD_GATE_ARG=(--dat_hd_gate_init "${DAT_HD_GATE_INIT}")
+    echo "[gate] enabling hd_gate_init=${DAT_HD_GATE_INIT}"
+fi
+
 torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40851}" llava/train/train_qwen_dat.py \
+    "${HD_GATE_ARG[@]}" \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
