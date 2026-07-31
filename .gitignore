@@ -179,3 +179,6 @@ bench_logs/
 
 # bench outputs
 bench_outputs/
+
+# local agent notes (含内网路径, 勿提交)
+.cursor/

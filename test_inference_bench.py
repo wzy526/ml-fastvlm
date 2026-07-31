@@ -64,6 +64,10 @@ python test_inference_bench.py --tasks all
 """
 
 import os
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import sys
 import time
 import json
@@ -76,11 +80,34 @@ from typing import Optional, Dict, List, Tuple, Any
 import torch
 from PIL import Image
 
-# ─── 默认路径 ────────────────────────────────────────────────────────────────
-DEFAULT_BASE_MODEL = '/cluster/data3/wzy/vldat_experiments/Qwen2.5-VL-3B-Instruct/Qwen/Qwen2___5-VL-3B-Instruct'
-DEFAULT_DAT_CKPT   = '/cluster/data3/wzy/vldat_experiments/checkpoint-3907'
-DEFAULT_VSTAR_DIR  = '/cluster/data3/wzy/sft_data_prev/sft_data/vstar_bench'
+# ─── 默认路径 (环境变量 MODEL_CACHE / VSTAR_DIR 可覆盖) ──────────────────────
+MODEL_CACHE = os.environ.get('MODEL_CACHE', '/workspace/model_cache')
+DEFAULT_BASE_MODEL = os.path.join(MODEL_CACHE, 'Qwen2.5-VL-3B-Instruct')
+# 空 = 无训练 ckpt，直接从 base 权重构建 DAT (DAT 模块随机初始化，测速等价)
+DEFAULT_DAT_CKPT   = ''
+# vstar 目录不存在时自动回退到合成图 (等价于 --synthetic)
+DEFAULT_VSTAR_DIR  = os.environ.get('VSTAR_DIR', 'data/vstar_bench')
 DEFAULT_VSTAR_JSONL = os.path.join(DEFAULT_VSTAR_DIR, 'test_questions.jsonl')
+
+# 从 base 构建时的 DAT 结构参数 (与 0701 实验一致; layers 按层数自动生成 1D-per-6)
+DEFAULT_DAT_EXTRA_ARGS = {
+    'grid_size': 20,
+    'off_ksize': 3,
+    'off_grps': 8,
+    'inter_size': 128,
+    'hr_scale': 3,
+    'hd_proj': True,
+    'use_intention_branch': True,
+    'intention_as_gate': True,
+    'use_spatial_attn_guide': False,
+    'hd_gate_init': None,
+    'hd_gate_freeze': False,
+    'inject_lr_image': False,
+    'image_hd_for_question': False,
+    'use_fused_vit': False,
+    'use_shared_vit': False,
+    'hd_early_exit_k': 0,
+}
 
 # ─── 模型常量 ────────────────────────────────────────────────────────────────
 PATCH_SIZE = 14
@@ -271,13 +298,18 @@ def make_synthetic_image(R: int) -> Image.Image:
 #   合并自 test_pareto_speed.py 的 ① E2E Prefill + ② Breakdown
 # ════════════════════════════════════════════════════════════════════════════════
 
-def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters):
+def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters,
+                 qwen_model=None):
     """单分辨率 R 上的 Prefill 测量。
+
+    qwen_model: 原生 Qwen2_5_VLForConditionalGeneration (官方类)。提供时额外测
+    t_qwen_e2e_ms，用于对照 DAT 类的 base 路径是否存在类本身的额外开销。
 
     返回:
       {
         'R', 'LR', 'HD_tokens', 'LR_tokens', 'nq_base', 'nq_lr',
-        't_base_e2e_ms', 't_dat_e2e_ms', 'speedup',
+        't_base_e2e_ms', 't_dat_e2e_ms', 't_dat_e2e_fused_ms',
+        't_qwen_e2e_ms', 'speedup', 'speedup_fused', 'speedup_fused_vs_qwen',
         't_vit_hd_ms', 't_vit_lr_ms', 't_llm_dat_pre_ms',
         'llm_base_est_ms', 'llm_dat_est_ms',
         'mem_base_mb', 'mem_dat_mb',
@@ -339,17 +371,38 @@ def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters):
                       pixel_values=pv_lr, image_grid_thw=thw_lr,
                       image_hd_features=hd_feats, use_cache=False)
 
+    def fwd_qwen_e2e():
+        # 原生 Qwen2.5-VL 官方类, 同 Base(R) 输入
+        with torch.no_grad():
+            qwen_model(input_ids=iids_b, attention_mask=amask_b,
+                       pixel_values=pv_base, image_grid_thw=thw_base,
+                       use_cache=False)
+
     # 联合 warmup（所有路径）
     for _ in range(warmup):
         fwd_base_e2e(); fwd_dat_e2e(); fwd_vit_hd(); fwd_vit_lr(); fwd_llm_dat_pre()
+        if qwen_model is not None:
+            fwd_qwen_e2e()
     torch.cuda.synchronize()
 
     # 计时 + 显存（E2E 两路单独测显存，分解项只测时间）
     t_base_e2e, mem_base = benchmark_with_memory(fwd_base_e2e,    warmup=0, iters=iters)
     t_dat_e2e,  mem_dat  = benchmark_with_memory(fwd_dat_e2e,     warmup=0, iters=iters)
+
+    # DAT E2E with fused ViT (LR+HD 单次 visual() 调用)
+    _set_vit_path(dat_model, 'fused')
+    t_dat_e2e_fused, mem_dat_fused = benchmark_with_memory(
+        fwd_dat_e2e, warmup=max(1, warmup), iters=iters)
+    _set_vit_path(dat_model, 'separate')
+
     t_vit_hd      = benchmark_fn(fwd_vit_hd,      warmup=0, iters=iters)
     t_vit_lr      = benchmark_fn(fwd_vit_lr,      warmup=0, iters=iters)
     t_llm_dat_pre = benchmark_fn(fwd_llm_dat_pre, warmup=0, iters=iters)
+
+    t_qwen_e2e, mem_qwen = (
+        benchmark_with_memory(fwd_qwen_e2e, warmup=0, iters=iters)
+        if qwen_model is not None else (None, None)
+    )
 
     llm_base = max(0.0, t_base_e2e    - t_vit_hd)
     llm_dat  = max(0.0, t_llm_dat_pre - t_vit_lr)
@@ -360,7 +413,14 @@ def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters):
         'nq_base': nq_base, 'nq_lr': nq_lr,
         't_base_e2e_ms':    t_base_e2e,
         't_dat_e2e_ms':     t_dat_e2e,
+        't_dat_e2e_fused_ms': t_dat_e2e_fused,
+        't_qwen_e2e_ms':    t_qwen_e2e,
+        'mem_qwen_mb':      mem_qwen,
         'speedup':          t_base_e2e / t_dat_e2e if t_dat_e2e > 0 else 0,
+        'speedup_fused':    t_base_e2e / t_dat_e2e_fused if t_dat_e2e_fused > 0 else 0,
+        'speedup_fused_vs_qwen': (
+            t_qwen_e2e / t_dat_e2e_fused
+            if t_qwen_e2e and t_dat_e2e_fused > 0 else None),
         't_vit_hd_ms':      t_vit_hd,
         't_vit_lr_ms':      t_vit_lr,
         't_llm_dat_pre_ms': t_llm_dat_pre,
@@ -369,11 +429,12 @@ def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters):
         'llm_speedup':      llm_base / llm_dat if llm_dat > 0 else 0,
         'mem_base_mb':      mem_base,
         'mem_dat_mb':       mem_dat,
+        'mem_dat_fused_mb': mem_dat_fused,
     }
 
 
 def run_prefill_sweep(dat_model, processor, img, resolutions, hr_scale,
-                      warmup, iters, save_cb=None):
+                      warmup, iters, save_cb=None, qwen_model=None):
     """对所有分辨率跑 prefill task，返回 list of result dicts。"""
     results = []
     for R in resolutions:
@@ -384,7 +445,7 @@ def run_prefill_sweep(dat_model, processor, img, resolutions, hr_scale,
 
         with oom_guard(f"prefill R={R}") as guard:
             res = task_prefill(dat_model, processor, img, R, hr_scale,
-                               warmup=warmup, iters=iters)
+                               warmup=warmup, iters=iters, qwen_model=qwen_model)
             guard['ok'] = True
             guard['result'] = res
 
@@ -392,9 +453,14 @@ def run_prefill_sweep(dat_model, processor, img, resolutions, hr_scale,
         if guard['ok']:
             entry.update(guard['result'])
             r = guard['result']
+            qwen_str = (f"  Qwen={r['t_qwen_e2e_ms']:>7.1f}ms"
+                        f" (fused vs Qwen: {r['speedup_fused_vs_qwen']:.2f}x)"
+                        if r.get('t_qwen_e2e_ms') else "")
             print(f"  R={R:>5}  Nq_base={r['nq_base']:>5}  Nq_lr={r['nq_lr']:>5}"
                   f"  Base={r['t_base_e2e_ms']:>7.1f}ms  DAT={r['t_dat_e2e_ms']:>7.1f}ms"
-                  f"  speedup={r['speedup']:>5.2f}x"
+                  f" ({r['speedup']:.2f}x)"
+                  f"  DAT-fused={r['t_dat_e2e_fused_ms']:>7.1f}ms ({r['speedup_fused']:.2f}x)"
+                  f"{qwen_str}"
                   f"  Mem Base={r['mem_base_mb']/1024:>5.2f}GB DAT={r['mem_dat_mb']/1024:>5.2f}GB")
         else:
             entry['oom'] = guard['oom']
@@ -451,10 +517,10 @@ def _measure_prefill_only(model, fwd_fn, warmup=1, iters=2):
 
 
 def task_batch_decode(dat_model, processor, img, R, B, T, hr_scale,
-                      warmup=1, iters=2):
+                      warmup=1, iters=2, qwen_model=None):
     """
     单个 (R, B, T) 配置上的 decode throughput 测量。
-    DAT 与 Base 各跑一次，返回 dict 列表（两条记录）。
+    DAT 与 Base 各跑一次（可选原生 Qwen 一次），返回 dict 列表。
     """
     text = make_text(processor, img)
     eos_id = processor.tokenizer.eos_token_id
@@ -469,6 +535,58 @@ def task_batch_decode(dat_model, processor, img, R, B, T, hr_scale,
     )
 
     out_records = []
+
+    # ── Qwen 原生（官方类, 同 Base 输入）────────────────────────────────────
+    if qwen_model is not None:
+        with oom_guard(f"batch_decode Qwen R={R} B={B} T={T}") as guard:
+            inp = process_base(processor, img, text, R, batch=B)
+            nq  = inp['input_ids'].shape[1]
+
+            def prefill_only():
+                with torch.no_grad():
+                    qwen_model(input_ids=inp['input_ids'],
+                               attention_mask=inp.get('attention_mask'),
+                               pixel_values=inp['pixel_values'].to(DTYPE),
+                               image_grid_thw=inp['image_grid_thw'],
+                               use_cache=True)
+
+            gen_inputs = dict(
+                input_ids=inp['input_ids'],
+                attention_mask=inp.get('attention_mask'),
+                pixel_values=inp['pixel_values'].to(DTYPE),
+                image_grid_thw=inp['image_grid_thw'],
+            )
+
+            t_prefill = _measure_prefill_only(qwen_model, prefill_only,
+                                              warmup=warmup, iters=iters)
+            t_total, mem_peak = _measure_generate(qwen_model, gen_inputs,
+                                                  gen_kwargs,
+                                                  warmup=warmup, iters=iters)
+            t_decode = max(0.0, t_total - t_prefill)
+
+            guard['ok'] = True
+            guard['result'] = dict(
+                R=R, B=B, T=T, model='qwen', nq=nq, decode_tokens=B * T,
+                ttft_ms=t_prefill,
+                decode_ms=t_decode,
+                total_ms=t_total,
+                itl_ms_per_token=t_decode / (B * T) if B * T > 0 else 0,
+                tokens_per_sec=(B * T) / (t_decode / 1000) if t_decode > 0 else 0,
+                samples_per_sec=B / (t_total / 1000) if t_total > 0 else 0,
+                peak_mem_mb=mem_peak,
+            )
+
+        if guard['ok']:
+            r = guard['result']
+            print(f"  Qwen  R={R:>5} B={B:>3} T={T:>4} Nq={r['nq']:>5}"
+                  f"  TTFT={r['ttft_ms']:>7.1f}ms  decode={r['decode_ms']:>7.1f}ms"
+                  f"  ITL={r['itl_ms_per_token']:>5.1f}ms/tok"
+                  f"  tok/s={r['tokens_per_sec']:>7.1f}"
+                  f"  mem={r['peak_mem_mb']/1024:>5.2f}GB")
+            out_records.append(r)
+        else:
+            out_records.append(dict(R=R, B=B, T=T, model='qwen',
+                                    oom=guard['oom'], error=guard['error']))
 
     # ── Base: pixel_values_hd=None（DAT 模型退化为 Qwen2.5-VL Base）─────────────
     with oom_guard(f"batch_decode Base R={R} B={B} T={T}") as guard:
@@ -580,7 +698,8 @@ def task_batch_decode(dat_model, processor, img, R, B, T, hr_scale,
 
 
 def run_batch_decode_sweep(dat_model, processor, img, resolutions, batch_sizes,
-                           decode_lens, hr_scale, warmup, iters, save_cb=None):
+                           decode_lens, hr_scale, warmup, iters, save_cb=None,
+                           qwen_model=None):
     """sweep (R, B, T)"""
     results = []
     for R in resolutions:
@@ -592,7 +711,8 @@ def run_batch_decode_sweep(dat_model, processor, img, resolutions, batch_sizes,
             for T in decode_lens:
                 print(f"\n  ── (R={R}, B={B}, T={T}) ──")
                 recs = task_batch_decode(dat_model, processor, img, R, B, T,
-                                         hr_scale, warmup=warmup, iters=iters)
+                                         hr_scale, warmup=warmup, iters=iters,
+                                         qwen_model=qwen_model)
                 results.extend(recs)
                 if save_cb is not None:
                     save_cb()
@@ -967,22 +1087,31 @@ def render_markdown(payload: Dict[str, Any]) -> str:
         rows = []
         for r in payload['prefill']:
             if r.get('oom'):
-                rows.append([r['R'], '—', '—', '—', 'OOM', '—', '—'])
+                rows.append([r['R'], '—', '—', '—', 'OOM', '—', '—', '—', '—'])
                 continue
             if 'error' in r:
-                rows.append([r['R'], '—', '—', '—', f"ERR: {r['error'][:30]}", '—', '—'])
+                rows.append([r['R'], '—', '—', '—', f"ERR: {r['error'][:30]}", '—', '—', '—', '—'])
                 continue
+            _tq = r.get('t_qwen_e2e_ms')
+            _sq = r.get('speedup_fused_vs_qwen')
             rows.append([
                 r['R'],
                 r['nq_base'], r['nq_lr'],
+                f"{_tq:.1f}" if _tq else '—',
                 f"{r['t_base_e2e_ms']:.1f}",
                 f"{r['t_dat_e2e_ms']:.1f}",
                 f"{r['speedup']:.2f}x",
+                f"{r.get('t_dat_e2e_fused_ms', 0):.1f}",
+                f"{r.get('speedup_fused', 0):.2f}x",
+                f"{_sq:.2f}x" if _sq else '—',
                 f"{r['mem_base_mb']/1024:.2f} → {r['mem_dat_mb']/1024:.2f}",
             ])
         md.append("### E2E\n")
-        md.append(_md_table(rows, ['R', 'Nq Base', 'Nq DAT', 'Base ms', 'DAT ms',
-                                   'Speedup', 'Mem GB (Base→DAT)']))
+        md.append(_md_table(rows, ['R', 'Nq Base', 'Nq DAT', 'Qwen ms',
+                                   'Base ms', 'DAT ms', 'Speedup',
+                                   'DAT-fused ms', 'Speedup(fused)',
+                                   'fused vs Qwen',
+                                   'Mem GB (Base→DAT)']))
 
         rows = []
         for r in payload['prefill']:
@@ -1023,28 +1152,33 @@ def render_markdown(payload: Dict[str, Any]) -> str:
             rows = []
             for B in sorted(by_b.keys()):
                 pair = by_b[B]
+                qwen = pair.get('qwen', {})
                 base = pair.get('base', {}); dat = pair.get('dat', {})
                 def fmt(d, k, sfx='', oom_str='OOM'):
+                    if not d: return '—'
                     if d.get('oom'): return oom_str
                     if 'error' in d: return 'ERR'
                     v = d.get(k);  return f"{v:.1f}{sfx}" if v is not None else '—'
+                def fmt_mem(d):
+                    if not d: return '—'
+                    if d.get('oom') or 'error' in d: return 'OOM'
+                    return f"{d.get('peak_mem_mb', 0)/1024:.2f}"
                 row = [
                     B,
-                    fmt(base, 'ttft_ms'),         fmt(dat, 'ttft_ms'),
-                    fmt(base, 'itl_ms_per_token'), fmt(dat, 'itl_ms_per_token'),
-                    fmt(base, 'tokens_per_sec'),  fmt(dat, 'tokens_per_sec'),
+                    fmt(qwen, 'ttft_ms'), fmt(base, 'ttft_ms'), fmt(dat, 'ttft_ms'),
+                    fmt(qwen, 'itl_ms_per_token'), fmt(base, 'itl_ms_per_token'), fmt(dat, 'itl_ms_per_token'),
+                    fmt(qwen, 'tokens_per_sec'), fmt(base, 'tokens_per_sec'), fmt(dat, 'tokens_per_sec'),
                     fmt(base, 'samples_per_sec'), fmt(dat, 'samples_per_sec'),
-                    f"{base.get('peak_mem_mb', 0)/1024:.2f}" if not base.get('oom') and 'error' not in base else 'OOM',
-                    f"{dat .get('peak_mem_mb', 0)/1024:.2f}" if not dat .get('oom') and 'error' not in dat  else 'OOM',
+                    fmt_mem(qwen), fmt_mem(base), fmt_mem(dat),
                 ]
                 rows.append(row)
             md.append(_md_table(rows, [
                 'B',
-                'TTFT Base', 'TTFT DAT',
-                'ITL Base', 'ITL DAT',
-                'tok/s Base', 'tok/s DAT',
+                'TTFT Qwen', 'TTFT Base', 'TTFT DAT',
+                'ITL Qwen', 'ITL Base', 'ITL DAT',
+                'tok/s Qwen', 'tok/s Base', 'tok/s DAT',
                 'samples/s Base', 'samples/s DAT',
-                'Mem Base GB', 'Mem DAT GB',
+                'Mem Qwen GB', 'Mem Base GB', 'Mem DAT GB',
             ]))
 
     # ── memory ──────────────────────────────────────────────────────────────
@@ -1185,7 +1319,16 @@ def main():
     parser.add_argument("--vstar-jsonl", type=str, default=DEFAULT_VSTAR_JSONL)
     parser.add_argument("--synthetic",   action="store_true",
                         help="使用合成图像（不依赖 vstar 数据集）")
+    parser.add_argument("--no-native",   action="store_true",
+                        help="不加载原生 Qwen2.5-VL 对照基线（省显存/时间）")
     parser.add_argument("--question",    type=str, default=DEFAULT_QUESTION)
+    parser.add_argument("--hd-early-k",  type=int, default=0,
+                        help="HD ViT 早退: 只跑前 k 个 vision block (0=关)。"
+                             "只影响 DAT 的 separate HD 路径; 与 fused/shared 不兼容")
+    parser.add_argument("--attn-impl",   type=str, default="flash_attention_2",
+                        choices=["flash_attention_2", "sdpa", "eager"],
+                        help="DAT 与原生 Qwen 统一的 attention backend (含 ViT)。"
+                             "sdpa 的 ViT window-attn 比 fa2 慢 ~2x, 默认 fa2")
 
     parser.add_argument("--tasks", nargs="+",
                         default=DEFAULT_TASKS,
@@ -1231,25 +1374,50 @@ def main():
     out_md   = os.path.join(args.output_dir, f"bench_{tag}.md")
 
     # ── 模型加载 ────────────────────────────────────────────────────────────
-    from transformers import AutoProcessor
+    from transformers import AutoConfig, AutoProcessor
     from llava.model.language_model.modeling_qwen2_5vl_dat import (
-        Qwen2_5_VLDATForConditionalGeneration, _FA_BACKEND,
+        Qwen2_5_VLDATForConditionalGeneration, convert_qwen2_5vl_to_dat, _FA_BACKEND,
     )
 
     print(f"PyTorch  : {torch.__version__}")
     print(f"CUDA     : {torch.version.cuda}")
     print(f"GPU      : {torch.cuda.get_device_name(0)}")
     print(f"FA backend: {_FA_BACKEND}")
-    print(f"DAT ckpt : {args.dat_ckpt}")
+    print(f"DAT ckpt : {args.dat_ckpt or '(none — 从 base 构建, DAT 模块随机初始化)'}")
     print(f"Tasks    : {tasks}")
     print()
 
     processor = AutoProcessor.from_pretrained(args.dat_ckpt or args.base_model)
 
-    print(f"Loading DAT model …")
-    dat_model = Qwen2_5_VLDATForConditionalGeneration.from_pretrained(
-        args.dat_ckpt, torch_dtype=DTYPE, device_map={"": 0},
-    ).eval()
+    if args.dat_ckpt:
+        print(f"Loading DAT model from ckpt (attn={args.attn_impl}) …")
+        dat_model = Qwen2_5_VLDATForConditionalGeneration.from_pretrained(
+            args.dat_ckpt, torch_dtype=DTYPE, device_map={"": 0},
+            attn_implementation=args.attn_impl,
+        ).eval()
+    else:
+        # 测速模式: base 权重 + 随机初始化 DAT 模块 (耗时与训练权重一致)
+        base_cfg = AutoConfig.from_pretrained(args.base_model)
+        n_layers = getattr(base_cfg, 'num_hidden_layers', None) or \
+                   base_cfg.text_config.num_hidden_layers
+        dat_extra_args = dict(DEFAULT_DAT_EXTRA_ARGS)
+        dat_extra_args['layers'] = ''.join(
+            'D' if i % 6 == 0 else 'L' for i in range(n_layers))
+        print(f"Building DAT from base ({n_layers} layers, "
+              f"pattern={dat_extra_args['layers']}, attn={args.attn_impl}) …")
+        dat_model = convert_qwen2_5vl_to_dat(
+            args.base_model, dat_extra_args, torch_dtype=DTYPE,
+            attn_implementation=args.attn_impl,
+        ).to(DEVICE).eval()
+
+    qwen_model = None
+    if not args.no_native:
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        print(f"Loading native Qwen2.5-VL (官方类, 对照基线, attn={args.attn_impl}) …")
+        qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            args.base_model, torch_dtype=DTYPE, device_map={"": 0},
+            attn_implementation=args.attn_impl,
+        ).eval()
 
     # 关 padding warning（generate 时左 padding，processor 默认右 padding）
     processor.tokenizer.padding_side = "left"
@@ -1261,6 +1429,12 @@ def main():
 
     # 强制走 separate ViT 路径（公平对比，避免之前残留 flag）
     _set_vit_path(dat_model, 'separate')
+
+    # HD 早退 (只对 separate HD 路径生效; prefill 任务里的 DAT-fused 列不受影响,
+    # 早退开启时请只看非 fused 的 DAT 数字)
+    dat_ea['hd_early_exit_k'] = args.hd_early_k
+    if args.hd_early_k:
+        print(f"  HD early exit: 前 {args.hd_early_k} 个 vision block")
 
     print(f"  hr_scale={hr_scale}, DAT layers={dat_layer_indices}")
     print(f"  GPU mem after load: {torch.cuda.memory_allocated()/(1024**3):.2f} GB")
@@ -1296,6 +1470,8 @@ def main():
         'dtype':      str(DTYPE),
         'dat_ckpt':   args.dat_ckpt,
         'hr_scale':   hr_scale,
+        'attn_impl':  args.attn_impl,
+        'hd_early_exit_k': args.hd_early_k,
         'dat_layer_indices': dat_layer_indices,
         'tasks':      tasks,
         'resolutions': args.resolutions,
@@ -1322,6 +1498,7 @@ def main():
             dat_model, processor, img,
             resolutions=args.resolutions, hr_scale=hr_scale,
             warmup=args.warmup, iters=args.iters, save_cb=save,
+            qwen_model=qwen_model,
         )
 
     if 'batch_decode' in tasks:
@@ -1333,6 +1510,7 @@ def main():
             decode_lens=args.decode_lens,
             hr_scale=hr_scale,
             warmup=args.warmup, iters=args.iters, save_cb=save,
+            qwen_model=qwen_model,
         )
 
     if 'memory' in tasks:

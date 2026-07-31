@@ -920,6 +920,7 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
         image_grid_thw_hd: Optional[torch.LongTensor] = None,
         image_hd_features: Optional[List[torch.Tensor]] = None,
         image_range_list: Optional[List[List]] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, Qwen2VLCausalLMOutputWithPast]:
         """Forward pass with DAT HD feature injection.
@@ -973,8 +974,13 @@ class Qwen2VLDATForConditionalGeneration(Qwen2VLForConditionalGeneration):
         )
 
         # === Step 4: LM head + loss ===
+        # generate() prefill 传 logits_to_keep=1, 不切片会物化全序列 logits。
         hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int) else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:

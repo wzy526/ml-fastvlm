@@ -26,6 +26,7 @@ Attention mechanism: Two-pass + LSE merge (GC-safe, shape-static):
     → Backend selectable via _FA_BACKEND constant: "fa2" | "fa3" | "fa4".
 """
 
+import contextlib
 import logging
 import math
 import os
@@ -318,6 +319,13 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
                                              # question tokens (offset depends ONLY on the image, so
                                              # causally safe for all question positions). Default off
                                              # reproduces the answer-only injection.
+            'hd_early_exit_k': 0,      # HD ViT early exit: run only the first k vision blocks
+                                       # (0 = off, full depth). Only affects the separate HD path
+                                       # (_generate_hd_features); ignored by use_fused_vit /
+                                       # use_shared_vit. Features from block k feed the merger
+                                       # directly — valid because DAT consumes HD features only
+                                       # through the from-scratch k_proj_hd/v_proj_hd adapters
+                                       # (+ RMSNorm), so no pretrained binding to the last block.
         }
 
 
@@ -1842,9 +1850,32 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
         return model_inputs
 
+    @contextlib.contextmanager
+    def _hd_vit_truncated(self):
+        """Temporarily truncate visual.blocks to the first k blocks (HD early exit).
+
+        Version-proof alternative to re-implementing the ViT forward: window
+        permutation, rotary embeddings and cu_seqlens are depth-independent,
+        and the merger operates on contiguous 4-token groups in window order,
+        so running blocks[:k] and then the stock merger + reverse_indices is
+        structurally identical to the full forward. fullatt_block_indexes keep
+        their meaning (block 7 stays index 7 for any k > 7).
+        """
+        k = int(self.config.dat_extra_args.get('hd_early_exit_k', 0) or 0)
+        visual = self.model.visual
+        if k <= 0 or k >= len(visual.blocks):
+            yield
+            return
+        full_blocks = visual.blocks
+        visual.blocks = full_blocks[:k]
+        try:
+            yield
+        finally:
+            visual.blocks = full_blocks
+
     def _generate_hd_features(self, pixel_values_hd, image_grid_thw_hd):
         """Generate HD feature maps from high-resolution pixel values (separate ViT call)."""
-        with torch.no_grad():
+        with torch.no_grad(), self._hd_vit_truncated():
             pixel_values_hd = pixel_values_hd.type(self.model.visual.dtype)
             hd_output = self.model.visual(pixel_values_hd, grid_thw=image_grid_thw_hd, return_dict=True)
             hd_embeds = hd_output.pooler_output
@@ -2056,6 +2087,7 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         image_grid_thw_hd: Optional[torch.LongTensor] = None,
         image_hd_features: Optional[List[torch.Tensor]] = None,
         image_range_list: Optional[List[List]] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         """Forward pass with DAT HD feature injection.
@@ -2194,8 +2226,15 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                     break
 
         # === Step 5: LM head + loss ===
+        # logits_to_keep: generate() 的 prefill 步只需要最后 1 个 token 的 logits。
+        # 不切片的话会物化 [B, seq, vocab] 的完整 logits (R=2016/B=8 时 ~12.7GB)。
+        # 默认 0 = 保留全部 (训练/loss 路径不变), 语义与上游实现一致。
         hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int) else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
@@ -2229,7 +2268,8 @@ DAT_KEYS_MATCH = [
 ]
 
 
-def convert_qwen2_5vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None):
+def convert_qwen2_5vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None,
+                             attn_implementation=None):
     """Convert a pretrained Qwen2.5VL to Qwen2.5VL-DAT.
 
     Uses from_pretrained() directly with the DAT model class so that
@@ -2239,6 +2279,10 @@ def convert_qwen2_5vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=Non
         base_model_or_path: path to pretrained Qwen2.5VL checkpoint
         dat_extra_args: dict with DAT parameters
         torch_dtype: optional torch dtype for loading
+        attn_implementation: optional, e.g. "flash_attention_2". None keeps the
+            transformers default (sdpa). NOTE: this also selects the VISION
+            tower backend — sdpa window-attention is ~2x slower than fa2
+            (measured on B200), so inference benchmarks should pass fa2.
 
     Returns:
         Qwen2_5_VLDATForConditionalGeneration with base weights + fresh DAT weights
@@ -2253,11 +2297,15 @@ def convert_qwen2_5vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=Non
     dat_config.dat_extra_args = dat_extra_args
 
     if isinstance(base_model_or_path, str):
+        _extra_kwargs = {}
+        if attn_implementation is not None:
+            _extra_kwargs['attn_implementation'] = attn_implementation
         dat_model = Qwen2_5_VLDATForConditionalGeneration.from_pretrained(
             base_model_or_path,
             config=dat_config,
             torch_dtype=torch_dtype,
             ignore_mismatched_sizes=False,
+            **_extra_kwargs,
         )
     else:
         # Already-instantiated base model: swap class and reinit DAT layers
