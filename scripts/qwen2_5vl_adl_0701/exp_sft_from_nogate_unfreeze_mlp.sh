@@ -96,7 +96,17 @@ export NCCL_P2P_DISABLE=0
 
 DAT_LAYERS="DLLLLLDLLLLLDLLLLLDLLLLLDLLLLLDLLLLL"
 
+# HD gate: MUST match the pretrain ckpt's architecture. If the pretrain ran
+# with DAT_HD_GATE_INIT=-4.0, pass the same value here, otherwise the gate
+# param in the ckpt is silently dropped and the merge behaves differently.
+HD_GATE_ARG=()
+if [[ -n "${DAT_HD_GATE_INIT:-}" ]]; then
+    HD_GATE_ARG=(--dat_hd_gate_init "${DAT_HD_GATE_INIT}")
+    echo "[gate] enabling hd_gate_init=${DAT_HD_GATE_INIT}"
+fi
+
 torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40951}" llava/train/train_qwen_dat.py \
+    "${HD_GATE_ARG[@]}" \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
