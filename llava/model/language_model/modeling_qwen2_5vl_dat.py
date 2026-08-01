@@ -942,6 +942,20 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             l=Lp, g=self.off_grps, c=self.off_dim,
         )
 
+        # SIGFPE hunt: the k_proj_hd/v_proj_hd GEMM below crashed with an
+        # integer-divide-by-zero inside cuBLAS on some clusters. Env-gated
+        # shape dump — the last line printed before the crash identifies the
+        # offending shapes. Enable with DAT_DEBUG_SHAPES=1.
+        if os.environ.get("DAT_DEBUG_SHAPES"):
+            print(
+                f"[rank {os.environ.get('RANK', '?')}] sample_hd: "
+                f"Lp={Lp} off_guide={tuple(off_guide.shape)} "
+                f"hd_feat={tuple(hd_feat.shape)} "
+                f"sampled_hr={tuple(sampled_hr.shape)} "
+                f"dtype={sampled_hr.dtype} dev={sampled_hr.device}",
+                flush=True,
+            )
+
         # 6. Project to KV
         if self.hd_proj:
             # Normalize sampled_hr to match the RMSNormed distribution that
