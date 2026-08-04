@@ -269,6 +269,15 @@ class ModelArguments:
                   "window attention), so k >= 8 is recommended to keep at least one "
                   "global-attention block in the truncated stack."}
     )
+    dat_hd_skip_merger_mlp: bool = field(
+        default=False,
+        metadata={"help": "HD branch bypasses the merger MLP: HD features are the ln_q + "
+                  "2x2 patch-concat pre-MLP tensor (vision_hidden*4 = 5120-dim for 3B) "
+                  "instead of the merger MLP's 2048-dim output. k/v_proj_hd and "
+                  "hd_input_layernorm are sized accordingly (fresh pretrain required). "
+                  "Fully decouples the HD path from the projector, so tune_mm_mlp only "
+                  "affects the LR path. Separate-ViT path only."}
+    )
     dat_fused_vit: bool = field(
         default=False,
         metadata={"help": "Fuse LR+HD into one ViT call (saves kernel launches; "
@@ -2750,6 +2759,7 @@ def train():
             'inject_lr_image': model_args.dat_inject_lr_image,
             'image_hd_for_question': model_args.dat_image_hd_for_question,
             'hd_early_exit_k': model_args.dat_hd_early_exit_k,
+            'hd_skip_merger_mlp': model_args.dat_hd_skip_merger_mlp,
             'use_fused_vit': model_args.dat_fused_vit,
             'use_shared_vit': model_args.dat_shared_vit,
         }

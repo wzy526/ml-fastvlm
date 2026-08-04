@@ -326,6 +326,13 @@ class Qwen2_5_VLDATConfig(Qwen2_5_VLConfig):
                                        # directly — valid because DAT consumes HD features only
                                        # through the from-scratch k_proj_hd/v_proj_hd adapters
                                        # (+ RMSNorm), so no pretrained binding to the last block.
+            'hd_skip_merger_mlp': False,  # HD branch bypasses the merger MLP: HD features are
+                                          # ln_q + 2x2 patch concat only (vision_hidden * 4 =
+                                          # 5120-dim for 3B) instead of the merger MLP's 2048-dim
+                                          # output. k/v_proj_hd + hd_input_layernorm are sized to
+                                          # hd_feat_dim accordingly (requires retraining). Fully
+                                          # decouples the HD path from the (frozen or trained)
+                                          # projector. Separate-ViT path only.
         }
 
 
@@ -556,6 +563,24 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
 
         self.off_dim = self.hidden_size // self.off_grps
 
+        # HD feature channel width. Default: merger output == LLM hidden size.
+        # With hd_skip_merger_mlp the HD branch bypasses the merger MLP, so HD
+        # features are the ln_q + 2x2-concat pre-MLP tensor (vision_hidden * 4;
+        # 5120 for 3B). The top-level model computes 'hd_feat_dim' from
+        # vision_config and injects it into dat_extra_args before layers are
+        # built (the attention layer only sees text_config).
+        self.hd_skip_merger_mlp = dat.get('hd_skip_merger_mlp', False)
+        if self.hd_skip_merger_mlp:
+            assert 'hd_feat_dim' in dat, (
+                "hd_skip_merger_mlp=True requires 'hd_feat_dim' in dat_extra_args "
+                "(computed from vision_config by the top-level model)"
+            )
+        self.hd_feat_dim = dat.get('hd_feat_dim') or self.hidden_size
+        assert self.hd_feat_dim % self.off_grps == 0, (
+            f"hd_feat_dim {self.hd_feat_dim} not divisible by off_grps {self.off_grps}"
+        )
+        self.hd_off_dim = self.hd_feat_dim // self.off_grps
+
         # --- Offset generation pipeline ---
         # All offset-path params use fp32-storage subclasses (see
         # _FP32Weight{LayerNorm2d, Conv2d, Linear}). The bf16 round-off that
@@ -598,8 +623,8 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         # HD feature KV projection
         if self.hd_proj:
             kv_dim = self.num_key_value_heads * self.head_dim
-            self.k_proj_hd = nn.Linear(self.hidden_size, kv_dim)
-            self.v_proj_hd = nn.Linear(self.hidden_size, kv_dim)
+            self.k_proj_hd = nn.Linear(self.hd_feat_dim, kv_dim)
+            self.v_proj_hd = nn.Linear(self.hd_feat_dim, kv_dim)
             # RMSNorm applied to ``sampled_hr`` before k_proj_hd / v_proj_hd
             # (F4 from the Run B fix).
             #
@@ -622,9 +647,13 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
             # Use a fp32-weight subclass to avoid bf16 round-off near 1.0
             # (see _FP32WeightRMSNorm docstring + Qwen2_5_VLAttentionDAT._apply).
             self.hd_input_layernorm = _FP32WeightRMSNorm(
-                self.hidden_size, eps=config.rms_norm_eps
+                self.hd_feat_dim, eps=config.rms_norm_eps
             )
         else:
+            assert not self.hd_skip_merger_mlp, (
+                "hd_skip_merger_mlp=True requires hd_proj=True: the shared "
+                "k_proj/v_proj expect hidden_size inputs, not hd_feat_dim"
+            )
             self.k_proj_hd = None
             self.v_proj_hd = None
             self.hd_input_layernorm = None
@@ -926,7 +955,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
         img_hr = einops.rearrange(
             hd_feat, 'h w (g c) -> g c h w',
-            g=self.off_grps, c=self.off_dim,
+            g=self.off_grps, c=self.hd_off_dim,
         )
         img_hr = einops.repeat(img_hr, 'g c h w -> (l g) c h w', l=Lp)
 
@@ -939,7 +968,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         sampled_hr = einops.rearrange(
             sampled_hr,
             '(l g) c h w -> l (h w) (g c)',
-            l=Lp, g=self.off_grps, c=self.off_dim,
+            l=Lp, g=self.off_grps, c=self.hd_off_dim,
         )
 
         # SIGFPE hunt: the k_proj_hd/v_proj_hd GEMM below crashed with an
@@ -1609,6 +1638,17 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         layers_str = dat_args.get('layers', '')
         text_config = config.text_config
 
+        # hd_skip_merger_mlp: HD features bypass the merger MLP, so their
+        # channel width is the pre-MLP ln_q + 2x2-concat dim. Compute it here
+        # (attention layers only see text_config) and inject into dat_args.
+        if dat_args.get('hd_skip_merger_mlp', False):
+            assert not dat_args.get('use_fused_vit', False) and not dat_args.get('use_shared_vit', False), (
+                "hd_skip_merger_mlp swaps visual.merger.mlp during the HD "
+                "forward, which would corrupt LR embeds in fused/shared ViT modes"
+            )
+            vis = config.vision_config
+            dat_args['hd_feat_dim'] = vis.hidden_size * (vis.spatial_merge_size ** 2)
+
         if layers_str:
             assert len(layers_str) == text_config.num_hidden_layers, (
                 f"Layer string length {len(layers_str)} != num_hidden_layers {text_config.num_hidden_layers}"
@@ -1887,9 +1927,30 @@ class Qwen2_5_VLDATForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         finally:
             visual.blocks = full_blocks
 
+    @contextlib.contextmanager
+    def _hd_merger_mlp_skipped(self):
+        """Temporarily replace visual.merger.mlp with Identity (hd_skip_merger_mlp).
+
+        The merger forward is ``mlp(ln_q(x).view(-1, context_dim * merge**2))``;
+        swapping mlp for Identity yields the ln_q + 2x2-concat pre-MLP features
+        (vision_hidden * 4 dims) in the same row order — reverse_indices index
+        rows, so the window-order restore downstream is unaffected. Only used
+        for the separate HD ViT call, never the LR call.
+        """
+        if not self.config.dat_extra_args.get('hd_skip_merger_mlp', False):
+            yield
+            return
+        merger = self.model.visual.merger
+        orig_mlp = merger.mlp
+        merger.mlp = nn.Identity()
+        try:
+            yield
+        finally:
+            merger.mlp = orig_mlp
+
     def _generate_hd_features(self, pixel_values_hd, image_grid_thw_hd):
         """Generate HD feature maps from high-resolution pixel values (separate ViT call)."""
-        with torch.no_grad(), self._hd_vit_truncated():
+        with torch.no_grad(), self._hd_vit_truncated(), self._hd_merger_mlp_skipped():
             pixel_values_hd = pixel_values_hd.type(self.model.visual.dtype)
             hd_output = self.model.visual(pixel_values_hd, grid_thw=image_grid_thw_hd, return_dict=True)
             hd_embeds = hd_output.pooler_output
@@ -2325,6 +2386,12 @@ def convert_qwen2_5vl_to_dat(base_model_or_path, dat_extra_args, torch_dtype=Non
         # Already-instantiated base model: swap class and reinit DAT layers
         base_model_or_path.config = dat_config
         base_model_or_path.__class__ = Qwen2_5_VLDATForConditionalGeneration
+        # This path bypasses Qwen2_5_VLDATForConditionalGeneration.__init__,
+        # so replicate its hd_feat_dim injection for hd_skip_merger_mlp.
+        if dat_extra_args.get('hd_skip_merger_mlp', False):
+            assert not dat_extra_args.get('use_fused_vit', False) and not dat_extra_args.get('use_shared_vit', False)
+            vis = dat_config.vision_config
+            dat_extra_args['hd_feat_dim'] = vis.hidden_size * (vis.spatial_merge_size ** 2)
         layers_str = dat_extra_args.get('layers', '')
         text_config = dat_config.text_config
         if layers_str:
