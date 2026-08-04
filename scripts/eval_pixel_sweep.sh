@@ -50,6 +50,14 @@ case "$MODEL_TYPE" in
     *) echo "[ERROR] MODEL_TYPE must be 'dat' or 'base', got '$MODEL_TYPE'" >&2; exit 1 ;;
 esac
 
+# Fail fast on a bad local ckpt path. Without this, transformers treats the
+# path as a HF repo id and every rank dies with a confusing "Repo id must be
+# in the form 'repo_name'" stack trace.
+if [[ "$CKPT" == /* && ! -d "$CKPT" ]]; then
+    echo "[ERROR] CKPT dir not found: $CKPT" >&2
+    exit 1
+fi
+
 # Default grid matches scripts/qwen2_5vl_adl_0528/_eval_pareto.sh
 # (200704≈256 tok … 9031680≈11520 tok, the Qwen2.5-VL default ceiling).
 PIXELS="${PIXELS:-200704 501760 1003520 2007040 5017600 9031680}"
