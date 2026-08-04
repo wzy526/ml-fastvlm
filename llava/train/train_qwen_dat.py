@@ -260,6 +260,15 @@ class ModelArguments:
                   "Targets the HRBench-single regression (question tokens otherwise never "
                   "see HD). Default off reproduces answer-only injection."}
     )
+    dat_hd_early_exit_k: int = field(
+        default=0,
+        metadata={"help": "HD ViT early exit: run only the first k vision blocks for the "
+                  "HD branch (0 = off, full depth). Only affects the separate HD path; "
+                  "ignored by dat_fused_vit / dat_shared_vit. NOTE: Qwen2.5-VL's ViT has "
+                  "full-attention blocks at indexes [7, 15, 23, 31] (the rest are 8x8 "
+                  "window attention), so k >= 8 is recommended to keep at least one "
+                  "global-attention block in the truncated stack."}
+    )
     dat_fused_vit: bool = field(
         default=False,
         metadata={"help": "Fuse LR+HD into one ViT call (saves kernel launches; "
@@ -2740,6 +2749,7 @@ def train():
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'inject_lr_image': model_args.dat_inject_lr_image,
             'image_hd_for_question': model_args.dat_image_hd_for_question,
+            'hd_early_exit_k': model_args.dat_hd_early_exit_k,
             'use_fused_vit': model_args.dat_fused_vit,
             'use_shared_vit': model_args.dat_shared_vit,
         }

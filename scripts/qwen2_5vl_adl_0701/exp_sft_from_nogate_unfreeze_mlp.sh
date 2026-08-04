@@ -105,8 +105,18 @@ if [[ -n "${DAT_HD_GATE_INIT:-}" ]]; then
     echo "[gate] enabling hd_gate_init=${DAT_HD_GATE_INIT}"
 fi
 
+# HD ViT early exit: MUST match the pretrain ckpt's setting (the hd adapters
+# k_proj_hd/v_proj_hd learn the block-k feature distribution). Set
+# DAT_HD_EARLY_EXIT_K=8/16/24 to enable; 0/unset = full depth.
+EARLY_EXIT_ARG=()
+if [[ -n "${DAT_HD_EARLY_EXIT_K:-}" ]]; then
+    EARLY_EXIT_ARG=(--dat_hd_early_exit_k "${DAT_HD_EARLY_EXIT_K}")
+    echo "[early-exit] hd_early_exit_k=${DAT_HD_EARLY_EXIT_K}"
+fi
+
 torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40951}" llava/train/train_qwen_dat.py \
     "${HD_GATE_ARG[@]}" \
+    "${EARLY_EXIT_ARG[@]}" \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen2_5_vl \
     --data_path "$DATA_JSON" \
