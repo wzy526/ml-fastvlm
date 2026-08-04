@@ -28,9 +28,11 @@
 #   GPUS        CUDA_VISIBLE_DEVICES             (default: 0,1,2,3,4,5,6,7)
 #   NPROC       accelerate num_processes         (default: 8)
 #   PORT        starting main_process_port       (default: 30200, +1 per point)
-#   OUT_ROOT    output dir                       (default: /root/autodl-tmp/ml-fastvlm/_test_outputs/_sweep_<TASK>_<TAG>)
+#   OUT_ROOT    output dir                       (default: <repo>/_test_outputs/_sweep_<TASK>_<TAG>)
 #   BASE_REF    base model to source preprocessor_config.json from when a DAT ckpt lacks it
 #               (default: /root/autodl-tmp/models_data/Qwen2.5-VL-3B-Instruct)
+#   CONDA_ENV   conda env name                   (default: vldat; new cluster: fastvlm)
+#   LMMS_EVAL_DIR  lmms-eval fork checkout       (default: /root/autodl-tmp/lmms-eval)
 
 # NOTE: intentionally NOT using `-e`: a single failing pixel point (OOM, flaky
 # dataset download, etc.) must not abort the rest of the sweep. Each point is
@@ -57,12 +59,18 @@ MIN_PIXELS="${MIN_PIXELS:-28224}"
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
 NPROC="${NPROC:-8}"
 PORT="${PORT:-30200}"
-OUT_ROOT="${OUT_ROOT:-/root/autodl-tmp/ml-fastvlm/_test_outputs/_sweep_${TASK}_${TAG}}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT_ROOT="${OUT_ROOT:-$REPO_DIR/_test_outputs/_sweep_${TASK}_${TAG}}"
 BASE_REF="${BASE_REF:-/root/autodl-tmp/models_data/Qwen2.5-VL-3B-Instruct}"
+LMMS_EVAL_DIR="${LMMS_EVAL_DIR:-/root/autodl-tmp/lmms-eval}"
 
 eval "$(conda shell.bash hook)"
-conda activate vldat
-cd /root/autodl-tmp/lmms-eval
+conda activate "${CONDA_ENV:-vldat}"
+if [[ ! -d "$LMMS_EVAL_DIR" ]]; then
+    echo "[ERROR] LMMS_EVAL_DIR not found: $LMMS_EVAL_DIR (set LMMS_EVAL_DIR=/path/to/lmms-eval)" >&2
+    exit 1
+fi
+cd "$LMMS_EVAL_DIR"
 
 # DAT ckpts often ship `processor_config.json` but not `preprocessor_config.json`
 # (the image-processor config). Without it the wrapper falls back to a HF repo id
