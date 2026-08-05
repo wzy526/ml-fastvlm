@@ -102,6 +102,13 @@ export HF_HUB_DOWNLOAD_TIMEOUT=1200
 export NUMEXPR_MAX_THREADS=64
 export CUDA_VISIBLE_DEVICES="$GPUS"
 
+# deepspeed writes a Triton autotune table (behind a FileLock) at process
+# exit. On clusters where $HOME forbids lock files this raises
+# PermissionError in atexit -> non-zero exit -> an otherwise-finished point
+# gets marked FAIL and loses its `done` marker. Redirect to a writable dir.
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/${USER}_triton_cache}"
+mkdir -p "$TRITON_CACHE_DIR"
+
 echo "=================================================================="
 echo " model=$MODEL  ckpt=$CKPT"
 echo " task=$TASK  pixels=[$PIXELS]"
