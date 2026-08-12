@@ -355,7 +355,8 @@ def collect_visualprobe(target_count, inspect=False):
         print(f"  [{name}] fragment exists ({len(cached)} samples). Skipping download.")
         return cached
 
-    from huggingface_hub import hf_hub_download, snapshot_download
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import HfHubHTTPError
     from tqdm import tqdm
     import shutil
 
@@ -367,29 +368,23 @@ def collect_visualprobe(target_count, inspect=False):
     if target_count and len(meta) > target_count:
         meta = random.Random(SEED + 2).sample(meta, target_count)
 
-    # Images are individual files in the repo; snapshot the data/ folder once.
-    # Low max_workers + retries: huggingface_hub shares one httpx client across
-    # threads in snapshot_download, so a single dropped connection can close
-    # it for every other in-flight thread ("Cannot send a request, as the
-    # client has been closed"). Fewer workers means fewer concurrent chances
-    # to trip that, and retrying with max_workers=1 on failure sidesteps it
-    # entirely (verified against this exact failure on 0812).
-    snap = None
-    for attempt, workers in enumerate((4, 1, 1), start=1):
-        try:
-            snap = snapshot_download(
-                VISUALPROBE_REPO, repo_type="dataset",
-                allow_patterns=["data/*.jpg"], max_workers=workers,
-            )
-            break
-        except Exception as e:
-            print(f"  [{name}] snapshot_download attempt {attempt} "
-                  f"(max_workers={workers}) failed: {type(e).__name__}: {e}")
-    if snap is None:
-        raise RuntimeError(f"[{name}] snapshot_download failed after 3 attempts")
-
     save_dir = os.path.join(TRAIN_SPLIT, name)
     os.makedirs(save_dir, exist_ok=True)
+
+    # Fetch each image with a plain hf_hub_download call (no tree listing).
+    # snapshot_download's recursive "list repo tree" API returns pagination
+    # links that point at the real huggingface.co even when HF_ENDPOINT is a
+    # mirror — hf-mirror.com doesn't fully proxy that endpoint — so every
+    # retry there hits the blocked domain no matter how HF_ENDPOINT is set.
+    # hf_hub_download builds file URLs directly from HF_ENDPOINT + filename,
+    # sidestepping tree listing entirely.
+    def _fetch(rel):
+        for attempt in range(3):
+            try:
+                return hf_hub_download(VISUALPROBE_REPO, rel, repo_type="dataset")
+            except HfHubHTTPError as e:
+                print(f"    ! fetch {rel} attempt {attempt + 1} failed: {e}")
+        return None
 
     samples, shown = [], 0
     for item in tqdm(meta, desc=f"    {name}"):
@@ -402,12 +397,12 @@ def collect_visualprobe(target_count, inspect=False):
             continue
         # e.g. "VisualProbe_train/data/visual_probe_train_7.jpg" -> "data/..."
         rel = imgs[0].split("/", 1)[1] if "/" in imgs[0] else imgs[0]
-        src = os.path.join(snap, rel)
-        if not os.path.exists(src):
-            continue
         fname = os.path.basename(rel)
         dst = os.path.join(save_dir, fname)
         if not os.path.exists(dst):
+            src = _fetch(rel)
+            if src is None:
+                continue
             shutil.copy2(src, dst)
         sample_id = item.get("doc_id", os.path.splitext(fname)[0])
         samples.append(_make_sample(name, sample_id, fname, question, answer))
