@@ -451,12 +451,16 @@ def merge(args):
         merged.extend(frag)
         print(f"  fragment {name}: {len(frag)}")
 
-    # id de-dup (prefixes shouldn't collide, but be safe)
+    # id de-dup (prefixes shouldn't collide, but be safe). The ivcap base has
+    # NO "id" field at all (verified: 0 occurrences across 369419 entries) —
+    # treat missing-id entries as always-unique rather than crashing/
+    # colliding on a shared sentinel key.
     seen, unique = set(), []
-    for s in merged:
-        if s["id"] in seen:
+    for idx, s in enumerate(merged):
+        key = s.get("id", f"__noid_{idx}__")
+        if key in seen:
             continue
-        seen.add(s["id"])
+        seen.add(key)
         unique.append(s)
     if len(unique) < len(merged):
         print(f"  de-dup: {len(merged)} -> {len(unique)}")
