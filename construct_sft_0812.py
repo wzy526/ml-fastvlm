@@ -368,10 +368,25 @@ def collect_visualprobe(target_count, inspect=False):
         meta = random.Random(SEED + 2).sample(meta, target_count)
 
     # Images are individual files in the repo; snapshot the data/ folder once.
-    snap = snapshot_download(
-        VISUALPROBE_REPO, repo_type="dataset",
-        allow_patterns=["data/*.jpg"], max_workers=16,
-    )
+    # Low max_workers + retries: huggingface_hub shares one httpx client across
+    # threads in snapshot_download, so a single dropped connection can close
+    # it for every other in-flight thread ("Cannot send a request, as the
+    # client has been closed"). Fewer workers means fewer concurrent chances
+    # to trip that, and retrying with max_workers=1 on failure sidesteps it
+    # entirely (verified against this exact failure on 0812).
+    snap = None
+    for attempt, workers in enumerate((4, 1, 1), start=1):
+        try:
+            snap = snapshot_download(
+                VISUALPROBE_REPO, repo_type="dataset",
+                allow_patterns=["data/*.jpg"], max_workers=workers,
+            )
+            break
+        except Exception as e:
+            print(f"  [{name}] snapshot_download attempt {attempt} "
+                  f"(max_workers={workers}) failed: {type(e).__name__}: {e}")
+    if snap is None:
+        raise RuntimeError(f"[{name}] snapshot_download failed after 3 attempts")
 
     save_dir = os.path.join(TRAIN_SPLIT, name)
     os.makedirs(save_dir, exist_ok=True)
