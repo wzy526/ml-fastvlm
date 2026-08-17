@@ -179,6 +179,26 @@ def _extract_zip(zip_path, dest_dir, want_exts=(".jpg", ".jpeg", ".png", ".webp"
     return names
 
 
+def _drop_from_cache(path):
+    """Delete a downloaded blob (and its snapshot symlink) from the HF cache.
+
+    The home dir has a tight disk quota; zips are single-use (extracted to
+    train_split immediately), so keep peak cache usage at ~one zip. Set
+    KEEP_ZIPS=1 to disable.
+    """
+    if os.environ.get("KEEP_ZIPS", "0") == "1":
+        return
+    try:
+        real = os.path.realpath(path)
+        if os.path.islink(path):
+            os.remove(path)
+        if os.path.exists(real):
+            os.remove(real)
+        print(f"    (cache) removed {os.path.basename(real)}")
+    except Exception as e:
+        print(f"    ! cache cleanup of {path} failed: {e}")
+
+
 # ---------------------------------------------------------------------------
 #  A-OKVQA (train, MC with rationales; images embedded in parquet)
 # ---------------------------------------------------------------------------
@@ -297,6 +317,7 @@ def collect_allava(target_count, inspect=False):
         print(f"  [{name}] fetching {z} (have {len(available)} images)")
         zp = _hf_download(ALLAVA_REPO, z)
         available.update(_extract_zip(zp, save_dir))
+        _drop_from_cache(zp)
     print(f"  [{name}] images available: {len(available)}")
 
     rng = random.Random(SEED + 3)
@@ -370,6 +391,7 @@ def collect_densefusion(target_count, inspect=False):
         print(f"  [{name}] fetching {z} (have {len(available)} images)")
         zp = _hf_download(DENSEFUSION_REPO, z)
         available.update(_extract_zip(zp, save_dir))
+        _drop_from_cache(zp)
     print(f"  [{name}] images available: {len(available)}")
 
     # Map basename (with and without extension) -> actual filename on disk.
