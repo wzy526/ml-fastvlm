@@ -157,26 +157,62 @@ def _list_repo_files(repo):
 
 
 def _extract_zip(zip_path, dest_dir, want_exts=(".jpg", ".jpeg", ".png", ".webp")):
-    """Flatten-extract image members; returns list of extracted basenames."""
+    """Flatten-extract image members; returns list of extracted basenames.
+
+    Robust against corrupt downloads: a bad member ("error -3 ... invalid
+    block type") is skipped (partial output removed) instead of aborting the
+    whole dataset; existing files are re-extracted when their size does not
+    match the archive record (heals truncated files from a previous crash).
+    """
     os.makedirs(dest_dir, exist_ok=True)
-    names = []
+    names, bad = [], 0
     with zipfile.ZipFile(zip_path) as zf:
-        members = [m for m in zf.namelist()
-                   if not m.endswith("/") and os.path.splitext(m)[1].lower() in want_exts]
+        members = [m for m in zf.infolist()
+                   if not m.is_dir() and os.path.splitext(m.filename)[1].lower() in want_exts]
         from tqdm import tqdm
         for m in tqdm(members, desc=f"    unzip {os.path.basename(zip_path)}"):
-            base = os.path.basename(m)
+            base = os.path.basename(m.filename)
             out = os.path.join(dest_dir, base)
-            names.append(base)
-            if os.path.exists(out):
+            if os.path.exists(out) and os.path.getsize(out) == m.file_size:
+                names.append(base)
                 continue
-            with zf.open(m) as src, open(out, "wb") as dst:
-                while True:
-                    chunk = src.read(1 << 20)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
+            try:
+                with zf.open(m) as src, open(out, "wb") as dst:
+                    while True:
+                        chunk = src.read(1 << 20)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                names.append(base)
+            except Exception as e:
+                bad += 1
+                if os.path.exists(out):
+                    os.remove(out)  # never leave truncated images behind
+                if bad <= 3:
+                    print(f"    ! corrupt member {base}: {type(e).__name__}: {e}")
+    if bad:
+        print(f"    [WARN] {os.path.basename(zip_path)}: {bad} corrupt members skipped")
+    if members and bad > 0.2 * len(members):
+        # The blob itself is likely a corrupt download, not a few flaky
+        # members — signal the caller to re-download it.
+        raise zipfile.BadZipFile(f"{bad}/{len(members)} members corrupt")
     return names
+
+
+def _fetch_and_extract(repo, zipname, dest_dir):
+    """Download + extract a repo zip; on a corrupt blob, drop the cached copy
+    (hf_hub_download would otherwise happily reuse it) and re-download once."""
+    for attempt in (1, 2):
+        zp = _hf_download(repo, zipname)
+        try:
+            names = _extract_zip(zp, dest_dir)
+            _drop_from_cache(zp)
+            return names
+        except zipfile.BadZipFile as e:
+            print(f"    ! {zipname} corrupt ({e}); "
+                  f"{'re-downloading' if attempt == 1 else 'giving up on this zip'}")
+            _drop_from_cache(zp)
+    return []
 
 
 def _drop_from_cache(path):
@@ -315,9 +351,7 @@ def collect_allava(target_count, inspect=False):
         if len(available) >= target_count * 1.15:
             break
         print(f"  [{name}] fetching {z} (have {len(available)} images)")
-        zp = _hf_download(ALLAVA_REPO, z)
-        available.update(_extract_zip(zp, save_dir))
-        _drop_from_cache(zp)
+        available.update(_fetch_and_extract(ALLAVA_REPO, z, save_dir))
     print(f"  [{name}] images available: {len(available)}")
 
     rng = random.Random(SEED + 3)
@@ -389,9 +423,7 @@ def collect_densefusion(target_count, inspect=False):
         if len(available) >= target_count * 1.1:
             break
         print(f"  [{name}] fetching {z} (have {len(available)} images)")
-        zp = _hf_download(DENSEFUSION_REPO, z)
-        available.update(_extract_zip(zp, save_dir))
-        _drop_from_cache(zp)
+        available.update(_fetch_and_extract(DENSEFUSION_REPO, z, save_dir))
     print(f"  [{name}] images available: {len(available)}")
 
     # Map basename (with and without extension) -> actual filename on disk.
