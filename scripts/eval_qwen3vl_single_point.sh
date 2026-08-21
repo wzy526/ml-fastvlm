@@ -19,6 +19,9 @@
 #
 # Env knobs:
 #   TASKS_OVERRIDE  space-separated task list  (default: the 14-task suite)
+#   MODEL           lmms-eval model name       (default: qwen3_vl; `qwen3_5`
+#                   switches to Qwen's sampled+thinking recipe for Qwen3.5)
+#   MARGS_EXTRA     appended to --model_args    (e.g. "enable_thinking=False")
 #   GPUS / NPROC    devices / ranks            (default: 0..7 / 8)
 #   PORT            starting main_process_port (default: 30300, +1 per task)
 #   OUT_ROOT_DIR    results root               (default: <repo>/_test_outputs)
@@ -69,8 +72,9 @@ if [[ ! -d "$LMMS_EVAL_DIR" ]]; then
 fi
 cd "$LMMS_EVAL_DIR"
 
-if ! python -c "import lmms_eval.models as m; import sys; sys.exit(0 if 'qwen3_vl' in m.AVAILABLE_SIMPLE_MODELS else 1)"; then
-    echo "[ERROR] qwen3_vl not registered in $LMMS_EVAL_DIR — git pull the fork first" >&2; exit 1
+MODEL="${MODEL:-qwen3_vl}"
+if ! python -c "import lmms_eval.models as m, sys; sys.exit(0 if '$MODEL' in m.AVAILABLE_SIMPLE_MODELS else 1)"; then
+    echo "[ERROR] $MODEL not registered in $LMMS_EVAL_DIR — git pull the fork first" >&2; exit 1
 fi
 
 # HF_HOME left over from a data-download session points at a cache without the
@@ -91,9 +95,12 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/${USER}_triton_cache}"
 mkdir -p "$TRITON_CACHE_DIR"
 
 MARGS="pretrained=${CKPT},attn_implementation=sdpa,max_pixels=${PX},min_pixels=${MIN_PIXELS}"
+if [[ -n "${MARGS_EXTRA:-}" ]]; then
+    MARGS="${MARGS},${MARGS_EXTRA}"
+fi
 
 echo "############################################################"
-echo "# qwen3_vl single-point   ckpt=$CKPT  tag=$TAG"
+echo "# $MODEL single-point   ckpt=$CKPT  tag=$TAG"
 echo "# tokens=$TOK  ->  max_pixels=$PX  (1024 px/token)"
 echo "# tasks: ${TASKS[*]}"
 echo "# start: $(date)"
@@ -105,7 +112,7 @@ for t in "${TASKS[@]}"; do
 
     echo; echo "########## $t  tok${TOK}  $(date +%H:%M:%S) ##########"
     if accelerate launch --num_processes "$NPROC" --main_process_port $((PORT++)) -m lmms_eval \
-        --model qwen3_vl \
+        --model "$MODEL" \
         --model_args "$MARGS" \
         --tasks "$t" \
         --batch_size 1 \
