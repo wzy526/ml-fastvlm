@@ -235,6 +235,24 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                         model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs
                     )
                     image_processor = processor
+                elif config.model_type == "qwen3_vl_dat":
+                    print("检测到 Qwen3-VL DAT 模型架构，使用 Qwen3VLDATForConditionalGeneration")
+                    from llava.model.language_model.modeling_qwen3_vl_dat import Qwen3VLDATForConditionalGeneration
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+                    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+                    model = Qwen3VLDATForConditionalGeneration.from_pretrained(
+                        model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs
+                    )
+                    image_processor = processor
+                elif config.model_type == "qwen3_5_dat":
+                    print("检测到 Qwen3.5 DAT 模型架构，使用 Qwen3_5DATForConditionalGeneration")
+                    from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5DATForConditionalGeneration
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+                    model = Qwen3_5DATForConditionalGeneration.from_pretrained(
+                        model_path, config=config, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs
+                    )
+                    image_processor = processor
                 elif config.model_type == "qwen2_vl":
                     print("检测到 Qwen2-VL 模型，优先使用带生成头的类加载")
                     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)

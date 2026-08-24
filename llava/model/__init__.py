@@ -9,3 +9,15 @@ try:
 except ImportError:
     pass
 
+# Newer-generation DAT ports: guarded separately so an old transformers
+# (without qwen3_vl / qwen3_5) doesn't take down the legacy imports above.
+try:
+    from .language_model.modeling_qwen3_vl_dat import Qwen3VLDATForConditionalGeneration, Qwen3VLDATConfig
+except ImportError:
+    pass
+
+try:
+    from .language_model.modeling_qwen3_5_dat import Qwen3_5DATForConditionalGeneration, Qwen3_5DATConfig
+except ImportError:
+    pass
+

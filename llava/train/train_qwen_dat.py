@@ -162,7 +162,9 @@ def _unwrap_to_base_dat_model(model):
 
 
 # ---------------------------------------------------------------------------
-# Token IDs (Qwen2-VL tokenizer, verified)
+# Token IDs (defaults = Qwen2/2.5/3-VL tokenizer, 151k vocab, verified)
+# Qwen3.5 uses a new 250k vocab — configure_token_scheme() swaps these at
+# runtime based on --model_family (verified against the actual tokenizer).
 # ---------------------------------------------------------------------------
 IM_START_TOKEN_ID = 151644  # <|im_start|>
 IM_END_TOKEN_ID = 151645    # <|im_end|>
@@ -173,6 +175,81 @@ ENDOFTEXT_ID = 151643       # <|endoftext|> (pad)
 ASSISTANT_TOKEN_ID = 77091  # 'assistant'
 NEWLINE_TOKEN_ID = 198      # '\n'
 
+_TOKEN_SCHEMES = {
+    # Qwen2-VL / Qwen2.5-VL / Qwen3-VL share the 151k-vocab ChatML ids.
+    "qwen2": dict(im_start=151644, im_end=151645, vision_start=151652,
+                  vision_end=151653, image_pad=151655, endoftext=151643,
+                  assistant=77091, newline=198),
+    # Qwen3.5 (natively multimodal, 250k vocab) — verified on Qwen3.5-2B/9B.
+    "qwen3_5": dict(im_start=248045, im_end=248046, vision_start=248053,
+                    vision_end=248054, image_pad=248056, endoftext=248044,
+                    assistant=74455, newline=200),
+}
+
+
+def configure_token_scheme(model_family: str, tokenizer=None) -> None:
+    """Swap module-level special-token ids to match the model family.
+
+    Must be called before any dataset / collator construction. When a
+    tokenizer is provided, ids are resolved from it directly (robust to
+    upstream tokenizer changes); the static scheme acts as a fallback.
+    """
+    global IM_START_TOKEN_ID, IM_END_TOKEN_ID, VISION_START_ID, VISION_END_ID
+    global IMAGE_PAD_ID, ENDOFTEXT_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID
+
+    scheme = dict(_TOKEN_SCHEMES["qwen3_5" if model_family == "qwen3_5" else "qwen2"])
+
+    if tokenizer is not None:
+        def _single_id(text, default):
+            try:
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                return ids[0] if len(ids) == 1 else default
+            except Exception:
+                return default
+
+        scheme['im_start'] = _single_id("<|im_start|>", scheme['im_start'])
+        scheme['im_end'] = _single_id("<|im_end|>", scheme['im_end'])
+        scheme['vision_start'] = _single_id("<|vision_start|>", scheme['vision_start'])
+        scheme['vision_end'] = _single_id("<|vision_end|>", scheme['vision_end'])
+        scheme['image_pad'] = _single_id("<|image_pad|>", scheme['image_pad'])
+        scheme['endoftext'] = _single_id("<|endoftext|>", scheme['endoftext'])
+        scheme['assistant'] = _single_id("assistant", scheme['assistant'])
+        scheme['newline'] = _single_id("\n", scheme['newline'])
+
+    IM_START_TOKEN_ID = scheme['im_start']
+    IM_END_TOKEN_ID = scheme['im_end']
+    VISION_START_ID = scheme['vision_start']
+    VISION_END_ID = scheme['vision_end']
+    IMAGE_PAD_ID = scheme['image_pad']
+    ENDOFTEXT_ID = scheme['endoftext']
+    ASSISTANT_TOKEN_ID = scheme['assistant']
+    NEWLINE_TOKEN_ID = scheme['newline']
+    rank0_print(
+        f"[token-scheme] model_family={model_family}: im_start={IM_START_TOKEN_ID}, "
+        f"im_end={IM_END_TOKEN_ID}, image_pad={IMAGE_PAD_ID}, pad={ENDOFTEXT_ID}, "
+        f"assistant={ASSISTANT_TOKEN_ID}"
+    )
+
+
+def configure_patch_geometry(processor) -> None:
+    """Swap module-level ViT patch geometry to match the processor.
+
+    Qwen2/2.5-VL: patch 14, merge 2 (28 px factor).
+    Qwen3-VL / Qwen3.5: patch 16, merge 2 (32 px factor).
+    """
+    global PATCH_SIZE, SPATIAL_MERGE
+    ip = getattr(processor, 'image_processor', None)
+    patch = getattr(ip, 'patch_size', None)
+    merge = getattr(ip, 'merge_size', None)
+    if patch:
+        PATCH_SIZE = int(patch)
+    if merge:
+        SPATIAL_MERGE = int(merge)
+    rank0_print(
+        f"[patch-geometry] PATCH_SIZE={PATCH_SIZE}, SPATIAL_MERGE={SPATIAL_MERGE} "
+        f"(factor={PATCH_SIZE * SPATIAL_MERGE})"
+    )
+
 # ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
@@ -181,7 +258,9 @@ class ModelArguments:
     model_name_or_path: str = field(default="./Qwen2-VL-2B")
     model_family: str = field(
         default="qwen2_vl",
-        metadata={"help": "Model family: 'qwen2_vl' or 'qwen2_5_vl'"}
+        metadata={"help": "Model family: 'qwen2_vl', 'qwen2_5_vl', 'qwen3_vl' or 'qwen3_5'. "
+                  "qwen3_5 is the hybrid (GatedDeltaNet + full-attn) natively-multimodal "
+                  "family; its dat_layers supports 'auto'/'autoN' anchored to layer_types."}
     )
     # Legacy flag (kept for backward compat; overridden by tune_mm_* if set)
     freeze_vision: bool = field(default=False)
@@ -536,6 +615,26 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
 
 
 # ---------------------------------------------------------------------------
+# Base VLM loading (shared by the no-DAT baseline path and the KD teacher)
+# ---------------------------------------------------------------------------
+def _load_base_vlm(model_family: str, path: str, torch_dtype):
+    """Load the pure (non-DAT) base VLM class for the given family."""
+    if model_family == "qwen2_5_vl":
+        from transformers import Qwen2_5_VLForConditionalGeneration as _cls
+    elif model_family == "qwen3_vl":
+        from transformers import Qwen3VLForConditionalGeneration as _cls
+    elif model_family == "qwen3_5":
+        from transformers import Qwen3_5ForConditionalGeneration as _cls
+    else:
+        from transformers import Qwen2VLForConditionalGeneration as _cls
+    return _cls.from_pretrained(
+        path,
+        torch_dtype=torch_dtype,
+        attn_implementation="sdpa",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Model freeze / trainable parameter control (Qwen3-VL style)
 # ---------------------------------------------------------------------------
 def _get_visual_module(model):
@@ -886,9 +985,10 @@ class Qwen2VLCoupledDATDataset(Dataset):
     HD resolution is determined by the processor's default min/max pixels
     (i.e. whatever smart_resize picks for the original image).  LR is
     derived as HD / hr_scale in each spatial dimension, rounded to the
-    nearest patch-merge factor (28).
+    nearest patch-merge factor (28 for Qwen2/2.5-VL, 32 for Qwen3-VL/3.5).
     """
 
+    # Class-level defaults (Qwen2/2.5-VL); __init__ overrides from processor.
     PATCH_SIZE = 14
     MERGE_SIZE = 2
     FACTOR = PATCH_SIZE * MERGE_SIZE  # 28
@@ -907,6 +1007,12 @@ class Qwen2VLCoupledDATDataset(Dataset):
         self.data_args = data_args
         self.model_max_length = model_max_length
         self.coord_format = coord_format
+
+        # Patch geometry from the actual processor (Qwen3-VL/3.5 use patch 16)
+        _ip = getattr(processor, 'image_processor', None)
+        self.PATCH_SIZE = int(getattr(_ip, 'patch_size', None) or type(self).PATCH_SIZE)
+        self.MERGE_SIZE = int(getattr(_ip, 'merge_size', None) or type(self).MERGE_SIZE)
+        self.FACTOR = self.PATCH_SIZE * self.MERGE_SIZE
 
         self.hr_scale = model_args.dat_hr_scale
         self.hd_max_pixels = data_args.hd_max_pixels
@@ -2712,25 +2818,40 @@ def train():
     )
 
     # ----- Model -----
-    is_qwen2_5 = model_args.model_family == "qwen2_5_vl"
+    _family = model_args.model_family
+    if _family not in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+        raise ValueError(f"Unknown model_family: {_family!r}")
+    is_qwen2_5 = _family == "qwen2_5_vl"
     dat_warmup_callback = None
 
     if model_args.use_dat:
         if is_qwen2_5 and model_args.dat_manual_attn:
             from llava.model.language_model.modeling_qwen2_5vl_dat_manual import (
-                convert_qwen2_5vl_to_dat,
+                convert_qwen2_5vl_to_dat as _convert_fn,
                 freeze_base_unfreeze_dat,
                 DAT_KEYS_MATCH as _DAT_KEYS,
             )
         elif is_qwen2_5:
             from llava.model.language_model.modeling_qwen2_5vl_dat import (
-                convert_qwen2_5vl_to_dat,
+                convert_qwen2_5vl_to_dat as _convert_fn,
+                freeze_base_unfreeze_dat,
+                DAT_KEYS_MATCH as _DAT_KEYS,
+            )
+        elif _family == "qwen3_vl":
+            from llava.model.language_model.modeling_qwen3_vl_dat import (
+                convert_qwen3_vl_to_dat as _convert_fn,
+                freeze_base_unfreeze_dat,
+                DAT_KEYS_MATCH as _DAT_KEYS,
+            )
+        elif _family == "qwen3_5":
+            from llava.model.language_model.modeling_qwen3_5_dat import (
+                convert_qwen3_5_to_dat as _convert_fn,
                 freeze_base_unfreeze_dat,
                 DAT_KEYS_MATCH as _DAT_KEYS,
             )
         else:
             from llava.model.language_model.modeling_qwen2vl_dat import (
-                convert_qwen2vl_to_dat,
+                convert_qwen2vl_to_dat as _convert_fn,
                 freeze_base_unfreeze_dat,
                 DAT_KEYS_MATCH as _DAT_KEYS,
             )
@@ -2766,7 +2887,7 @@ def train():
 
         rank0_print(f"Loading DAT model ({model_args.model_family}) from {model_args.model_name_or_path}...")
         rank0_print(f"DAT config: {dat_extra_args}")
-        convert_fn = convert_qwen2_5vl_to_dat if is_qwen2_5 else convert_qwen2vl_to_dat
+        convert_fn = _convert_fn
         model = convert_fn(
             model_args.model_name_or_path,
             dat_extra_args=dat_extra_args,
@@ -2806,8 +2927,14 @@ def train():
                 if any(k in name for k in _DAT_KEYS):
                     param.requires_grad = True
 
-        # Validate dat_layers length
+        # Validate dat_layers length (qwen3_5 'auto' patterns are resolved
+        # inside convert_qwen3_5_to_dat — read back the resolved string so
+        # downstream consumers like the LoRA regex builder see D/L chars).
         if model_args.dat_layers:
+            _resolved_layers = model.config.dat_extra_args.get('layers', model_args.dat_layers)
+            if _resolved_layers != model_args.dat_layers:
+                rank0_print(f"dat_layers resolved: {model_args.dat_layers!r} -> {_resolved_layers!r}")
+                model_args.dat_layers = _resolved_layers
             _text_cfg = getattr(model.config, 'text_config', None)
             num_layers = getattr(model.config, 'num_hidden_layers', None) or \
                          (_text_cfg.num_hidden_layers if _text_cfg else None)
@@ -2826,20 +2953,7 @@ def train():
             _apply_hd_gate_freeze(model, model_args)
     else:
         rank0_print(f"Loading model ({model_args.model_family}) from {model_args.model_name_or_path}...")
-        if is_qwen2_5:
-            from transformers import Qwen2_5_VLForConditionalGeneration
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_args.model_name_or_path,
-                torch_dtype=compute_dtype,
-                attn_implementation="sdpa",
-            )
-        else:
-            from transformers import Qwen2VLForConditionalGeneration
-            model = Qwen2VLForConditionalGeneration.from_pretrained(
-                model_args.model_name_or_path,
-                torch_dtype=compute_dtype,
-                attn_implementation="sdpa",
-            )
+        model = _load_base_vlm(_family, model_args.model_name_or_path, compute_dtype)
 
         # Apply fine-grained freeze control
         set_model(model, model_args)
@@ -2847,12 +2961,19 @@ def train():
     # ----- Processor -----
     from transformers import AutoProcessor
 
+    # Qwen3.5 ships a fast-only tokenizer; the legacy use_fast=False is kept
+    # for the Qwen2/2.5/3-VL families where it matches previous runs.
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path,
-        use_fast=False,
+        use_fast=(_family == "qwen3_5"),
     )
     processor.tokenizer.model_max_length = training_args.model_max_length
     processor.tokenizer.padding_side = "right"
+
+    # Swap module-level token ids / patch geometry to the actual family
+    # BEFORE any dataset, label-mask or collator construction.
+    configure_token_scheme(_family, tokenizer=processor.tokenizer)
+    configure_patch_geometry(processor)
 
     # Align model config & generation_config with tokenizer special tokens
     # so the Trainer doesn't auto-override and emit a noisy warning.
@@ -2962,15 +3083,7 @@ def train():
             f"T={training_args.kd_temperature} | layer_stride={training_args.kd_layer_stride}"
         )
         rank0_print(f"[KD] Loading pure base VLM as teacher from: {teacher_path}")
-        if is_qwen2_5:
-            from transformers import Qwen2_5_VLForConditionalGeneration as _KD_TeacherCls
-        else:
-            from transformers import Qwen2VLForConditionalGeneration as _KD_TeacherCls
-        kd_teacher = _KD_TeacherCls.from_pretrained(
-            teacher_path,
-            torch_dtype=compute_dtype,
-            attn_implementation="sdpa",
-        )
+        kd_teacher = _load_base_vlm(_family, teacher_path, compute_dtype)
         kd_teacher.eval()
         for p in kd_teacher.parameters():
             p.requires_grad_(False)
@@ -2992,8 +3105,10 @@ def train():
             pass
 
     # ----- Dataset -----
-    coord_format = model_args.model_family  # "qwen2_vl" or "qwen2_5_vl"
-    rank0_print(f"Bbox coordinate format: {coord_format}")
+    # qwen2_vl uses ×1000 normalized coords; qwen2.5-VL / qwen3-VL / qwen3.5
+    # all use absolute pixel coords (mapped onto the qwen2_5_vl converter).
+    coord_format = "qwen2_vl" if _family == "qwen2_vl" else "qwen2_5_vl"
+    rank0_print(f"Bbox coordinate format: {coord_format} (family={_family})")
     _kd_enabled_for_dataset = bool(getattr(training_args, 'kd_on', False)) and (kd_teacher is not None)
     if model_args.use_dat:
         train_dataset = Qwen2VLCoupledDATDataset(

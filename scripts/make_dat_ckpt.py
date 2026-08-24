@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""把 base Qwen2.5-VL 转成 DAT 版并存盘 (DAT 模块随机初始化, 测速用)。
+"""把 base Qwen VLM 转成 DAT 版并存盘 (DAT 模块随机初始化, 测速用)。
+
+支持 --family qwen2_5_vl / qwen3_vl / qwen3_5。
 
 用法 (pod):
   python scripts/make_dat_ckpt.py \
       --base-model /workspace/model_cache/Qwen2.5-VL-3B-Instruct \
       --output /workspace/model_cache/Qwen2.5-VL-3B-Instruct-DAT-rand
+
+  python scripts/make_dat_ckpt.py --family qwen3_5 \
+      --base-model /workspace/model_cache/Qwen3.5-2B \
+      --output /workspace/model_cache/Qwen3.5-2B-DAT-rand
 """
 
 import os
@@ -34,28 +40,55 @@ DAT_EXTRA_ARGS = {
     'use_shared_vit': False,
 }
 
+_FAMILY_IMPORTS = {
+    'qwen2_5_vl': ('llava.model.language_model.modeling_qwen2_5vl_dat',
+                   'convert_qwen2_5vl_to_dat',
+                   'Qwen2_5_VLDATForConditionalGeneration'),
+    'qwen3_vl':   ('llava.model.language_model.modeling_qwen3_vl_dat',
+                   'convert_qwen3_vl_to_dat',
+                   'Qwen3VLDATForConditionalGeneration'),
+    'qwen3_5':    ('llava.model.language_model.modeling_qwen3_5_dat',
+                   'convert_qwen3_5_to_dat',
+                   'Qwen3_5DATForConditionalGeneration'),
+}
+
 
 def main():
     p = argparse.ArgumentParser()
     _cache = os.environ.get("MODEL_CACHE", "/workspace/model_cache")
+    p.add_argument("--family", default="qwen2_5_vl", choices=sorted(_FAMILY_IMPORTS))
     p.add_argument("--base-model", default=os.path.join(_cache, "Qwen2.5-VL-3B-Instruct"))
     p.add_argument("--output", default=os.path.join(_cache, "Qwen2.5-VL-3B-Instruct-DAT-rand"))
+    p.add_argument("--layers", default=None,
+                   help="Explicit D/L pattern. Default: every 6th layer for "
+                        "qwen2_5_vl/qwen3_vl; 'auto' (all full-attn layers) for qwen3_5.")
     args = p.parse_args()
 
+    import importlib
     from transformers import AutoConfig, AutoProcessor
-    from llava.model.language_model.modeling_qwen2_5vl_dat import convert_qwen2_5vl_to_dat
+
+    mod_name, convert_name, cls_name = _FAMILY_IMPORTS[args.family]
+    mod = importlib.import_module(mod_name)
+    convert_fn = getattr(mod, convert_name)
+    model_cls = getattr(mod, cls_name)
 
     base_cfg = AutoConfig.from_pretrained(args.base_model)
-    n_layers = getattr(base_cfg, 'num_hidden_layers', None) or \
-               base_cfg.text_config.num_hidden_layers
-    dat_extra_args = dict(DAT_EXTRA_ARGS)
-    dat_extra_args['layers'] = ''.join(
-        'D' if i % 6 == 0 else 'L' for i in range(n_layers))
+    text_cfg = getattr(base_cfg, 'text_config', base_cfg)
+    n_layers = text_cfg.num_hidden_layers
 
-    print(f"[convert] {args.base_model} ({n_layers} layers, "
+    dat_extra_args = dict(DAT_EXTRA_ARGS)
+    if args.layers is not None:
+        dat_extra_args['layers'] = args.layers
+    elif args.family == 'qwen3_5':
+        # Hybrid arch: anchor D layers to the full_attention positions.
+        dat_extra_args['layers'] = 'auto'
+    else:
+        dat_extra_args['layers'] = ''.join(
+            'D' if i % 6 == 0 else 'L' for i in range(n_layers))
+
+    print(f"[convert] {args.base_model} ({args.family}, {n_layers} layers, "
           f"pattern={dat_extra_args['layers']})")
-    model = convert_qwen2_5vl_to_dat(args.base_model, dat_extra_args,
-                                     torch_dtype=torch.bfloat16)
+    model = convert_fn(args.base_model, dat_extra_args, torch_dtype=torch.bfloat16)
 
     n_total = sum(x.numel() for x in model.parameters()) / 1e9
     print(f"[save] params={n_total:.2f}B -> {args.output}")
@@ -63,11 +96,7 @@ def main():
     AutoProcessor.from_pretrained(args.base_model).save_pretrained(args.output)
 
     # 回读验证 save/load 对称 (conversion mapping 已注册)
-    from llava.model.language_model.modeling_qwen2_5vl_dat import (
-        Qwen2_5_VLDATForConditionalGeneration,
-    )
-    reloaded = Qwen2_5_VLDATForConditionalGeneration.from_pretrained(
-        args.output, torch_dtype=torch.bfloat16)
+    reloaded = model_cls.from_pretrained(args.output, torch_dtype=torch.bfloat16)
     n_reload = sum(x.numel() for x in reloaded.parameters()) / 1e9
     assert abs(n_reload - n_total) < 1e-6, f"参数量不一致: {n_reload} vs {n_total}"
     print(f"[verify] reload OK, params={n_reload:.2f}B")
