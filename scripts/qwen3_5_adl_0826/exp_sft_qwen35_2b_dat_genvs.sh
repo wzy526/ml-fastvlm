@@ -101,6 +101,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
+# fla triton autotune can stall one rank while others wait in allreduce;
+# raise NCCL heartbeat + ddp timeout so the watchdog doesn't SIGABRT step 1.
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
+
 # MUST match stage 1 (dat_extra_args is rebuilt from CLI, not read from ckpt).
 DAT_LAYERS="${DAT_LAYERS:-auto}"
 
@@ -142,6 +146,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40981}" llava/train/tr
     --bf16 True \
     --tf32 True \
     --max_grad_norm 1.0 \
+    --ddp_timeout 7200 \
     --output_dir "$CKPT_ROOT/$EXP_NAME" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS:-1}" \
     --per_device_train_batch_size "${PER_DEVICE_BATCH:-4}" \
