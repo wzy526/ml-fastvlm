@@ -7,18 +7,20 @@ Usage:
         --lora_path  /path/to/lora_checkpoint \
         --output_dir /path/to/merged_output
 
+Supports all DAT families; the family is auto-detected from the checkpoint's
+config.json model_type (qwen2_5_vl_dat / qwen3_vl_dat / qwen3_5_dat), or can
+be forced with --family.
+
 The script:
-  1. Loads the base Qwen2.5-VL model
+  1. Loads the base model
   2. Converts it to DAT (using dat_extra_args from the checkpoint config)
   3. Loads trained DAT weights from non_lora_trainables.bin
   4. Loads LoRA adapters and merges them into the base weights
   5. Saves the full merged model as a standard HF checkpoint
-
-The output can be loaded directly with:
-    Qwen2_5_VLDATForConditionalGeneration.from_pretrained(output_dir)
 """
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -27,6 +29,35 @@ import torch
 from transformers import AutoProcessor, AutoConfig
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+_FAMILIES = {
+    'qwen2_5_vl': ('llava.model.language_model.modeling_qwen2_5vl_dat',
+                   'convert_qwen2_5vl_to_dat',
+                   'Qwen2_5_VLDATConfig',
+                   'Qwen2_5_VLDATForConditionalGeneration'),
+    'qwen3_vl':   ('llava.model.language_model.modeling_qwen3_vl_dat',
+                   'convert_qwen3_vl_to_dat',
+                   'Qwen3VLDATConfig',
+                   'Qwen3VLDATForConditionalGeneration'),
+    'qwen3_5':    ('llava.model.language_model.modeling_qwen3_5_dat',
+                   'convert_qwen3_5_to_dat',
+                   'Qwen3_5DATConfig',
+                   'Qwen3_5DATForConditionalGeneration'),
+}
+
+
+def _detect_family(lora_path: str) -> str:
+    """Map the checkpoint's config.json model_type to a DAT family."""
+    cfg_path = os.path.join(lora_path, 'config.json')
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        model_type = json.load(f).get('model_type', '')
+    for fam in ('qwen3_5', 'qwen3_vl', 'qwen2_5_vl'):
+        if model_type.startswith(fam):
+            return fam
+    raise ValueError(
+        f"Cannot infer DAT family from model_type={model_type!r} in {cfg_path}; "
+        f"pass --family explicitly."
+    )
 
 
 def main():
@@ -39,6 +70,8 @@ def main():
                         help="Where to save the merged full-weight model")
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"],
                         help="Torch dtype for loading and saving")
+    parser.add_argument("--family", default=None, choices=sorted(_FAMILIES),
+                        help="DAT model family. Default: auto-detect from the checkpoint config.")
     args = parser.parse_args()
 
     dtype_map = {
@@ -48,19 +81,21 @@ def main():
     }
     torch_dtype = dtype_map[args.torch_dtype]
 
-    from llava.model.language_model.modeling_qwen2_5vl_dat import (
-        convert_qwen2_5vl_to_dat,
-        Qwen2_5_VLDATConfig,
-    )
+    family = args.family or _detect_family(args.lora_path)
+    mod_name, convert_name, config_name, cls_name = _FAMILIES[family]
+    mod = importlib.import_module(mod_name)
+    convert_fn = getattr(mod, convert_name)
+    config_cls = getattr(mod, config_name)
+    print(f"[family] {family}  ({mod_name})")
 
     # --- Step 1: Read DAT config from checkpoint ---
     print(f"[1/5] Loading config from {args.lora_path} ...")
-    dat_config = Qwen2_5_VLDATConfig.from_pretrained(args.lora_path)
+    dat_config = config_cls.from_pretrained(args.lora_path)
     print(f"  dat_extra_args: {dat_config.dat_extra_args}")
 
     # --- Step 2: Load base model and convert to DAT ---
     print(f"[2/5] Loading base model from {args.model_base} and converting to DAT ...")
-    model = convert_qwen2_5vl_to_dat(
+    model = convert_fn(
         args.model_base,
         dat_extra_args=dat_config.dat_extra_args,
         torch_dtype=torch_dtype,
@@ -107,7 +142,10 @@ def main():
     print(f"[5/5] Saving merged model to {args.output_dir} ...")
     model.save_pretrained(args.output_dir, safe_serialization=True)
 
-    processor = AutoProcessor.from_pretrained(args.model_base, trust_remote_code=True, use_fast=False)
+    # Qwen3.5 ships a fast-only tokenizer; legacy use_fast=False elsewhere.
+    processor = AutoProcessor.from_pretrained(
+        args.model_base, trust_remote_code=True, use_fast=(family == 'qwen3_5'),
+    )
     processor.save_pretrained(args.output_dir)
 
     # Newer transformers' ProcessorMixin.save_pretrained() only writes a unified
@@ -128,8 +166,8 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nDone! Saved merged model ({total_params:,} params) to {args.output_dir}")
     print(f"Load with:")
-    print(f"  from llava.model.language_model.modeling_qwen2_5vl_dat import Qwen2_5_VLDATForConditionalGeneration")
-    print(f"  model = Qwen2_5_VLDATForConditionalGeneration.from_pretrained('{args.output_dir}')")
+    print(f"  from {mod_name} import {cls_name}")
+    print(f"  model = {cls_name}.from_pretrained('{args.output_dir}')")
 
 
 if __name__ == "__main__":
