@@ -1911,7 +1911,15 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             if not (any(k in name for k in DAT_KEYS_MATCH) and param.requires_grad):
                 continue
             try:
-                fp32_tensor = _get_fp32(param) if _get_fp32 is not None else None
+                # safe_get_full_fp32_param is COLLECTIVE under ZeRO-1/2 as well
+                # (fp32 master partitions live in the optimizer), so it may only
+                # be used when every rank calls in lockstep. We restrict it to
+                # ZeRO-3 (ds_id params, gated by _uses_zero in on_log). Under
+                # ZeRO-1/2 the module's bf16 weights are full on every rank —
+                # the local copy is plenty for a diagnostic metric, and using
+                # it avoids a rank-0-only all-gather that deadlocks NCCL.
+                _shard = hasattr(param, 'ds_id')
+                fp32_tensor = _get_fp32(param) if (_get_fp32 is not None and _shard) else None
                 # Scalar params: report value directly, don't fold into L2 norm
                 if 'hd_gate' in name and param.numel() == 1:
                     val = fp32_tensor.item() if fp32_tensor is not None else param.data.float().item()
@@ -1940,9 +1948,11 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         _model     = model     or self._model
         _optimizer = optimizer or self._optimizer
 
-        # Under ZeRO-2/3, safe_get_full_fp32_param does an all-gather so ALL
-        # ranks must call _compute_weight_norms.  Under DDP (no ZeRO), each rank
-        # has the full model — only rank 0 needs to compute.
+        # Only ZeRO-3 shards module params (ds_id); there all ranks must call
+        # _compute_weight_norms in lockstep because the fp32 gather is a
+        # collective. Under DDP or ZeRO-1/2 each rank holds the full (bf16)
+        # module weights and _compute_weight_norms stays local (see _shard
+        # gating inside), so rank 0 alone is safe.
         _uses_zero = _model is not None and any(
             hasattr(p, 'ds_id') for p in _model.parameters()
         )
