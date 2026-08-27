@@ -101,9 +101,11 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
-# fla triton autotune can stall one rank while others wait in allreduce;
-# raise NCCL heartbeat + ddp timeout so the watchdog doesn't SIGABRT step 1.
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
+# fla triton compile/autotune can stall ranks while others wait in allreduce.
+# --ddp_timeout is IGNORED under deepspeed; DEEPSPEED_TIMEOUT (seconds) is
+# what actually raises the process-group timeout there.
+export DEEPSPEED_TIMEOUT="${DEEPSPEED_TIMEOUT:-7200}"
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-7200}"
 
 # MUST match stage 1 (dat_extra_args is rebuilt from CLI, not read from ckpt).
 DAT_LAYERS="${DAT_LAYERS:-auto}"
