@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generic LLM-visual-token sweep for lmms-eval (DAT or base Qwen2.5-VL).
+# Generic LLM-visual-token sweep for lmms-eval (DAT or base; Qwen2.5-VL or Qwen3.5).
 #
 # Loops one benchmark across several pixel budgets to trace the
 # accuracy-vs-LLM-tokens curve. Swap model / ckpt / task / pixel list from the
@@ -12,11 +12,17 @@
 #     LLM visual tokens per image ≈ pixels / 784.
 #
 # Usage:
-#   bash eval_pixel_sweep.sh <dat|base> <CKPT> <TASK> [TAG]
+#   bash eval_pixel_sweep.sh <dat|base|dat35|base35> <CKPT> <TASK> [TAG]
+#
+#   dat / base     : Qwen2.5-VL family (factor 28; 1 LLM token = 784 px)
+#   dat35 / base35 : Qwen3.5 family    (factor 32; 1 LLM token = 1024 px)
+#   The default PIXELS grid is family-scaled so both families sweep the SAME
+#   token axis (~256/640/1280/2560/6400/11520) and rows stay comparable.
 #
 # Examples:
-#   bash eval_pixel_sweep.sh dat  /root/autodl-tmp/vldat_experiments/0606_sft_dirA_nogate_full_12dat  docvqa_val  0606_12dat
-#   bash eval_pixel_sweep.sh base /root/autodl-tmp/models_data/Qwen2.5-VL-3B-Instruct                docvqa_val  base3b
+#   bash eval_pixel_sweep.sh dat   /root/autodl-tmp/vldat_experiments/0606_sft_dirA_nogate_full_12dat  docvqa_val  0606_12dat
+#   bash eval_pixel_sweep.sh base  /root/autodl-tmp/models_data/Qwen2.5-VL-3B-Instruct                docvqa_val  base3b
+#   bash eval_pixel_sweep.sh dat35 ~/vldat_experiments/0826_sft_qwen35_2b_dat_genvs-merged             vstar_bench 0826_q35
 #   PIXELS="200704 501760 1003520" bash eval_pixel_sweep.sh dat <CKPT> ocrbench dat_ocr
 #
 # Env knobs (all optional):
@@ -44,11 +50,15 @@ CKPT="${2:?usage: $0 <dat|base> CKPT TASK [TAG]}"
 TASK="${3:?usage: $0 <dat|base> CKPT TASK [TAG]}"
 TAG="${4:-$(basename "$CKPT")}"
 
+# TOK_PX: pixels per merged LLM token = (patch_size * spatial_merge)^2.
 case "$MODEL_TYPE" in
-    dat)  MODEL=qwen2_5_dat_vl ;;
-    base) MODEL=qwen2_5_vl ;;
-    *) echo "[ERROR] MODEL_TYPE must be 'dat' or 'base', got '$MODEL_TYPE'" >&2; exit 1 ;;
+    dat)    MODEL=qwen2_5_dat_vl; TOK_PX=784 ;;
+    base)   MODEL=qwen2_5_vl;     TOK_PX=784 ;;
+    dat35)  MODEL=qwen3_5_dat;    TOK_PX=1024 ;;
+    base35) MODEL=qwen3_5;        TOK_PX=1024 ;;
+    *) echo "[ERROR] MODEL_TYPE must be dat|base|dat35|base35, got '$MODEL_TYPE'" >&2; exit 1 ;;
 esac
+IS_DAT=0; [[ "$MODEL_TYPE" == dat* ]] && IS_DAT=1
 
 # Fail fast on a bad local ckpt path. Without this, transformers treats the
 # path as a HF repo id and every rank dies with a confusing "Repo id must be
@@ -58,9 +68,16 @@ if [[ "$CKPT" == /* && ! -d "$CKPT" ]]; then
     exit 1
 fi
 
-# Default grid matches scripts/qwen2_5vl_adl_0528/_eval_pareto.sh
-# (200704≈256 tok … 9031680≈11520 tok, the Qwen2.5-VL default ceiling).
-PIXELS="${PIXELS:-200704 501760 1003520 2007040 5017600 9031680}"
+# Default grid = the token axis 256/640/1280/2560/6400/11520 from
+# scripts/qwen2_5vl_adl_0528/_eval_pareto.sh, converted to pixels with the
+# family's TOK_PX so qwen2.5 (784) and qwen3.5 (1024) rows line up by tokens.
+if [[ -z "${PIXELS:-}" ]]; then
+    PIXELS=""
+    for tok in 256 640 1280 2560 6400 11520; do
+        PIXELS+="$((tok * TOK_PX)) "
+    done
+    PIXELS="${PIXELS% }"
+fi
 HR_CAP="${HR_CAP:-5017600}"
 HR_SCALE="${HR_SCALE:-3}"
 MIN_PIXELS="${MIN_PIXELS:-28224}"
@@ -69,7 +86,12 @@ NPROC="${NPROC:-8}"
 PORT="${PORT:-30200}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_ROOT="${OUT_ROOT:-$REPO_DIR/_test_outputs/_sweep_${TASK}_${TAG}}"
-BASE_REF="${BASE_REF:-/root/autodl-tmp/models_data/Qwen2.5-VL-3B-Instruct}"
+if [[ "$TOK_PX" == 1024 ]]; then
+    _BASE_REF_DEFAULT=/data/oss_bucket_0/wangziyi/official_ckpt/Qwen3.5-2B
+else
+    _BASE_REF_DEFAULT=/root/autodl-tmp/models_data/Qwen2.5-VL-3B-Instruct
+fi
+BASE_REF="${BASE_REF:-$_BASE_REF_DEFAULT}"
 LMMS_EVAL_DIR="${LMMS_EVAL_DIR:-/root/autodl-tmp/lmms-eval}"
 
 eval "$(conda shell.bash hook)"
@@ -83,7 +105,7 @@ cd "$LMMS_EVAL_DIR"
 # DAT ckpts often ship `processor_config.json` but not `preprocessor_config.json`
 # (the image-processor config). Without it the wrapper falls back to a HF repo id
 # and dies offline. Source it from the local base model once.
-if [[ "$MODEL_TYPE" == "dat" && ! -f "$CKPT/preprocessor_config.json" ]]; then
+if [[ "$IS_DAT" == 1 && ! -f "$CKPT/preprocessor_config.json" ]]; then
     if [[ -f "$BASE_REF/preprocessor_config.json" ]]; then
         echo "[fix] copying preprocessor_config.json from $BASE_REF into $CKPT"
         cp "$BASE_REF/preprocessor_config.json" "$CKPT/"
@@ -116,16 +138,21 @@ echo " out=$OUT_ROOT"
 echo "=================================================================="
 
 for px in $PIXELS; do
-    tok=$((px / 784))
+    tok=$((px / TOK_PX))
     tag="${MODEL_TYPE}_tok${tok}"
     out="$OUT_ROOT/$tag"
     if [[ -f "$out/done" ]]; then echo "[skip] $tag already done"; continue; fi
 
-    if [[ "$MODEL_TYPE" == "dat" ]]; then
+    if [[ "$IS_DAT" == 1 ]]; then
         # Sweep LR (LLM tokens); HR auto = LR*hr_scale^2 capped at HR_CAP.
         margs="pretrained=${CKPT},attn_implementation=sdpa,hr_scale=${HR_SCALE},max_pixels=${HR_CAP},min_pixels=${MIN_PIXELS},lr_max_pixels=${px},lr_min_pixels=${MIN_PIXELS}"
     else
         margs="pretrained=${CKPT},attn_implementation=sdpa,max_pixels=${px},min_pixels=${MIN_PIXELS}"
+    fi
+    # Qwen3.5 base defaults to sampled decoding + hybrid thinking; force the
+    # deterministic non-thinking mode so numbers are comparable to DAT rows.
+    if [[ "$MODEL_TYPE" == "base35" ]]; then
+        margs+=",enable_thinking=False,max_new_tokens=1024"
     fi
 
     echo "------------------------------------------------------------------"
