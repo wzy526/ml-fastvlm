@@ -55,7 +55,11 @@ case "$MODEL_TYPE" in
     dat)    MODEL=qwen2_5_dat_vl; TOK_PX=784 ;;
     base)   MODEL=qwen2_5_vl;     TOK_PX=784 ;;
     dat35)  MODEL=qwen3_5_dat;    TOK_PX=1024 ;;
-    base35) MODEL=qwen3_5;        TOK_PX=1024 ;;
+    # base35 uses the qwen3_vl wrapper on purpose: it auto-resolves the
+    # Qwen3.5 model class from config.json but keeps GREEDY decoding defaults
+    # (the qwen3_5 wrapper carries Qwen's sampled temp-0.7 model-card recipe,
+    # which is neither reproducible nor comparable to the DAT rows).
+    base35) MODEL=qwen3_vl;       TOK_PX=1024 ;;
     *) echo "[ERROR] MODEL_TYPE must be dat|base|dat35|base35, got '$MODEL_TYPE'" >&2; exit 1 ;;
 esac
 IS_DAT=0; [[ "$MODEL_TYPE" == dat* ]] && IS_DAT=1
@@ -149,10 +153,10 @@ for px in $PIXELS; do
     else
         margs="pretrained=${CKPT},attn_implementation=sdpa,max_pixels=${px},min_pixels=${MIN_PIXELS}"
     fi
-    # Qwen3.5 base defaults to sampled decoding + hybrid thinking; force the
-    # deterministic non-thinking mode so numbers are comparable to DAT rows.
+    # Qwen3.5's chat template can default to thinking mode; force it off so
+    # numbers are deterministic and comparable to the DAT rows.
     if [[ "$MODEL_TYPE" == "base35" ]]; then
-        margs+=",enable_thinking=False,max_new_tokens=1024"
+        margs+=",enable_thinking=False"
     fi
 
     echo "------------------------------------------------------------------"
