@@ -182,3 +182,5 @@ bench_outputs/
 
 # local agent notes (含内网路径, 勿提交)
 .cursor/
+# generated paper tables/figures (regenerable from _test_outputs)
+paper_exports/
