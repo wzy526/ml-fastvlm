@@ -20,6 +20,9 @@ export NUMEXPR_MAX_THREADS=4 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 
 XZF_ROOT="${XZF_ROOT:-/home/ea-cvfa-aigc-x2v-2/xzf}"
 MODEL_PATH="${MODEL_PATH:-/workspace/model_cache/Qwen3.5-2B}"
+if [[ ! -f "$MODEL_PATH/config.json" ]]; then
+    MODEL_PATH="/home/ea-cv-nlp-train-offline-2/xzf/models/Qwen3.5-2B"
+fi
 DATA_JSON="${DATA_JSON:?set DATA_JSON to the sft json}"
 IMAGE_ROOT="${IMAGE_ROOT:?set IMAGE_ROOT to the image folder}"
 CKPT_ROOT="${CKPT_ROOT:-$XZF_ROOT/vldat_experiments}"
