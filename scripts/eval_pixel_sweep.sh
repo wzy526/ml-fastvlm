@@ -37,6 +37,8 @@
 #   OUT_ROOT    output dir                       (default: <repo>/_test_outputs/_sweep_<TASK>_<TAG>)
 #   BASE_REF    base model to source preprocessor_config.json from when a DAT ckpt lacks it
 #               (default: /root/autodl-tmp/models_data/Qwen2.5-VL-3B-Instruct)
+#   EXTRA_MARGS extra model_args appended verbatim (e.g. "disable_hd=True" for
+#               the HD-pathway-off ablation; remember to also pass a new TAG)
 #   CONDA_ENV   conda env name                   (default: vldat; new cluster: fastvlm)
 #   LMMS_EVAL_DIR  lmms-eval fork checkout       (default: /root/autodl-tmp/lmms-eval)
 
@@ -157,6 +159,9 @@ for px in $PIXELS; do
     # numbers are deterministic and comparable to the DAT rows.
     if [[ "$MODEL_TYPE" == "base35" ]]; then
         margs+=",enable_thinking=False"
+    fi
+    if [[ -n "${EXTRA_MARGS:-}" ]]; then
+        margs+=",${EXTRA_MARGS}"
     fi
 
     echo "------------------------------------------------------------------"
