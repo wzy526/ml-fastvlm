@@ -85,13 +85,15 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_DOWNLOAD_TIMEOUT=1200
 export NUMEXPR_MAX_THREADS=64
 export CUDA_VISIBLE_DEVICES="$GPUS"
+# Platform injects NCCL_DEBUG=INFO. Use NCCL_DEBUG_LEVEL=INFO to get it back.
+export NCCL_DEBUG="${NCCL_DEBUG_LEVEL:-WARN}"
 unset TRANSFORMERS_OFFLINE HF_HUB_OFFLINE HF_DATASETS_OFFLINE 2>/dev/null || true
 
 # MMBench's answer extraction calls a GPT endpoint that this cluster can't
 # reach; the fork falls back to local matching when this is set.
 export MMBENCH_SKIP_GPT_EVAL=1
 
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/${USER}_triton_cache}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/${USER:-$(id -un)}_triton_cache}"
 mkdir -p "$TRITON_CACHE_DIR"
 
 MARGS="pretrained=${CKPT},attn_implementation=sdpa,max_pixels=${PX},min_pixels=${MIN_PIXELS}"

@@ -13,6 +13,7 @@ MODELS=(
     Qwen3-VL-2B-Instruct
     Qwen3-VL-8B-Instruct
     Qwen3.5-2B
+    Qwen3.5-4B
     Qwen3.5-9B
 )
 

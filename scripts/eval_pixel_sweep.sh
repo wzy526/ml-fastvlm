@@ -85,7 +85,9 @@ GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
 NPROC="${NPROC:-8}"
 PORT="${PORT:-30200}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT_ROOT="${OUT_ROOT:-$REPO_DIR/_test_outputs/_sweep_${TASK}_${TAG}}"
+# TASK may be a comma list (one launch, several tasks); keep dir names sane.
+TASK_SLUG="${TASK//,/+}"
+OUT_ROOT="${OUT_ROOT:-$REPO_DIR/_test_outputs/_sweep_${TASK_SLUG}_${TAG}}"
 if [[ "$TOK_PX" == 1024 ]]; then
     _BASE_REF_DEFAULT=/data/oss_bucket_0/wangziyi/official_ckpt/Qwen3.5-2B
 else
@@ -94,12 +96,21 @@ fi
 BASE_REF="${BASE_REF:-$_BASE_REF_DEFAULT}"
 LMMS_EVAL_DIR="${LMMS_EVAL_DIR:-/root/autodl-tmp/lmms-eval}"
 
-eval "$(conda shell.bash hook)"
-conda activate "${CONDA_ENV:-vldat}"
 if [[ ! -d "$LMMS_EVAL_DIR" ]]; then
     echo "[ERROR] LMMS_EVAL_DIR not found: $LMMS_EVAL_DIR (set LMMS_EVAL_DIR=/path/to/lmms-eval)" >&2
     exit 1
 fi
+if [[ -n "${VLDAT_VENV:-}" && -f "${VLDAT_VENV}/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "${VLDAT_VENV}/bin/activate"
+else
+    eval "$(conda shell.bash hook)"
+    conda activate "${CONDA_ENV:-vldat}"
+fi
+# `llava` (DAT modeling) may not be pip-installed; keep the repo root importable.
+FASTVLM_DIR="${FASTVLM_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export LMMS_FASTVLM_PATH="${LMMS_FASTVLM_PATH:-$FASTVLM_DIR}"
+export PYTHONPATH="${LMMS_EVAL_DIR}:${FASTVLM_DIR}${PYTHONPATH:+:$PYTHONPATH}"
 cd "$LMMS_EVAL_DIR"
 
 # DAT ckpts often ship `processor_config.json` but not `preprocessor_config.json`
@@ -114,21 +125,32 @@ if [[ "$IS_DAT" == 1 && ! -f "$CKPT/preprocessor_config.json" ]]; then
     fi
 fi
 
-# This box can't reach huggingface.co; use the mirror for dataset downloads.
-# IMPORTANT: do NOT set TRANSFORMERS_OFFLINE / HF_HUB_OFFLINE — recent
-# huggingface_hub treats them as a global offline switch that ALSO blocks
-# `datasets` from downloading uncached benchmarks. The model loads from a local
-# dir path (no hub call needed), so offline mode buys nothing here.
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-export HF_HUB_DOWNLOAD_TIMEOUT=1200
 export NUMEXPR_MAX_THREADS=64
 export CUDA_VISIBLE_DEVICES="$GPUS"
+# Platform injects NCCL_DEBUG=INFO, which buries eval progress. Overriding the
+# injected value needs a separate knob: NCCL_DEBUG_LEVEL=INFO for the full dump.
+export NCCL_DEBUG="${NCCL_DEBUG_LEVEL:-WARN}"
+if [[ "${EVAL_OFFLINE:-0}" == "1" ]]; then
+    # Pod: no internet. Datasets must already be in $HF_HOME (hub snapshots).
+    export WANDB_MODE=offline
+    export HF_HUB_OFFLINE=1
+    export HF_DATASETS_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export MMBENCH_SKIP_GPT_EVAL="${MMBENCH_SKIP_GPT_EVAL:-1}"
+    unset HF_ENDPOINT 2>/dev/null || true
+else
+    # Autodl / machines that can reach a HF mirror. Do NOT set HF_HUB_OFFLINE:
+    # huggingface_hub treats it as a global switch that also blocks datasets
+    # from fetching uncached benchmarks.
+    export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+    export HF_HUB_DOWNLOAD_TIMEOUT=1200
+fi
 
 # deepspeed writes a Triton autotune table (behind a FileLock) at process
 # exit. On clusters where $HOME forbids lock files this raises
 # PermissionError in atexit -> non-zero exit -> an otherwise-finished point
 # gets marked FAIL and loses its `done` marker. Redirect to a writable dir.
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/${USER}_triton_cache}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/${USER:-$(id -un)}_triton_cache}"
 mkdir -p "$TRITON_CACHE_DIR"
 
 echo "=================================================================="
@@ -146,6 +168,9 @@ for px in $PIXELS; do
     if [[ "$IS_DAT" == 1 ]]; then
         # Sweep LR (LLM tokens); HR auto = LR*hr_scale^2 capped at HR_CAP.
         margs="pretrained=${CKPT},attn_implementation=sdpa,hr_scale=${HR_SCALE},max_pixels=${HR_CAP},min_pixels=${MIN_PIXELS},lr_max_pixels=${px},lr_min_pixels=${MIN_PIXELS}"
+        # DISABLE_HD=1: same DAT checkpoint, HD branch off (LR tokens only) —
+        # the SFT-only control that separates the HD pathway from the SFT data.
+        [[ "${DISABLE_HD:-0}" == "1" ]] && margs+=",disable_hd=True"
     else
         margs="pretrained=${CKPT},attn_implementation=sdpa,max_pixels=${px},min_pixels=${MIN_PIXELS}"
     fi
@@ -171,33 +196,43 @@ for px in $PIXELS; do
     fi
 done
 
-# ---- summary: dump every numeric metric for $TASK, sorted by token count ----
+# ---- summary: dump every numeric metric, sorted by token count. TASK may be
+#      a comma list; group tasks also match their subtask keys by prefix. ----
 python3 - << EOF
 import json, glob, os, re
 OUT_ROOT, TASK = "$OUT_ROOT", "$TASK"
-rows = []
+req = [t.strip() for t in TASK.split(",") if t.strip()]
+per_key = {}  # results-json task key -> [(tok, tag, metrics), ...]
 for d in sorted(glob.glob(f"{OUT_ROOT}/*/")):
     tag = os.path.basename(d.rstrip("/"))
     m = re.search(r"tok(\d+)", tag)
     tok = int(m.group(1)) if m else -1
     for f in glob.glob(f"{d}**/*_results.json", recursive=True):
         try:
-            res = json.load(open(f))["results"].get(TASK, {})
-            metrics = {k: v for k, v in res.items()
-                       if k.endswith(",none") and isinstance(v, (int, float))}
-            rows.append((tok, tag, metrics)); break
+            res_all = json.load(open(f)).get("results", {})
+            for key, res in res_all.items():
+                if not isinstance(res, dict):
+                    continue
+                if not any(key == t or key.startswith(t + "_") for t in req):
+                    continue
+                metrics = {k: v for k, v in res.items()
+                           if k.endswith(",none") and isinstance(v, (int, float))}
+                if metrics:
+                    per_key.setdefault(key, []).append((tok, tag, metrics))
+            break
         except Exception:
             pass
-if not rows:
+if not per_key:
     print("no results yet"); raise SystemExit
-rows.sort()
-keys = sorted({k for _, _, m in rows for k in m})
-print(f"\n==== {TASK} : metric vs ~LLM tokens ====")
-hdr = f'{"~tokens":>8} | ' + " ".join(f"{k.replace(',none',''):>16}" for k in keys)
-print(hdr); print("-" * len(hdr))
-for tok, tag, m in rows:
-    line = f"{tok:>8} | " + " ".join(
-        (f"{m[k]*100:>16.2f}" if (k in m and m[k] <= 1.0) else
-         (f"{m[k]:>16.2f}" if k in m else f'{"—":>16}')) for k in keys)
-    print(line)
+for key in sorted(per_key):
+    rows = sorted(per_key[key])
+    keys = sorted({k for _, _, m in rows for k in m})
+    print(f"\n==== {key} : metric vs ~LLM tokens ====")
+    hdr = f'{"~tokens":>8} | ' + " ".join(f"{k.replace(',none',''):>16}" for k in keys)
+    print(hdr); print("-" * len(hdr))
+    for tok, tag, m in rows:
+        line = f"{tok:>8} | " + " ".join(
+            (f"{m[k]*100:>16.2f}" if (k in m and m[k] <= 1.0) else
+             (f"{m[k]:>16.2f}" if k in m else f'{"—":>16}')) for k in keys)
+        print(line)
 EOF
