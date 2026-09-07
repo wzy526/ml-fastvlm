@@ -60,30 +60,59 @@ DTYPE = torch.bfloat16
 DEFAULT_MODEL = os.path.join(
     os.environ.get("MODEL_CACHE", "/workspace/model_cache"),
     "Qwen2.5-VL-3B-Instruct")
-# R 需同时是 28 (patch14 x merge2) 和 28*hr_scale 的倍数
-DEFAULT_RESOLUTIONS = [672, 1008, 1344, 2016, 2688]
+# R 需是 patch_size * merge_size * hr_scale 的倍数 —— qwen2_5 是 84, qwen3_5 是 96
+# (patch 16)。672 / 1344 / 2016 两个家族都合法; 其余点会按家族被 main() 过滤掉。
+DEFAULT_RESOLUTIONS = [672, 1008, 1152, 1344, 2016, 2688]
 
 
 # ────────────────────────────────────────────────────────────────────
 # 模型加载: 只要视觉塔
 # ────────────────────────────────────────────────────────────────────
 
-def build_visual(model_path: str, random_init: bool):
+def detect_family(model_path: str) -> str:
+    """从 config.json 的 model_type（回退到路径名）猜模型家族。"""
+    probe = model_path.lower()
+    cfg_path = os.path.join(model_path, "config.json")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path) as f:
+                probe = f"{json.load(f).get('model_type', '')} {probe}".lower()
+        except (OSError, json.JSONDecodeError):
+            pass
+    if "qwen3_5" in probe or "qwen3.5" in probe:
+        return "qwen3_5"
+    return "qwen2_5"
+
+
+def build_visual(model_path: str, random_init: bool, family: str = "auto"):
     from transformers import AutoConfig
-    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-        Qwen2_5_VisionTransformerPretrainedModel,
-    )
+
+    if family == "auto":
+        family = detect_family(model_path)
+
+    if family == "qwen3_5":
+        # DAT ckpt 的 model_type 是 qwen3_5_dat, AutoConfig 需要先注册
+        import llava.model.language_model.modeling_qwen3_5_dat  # noqa: F401
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+        from transformers import Qwen3_5ForConditionalGeneration
+        visual_cls, full_cls = Qwen3_5VisionModel, Qwen3_5ForConditionalGeneration
+    else:
+        import llava.model.language_model.modeling_qwen2_5vl_dat  # noqa: F401
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            Qwen2_5_VisionTransformerPretrainedModel,
+        )
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        visual_cls = Qwen2_5_VisionTransformerPretrainedModel
+        full_cls = Qwen2_5_VLForConditionalGeneration
 
     cfg = AutoConfig.from_pretrained(model_path)
     vcfg = cfg.vision_config
 
     if random_init:
         vcfg._attn_implementation = "flash_attention_2"
-        visual = Qwen2_5_VisionTransformerPretrainedModel(vcfg)
+        visual = visual_cls(vcfg)
     else:
-        from transformers import Qwen2_5_VLForConditionalGeneration
-
-        full = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        full = full_cls.from_pretrained(
             model_path, dtype=DTYPE, attn_implementation="flash_attention_2"
         )
         # transformers 5.x: model.visual; 兼容旧版扁平布局
@@ -91,7 +120,7 @@ def build_visual(model_path: str, random_init: bool):
 
     visual = visual.to(device=DEVICE, dtype=DTYPE).eval()
     torch.cuda.empty_cache()
-    return visual, vcfg
+    return visual, vcfg, family
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -272,12 +301,22 @@ def truncated_blocks(visual, k: int):
 
 
 def vit_prefix_flops(R: int, k: int, vcfg) -> float:
-    """前 k 个 block 的 ViT FLOPs (含 patch_embed + merger, window ctx=8x8=64)。"""
+    """前 k 个 block 的 ViT FLOPs (含 patch_embed + merger)。
+
+    Qwen2.5-VL 的 ViT 是 window-attn + 少数 full-attn 块; Qwen3.5 的 ViT 没有
+    window attention (无 window_size / fullatt_block_indexes), 每个块都是 full
+    attention —— 此时 win_ctx 取 N, 二次项对每一层都成立。
+    """
     d, inter = vcfg.hidden_size, vcfg.intermediate_size
     depth = vcfg.depth
-    fullatt = set(getattr(vcfg, "fullatt_block_indexes", []) or [])
     N = (R // vcfg.patch_size) ** 2
-    win_ctx = (vcfg.window_size // vcfg.patch_size) ** 2
+    window_size = getattr(vcfg, "window_size", None)
+    if window_size:
+        fullatt = set(getattr(vcfg, "fullatt_block_indexes", []) or [])
+        win_ctx = (window_size // vcfg.patch_size) ** 2
+    else:
+        fullatt = set(range(depth))
+        win_ctx = N
 
     f = 2 * N * (vcfg.in_channels * vcfg.temporal_patch_size * vcfg.patch_size ** 2) * d
     for i in range(min(k, depth)):
@@ -333,6 +372,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-path", default=DEFAULT_MODEL)
+    p.add_argument("--model-family", default="auto",
+                   choices=["auto", "qwen2_5", "qwen3_5"],
+                   help="模型家族。auto=从 config.json 的 model_type 猜")
     p.add_argument("--random-init", action="store_true",
                    help="不加载权重, 纯 config 初始化 (测速结果一致)")
     p.add_argument("--tasks", nargs="+", default=["paths", "breakdown"],
@@ -352,23 +394,37 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
 
     print(f"[load] {args.model_path}  random_init={args.random_init}")
-    visual, vcfg = build_visual(args.model_path, args.random_init)
+    visual, vcfg, family = build_visual(args.model_path, args.random_init,
+                                        args.model_family)
+    depth = len(visual.blocks)
     n_params = sum(x.numel() for x in visual.parameters()) / 1e6
-    print(f"[info] ViT params={n_params:.0f}M  depth={len(visual.blocks)}"
+    print(f"[info] family={family}  ViT params={n_params:.0f}M  depth={depth}"
+          f"  patch={vcfg.patch_size}"
           f"  fullatt_blocks={getattr(vcfg, 'fullatt_block_indexes', None)}"
           f"  gpu={torch.cuda.get_device_name(0)}")
 
-    unit = 28 * args.hr_scale
+    unit = vcfg.patch_size * vcfg.spatial_merge_size * args.hr_scale
     resolutions = []
     for R in args.resolutions:
         if R % unit == 0:
             resolutions.append(R)
         else:
-            print(f"  [skip] R={R} 非 {unit} 的倍数 (28 x hr_scale)")
+            print(f"  [skip] R={R} 非 {unit} 的倍数 "
+                  f"(patch{vcfg.patch_size} x merge{vcfg.spatial_merge_size} "
+                  f"x hr_scale{args.hr_scale})")
+
+    # k > depth 的早退点没有意义 (等价于不早退)
+    early_ks = [k for k in args.early_ks if k <= depth]
+    if len(early_ks) != len(args.early_ks):
+        dropped = [k for k in args.early_ks if k > depth]
+        print(f"  [skip] early-ks {dropped} > ViT depth {depth}")
+    args.early_ks = early_ks
 
     payload = {
         "meta": {
             "model": args.model_path, "random_init": args.random_init,
+            "family": family, "vit_depth": depth,
+            "patch_size": vcfg.patch_size,
             "gpu": torch.cuda.get_device_name(0),
             "torch": torch.__version__, "dtype": str(DTYPE),
             "hr_scale": args.hr_scale, "warmup": args.warmup, "iters": args.iters,

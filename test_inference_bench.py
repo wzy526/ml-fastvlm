@@ -73,6 +73,7 @@ import time
 import json
 import argparse
 import contextlib
+import math
 import traceback
 from collections import defaultdict
 from typing import Optional, Dict, List, Tuple, Any
@@ -110,15 +111,27 @@ DEFAULT_DAT_EXTRA_ARGS = {
 }
 
 # ─── 模型常量 ────────────────────────────────────────────────────────────────
+# 默认是 qwen2_5 家族的几何; main() 会按 --model-family 覆盖这三个全局量
+# (qwen3_5 的 ViT 是 patch 16, 所以 FACTOR=32 而不是 28)。
 PATCH_SIZE = 14
 MERGE_SIZE = 2
 FACTOR     = PATCH_SIZE * MERGE_SIZE   # 28 = pixels per merged token
+
+# 每个家族的 ViT 几何; DAT/native 的类与 convert 函数在 _load_family() 里按需导入
+# (import 本身很贵, 且两个 modeling 文件都会注册 AutoConfig)。
+FAMILY_GEOMETRY = {
+    'qwen2_5': {'patch_size': 14, 'merge_size': 2},
+    'qwen3_5': {'patch_size': 16, 'merge_size': 2},
+}
 
 DTYPE  = torch.bfloat16
 DEVICE = 'cuda'
 
 # ─── 默认 sweep 参数 ─────────────────────────────────────────────────────────
+# R 必须能被 FACTOR*hr_scale 整除 (qwen2_5→84, qwen3_5→96)，所以两个家族的
+# 默认格点不同; 672 / 1344 / 2016 两边都合法，可直接跨家族对比。
 DEFAULT_RESOLUTIONS  = [672, 1008, 1344, 2016]
+DEFAULT_RESOLUTIONS_Q35 = [672, 1152, 1344, 2016]
 DEFAULT_BATCH_SIZES  = [1, 2, 4, 8, 16]
 DEFAULT_DECODE_LENS  = [128]
 DEFAULT_WARMUP       = 2
@@ -126,8 +139,95 @@ DEFAULT_ITERS        = 3
 DEFAULT_LAYERWISE_R  = [1344]
 DEFAULT_QUESTION     = "Describe this image in detail."
 
-ALL_TASKS = ['prefill', 'batch_decode', 'memory', 'layerwise', 'vit_paths']
+ALL_TASKS = ['prefill', 'batch_decode', 'memory', 'layerwise', 'vit_paths',
+             'pareto']
 DEFAULT_TASKS = ['prefill', 'batch_decode', 'memory']
+
+# ─── pareto 任务: 与 eval_pixel_sweep.sh 对齐的口径 ──────────────────────────
+# 同一条 LLM-token 轴 (每 token = FACTOR² 像素), 于是延迟点能和精度点配对。
+DEFAULT_PARETO_TOKENS = [256, 640, 1280, 2560, 6400, 11520]
+# DAT HR 分支的像素上限, 等于训练时的 hd_max
+DEFAULT_HR_CAP = 5017600
+# 像素预算下界, 与 eval 脚本的 MIN_PIXELS 一致
+MIN_PIXELS = 28224
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 模型家族分派
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _read_model_type(path: str) -> str:
+    """读 config.json 的 model_type，不触发 AutoConfig 注册。"""
+    cfg_path = os.path.join(path, 'config.json')
+    if not os.path.isfile(cfg_path):
+        return ''
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return ''
+    return str(cfg.get('model_type', ''))
+
+
+def detect_family(*paths: str) -> str:
+    """从 ckpt 的 config.json（回退到路径名）猜模型家族。"""
+    for p in paths:
+        if not p:
+            continue
+        probe = f"{_read_model_type(p)} {p}".lower()
+        if 'qwen3_5' in probe or 'qwen3.5' in probe:
+            return 'qwen3_5'
+        if 'qwen2_5' in probe or 'qwen2.5' in probe:
+            return 'qwen2_5'
+    return 'qwen2_5'
+
+
+def _load_family(family: str) -> Dict[str, Any]:
+    """按家族导入 DAT 类 / convert 函数 / 原生对照类。
+
+    两个 modeling 文件都会在 import 时注册 AutoConfig，所以只导入需要的那个。
+    """
+    if family == 'qwen3_5':
+        from llava.model.language_model.modeling_qwen3_5_dat import (
+            Qwen3_5DATForConditionalGeneration, convert_qwen3_5_to_dat,
+            build_dat_layers_string, _USE_FA4,
+        )
+        from transformers import Qwen3_5ForConditionalGeneration
+
+        def build_layers(base_cfg):
+            # Qwen3.5 是 hybrid attention: 'D' 只能替换 full_attention 层，
+            # 所以层串必须由 layer_types 推导，不能按 i % 6 均匀撒点。
+            text_cfg = getattr(base_cfg, 'text_config', base_cfg)
+            return build_dat_layers_string(text_cfg, 'auto')
+
+        return {
+            'dat_cls': Qwen3_5DATForConditionalGeneration,
+            'convert_fn': convert_qwen3_5_to_dat,
+            'native_cls': Qwen3_5ForConditionalGeneration,
+            'native_name': 'Qwen3.5-VL',
+            'build_layers': build_layers,
+            # qwen3_5 只暴露 _USE_FA4 布尔量，没有 qwen2_5 的 _FA_BACKEND 字符串
+            'fa_backend': 'fa4' if _USE_FA4 else 'fa2',
+        }
+
+    from llava.model.language_model.modeling_qwen2_5vl_dat import (
+        Qwen2_5_VLDATForConditionalGeneration, convert_qwen2_5vl_to_dat, _FA_BACKEND,
+    )
+    from transformers import Qwen2_5_VLForConditionalGeneration
+
+    def build_layers(base_cfg):
+        n = getattr(base_cfg, 'num_hidden_layers', None) or \
+            base_cfg.text_config.num_hidden_layers
+        return ''.join('D' if i % 6 == 0 else 'L' for i in range(n))
+
+    return {
+        'dat_cls': Qwen2_5_VLDATForConditionalGeneration,
+        'convert_fn': convert_qwen2_5vl_to_dat,
+        'native_cls': Qwen2_5_VLForConditionalGeneration,
+        'native_name': 'Qwen2.5-VL',
+        'build_layers': build_layers,
+        'fa_backend': _FA_BACKEND,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -139,6 +239,16 @@ def visual_tokens(inputs) -> int:
     thw = inputs["image_grid_thw"][0]
     t, h, w = thw[0].item(), thw[1].item(), thw[2].item()
     return (h // MERGE_SIZE) * (w // MERGE_SIZE) * t
+
+
+def mm_kw(inp) -> Dict[str, Any]:
+    """Qwen3.5 的 M-RoPE 要求显式传 processor 产出的 mm_token_type_ids。
+
+    qwen2_5 的 processor 不产出这个键，此时返回空 dict —— 于是同一份调用代码
+    对两个家族都成立。只对进 LLM 的输入需要（HD 分支不进 LLM）。
+    """
+    v = inp.get("mm_token_type_ids")
+    return {} if v is None else {"mm_token_type_ids": v}
 
 
 def make_text(processor, img: Image.Image, question: str = DEFAULT_QUESTION) -> str:
@@ -275,6 +385,43 @@ def process_dat(processor, img, text, R, hr_scale, batch=1, device=DEVICE):
     )
 
 
+def process_base_px(processor, img, text, px, batch=1, device=DEVICE):
+    """Base 的像素预算口径 (max_pixels=px), 与 eval_pixel_sweep.sh 完全一致。
+
+    prefill/memory 那几个任务用 min=max=R² 精确控制方形分辨率; pareto 任务要跟
+    精度评测同口径, 所以走 (MIN_PIXELS, px) 这个区间让 smart_resize 自己定形。
+    """
+    images = [img] * batch
+    texts  = [text] * batch
+    inp = processor(images=images, text=texts, return_tensors="pt",
+                    padding=True, min_pixels=MIN_PIXELS, max_pixels=px)
+    return {k: v.to(device) for k, v in inp.items()}
+
+
+def process_dat_px(processor, img, text, lr_px, hr_px, batch=1, device=DEVICE):
+    """DAT 的像素预算口径: LR 定 LLM token 数, HR 只喂 cross-attn (0 LLM token)。
+
+    对应 eval_pixel_sweep.sh 的 lr_max_pixels=lr_px + max_pixels=hr_px。
+    """
+    images = [img] * batch
+    texts  = [text] * batch
+    inp_lr = processor(images=images, text=texts, return_tensors="pt",
+                       padding=True, min_pixels=MIN_PIXELS, max_pixels=lr_px)
+    inp_hd = processor(images=images, text=["<|im_start|>"] * batch,
+                       return_tensors="pt", padding=True,
+                       min_pixels=MIN_PIXELS, max_pixels=hr_px)
+    return (
+        {k: v.to(device) for k, v in inp_lr.items()},
+        {k: v.to(device) for k, v in inp_hd.items()},
+    )
+
+
+def grid_hw(inputs) -> Tuple[int, int]:
+    """从 image_grid_thw 反推实际送进 ViT 的像素高宽。"""
+    thw = inputs["image_grid_thw"][0]
+    return int(thw[1].item()) * PATCH_SIZE, int(thw[2].item()) * PATCH_SIZE
+
+
 def process_fair_hd(processor, img, text, R, batch=1, device=DEVICE):
     """
     Fair-HD baseline（仅 vit_paths 任务用）:
@@ -291,6 +438,142 @@ def process_fair_hd(processor, img, text, R, batch=1, device=DEVICE):
 def make_synthetic_image(R: int) -> Image.Image:
     """合成一张 R×R 图（控制分辨率精确）。"""
     return Image.new("RGB", (R, R), color=(100, 149, 237))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Task: pareto — latency at exactly the configs the accuracy sweep used
+#   x 轴是 LLM visual token 预算, 与 eval_pixel_sweep.sh 一一对应, 于是每个精度
+#   点都能配一个延迟点, 直接画 latency-accuracy 曲线。
+# ════════════════════════════════════════════════════════════════════════════════
+
+def task_pareto(dat_model, processor, img, tok, hr_cap, warmup, iters,
+                qwen_model=None):
+    """单个 token 预算下的 base / DAT / 原生 Qwen prefill 延迟。
+
+    tok: 目标 LLM visual token 数 (256/640/... 与精度评测同一格点)。
+    hr_cap: DAT HR 分支的像素上限 (训练时的 hd_max, 默认 5017600)。
+
+    DAT 的 HR 像素 = min(lr_px * hr_scale^2, hr_cap) —— 与 eval 脚本一致。
+    """
+    px = tok * (FACTOR ** 2)
+    hr_scale = dat_model.config.dat_extra_args.get('hr_scale', 3)
+    hr_px = min(px * hr_scale ** 2, hr_cap)
+
+    text = make_text(processor, img)
+    inp_base       = process_base_px(processor, img, text, px)
+    inp_lr, inp_hd = process_dat_px(processor, img, text, px, hr_px)
+
+    pv_base  = inp_base['pixel_values'].to(DTYPE)
+    thw_base = inp_base['image_grid_thw']
+    iids_b   = inp_base['input_ids']
+    amask_b  = inp_base.get('attention_mask')
+    mm_b     = mm_kw(inp_base)
+
+    pv_lr   = inp_lr['pixel_values'].to(DTYPE)
+    thw_lr  = inp_lr['image_grid_thw']
+    iids_l  = inp_lr['input_ids']
+    amask_l = inp_lr.get('attention_mask')
+    mm_l    = mm_kw(inp_lr)
+
+    pv_hd  = inp_hd['pixel_values'].to(DTYPE)
+    thw_hd = inp_hd['image_grid_thw']
+
+    base_h, base_w = grid_hw(inp_base)
+    lr_h, lr_w     = grid_hw(inp_lr)
+    hd_h, hd_w     = grid_hw(inp_hd)
+
+    def fwd_base():
+        with torch.no_grad():
+            dat_model(input_ids=iids_b, attention_mask=amask_b,
+                      pixel_values=pv_base, image_grid_thw=thw_base,
+                      pixel_values_hd=None, image_grid_thw_hd=None,
+                      use_cache=False, **mm_b)
+
+    def fwd_dat():
+        with torch.no_grad():
+            dat_model(input_ids=iids_l, attention_mask=amask_l,
+                      pixel_values=pv_lr, image_grid_thw=thw_lr,
+                      pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
+                      use_cache=False, **mm_l)
+
+    def fwd_vit_hd():
+        with torch.no_grad():
+            dat_model._generate_hd_features(pv_hd, thw_hd)
+
+    def fwd_qwen():
+        with torch.no_grad():
+            qwen_model(input_ids=iids_b, attention_mask=amask_b,
+                       pixel_values=pv_base, image_grid_thw=thw_base,
+                       use_cache=False, **mm_b)
+
+    for _ in range(warmup):
+        fwd_base(); fwd_dat(); fwd_vit_hd()
+        if qwen_model is not None:
+            fwd_qwen()
+    torch.cuda.synchronize()
+
+    t_base, mem_base = benchmark_with_memory(fwd_base, warmup=0, iters=iters)
+    t_dat,  mem_dat  = benchmark_with_memory(fwd_dat,  warmup=0, iters=iters)
+
+    _set_vit_path(dat_model, 'fused')
+    try:
+        t_dat_fused, mem_dat_fused = benchmark_with_memory(
+            fwd_dat, warmup=max(1, warmup), iters=iters)
+    finally:
+        _set_vit_path(dat_model, 'separate')
+
+    t_vit_hd = benchmark_fn(fwd_vit_hd, warmup=0, iters=iters)
+    t_qwen, mem_qwen = (
+        benchmark_with_memory(fwd_qwen, warmup=0, iters=iters)
+        if qwen_model is not None else (None, None)
+    )
+
+    return dict(
+        tok=tok, px=px, hr_px=hr_px, hr_capped=bool(px * hr_scale ** 2 > hr_cap),
+        base_res=f"{base_h}x{base_w}", lr_res=f"{lr_h}x{lr_w}",
+        hd_res=f"{hd_h}x{hd_w}",
+        base_vis_tokens=visual_tokens(inp_base),
+        lr_vis_tokens=visual_tokens(inp_lr),
+        hd_vis_tokens=visual_tokens(inp_hd),
+        nq_base=iids_b.shape[1], nq_lr=iids_l.shape[1],
+        t_base_ms=t_base, t_dat_ms=t_dat, t_dat_fused_ms=t_dat_fused,
+        t_qwen_ms=t_qwen, t_vit_hd_ms=t_vit_hd,
+        speedup_dat=(t_qwen / t_dat) if (t_qwen and t_dat) else None,
+        speedup_fused=(t_qwen / t_dat_fused) if (t_qwen and t_dat_fused) else None,
+        mem_base_mb=mem_base, mem_dat_mb=mem_dat, mem_qwen_mb=mem_qwen,
+    )
+
+
+def run_pareto_sweep(dat_model, processor, img, toks, hr_cap, warmup, iters,
+                     save_cb=None, qwen_model=None, out=None):
+    # out 是 payload 里那个 list 本身, 于是 save_cb() 能看到已完成的点
+    results = out if out is not None else []
+    for tok in toks:
+        with oom_guard(f"pareto tok={tok}") as guard:
+            guard['result'] = task_pareto(dat_model, processor, img, tok, hr_cap,
+                                          warmup=warmup, iters=iters,
+                                          qwen_model=qwen_model)
+            guard['ok'] = True
+
+        if guard['ok']:
+            r = guard['result']
+            cap = ' (HR capped)' if r['hr_capped'] else ''
+            print(f"  tok={tok:>6}  base={r['base_res']:>9} "
+                  f"({r['base_vis_tokens']:>5} vis)  "
+                  f"LR={r['lr_res']:>9} HD={r['hd_res']:>9}{cap}")
+            qs = f"{r['t_qwen_ms']:>7.1f}" if r['t_qwen_ms'] else '      -'
+            sp = f"{r['speedup_dat']:.2f}x" if r['speedup_dat'] else '    -'
+            spf = f"{r['speedup_fused']:.2f}x" if r['speedup_fused'] else '    -'
+            print(f"             qwen={qs}ms  base={r['t_base_ms']:>7.1f}ms  "
+                  f"dat={r['t_dat_ms']:>7.1f}ms ({sp})  "
+                  f"fused={r['t_dat_fused_ms']:>7.1f}ms ({spf})  "
+                  f"vit_hd={r['t_vit_hd_ms']:>6.1f}ms")
+            results.append(r)
+        else:
+            results.append(dict(tok=tok, oom=guard['oom'], error=guard['error']))
+        if save_cb:
+            save_cb()
+    return results
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -332,6 +615,9 @@ def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters,
     pv_hd   = inp_hd['pixel_values'].to(DTYPE)
     thw_hd  = inp_hd['image_grid_thw']
 
+    mm_b = mm_kw(inp_base)
+    mm_l = mm_kw(inp_lr)
+
     nq_base = iids_b.shape[1]
     nq_lr   = iids_l.shape[1]
     n_vis_b = visual_tokens(inp_base)
@@ -347,14 +633,14 @@ def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters,
             dat_model(input_ids=iids_b, attention_mask=amask_b,
                       pixel_values=pv_base, image_grid_thw=thw_base,
                       pixel_values_hd=None, image_grid_thw_hd=None,
-                      use_cache=False)
+                      use_cache=False, **mm_b)
 
     def fwd_dat_e2e():
         with torch.no_grad():
             dat_model(input_ids=iids_l, attention_mask=amask_l,
                       pixel_values=pv_lr, image_grid_thw=thw_lr,
                       pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
-                      use_cache=False)
+                      use_cache=False, **mm_l)
 
     def fwd_vit_hd():
         with torch.no_grad():
@@ -369,14 +655,14 @@ def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters,
         with torch.no_grad():
             dat_model(input_ids=iids_l, attention_mask=amask_l,
                       pixel_values=pv_lr, image_grid_thw=thw_lr,
-                      image_hd_features=hd_feats, use_cache=False)
+                      image_hd_features=hd_feats, use_cache=False, **mm_l)
 
     def fwd_qwen_e2e():
-        # 原生 Qwen2.5-VL 官方类, 同 Base(R) 输入
+        # 原生 Qwen 官方类, 同 Base(R) 输入
         with torch.no_grad():
             qwen_model(input_ids=iids_b, attention_mask=amask_b,
                        pixel_values=pv_base, image_grid_thw=thw_base,
-                       use_cache=False)
+                       use_cache=False, **mm_b)
 
     # 联合 warmup（所有路径）
     for _ in range(warmup):
@@ -390,10 +676,13 @@ def task_prefill(dat_model, processor, img, R, hr_scale, warmup, iters,
     t_dat_e2e,  mem_dat  = benchmark_with_memory(fwd_dat_e2e,     warmup=0, iters=iters)
 
     # DAT E2E with fused ViT (LR+HD 单次 visual() 调用)
+    # finally 是必需的: fused 抛异常时若不还原 path, 之后每个任务都会跑 fused
     _set_vit_path(dat_model, 'fused')
-    t_dat_e2e_fused, mem_dat_fused = benchmark_with_memory(
-        fwd_dat_e2e, warmup=max(1, warmup), iters=iters)
-    _set_vit_path(dat_model, 'separate')
+    try:
+        t_dat_e2e_fused, mem_dat_fused = benchmark_with_memory(
+            fwd_dat_e2e, warmup=max(1, warmup), iters=iters)
+    finally:
+        _set_vit_path(dat_model, 'separate')
 
     t_vit_hd      = benchmark_fn(fwd_vit_hd,      warmup=0, iters=iters)
     t_vit_lr      = benchmark_fn(fwd_vit_lr,      warmup=0, iters=iters)
@@ -548,13 +837,14 @@ def task_batch_decode(dat_model, processor, img, R, B, T, hr_scale,
                                attention_mask=inp.get('attention_mask'),
                                pixel_values=inp['pixel_values'].to(DTYPE),
                                image_grid_thw=inp['image_grid_thw'],
-                               use_cache=True)
+                               use_cache=True, **mm_kw(inp))
 
             gen_inputs = dict(
                 input_ids=inp['input_ids'],
                 attention_mask=inp.get('attention_mask'),
                 pixel_values=inp['pixel_values'].to(DTYPE),
                 image_grid_thw=inp['image_grid_thw'],
+                **mm_kw(inp),
             )
 
             t_prefill = _measure_prefill_only(qwen_model, prefill_only,
@@ -600,7 +890,7 @@ def task_batch_decode(dat_model, processor, img, R, B, T, hr_scale,
                           pixel_values=inp['pixel_values'].to(DTYPE),
                           image_grid_thw=inp['image_grid_thw'],
                           pixel_values_hd=None, image_grid_thw_hd=None,
-                          use_cache=True)
+                          use_cache=True, **mm_kw(inp))
 
         gen_inputs = dict(
             input_ids=inp['input_ids'],
@@ -608,6 +898,7 @@ def task_batch_decode(dat_model, processor, img, R, B, T, hr_scale,
             pixel_values=inp['pixel_values'].to(DTYPE),
             image_grid_thw=inp['image_grid_thw'],
             pixel_values_hd=None, image_grid_thw_hd=None,
+            **mm_kw(inp),
         )
 
         t_prefill = _measure_prefill_only(dat_model, prefill_only,
@@ -653,7 +944,7 @@ def task_batch_decode(dat_model, processor, img, R, B, T, hr_scale,
                           image_grid_thw=inp_lr['image_grid_thw'],
                           pixel_values_hd=inp_hd['pixel_values'].to(DTYPE),
                           image_grid_thw_hd=inp_hd['image_grid_thw'],
-                          use_cache=True)
+                          use_cache=True, **mm_kw(inp_lr))
 
         gen_inputs = dict(
             input_ids=inp_lr['input_ids'],
@@ -662,6 +953,7 @@ def task_batch_decode(dat_model, processor, img, R, B, T, hr_scale,
             image_grid_thw=inp_lr['image_grid_thw'],
             pixel_values_hd=inp_hd['pixel_values'].to(DTYPE),
             image_grid_thw_hd=inp_hd['image_grid_thw'],
+            **mm_kw(inp_lr),
         )
 
         t_prefill = _measure_prefill_only(dat_model, prefill_only,
@@ -743,7 +1035,7 @@ def task_memory(dat_model, processor, img, R, B, hr_scale, warmup=1, iters=2):
                           pixel_values=inp['pixel_values'].to(DTYPE),
                           image_grid_thw=inp['image_grid_thw'],
                           pixel_values_hd=None, image_grid_thw_hd=None,
-                          use_cache=False)
+                          use_cache=False, **mm_kw(inp))
 
         t_ms, mem_mb = benchmark_with_memory(fwd, warmup=warmup, iters=iters)
         guard['ok'] = True
@@ -773,7 +1065,7 @@ def task_memory(dat_model, processor, img, R, B, hr_scale, warmup=1, iters=2):
                           image_grid_thw=inp_lr['image_grid_thw'],
                           pixel_values_hd=inp_hd['pixel_values'].to(DTYPE),
                           image_grid_thw_hd=inp_hd['image_grid_thw'],
-                          use_cache=False)
+                          use_cache=False, **mm_kw(inp_lr))
 
         t_ms, mem_mb = benchmark_with_memory(fwd, warmup=warmup, iters=iters)
         guard['ok'] = True
@@ -859,6 +1151,9 @@ def task_layerwise(dat_model, processor, img, R, hr_scale, dat_layer_indices,
     pv_hd   = inp_hd['pixel_values'].to(DTYPE)
     thw_hd  = inp_hd['image_grid_thw']
 
+    mm_b = mm_kw(inp_base)
+    mm_l = mm_kw(inp_lr)
+
     with torch.no_grad():
         hd_feats = dat_model._generate_hd_features(pv_hd, thw_hd)
 
@@ -867,13 +1162,13 @@ def task_layerwise(dat_model, processor, img, R, hr_scale, dat_layer_indices,
             dat_model(input_ids=iids_b, attention_mask=amask_b,
                       pixel_values=pv_base, image_grid_thw=thw_base,
                       pixel_values_hd=None, image_grid_thw_hd=None,
-                      use_cache=False)
+                      use_cache=False, **mm_b)
 
     def fwd_dat():
         with torch.no_grad():
             dat_model(input_ids=iids_l, attention_mask=amask_l,
                       pixel_values=pv_lr, image_grid_thw=thw_lr,
-                      image_hd_features=hd_feats, use_cache=False)
+                      image_hd_features=hd_feats, use_cache=False, **mm_l)
 
     for _ in range(warmup):
         fwd_base(); fwd_dat()
@@ -956,6 +1251,9 @@ def task_vit_paths(dat_model, processor, img, R, hr_scale, warmup=2, iters=3):
     nq_lr  = iids_l.shape[1]
     nq_hd  = iids_hdf.shape[1]
 
+    mm_l   = mm_kw(inp_lr)
+    mm_hdf = mm_kw(inp_hd_full)
+
     def fwd_hd_enc():
         with torch.no_grad():
             dat_model._generate_hd_features(pv_hd, thw_hd)
@@ -967,7 +1265,7 @@ def task_vit_paths(dat_model, processor, img, R, hr_scale, warmup=2, iters=3):
                 dat_model(input_ids=iids_l, attention_mask=amask_l,
                           pixel_values=pv_lr, image_grid_thw=thw_lr,
                           pixel_values_hd=pv_hd, image_grid_thw_hd=thw_hd,
-                          use_cache=False)
+                          use_cache=False, **mm_l)
         return _f
 
     def fwd_fair_hd():
@@ -976,7 +1274,7 @@ def task_vit_paths(dat_model, processor, img, R, hr_scale, warmup=2, iters=3):
             dat_model(input_ids=iids_hdf, attention_mask=amask_hdf,
                       pixel_values=pv_hdf, image_grid_thw=thw_hdf,
                       pixel_values_hd=None, image_grid_thw_hd=None,
-                      use_cache=False)
+                      use_cache=False, **mm_hdf)
 
     def fwd_lr_only():
         _set_vit_path(dat_model, 'separate')
@@ -984,7 +1282,7 @@ def task_vit_paths(dat_model, processor, img, R, hr_scale, warmup=2, iters=3):
             dat_model(input_ids=iids_l, attention_mask=amask_l,
                       pixel_values=pv_lr, image_grid_thw=thw_lr,
                       pixel_values_hd=None, image_grid_thw_hd=None,
-                      use_cache=False)
+                      use_cache=False, **mm_l)
 
     t_hd_enc = benchmark_fn(fwd_hd_enc,               warmup=warmup, iters=iters)
     t_sep    = benchmark_fn(make_fwd_dat('separate'), warmup=warmup, iters=iters)
@@ -1310,9 +1608,14 @@ def render_markdown(payload: Dict[str, Any]) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Qwen2.5-VL DAT 统一推理基准测试",
+        description="Qwen2.5-VL / Qwen3.5 DAT 统一推理基准测试",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--model-family", type=str, default='auto',
+                        choices=['auto', 'qwen2_5', 'qwen3_5'],
+                        help="模型家族。auto=从 ckpt 的 config.json 猜。"
+                             "决定 DAT 类、原生对照类和 ViT patch size "
+                             "(qwen2_5→28px/token, qwen3_5→32px/token)")
     parser.add_argument("--base-model",  type=str, default=DEFAULT_BASE_MODEL)
     parser.add_argument("--dat-ckpt",    type=str, default=DEFAULT_DAT_CKPT)
     parser.add_argument("--vstar-dir",   type=str, default=DEFAULT_VSTAR_DIR)
@@ -1320,7 +1623,7 @@ def main():
     parser.add_argument("--synthetic",   action="store_true",
                         help="使用合成图像（不依赖 vstar 数据集）")
     parser.add_argument("--no-native",   action="store_true",
-                        help="不加载原生 Qwen2.5-VL 对照基线（省显存/时间）")
+                        help="不加载原生 Qwen 对照基线（省显存/时间）")
     parser.add_argument("--question",    type=str, default=DEFAULT_QUESTION)
     parser.add_argument("--hd-early-k",  type=int, default=0,
                         help="HD ViT 早退: 只跑前 k 个 vision block (0=关)。"
@@ -1334,8 +1637,11 @@ def main():
                         default=DEFAULT_TASKS,
                         help=f"待跑的任务，可选: {ALL_TASKS} 或 'all'。默认: {DEFAULT_TASKS}")
 
-    parser.add_argument("--resolutions", type=int, nargs="+",
-                        default=DEFAULT_RESOLUTIONS)
+    parser.add_argument("--resolutions", type=int, nargs="+", default=None,
+                        help=f"HD 分辨率列表。必须是 FACTOR*hr_scale 的倍数, "
+                             f"所以默认值随家族不同 "
+                             f"(qwen2_5: {DEFAULT_RESOLUTIONS}, "
+                             f"qwen3_5: {DEFAULT_RESOLUTIONS_Q35})")
     parser.add_argument("--batch-sizes", type=int, nargs="+",
                         default=DEFAULT_BATCH_SIZES,
                         help="batch_decode / memory 用的 batch 列表")
@@ -1345,6 +1651,15 @@ def main():
     parser.add_argument("--layerwise-r", type=int, nargs="+",
                         default=DEFAULT_LAYERWISE_R,
                         help="layerwise 任务用的分辨率（默认只测一个 R 减少开销）")
+
+    parser.add_argument("--pareto-tokens", type=int, nargs="+",
+                        default=DEFAULT_PARETO_TOKENS,
+                        help="pareto 任务的 LLM visual token 预算列表。"
+                             "与 eval_pixel_sweep.sh 同一格点, 于是每个精度点"
+                             "都能配一个延迟点")
+    parser.add_argument("--hr-cap", type=int, default=DEFAULT_HR_CAP,
+                        help="pareto 任务里 DAT HR 分支的像素上限 "
+                             "(= 训练时的 hd_max)")
 
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--iters",  type=int, default=DEFAULT_ITERS)
@@ -1373,16 +1688,31 @@ def main():
     out_json = os.path.join(args.output_dir, f"bench_{tag}.json")
     out_md   = os.path.join(args.output_dir, f"bench_{tag}.md")
 
+    # ── 模型家族与 ViT 几何 ─────────────────────────────────────────────────
+    global PATCH_SIZE, MERGE_SIZE, FACTOR
+    family = args.model_family
+    if family == 'auto':
+        family = detect_family(args.dat_ckpt, args.base_model)
+    geo = FAMILY_GEOMETRY[family]
+    PATCH_SIZE = geo['patch_size']
+    MERGE_SIZE = geo['merge_size']
+    FACTOR     = PATCH_SIZE * MERGE_SIZE
+
+    if args.resolutions is None:
+        args.resolutions = (DEFAULT_RESOLUTIONS_Q35 if family == 'qwen3_5'
+                            else DEFAULT_RESOLUTIONS)
+
     # ── 模型加载 ────────────────────────────────────────────────────────────
     from transformers import AutoConfig, AutoProcessor
-    from llava.model.language_model.modeling_qwen2_5vl_dat import (
-        Qwen2_5_VLDATForConditionalGeneration, convert_qwen2_5vl_to_dat, _FA_BACKEND,
-    )
+    fam = _load_family(family)
+    _FA_BACKEND = fam['fa_backend']
 
     print(f"PyTorch  : {torch.__version__}")
     print(f"CUDA     : {torch.version.cuda}")
     print(f"GPU      : {torch.cuda.get_device_name(0)}")
     print(f"FA backend: {_FA_BACKEND}")
+    print(f"Family   : {family} (patch={PATCH_SIZE}, merge={MERGE_SIZE}, "
+          f"factor={FACTOR})")
     print(f"DAT ckpt : {args.dat_ckpt or '(none — 从 base 构建, DAT 模块随机初始化)'}")
     print(f"Tasks    : {tasks}")
     print()
@@ -1391,30 +1721,27 @@ def main():
 
     if args.dat_ckpt:
         print(f"Loading DAT model from ckpt (attn={args.attn_impl}) …")
-        dat_model = Qwen2_5_VLDATForConditionalGeneration.from_pretrained(
+        dat_model = fam['dat_cls'].from_pretrained(
             args.dat_ckpt, torch_dtype=DTYPE, device_map={"": 0},
             attn_implementation=args.attn_impl,
         ).eval()
     else:
         # 测速模式: base 权重 + 随机初始化 DAT 模块 (耗时与训练权重一致)
         base_cfg = AutoConfig.from_pretrained(args.base_model)
-        n_layers = getattr(base_cfg, 'num_hidden_layers', None) or \
-                   base_cfg.text_config.num_hidden_layers
         dat_extra_args = dict(DEFAULT_DAT_EXTRA_ARGS)
-        dat_extra_args['layers'] = ''.join(
-            'D' if i % 6 == 0 else 'L' for i in range(n_layers))
-        print(f"Building DAT from base ({n_layers} layers, "
-              f"pattern={dat_extra_args['layers']}, attn={args.attn_impl}) …")
-        dat_model = convert_qwen2_5vl_to_dat(
+        dat_extra_args['layers'] = fam['build_layers'](base_cfg)
+        print(f"Building DAT from base (pattern={dat_extra_args['layers']}, "
+              f"attn={args.attn_impl}) …")
+        dat_model = fam['convert_fn'](
             args.base_model, dat_extra_args, torch_dtype=DTYPE,
             attn_implementation=args.attn_impl,
         ).to(DEVICE).eval()
 
     qwen_model = None
     if not args.no_native:
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        print(f"Loading native Qwen2.5-VL (官方类, 对照基线, attn={args.attn_impl}) …")
-        qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        print(f"Loading native {fam['native_name']} (官方类, 对照基线, "
+              f"attn={args.attn_impl}) …")
+        qwen_model = fam['native_cls'].from_pretrained(
             args.base_model, torch_dtype=DTYPE, device_map={"": 0},
             attn_implementation=args.attn_impl,
         ).eval()
@@ -1440,8 +1767,14 @@ def main():
     print(f"  GPU mem after load: {torch.cuda.memory_allocated()/(1024**3):.2f} GB")
 
     # ── 准备图像 ────────────────────────────────────────────────────────────
+    # 合成图必须不小于任何一档预算, 否则 smart_resize 会放大, 实测的就不是目标
+    # 分辨率了。pareto 任务的预算按像素给, 换算成边长参与取最大。
+    max_R = max(args.resolutions)
+    if 'pareto' in tasks:
+        need_px = max(max(args.pareto_tokens) * (FACTOR ** 2), args.hr_cap)
+        max_R = max(max_R, math.ceil(math.sqrt(need_px)))
+
     if args.synthetic or not os.path.exists(args.vstar_jsonl):
-        max_R = max(args.resolutions)
         print(f"\nUsing synthetic image {max_R}×{max_R}")
         img = make_synthetic_image(max_R)
     else:
@@ -1459,7 +1792,6 @@ def main():
                     except Exception:
                         continue
         if img is None:
-            max_R = max(args.resolutions)
             print(f"  no vstar image found, fallback to synthetic {max_R}×{max_R}")
             img = make_synthetic_image(max_R)
 
@@ -1479,6 +1811,9 @@ def main():
         'decode_lens': args.decode_lens,
         'warmup':     args.warmup,
         'iters':      args.iters,
+        'pareto_tokens': args.pareto_tokens,
+        'hr_cap':     args.hr_cap,
+        'tok_px':     FACTOR ** 2,
         'use_synthetic': args.synthetic or not os.path.exists(args.vstar_jsonl),
         'timestamp':  time.strftime('%Y-%m-%d %H:%M:%S'),
     }
@@ -1492,6 +1827,19 @@ def main():
     save()
 
     # ── 跑各任务 ────────────────────────────────────────────────────────────
+    if 'pareto' in tasks:
+        print(f"\n{'═'*88}\n[Task: pareto] latency at the accuracy-sweep configs"
+              f"\n{'═'*88}")
+        print(f"  token grid = {args.pareto_tokens}  "
+              f"(1 token = {FACTOR ** 2} px)   HR cap = {args.hr_cap}")
+        payload['pareto'] = []
+        run_pareto_sweep(
+            dat_model, processor, img,
+            toks=args.pareto_tokens, hr_cap=args.hr_cap,
+            warmup=args.warmup, iters=args.iters, save_cb=save,
+            qwen_model=qwen_model, out=payload['pareto'],
+        )
+
     if 'prefill' in tasks:
         print(f"\n{'═'*88}\n[Task: prefill] E2E + Breakdown\n{'═'*88}")
         payload['prefill'] = run_prefill_sweep(
