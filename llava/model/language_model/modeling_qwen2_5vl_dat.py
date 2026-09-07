@@ -109,6 +109,10 @@ _flash_attn_func = None
 _flash_attn_varlen_func = None
 _FA_HAS_SOFTMAX_LSE = False
 
+from ._cutlass_warn_filter import install as _install_cutlass_warn_filter
+
+_install_cutlass_warn_filter()
+
 if _FA_BACKEND == "fa4":
     from flash_attn.cute import flash_attn_func as _flash_attn_func          # type: ignore[assignment]
     from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore[assignment]
