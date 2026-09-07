@@ -35,7 +35,9 @@ Attention mechanism: Two-pass + LSE merge (GC-safe, shape-static):
     Gate:   out = merge(o₁, o₂) * sigmoid(gate);  out = o_proj(out)
 """
 
+import contextlib
 import logging
+import json
 import math
 import os
 from typing import Dict, List, Optional, Tuple, Union
@@ -72,16 +74,54 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 
-# ── Backend selection (fa2 only for now; same LSE API as qwen3_vl_dat) ──────
+# ── Backend selection: FA4 (CuTe-DSL, sm90+) preferred, FA2 fallback ────────
+# DAT_ATTN_BACKEND env: 'auto' (default) picks FA4 when flash_attn.cute is
+# importable, exposes return_lse, and the visible GPU is sm90+; 'fa4' forces
+# FA4 (raises if unavailable); 'fa2' forces the FA2 path.
+# FA4 parity vs FA2 (verified on B200, bf16, H=16 D=256, causal + varlen):
+# identical out/LSE layouts — dense out [B,N,H,D] + lse [B,H,N] fp32, varlen
+# out [total,H,D] + lse [H,total] — out/grad rel err ~0.2-0.5% (bf16 kernel
+# noise), lse ~1e-5. CAUTION: FA4's 4th positional arg is `qv`, so varlen
+# args after q/k/v must be passed by keyword. First call JIT-compiles CuTe
+# kernels (~2 min, cached on disk under XDG_CACHE_HOME).
 import inspect as _inspect
 from flash_attn import flash_attn_func as _flash_attn_func
 from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
 import flash_attn as _fa_mod
 
+from ._cutlass_warn_filter import install as _install_cutlass_warn_filter
+
+_install_cutlass_warn_filter()
+
 _FA_HAS_SOFTMAX_LSE = "return_softmax_lse" in _inspect.signature(_flash_attn_func).parameters
 _fa_ver = getattr(_fa_mod, "__version__", "unknown")
 _lse_api = "return_softmax_lse" if _FA_HAS_SOFTMAX_LSE else "return_attn_probs"
-print(f"[DAT-LSE/qwen3_5] flash_attn 2 v{_fa_ver} — {_lse_api} + varlen")
+
+_fa4_func = None
+_fa4_varlen_func = None
+_backend_req = os.environ.get("DAT_ATTN_BACKEND", "auto").lower()
+if _backend_req in ("auto", "fa4"):
+    try:
+        from flash_attn.cute.interface import flash_attn_func as _fa4_f
+        from flash_attn.cute.interface import flash_attn_varlen_func as _fa4_v
+        if "return_lse" not in _inspect.signature(_fa4_f).parameters:
+            raise ImportError("flash_attn.cute present but lacks return_lse")
+        if _backend_req == "auto" and not (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability(0)[0] >= 9
+        ):
+            raise ImportError("FA4 needs an sm90+ GPU (set DAT_ATTN_BACKEND=fa4 to force)")
+        _fa4_func, _fa4_varlen_func = _fa4_f, _fa4_v
+    except Exception as _fa4_err:
+        if _backend_req == "fa4":
+            raise
+        print(f"[DAT-LSE/qwen3_5] FA4 unavailable ({_fa4_err}); using FA2")
+
+_USE_FA4 = _fa4_func is not None
+if _USE_FA4:
+    print(f"[DAT-LSE/qwen3_5] backend=FA4 (flash_attn.cute, return_lse) — FA2 v{_fa_ver} fallback available")
+else:
+    print(f"[DAT-LSE/qwen3_5] backend=FA2 v{_fa_ver} — {_lse_api} + varlen")
 
 
 def _dat_attn_with_lse(
@@ -104,13 +144,23 @@ def _dat_attn_with_lse(
     k_fa = k.transpose(1, 2).contiguous()
     v_fa = v.transpose(1, 2).contiguous()
 
-    if _FA_HAS_SOFTMAX_LSE:
+    if _USE_FA4:
+        out_fa, lse = _fa4_func(q_fa, k_fa, v_fa, causal=causal,
+                                return_lse=True)
+    elif _FA_HAS_SOFTMAX_LSE:
         out_fa, lse = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
                                        return_softmax_lse=True)
     else:
         out_fa, lse, _ = _flash_attn_func(q_fa, k_fa, v_fa, causal=causal,
                                           return_attn_probs=True)
-    return out_fa, lse
+    # Detach LSE at the backend boundary. FA2's autograd silently DROPS dlse
+    # in backward (extra output grads are ignored), so all historical DAT
+    # training effectively treated the LSE-merge weights as constants w.r.t.
+    # q/k/v. FA4 asserts instead of dropping ("SM100 backward with
+    # head_dim=256 does not support dlse"), so make the historical semantics
+    # explicit. Trainable terms added downstream (e.g. hd_gate via
+    # logsigmoid) still get their gradients through the merge.
+    return out_fa, lse.detach()
 
 
 def _dat_cross_attn_varlen(
@@ -145,7 +195,15 @@ def _dat_cross_attn_varlen(
         cu_q[i + 1] = cu_q[i] + nq_lens[i]
         cu_k[i + 1] = cu_k[i] + nk_lens[i]
 
-    if _FA_HAS_SOFTMAX_LSE:
+    if _USE_FA4:
+        # keyword args mandatory: FA4's 4th positional parameter is `qv`
+        out_packed, lse_packed = _fa4_varlen_func(
+            q_packed, k_packed, v_packed,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max(nq_lens), max_seqlen_k=max(nk_lens),
+            causal=False, return_lse=True,
+        )
+    elif _FA_HAS_SOFTMAX_LSE:
         out_packed, lse_packed = _flash_attn_varlen_func(
             q_packed, k_packed, v_packed,
             cu_q, cu_k, max(nq_lens), max(nk_lens),
@@ -158,6 +216,9 @@ def _dat_cross_attn_varlen(
             causal=False, return_attn_probs=True,
         )
 
+    # Same rationale as _dat_attn_with_lse: FA2 drops dlse, FA4 asserts on it.
+    lse_packed = lse_packed.detach()
+
     out_list = []
     lse_list = []
     q_offset = 0
@@ -168,6 +229,127 @@ def _dat_cross_attn_varlen(
         q_offset += nq
 
     return out_list, lse_list
+
+
+# ── Exact merged-gradient two-pass attention (FA4 raw backward) ─────────────
+# DAT_EXACT_MERGE_GRAD=1 (default) enables ring-attention-style EXACT
+# gradients through the LSE merge; =0 falls back to the legacy detached-LSE
+# semantics (identical to FA2 history) everywhere.
+_EXACT_MERGE_GRAD = os.environ.get("DAT_EXACT_MERGE_GRAD", "1") == "1"
+_fa4_raw_bwd = None
+if _USE_FA4:
+    try:
+        from flash_attn.cute.interface import _flash_attn_bwd as _fa4_raw_bwd
+    except Exception as _raw_err:  # pragma: no cover
+        print(f"[DAT-LSE/qwen3_5] FA4 raw bwd unavailable ({_raw_err}); "
+              f"exact merge gradients disabled")
+if _EXACT_MERGE_GRAD and _fa4_raw_bwd is not None:
+    print("[DAT-LSE/qwen3_5] exact merge gradients ENABLED "
+          "(merged-stats backward, requires hd_gate=None)")
+
+
+class _TwoPassMergedAttnFn(torch.autograd.Function):
+    """Two-pass attention + LSE merge with EXACT gradients.
+
+    Forward math is identical to the legacy path (_dat_attn_with_lse +
+    _dat_cross_attn_varlen + _merge_two_pass_lse with hd_gate=None). The
+    difference is the backward: the legacy path detaches LSE, so autograd
+    treats the merge weights w_i = exp(lse_i - lse*) as constants (FA2's
+    historical semantics — FA2 silently drops dlse). Here each pass's raw
+    flash backward is instead fed the MERGED per-row stats (out*, lse*): the
+    kernel reconstructs p = exp(s - lse*) — the union-softmax probabilities —
+    and yields ds = p * (g·v - g·out*), exactly the gradient of a single
+    attention over the concatenated KV set. This is the standard ring-
+    attention / context-parallel merged backward. No dlse is involved, so
+    FA4's "SM100 backward with head_dim=256 does not support dlse" assert is
+    never hit.
+
+    Constraints:
+      - segments must be row-disjoint (guaranteed by construction: answer /
+        question / lr-inject spans never overlap);
+      - hd_gate must be None (a trainable gate on lse2 would need an explicit
+        dlse2 term); callers fall back to the legacy path otherwise.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, q2p, k2p, v2p, cu_q, cu_k, max_q, max_k, seg_meta,
+                stats_sink=None):
+        # q/k/v: [B, H, N, D] (GQA already repeated); q2p/k2p/v2p: packed
+        # [total, H, D]; seg_meta: tuple of (b_idx, row_start, n_rows);
+        # stats_sink: attention module to stash w2 (HD attention-mass share)
+        # diagnostics on during training (harvested by DATMonitor).
+        q_t = q.transpose(1, 2).contiguous()
+        k_t = k.transpose(1, 2).contiguous()
+        v_t = v.transpose(1, 2).contiguous()
+
+        out1, lse1 = _fa4_func(q_t, k_t, v_t, causal=True, return_lse=True)
+        out2p, lse2p = _fa4_varlen_func(
+            q2p, k2p, v2p,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q, max_seqlen_k=max_k,
+            causal=False, return_lse=True,
+        )
+
+        # Row-disjoint merge; also build the per-row merged stats that the
+        # backward feeds to both raw kernels.
+        out = out1.clone()          # [B, N, H, D]
+        lse_c = lse1.clone()        # [B, H, N] fp32
+        w2_sum = None
+        w2_max = None
+        w2_cnt = 0
+        qoff = 0
+        for (b, s, n) in seg_meta:
+            l1 = lse1[b, :, s:s + n]                    # [H, n] fp32
+            l2 = lse2p[:, qoff:qoff + n]                # [H, n] fp32
+            lm = torch.logaddexp(l1, l2)
+            w1 = (l1 - lm).exp().transpose(0, 1).unsqueeze(-1)   # [n, H, 1]
+            w2 = (l2 - lm).exp().transpose(0, 1).unsqueeze(-1)
+            merged = w1 * out1[b, s:s + n] + w2 * out2p[qoff:qoff + n]
+            out[b, s:s + n] = merged.to(out.dtype)
+            lse_c[b, :, s:s + n] = lm
+            if stats_sink is not None:
+                w2_sum = w2.sum() if w2_sum is None else w2_sum + w2.sum()
+                w2_max = w2.max() if w2_max is None else torch.maximum(w2_max, w2.max())
+                w2_cnt += w2.numel()
+            qoff += n
+
+        if stats_sink is not None and w2_cnt > 0:
+            stats_sink._dat_hd_w2_stats = (
+                (w2_sum / w2_cnt).item(),
+                w2_max.item(),
+            )
+
+        ctx.save_for_backward(q_t, k_t, v_t, q2p, k2p, v2p, out, lse_c, cu_q, cu_k)
+        ctx.seg_meta = seg_meta
+        ctx.max_q = max_q
+        ctx.max_k = max_k
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        q_t, k_t, v_t, q2p, k2p, v2p, out, lse_c, cu_q, cu_k = ctx.saved_tensors
+        seg_meta = ctx.seg_meta
+        g = g.contiguous()
+
+        # Pass 1 backward with merged stats. At merged rows out/lse_c hold
+        # (out*, lse*): the kernel's reconstructed p becomes the union-softmax
+        # probability restricted to sequence keys, and its D-term uses g·out*.
+        # Non-merged rows carry their own (out1, lse1) — plain exact backward.
+        dq_t, dk_t, dv_t = _fa4_raw_bwd(q_t, k_t, v_t, out, g, lse_c, causal=True)
+
+        # Pass 2 backward, same merged stats gathered per segment row.
+        out2s = torch.cat([out[b, s:s + n] for (b, s, n) in seg_meta], dim=0).contiguous()
+        g2s = torch.cat([g[b, s:s + n] for (b, s, n) in seg_meta], dim=0).contiguous()
+        lse2s = torch.cat([lse_c[b, :, s:s + n] for (b, s, n) in seg_meta], dim=1).contiguous()
+        dq2p, dk2p, dv2p = _fa4_raw_bwd(
+            q2p, k2p, v2p, out2s, g2s, lse2s,
+            causal=False,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=ctx.max_q, max_seqlen_k=ctx.max_k,
+        )
+
+        return (dq_t.transpose(1, 2), dk_t.transpose(1, 2), dv_t.transpose(1, 2),
+                dq2p, dk2p, dv2p, None, None, None, None, None, None)
 
 
 logger = logging.getLogger(__name__)
@@ -311,12 +493,25 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             'layers': '',
             'use_intention_branch': True,
             'intention_as_gate': True,
+            'intention_inject': 'gate',   # 'gate' (legacy) | 'film' (post-norm)
+            'off_range': 0.0,             # 0 = legacy clamp; >0 = off_range*tanh
+            'off_penalty': 0.0,           # >0 = honest clamp + out-of-range pull-back
             'hd_gate_init': None,
             'hd_gate_freeze': False,
             'use_fused_vit': False,
             'use_shared_vit': False,
             'use_spatial_attn_guide': True,
             'image_hd_for_question': False,
+            'hd_early_exit_k': 0,      # HD ViT early exit: run only the first k vision blocks
+                                       # (0 = off, full depth). Only affects the separate HD path
+                                       # (_generate_hd_features); ignored by use_fused_vit /
+                                       # use_shared_vit. Unlike Qwen2.5-VL (32 blocks, window+full
+                                       # mix), the Qwen3.5 ViT has `depth` (4B: 24) uniform
+                                       # full-attention blocks, so any 0 < k < depth is valid and
+                                       # HD ViT runtime scales ~k/depth. Valid because DAT consumes
+                                       # HD features only through the from-scratch k_proj_hd /
+                                       # v_proj_hd adapters — but the adapters bind to whatever
+                                       # depth they were trained with, so train/infer k must match.
         }
 
 
@@ -437,6 +632,13 @@ def compute_image_range_list(input_ids, labels, image_token_id,
 # DAT Attention (Qwen3.5 gated attention + partial interleaved mRoPE)
 # ============================================================================
 
+# conv_off_proj init. Not zero: a zero readout sends zero gradient to conv_lr_dw /
+# conv_lr_proj / proj_intention, and on the 0901 / op10 / or10 4B ckpts those never
+# left their random init. 0.005 puts the initial offsets at ~0.3 grid pitch
+# (ln_2 output ~N(0,1) over 128 channels -> std(offset) ~= 6.8 * std).
+OFF_PROJ_INIT_STD = 0.005
+
+
 class Qwen3_5AttentionDAT(Qwen3_5Attention):
     """
     Core DAT mechanism for Qwen3.5 (two-pass + LSE merge):
@@ -490,6 +692,44 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         else:
             self.proj_intention = nn.Identity()
 
+        # Question conditioning of the offsets: where it is applied decides
+        # whether it survives. ln_2 is a channel-wise LayerNorm evaluated per
+        # spatial position, so a factor multiplied in BEFORE it is either
+        # partially removed (a per-channel gate keeps only its relative
+        # profile) or removed outright (a per-position scalar s > 0 cancels
+        # exactly, since mu -> s*mu and sigma -> s*sigma). Measured on the
+        # 0901 4B ckpt: sampling points move only ~4% of the grid pitch across
+        # different questions on the same image.
+        #
+        # 'film' adds a second, post-norm route that nothing downstream can
+        # divide out: per-channel FiLM plus an additive spatial map. All new
+        # parameters are zero-init, so a checkpoint trained under 'gate' keeps
+        # bit-identical outputs and can be warm-started.
+        self.intention_inject = dat.get('intention_inject', 'gate')
+
+        # Offset magnitude. With the legacy straight-through clamp nothing
+        # penalizes an offset that overshoots [-1,1]: the forward value is
+        # capped while the gradient keeps pushing outward. Measured on the 0901
+        # 4B ckpt, 53.6% of sampling points end up pinned to the border and
+        # 69.8% of the HD attention mass lands on those pinned points, i.e.
+        # roughly half the sampling budget reads the image edge. A positive
+        # off_range bounds each point to a neighbourhood of its reference
+        # instead, which is what deformable-attention work normally does.
+        self.off_range = float(dat.get('off_range', 0.0))
+
+        # Alternative to off_range that costs nothing inside the valid region.
+        # Any bounded smooth squashing function must have a vanishing derivative
+        # far out (otherwise it would be unbounded), so tanh necessarily damps
+        # exactly the points that travel furthest -- at the measured max raw
+        # offset of 2.754 the gradient is already attenuated ~60x, and it also
+        # compresses points that never left the region. Moving the constraint
+        # from the forward map into the loss avoids both: an honest clamp keeps
+        # the in-region gradient at exactly 1, and a quadratic out-of-range
+        # penalty supplies the pull-back that the clamp alone lacks.
+        self.off_penalty = float(dat.get('off_penalty', 0.0))
+        # See _merge_two_pass_lse; 0 = off (all trained checkpoints).
+        self.hd_lse_bias = float(dat.get('hd_lse_bias', 0.0))
+
         # Offset prediction
         if self.intention_as_gate:
             self.ln_2 = _FP32WeightLayerNorm2d(self.inter_size)
@@ -501,6 +741,14 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             self.conv_off_proj = _FP32WeightConv2d(
                 self.inter_size * 2, 2, kernel_size=1, stride=1, padding=0, bias=False,
             )
+
+        if self.intention_inject == 'film' and self.use_intention_branch:
+            ln2_ch = self.ln_2.weight.numel()
+            self.proj_film = _FP32WeightLinear(self.off_dim, 2 * ln2_ch)
+            self.spatial_gain = nn.Parameter(torch.zeros(ln2_ch))
+        else:
+            self.proj_film = None
+            self.spatial_gain = None
 
         # HD feature KV projection
         if self.hd_proj:
@@ -554,8 +802,12 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 self.hd_input_layernorm.weight.data = (
                     self.hd_input_layernorm.weight.data.to(torch.float32)
                 )
+        if self.spatial_gain is not None and self.spatial_gain.dtype != torch.float32:
+            with torch.no_grad():
+                self.spatial_gain.data = self.spatial_gain.data.to(torch.float32)
         for sub in (self.conv_lr_dw, self.ln_1, self.conv_lr_proj,
-                    self.proj_intention, self.ln_2, self.conv_off_proj):
+                    self.proj_intention, self.ln_2, self.conv_off_proj,
+                    self.proj_film):
             if not isinstance(sub, nn.Module):
                 continue
             for p in sub.parameters(recurse=False):
@@ -570,11 +822,17 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         nn.init.kaiming_normal_(self.conv_lr_proj.weight)
         if self.conv_lr_proj.bias is not None:
             nn.init.zeros_(self.conv_lr_proj.bias)
-        nn.init.zeros_(self.conv_off_proj.weight)
+        nn.init.normal_(self.conv_off_proj.weight, std=OFF_PROJ_INIT_STD)
         if isinstance(self.proj_intention, nn.Linear):
             nn.init.xavier_uniform_(self.proj_intention.weight)
             if self.proj_intention.bias is not None:
                 nn.init.zeros_(self.proj_intention.bias)
+        if self.proj_film is not None:
+            # zero => gamma = beta = 0 => post-norm modulation is the identity,
+            # so a 'gate'-trained ckpt is reproduced exactly on load
+            nn.init.zeros_(self.proj_film.weight)
+            nn.init.zeros_(self.proj_film.bias)
+            nn.init.zeros_(self.spatial_gain)
         self._init_hd_proj_weights()
 
     @torch.no_grad()
@@ -639,15 +897,32 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
         return torch.stack([t_grid, h_grid, w_grid])  # [3, Ns]
 
-    def _sample_hd_from_off_guide(self, off_guide, image_hd_features, hd_feat_idx, Lp, device):
+    def _sample_hd_from_off_guide(self, off_guide, image_hd_features, hd_feat_idx, Lp, device,
+                                  film=None, spatial=None):
         """Core deformable sampling: off_guide -> offsets -> grid_sample -> KV.
+
+        Args:
+            film:    optional (gamma, beta), each [Lp*off_grps, C, 1, 1]. Applied
+                     after ln_2 so the channel modulation cannot be normalized
+                     away (see the note in __init__).
+            spatial: optional [Lp*off_grps, 1, gh, gw] map added after ln_2;
+                     additive, because any multiplicative per-position scalar is
+                     cancelled exactly by a channel-wise LayerNorm.
 
         Returns:
             key_hd:        [Lp, Ns, kv_dim]
             value_hd:      [Lp, Ns, kv_dim]
             sampling_locs: [Lp, off_grps, grid_size, grid_size, 2]
         """
-        offsets = self.conv_off_proj(F.silu(self.ln_2(off_guide))).float()
+        h = self.ln_2(off_guide)
+        if film is not None:
+            gamma, beta = film
+            h = h * (1.0 + gamma.to(h.dtype)) + beta.to(h.dtype)
+        if spatial is not None:
+            h = h + self.spatial_gain.view(1, -1, 1, 1).to(h.dtype) * spatial.to(h.dtype)
+        offsets = self.conv_off_proj(F.silu(h)).float()
+        if self.off_range > 0:
+            offsets = self.off_range * torch.tanh(offsets)
         if self.training:
             self._dat_offset_stats = (
                 offsets.detach().mean().item(),
@@ -656,7 +931,35 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device)
 
         x = references + offsets
-        sample_locs = (x + (x.clamp(-1, 1) - x).detach()).permute(0, 2, 3, 1)
+        if self.training:
+            self._dat_offset_oob = (x.abs() > 1.0).float().mean().item()
+
+        if self.off_range > 0:
+            # A plain clamp, not the straight-through one: offsets are already
+            # bounded, so the only points that can still reach the border are
+            # those whose reference sits next to it, and a zero gradient there
+            # is the correct signal rather than a runaway.
+            sample_locs = x.clamp(-1, 1).permute(0, 2, 3, 1)
+        elif self.off_penalty > 0:
+            # Honest clamp plus a pull-back. The clamp gives an exact gradient
+            # of 1 everywhere inside the region — unlike tanh, which also
+            # compresses points that never went out of bounds — and zero
+            # outside, which is at least truthful about a further push having
+            # no effect. The missing ingredient is a force that returns an
+            # escaped point, and that is what the penalty adds.
+            #
+            # Equivalent to  loss += off_penalty * mean(relu(|x| - 1) ** 2),
+            # injected as a gradient rather than routed through the loss: under
+            # gradient checkpointing the graph-building forward is the
+            # recomputed one, so a penalty stashed during the first pass would
+            # carry no grad_fn and silently contribute nothing.
+            if self.training and x.requires_grad:
+                over = ((x.abs() - 1.0).clamp_min(0) * torch.sign(x)).detach()
+                coef = self.off_penalty * 2.0 / x.numel()
+                x.register_hook(lambda g, o=over, c=coef: g + c * o)
+            sample_locs = x.clamp(-1, 1).permute(0, 2, 3, 1)
+        else:
+            sample_locs = (x + (x.clamp(-1, 1) - x).detach()).permute(0, 2, 3, 1)
 
         hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
         img_hr = einops.rearrange(
@@ -712,6 +1015,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
         intention_indices = None
         embed_intention = None
+        film = None            # post-norm channel modulation (intention_inject='film')
         if self.use_intention_branch:
             intention_indices = [ar[2] for ar in answer_ranges]
             intention_tokens = query_states[b_idx, intention_indices]
@@ -723,6 +1027,11 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             embed_intention = einops.rearrange(
                 embed_intention, 'l g c -> (l g) c 1 1',
             )
+            if self.proj_film is not None:
+                _film = einops.rearrange(
+                    self.proj_film(intention_per_group), 'l g c -> (l g) c 1 1',
+                )
+                film = tuple(_film.chunk(2, dim=1))
 
         if want_image:
             assert not (self.use_intention_branch and not self.intention_as_gate), (
@@ -756,6 +1065,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 embed_lr, 'g c h w -> (l g) c h w', l=Lp,
             )
 
+            spatial_add = None
             if self.use_intention_branch and self.use_spatial_attn_guide:
                 q_lr_flat = query_states[b_idx, image_range_index]
                 q_int_flat = query_states[b_idx, intention_indices]
@@ -768,8 +1078,15 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 ) * (lr_h * lr_w)
                 spatial_guide_rep = einops.repeat(
                     spatial_attn_guide, 'l 1 h w -> (l g) 1 h w', g=self.off_grps,
-                ).to(embed_lr_rep.dtype)
-                embed_lr_rep = embed_lr_rep * spatial_guide_rep
+                )
+                if self.intention_inject == 'film':
+                    # Log-scale so uniform attention maps to exactly 0, then add
+                    # it after ln_2. Multiplying it in here would be a no-op: a
+                    # positive per-position scalar cancels in a channel-wise
+                    # LayerNorm (verified numerically at 2e-5 relative change).
+                    spatial_add = torch.log(spatial_guide_rep.clamp_min(1e-6))
+                else:
+                    embed_lr_rep = embed_lr_rep * spatial_guide_rep.to(embed_lr_rep.dtype)
 
             if self.use_intention_branch:
                 if self.intention_as_gate:
@@ -791,8 +1108,19 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             if want_image:
                 off_guide_img = einops.repeat(embed_lr, 'g c h w -> (l g) c h w', l=1)
                 off_guide_all = torch.cat([off_guide_img, off_guide], dim=0)
+                # The image-conditioned slot is question-agnostic by definition,
+                # so it is padded with the identity (gamma=beta=0, no spatial add).
+                film_all, spatial_all = film, spatial_add
+                if film is not None:
+                    pad = film[0].new_zeros((self.off_grps,) + film[0].shape[1:])
+                    film_all = (torch.cat([pad, film[0]], dim=0),
+                                torch.cat([pad, film[1]], dim=0))
+                if spatial_add is not None:
+                    pad = spatial_add.new_zeros((self.off_grps,) + spatial_add.shape[1:])
+                    spatial_all = torch.cat([pad, spatial_add], dim=0)
                 key_all, value_all, slocs_all = self._sample_hd_from_off_guide(
                     off_guide_all, image_hd_features, hd_feat_idx, Lp + 1, device,
+                    film=film_all, spatial=spatial_all,
                 )
                 kimg_parts.append(key_all[0:1])
                 vimg_parts.append(value_all[0:1])
@@ -803,6 +1131,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             else:
                 key_hd, value_hd, slocs = self._sample_hd_from_off_guide(
                     off_guide, image_hd_features, hd_feat_idx, Lp, device,
+                    film=film, spatial=spatial_add,
                 )
                 key_parts.append(key_hd)
                 value_parts.append(value_hd)
@@ -839,6 +1168,15 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             lse2 = lse2 + F.logsigmoid(self.hd_gate)
             if self.training:
                 self._dat_hd_gate_value = self.hd_gate.detach().sigmoid().item()
+
+        # Inference-only diagnostic: a constant added to the HD log-partition
+        # before the merge. With N sampled keys instead of the 400 trained on,
+        # lse2 grows by ~log(N/400) and w_hd = sigmoid(lse2 - lse1) shifts with
+        # it; -log(N/400) undoes that so a grid-density sweep isolates the
+        # effect of denser sampling from the effect of re-weighting the merge.
+        # Only reaches this legacy merge (the exact-gradient path is training).
+        if self.hd_lse_bias != 0.0:
+            lse2 = lse2 + self.hd_lse_bias
 
         lse = torch.logaddexp(lse1_ans, lse2)
 
@@ -926,8 +1264,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
-        # === Pass 1: standard causal attention + LSE ===
-        out1, lse1 = _dat_attn_with_lse(query_states, key_states, value_states, causal=True)
+        # (Pass 1 runs below: the exact-merge path executes it inside the
+        # autograd Function so its backward can be fed the merged stats.)
 
         # Build mapping from batch index to image_hd_features indices
         b_idx_to_hd_idxs: Dict[int, List[int]] = {}
@@ -940,6 +1278,12 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
         # Use the raw hidden_states for offset generation (pre-projection features)
         query_for_offsets = hidden_states
+
+        # Sampling-distribution visualization (WandbSamplingVisCallback arms
+        # _dat_request_vis one log before each vis step; we record the first
+        # image-bearing sample's sampling locations).
+        _want_vis = self.training and getattr(self, '_dat_request_vis', False)
+        _dat_vis_entry = None  # (b_idx, slocs)
 
         # === Pass 2: HD cross-attention (batched via varlen) ===
         seg_q_list: List[torch.Tensor] = []
@@ -993,6 +1337,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     query_for_offsets, image_hd_features, image_range_list,
                     b_idx, hd_feat_idxs, want_image=bool(question_segs),
                 )
+
+            if _want_vis and _dat_vis_entry is None and _slocs is not None:
+                _dat_vis_entry = (b_idx, _slocs)
 
             if question_segs:
                 k_img = (k_img_all[0]
@@ -1093,32 +1440,74 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     seg_v_list.append(v_hd_l_first[_m * Ns:(_m + 1) * Ns])
                     seg_meta.append((b_idx, _s, Nlr))
 
-        # Phase 2b: Batched cross-attention
-        if seg_q_list:
-            out2_list, lse2_list = _dat_cross_attn_varlen(
-                seg_q_list, seg_k_list, seg_v_list,
-            )
+        # Phase 2b/2c: cross-attention + LSE merge.
+        # Exact path (training default): one autograd Function owns Pass 1 +
+        # Pass 2 + merge and implements the merged-stats backward — gradients
+        # are exactly those of a single attention over the concatenated KV
+        # set. Legacy path (inference / hd_gate / FA4-less / kill switch):
+        # detached-LSE merge, FA2-historical stop-gradient semantics.
+        use_exact_merge = (
+            _EXACT_MERGE_GRAD
+            and _fa4_raw_bwd is not None
+            and self.hd_gate is None
+            and torch.is_grad_enabled()
+            and bool(seg_q_list)
+        )
+
+        if use_exact_merge:
+            q2_packed = torch.cat(seg_q_list, dim=0)
+            k2_packed = torch.cat(seg_k_list, dim=0)
+            v2_packed = torch.cat(seg_v_list, dim=0)
+            nq_lens = [m[2] for m in seg_meta]
+            nk_lens = [k_.shape[0] for k_ in seg_k_list]
+            cu_q = torch.zeros(len(seg_meta) + 1, dtype=torch.int32, device=device)
+            cu_k = torch.zeros(len(seg_meta) + 1, dtype=torch.int32, device=device)
+            for i in range(len(seg_meta)):
+                cu_q[i + 1] = cu_q[i] + nq_lens[i]
+                cu_k[i + 1] = cu_k[i] + nk_lens[i]
+            out_final = _TwoPassMergedAttnFn.apply(
+                query_states, key_states, value_states,
+                q2_packed, k2_packed, v2_packed,
+                cu_q, cu_k, max(nq_lens), max(nk_lens),
+                tuple(seg_meta),
+                self if self.training else None,
+            )  # [B, Nq, H, D]
         else:
-            out2_list, lse2_list = [], []
-
-        # Phase 2c: LSE merge
-        out_parts: List[torch.Tensor] = []
-        seg_iter = 0
-        for b_idx in range(B):
-            out_b = out1[b_idx:b_idx + 1]
-
-            while seg_iter < len(seg_meta) and seg_meta[seg_iter][0] == b_idx:
-                _, q_start, Nseg = seg_meta[seg_iter]
-                out_b = self._merge_two_pass_lse(
-                    out_b, lse1[b_idx:b_idx + 1],
-                    out2_list[seg_iter], lse2_list[seg_iter],
-                    q_start, q_start + Nseg,
+            out1, lse1 = _dat_attn_with_lse(
+                query_states, key_states, value_states, causal=True,
+            )
+            if seg_q_list:
+                out2_list, lse2_list = _dat_cross_attn_varlen(
+                    seg_q_list, seg_k_list, seg_v_list,
                 )
-                seg_iter += 1
+            else:
+                out2_list, lse2_list = [], []
 
-            out_parts.append(out_b)
+            out_parts: List[torch.Tensor] = []
+            seg_iter = 0
+            for b_idx in range(B):
+                out_b = out1[b_idx:b_idx + 1]
 
-        out_final = torch.cat(out_parts, dim=0)  # [B, Nq, H, D]
+                while seg_iter < len(seg_meta) and seg_meta[seg_iter][0] == b_idx:
+                    _, q_start, Nseg = seg_meta[seg_iter]
+                    out_b = self._merge_two_pass_lse(
+                        out_b, lse1[b_idx:b_idx + 1],
+                        out2_list[seg_iter], lse2_list[seg_iter],
+                        q_start, q_start + Nseg,
+                    )
+                    seg_iter += 1
+
+                out_parts.append(out_b)
+
+            out_final = torch.cat(out_parts, dim=0)  # [B, Nq, H, D]
+
+        # Visualization: record sampling locations (no attention map on the
+        # two-pass path; the vis falls back to random point selection).
+        if _want_vis and _dat_vis_entry is not None:
+            self._dat_request_vis = False
+            b_idx_v, slocs_v = _dat_vis_entry
+            self._dat_vis_data = (slocs_v.detach(), None)
+            self._dat_vis_b_idx = b_idx_v
 
         # [B, Nq, H, D] → [B, Nq, C], then apply the sigmoid output gate.
         # Gate is computed from Q-side hidden states only, so applying it after
@@ -1284,7 +1673,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                         module.hd_gate.requires_grad = False
                 nn.init.kaiming_normal_(module.conv_lr_dw.weight)
                 nn.init.kaiming_normal_(module.conv_lr_proj.weight)
-                nn.init.zeros_(module.conv_off_proj.weight)
+                nn.init.normal_(module.conv_off_proj.weight, std=OFF_PROJ_INIT_STD)
                 if module.conv_lr_proj.bias is not None:
                     nn.init.zeros_(module.conv_lr_proj.bias)
                 if isinstance(module.proj_intention, nn.Linear):
@@ -1299,16 +1688,36 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     @torch.no_grad()
     def init_hd_proj_from_kv(self):
-        """Apply zero-init adapter pattern (K=Kaiming, V=0) to all DAT layers."""
+        """Warm-start the HD adapters from the layer's own k_proj / v_proj.
+
+        HD features leave the same merger as the LR tokens, so the base
+        projections already turn them into keys the layer's queries can match
+        and values the layer knows how to read. The previous K=Kaiming, V=0
+        start never escaped its own deadlock: with V~0 the attention pattern
+        has no effect on the loss, so K receives only directionless gradient,
+        so the attention stays random, so V only ever learns a bias. On the
+        0901 / op10 / or10 / ee6 4B ckpts k_proj_hd sits at its kaiming init
+        (rms 0.0198 = 1/sqrt(2560)) in every layer and v_proj_hd at ~25% of the
+        base scale; disabling the branch at inference changes nothing.
+        hd_input_layernorm is copied from the layer's input_layernorm for the
+        same reason. Only for fresh conversions -- see convert_qwen3_5_to_dat.
+        """
         n = 0
-        for m in self.modules():
-            if isinstance(m, Qwen3_5AttentionDAT) and m.k_proj_hd is not None:
-                m._init_hd_proj_weights()
-                n += 1
-        logger.info(
-            f"Zero-init adapter pattern (K=Kaiming, V=0) applied to "
-            f"k_proj_hd / v_proj_hd for {n} DAT layers"
-        )
+        for layer in self.model.language_model.layers:
+            m = getattr(layer, 'self_attn', None)
+            if not isinstance(m, Qwen3_5AttentionDAT) or m.k_proj_hd is None:
+                continue
+            m.k_proj_hd.weight.copy_(m.k_proj.weight)
+            m.v_proj_hd.weight.copy_(m.v_proj.weight)
+            if m.k_proj_hd.bias is not None and m.k_proj.bias is not None:
+                m.k_proj_hd.bias.copy_(m.k_proj.bias)
+            if m.v_proj_hd.bias is not None and m.v_proj.bias is not None:
+                m.v_proj_hd.bias.copy_(m.v_proj.bias)
+            if m.hd_input_layernorm is not None and hasattr(layer, 'input_layernorm'):
+                m.hd_input_layernorm.weight.copy_(
+                    layer.input_layernorm.weight.to(m.hd_input_layernorm.weight.dtype))
+            n += 1
+        logger.info(f"HD adapters warm-started from base k_proj / v_proj for {n} DAT layers")
 
     def prepare_inputs_for_generation(
         self,
@@ -1355,9 +1764,38 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
         return model_inputs
 
+    @contextlib.contextmanager
+    def _hd_vit_truncated(self):
+        """Temporarily truncate visual.blocks to the first k blocks (HD early exit).
+
+        Port of the Qwen2.5-VL trick; structurally even simpler here. The
+        Qwen3.5 ViT forward computes pos_embed / rotary / cu_seqlens before
+        the block loop (all depth-independent), has no window permutation, no
+        deepstack (deepstack_visual_indexes is empty), and the merger consumes
+        the final hidden states directly — so running blocks[:k] + the stock
+        merger is structurally identical to the full forward. All blocks are
+        uniform full-attention, hence HD ViT runtime scales ~k/depth.
+        """
+        k = int(self.config.dat_extra_args.get('hd_early_exit_k', 0) or 0)
+        visual = self.model.visual
+        if k <= 0 or k >= len(visual.blocks):
+            yield
+            return
+        full_blocks = visual.blocks
+        if not getattr(self, '_hd_early_exit_logged', False):
+            logger.info(
+                f"[DAT] HD ViT early exit active: first {k}/{len(full_blocks)} blocks"
+            )
+            self._hd_early_exit_logged = True
+        visual.blocks = full_blocks[:k]
+        try:
+            yield
+        finally:
+            visual.blocks = full_blocks
+
     def _generate_hd_features(self, pixel_values_hd, image_grid_thw_hd):
         """Generate HD feature maps from high-resolution pixel values (separate ViT call)."""
-        with torch.no_grad():
+        with torch.no_grad(), self._hd_vit_truncated():
             pixel_values_hd = pixel_values_hd.type(self.model.visual.dtype)
             hd_output = self.model.visual(pixel_values_hd, grid_thw=image_grid_thw_hd, return_dict=True)
             hd_embeds = hd_output.pooler_output
@@ -1609,8 +2047,10 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         # === Step 4: Call base model with DAT kwargs ===
         # DAT kwargs flow through: Model → TextModel → DecoderLayer → Attention.
         # GatedDeltaNet layers receive and ignore them (**kwargs tolerant).
+        # Qwen3_5Model accepts exactly one of input_ids / inputs_embeds, and the
+        # fused and shared ViT paths above already materialised inputs_embeds.
         outputs = self.model(
-            input_ids=input_ids,
+            input_ids=None if inputs_embeds is not None else input_ids,
             pixel_values=_pixel_values_for_model,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=_image_grid_thw_for_model,
@@ -1626,6 +2066,17 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             mrope_position_ids=mrope_position_ids,
             **kwargs,
         )
+
+        # === Vis: capture input_ids + image_path for the selected sample ===
+        if self.training and input_ids is not None:
+            for _m in self.modules():
+                if hasattr(_m, '_dat_vis_b_idx'):
+                    vis_b = _m._dat_vis_b_idx
+                    self._dat_vis_input_ids = input_ids[vis_b].detach().cpu()
+                    if hasattr(self, '_batch_image_paths'):
+                        self._dat_vis_image_path = self._batch_image_paths[vis_b]
+                    del _m._dat_vis_b_idx
+                    break
 
         # === Step 5: LM head + loss ===
         # generate() prefill 传 logits_to_keep=1, 不切片会物化全序列 logits。
@@ -1667,7 +2118,8 @@ DAT_KEYS_MATCH = [
 ]
 
 
-def convert_qwen3_5_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None):
+def convert_qwen3_5_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None,
+                           attn_implementation=None):
     """Convert a pretrained Qwen3.5 to Qwen3.5-DAT.
 
     Args:
@@ -1675,6 +2127,11 @@ def convert_qwen3_5_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None)
         dat_extra_args: dict with DAT parameters. 'layers' may be an explicit
             D/L string or 'auto' / 'autoN' (anchored to full_attention positions).
         torch_dtype: optional torch dtype for loading
+        attn_implementation: optional, e.g. "flash_attention_2". None keeps the
+            transformers default (sdpa). Only affects HF-managed attention —
+            i.e. the VISION tower: with dat_layers 'auto' every full_attention
+            LLM layer becomes a DAT layer, whose attention runs through the
+            module-level FA4/FA2 backend above regardless of this setting.
 
     Returns:
         Qwen3_5DATForConditionalGeneration with base weights + fresh DAT weights
@@ -1695,11 +2152,15 @@ def convert_qwen3_5_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None)
     dat_config.dat_extra_args = dat_extra_args
 
     if isinstance(base_model_or_path, str):
+        _extra_kwargs = {}
+        if attn_implementation is not None:
+            _extra_kwargs['attn_implementation'] = attn_implementation
         dat_model = Qwen3_5DATForConditionalGeneration.from_pretrained(
             base_model_or_path,
             config=dat_config,
             torch_dtype=torch_dtype,
             ignore_mismatched_sizes=False,
+            **_extra_kwargs,
         )
     else:
         base_model_or_path.config = dat_config
@@ -1713,7 +2174,25 @@ def convert_qwen3_5_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None)
                         Qwen3_5DecoderLayerDAT(text_config, i, dat_extra_args)
         dat_model = base_model_or_path
 
-    dat_model.init_hd_proj_from_kv()
+    # Only a fresh conversion gets new adapters. A DAT checkpoint (stage-1 ->
+    # stage-2 SFT, or a merged model) already carries trained k/v_hd; the
+    # unconditional re-init that used to sit here silently threw stage 1's
+    # adapters away at the start of every SFT run.
+    # Qwen3_5Config.from_pretrained overwrites model_type with the class value, so
+    # detect a DAT checkpoint from the raw config.json / the object's config.
+    if isinstance(base_model_or_path, str):
+        try:
+            with open(os.path.join(base_model_or_path, 'config.json')) as _f:
+                _raw = json.load(_f)
+        except (OSError, ValueError):
+            _raw = {}
+        _is_dat_ckpt = _raw.get('model_type') == 'qwen3_5_dat' or 'dat_extra_args' in _raw
+    else:
+        _is_dat_ckpt = getattr(base_config, 'dat_extra_args', None) is not None
+    if _is_dat_ckpt:
+        logger.info("[DAT] loaded a DAT checkpoint: keeping its k/v_hd adapters (no re-init)")
+    else:
+        dat_model.init_hd_proj_from_kv()
 
     # Force fp32 storage for DAT scalar/near-unity params
     n_fixed = 0

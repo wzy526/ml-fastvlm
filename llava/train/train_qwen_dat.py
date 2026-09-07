@@ -27,6 +27,30 @@ import transformers
 from torch.utils.data import Dataset, Sampler
 from PIL import Image
 
+# ── Suppress third-party warning spam that defeats standard filters ─────────
+# flash-attn-4's CuTe code trips a deprecated cutlass accessor which warns via
+# `catch_warnings() + simplefilter("always")` — that bypasses PYTHONWARNINGS
+# and filterwarnings entirely (their simplefilter wipes the filter list inside
+# the block). catch_warnings snapshots-and-restores `showwarning` but does NOT
+# reset it, so dropping these messages at the display layer works everywhere,
+# including inside their block. Inherited by forked dataloader workers.
+import warnings as _warnings
+_ORIG_SHOWWARNING = _warnings.showwarning
+_NOISY_WARNING_SNIPPETS = (
+    "Use explicit `struct.scalar.ptr` for pointer instead.",
+    "__array__ implementation doesn't accept a copy keyword",
+    "builtin type swigvarlink has no __module__ attribute",
+)
+
+
+def _quiet_showwarning(message, category, filename, lineno, file=None, line=None):
+    if any(s in str(message) for s in _NOISY_WARNING_SNIPPETS):
+        return
+    _ORIG_SHOWWARNING(message, category, filename, lineno, file, line)
+
+
+_warnings.showwarning = _quiet_showwarning
+
 try:
     import wandb
 except ImportError:
@@ -296,6 +320,32 @@ class ModelArguments:
         default=True,
         metadata={"help": "Enable Q_intention x Q_lr spatial attention guidance when predicting DAT offsets."}
     )
+    dat_off_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Out-of-range penalty on sampling positions, equivalent to "
+                          "loss += w * mean(relu(|ref+off| - 1)**2). Pairs with an honest "
+                          "clamp (gradient exactly 1 inside the region, unlike off_range's "
+                          "tanh which also compresses points that never left it) and "
+                          "supplies the pull-back a bare clamp lacks. Mutually exclusive "
+                          "with dat_off_range; suggested 1.0."}
+    )
+    dat_off_range: float = field(
+        default=0.0,
+        metadata={"help": "Bound sampling offsets to off_range*tanh(raw) instead of the "
+                          "legacy straight-through clamp. 0 keeps legacy behaviour. On the "
+                          "0901 4B ckpt the legacy path pins 53.6%% of sampling points to "
+                          "the [-1,1] border and 69.8%% of HD attention mass lands there. "
+                          "Suggested 0.2-0.4 (2-4x the grid pitch of 0.0997 at grid=20)."}
+    )
+    dat_intention_inject: str = field(
+        default="gate",
+        metadata={"help": "How the question conditions the offsets. 'gate' (legacy) "
+                          "multiplies before ln_2, where a channel gate is partly and a "
+                          "spatial scalar is entirely normalized away. 'film' adds a "
+                          "post-norm route (per-channel FiLM + additive spatial map) with "
+                          "zero-init params, so a 'gate' ckpt warm-starts unchanged. "
+                          "Use with --dat_use_spatial_attn_guide True."}
+    )
     dat_insert_kvhd_offset: int = field(
         default=6,
         metadata={"help": "DEPRECATED: intention token position is now computed dynamically"}
@@ -346,7 +396,11 @@ class ModelArguments:
                   "ignored by dat_fused_vit / dat_shared_vit. NOTE: Qwen2.5-VL's ViT has "
                   "full-attention blocks at indexes [7, 15, 23, 31] (the rest are 8x8 "
                   "window attention), so k >= 8 is recommended to keep at least one "
-                  "global-attention block in the truncated stack."}
+                  "global-attention block in the truncated stack. Qwen3.5's ViT instead "
+                  "has `vision_config.depth` (4B: 24) uniform full-attention blocks, so "
+                  "any 0 < k < depth is valid and HD ViT time scales ~k/depth. The "
+                  "k_proj_hd/v_proj_hd adapters bind to the feature depth they were "
+                  "trained with — SFT/inference k must match pretrain k."}
     )
     dat_hd_skip_merger_mlp: bool = field(
         default=False,
@@ -1678,9 +1732,13 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         # Buffers for forward-pass diagnostics (flushed at on_log)
         self._offset_mean_buf = []
         self._offset_std_buf  = []
+        self._offset_oob_buf  = []
         self._gate_mean_buf   = []
         self._gate_std_buf    = []
         self._hd_gate_buf     = []
+        self._hd_w2_mean_buf  = []
+        self._hd_w2_max_buf   = []
+        self._tb_writer       = None   # lazy; False = permanently unavailable
         # KVHD-specific gradient monitoring (only when hd_proj is enabled)
         self._use_kvhd       = use_kvhd
         self._kvhd_step_sq   = 0.0
@@ -1818,9 +1876,10 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         # for diagnostics so we can report the exact DAT-attention count.
         base_model = _unwrap_to_base_dat_model(model)
 
-        off_means, off_stds = [], []
+        off_means, off_stds, off_oobs = [], [], []
         gate_means, gate_stds = [], []
         hd_gate_vals = []
+        hd_w2_means, hd_w2_maxes = [], []
 
         dat_attn_count = 0
         for module in model.modules():
@@ -1832,6 +1891,9 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 off_means.append(m)
                 off_stds.append(s)
                 del module._dat_offset_stats
+            if hasattr(module, '_dat_offset_oob'):
+                off_oobs.append(module._dat_offset_oob)
+                del module._dat_offset_oob
             if hasattr(module, '_dat_gate_stats'):
                 m, s = module._dat_gate_stats
                 gate_means.append(m)
@@ -1840,6 +1902,11 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             if hasattr(module, '_dat_hd_gate_value'):
                 hd_gate_vals.append(module._dat_hd_gate_value)
                 del module._dat_hd_gate_value
+            if hasattr(module, '_dat_hd_w2_stats'):
+                m, x = module._dat_hd_w2_stats
+                hd_w2_means.append(m)
+                hd_w2_maxes.append(x)
+                del module._dat_hd_w2_stats
 
         # One-time diagnostic: report what the callback sees on its very
         # first harvest call.  Helps pin down wrapper / training-mode issues
@@ -1860,9 +1927,14 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
 
         if hd_gate_vals:
             self._hd_gate_buf.append(sum(hd_gate_vals) / len(hd_gate_vals))
+        if hd_w2_means:
+            self._hd_w2_mean_buf.append(sum(hd_w2_means) / len(hd_w2_means))
+            self._hd_w2_max_buf.append(max(hd_w2_maxes))
         if off_means:
             self._offset_mean_buf.append(sum(off_means) / len(off_means))
             self._offset_std_buf.append(sum(off_stds) / len(off_stds))
+        if off_oobs:
+            self._offset_oob_buf.append(sum(off_oobs) / len(off_oobs))
             if not getattr(self, '_harvest_offset_confirmed', False):
                 rank0_print(
                     f"[DATMonitor] First successful harvest of offset/gate "
@@ -1998,6 +2070,13 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             self._offset_mean_buf.clear()
             self._offset_std_buf.clear()
 
+        # Fraction of sampling points landing outside [-1,1]. The shipped
+        # 0901 ckpt sits at 0.54; watching this fall is how off_range /
+        # off_penalty are verified to be doing their job during training.
+        if self._offset_oob_buf:
+            metrics["dat/offset_oob"] = sum(self._offset_oob_buf) / len(self._offset_oob_buf)
+            self._offset_oob_buf.clear()
+
         # 5. Gate value statistics (intention_as_gate sigmoid output)
         if self._gate_mean_buf:
             metrics["dat/gate_mean"] = sum(self._gate_mean_buf) / len(self._gate_mean_buf)
@@ -2023,9 +2102,33 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         if self._hd_gate_buf:
             metrics["dat/hd_gate"] = sum(self._hd_gate_buf) / len(self._hd_gate_buf)
             self._hd_gate_buf.clear()
+        if self._hd_w2_mean_buf:
+            # HD attention-mass share w2 = exp(lse2 - lse*) on merged rows
+            # (exact-merge path only). THE metric for "did the model learn
+            # to actually look at the HD branch".
+            metrics["dat/hd_w2_mean"] = sum(self._hd_w2_mean_buf) / len(self._hd_w2_mean_buf)
+            metrics["dat/hd_w2_max"] = max(self._hd_w2_max_buf)
+            self._hd_w2_mean_buf.clear()
+            self._hd_w2_max_buf.clear()
 
         if not metrics:
             return
+
+        # TB emission: report_to=tensorboard runs have no wandb.run, and HF's
+        # TensorBoardCallback consumes `logs` before this callback fires — so
+        # write dat/* scalars ourselves into the same event dir.
+        tb_dir = os.getenv("TENSORBOARD_LOGGING_DIR")
+        if self._tb_writer is None and tb_dir:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                self._tb_writer = SummaryWriter(log_dir=tb_dir)
+            except Exception as e:
+                rank0_print(f"[DATMonitor] TB writer unavailable: {e}")
+                self._tb_writer = False
+        if self._tb_writer:
+            for k, v in metrics.items():
+                self._tb_writer.add_scalar(k, v, state.global_step)
+            self._tb_writer.flush()
 
         if wandb is not None and wandb.run is not None:
             _define_wandb_step_metric()
@@ -2045,6 +2148,8 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+        if self._tb_writer:
+            self._tb_writer.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2064,6 +2169,7 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
         self._tokenizer = tokenizer
         self._vis_every_n_logs = vis_every_n_logs
         self._log_count = 0
+        self._tb_writer = None   # lazy; False = permanently unavailable
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if model is not None:
@@ -2080,29 +2186,46 @@ class WandbSamplingVisCallback(transformers.TrainerCallback):
         _model = model or self._model
         self._log_count += 1
 
+        _has_wandb = wandb is not None and wandb.run is not None
+        _tb_dir = os.getenv("TENSORBOARD_LOGGING_DIR")
         is_vis_step = (
             _model is not None
             and state.is_world_process_zero
             and self._log_count % self._vis_every_n_logs == 0
-            and wandb is not None and wandb.run is not None
+            and (_has_wandb or bool(_tb_dir))
         )
 
         # Harvest results computed during the most recent forward
         if is_vis_step:
             try:
                 import matplotlib.pyplot as plt
-                _define_wandb_step_metric()
                 figs = self._create_sampling_vis(_model, self._tokenizer)
+                if figs and _tb_dir and self._tb_writer is None:
+                    try:
+                        from torch.utils.tensorboard import SummaryWriter
+                        self._tb_writer = SummaryWriter(log_dir=_tb_dir)
+                    except Exception as e:
+                        rank0_print(f"[SamplingVis] TB writer unavailable: {e}")
+                        self._tb_writer = False
+                if _has_wandb and figs:
+                    _define_wandb_step_metric()
                 for key, fig in figs.items():
-                    # No ``step=`` — the registered step_metric
-                    # (``train/global_step`` in the payload) is what wandb
-                    # will use as the X-axis for this image panel.
-                    wandb.log(
-                        {key: wandb.Image(fig),
-                         "train/global_step": state.global_step},
-                        commit=False,
-                    )
+                    if _has_wandb:
+                        # No ``step=`` — the registered step_metric
+                        # (``train/global_step`` in the payload) is what wandb
+                        # will use as the X-axis for this image panel.
+                        wandb.log(
+                            {key: wandb.Image(fig),
+                             "train/global_step": state.global_step},
+                            commit=False,
+                        )
+                    if self._tb_writer:
+                        self._tb_writer.add_figure(
+                            key, fig, state.global_step, close=False,
+                        )
                     plt.close(fig)
+                if self._tb_writer and figs:
+                    self._tb_writer.flush()
             except Exception as e:
                 rank0_print(f"[SamplingVis] Error: {e}")
 
@@ -2820,6 +2943,11 @@ def train():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     local_rank = training_args.local_rank
+    if local_rank is None or local_rank == -1:
+        # transformers >= 5.10 deprecated TrainingArguments.local_rank (it
+        # stays -1 under torchrun), which silently muted every rank0_print
+        # and the DATMonitor harvest gate. Fall back to the launcher env.
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
     os.makedirs(training_args.output_dir, exist_ok=True)
 
     compute_dtype = (
@@ -2885,6 +3013,9 @@ def train():
             'use_intention_branch': model_args.dat_use_intention_branch,
             'intention_as_gate': model_args.dat_intention_as_gate,
             'use_spatial_attn_guide': model_args.dat_use_spatial_attn_guide,
+            'intention_inject': model_args.dat_intention_inject,
+            'off_range': model_args.dat_off_range,
+            'off_penalty': model_args.dat_off_penalty,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'inject_lr_image': model_args.dat_inject_lr_image,
