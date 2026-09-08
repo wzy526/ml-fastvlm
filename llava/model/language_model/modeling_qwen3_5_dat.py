@@ -231,21 +231,141 @@ def _dat_cross_attn_varlen(
     return out_list, lse_list
 
 
-# ── Exact merged-gradient two-pass attention (FA4 raw backward) ─────────────
+# ── Exact merged-gradient two-pass attention (raw flash backward) ───────────
 # DAT_EXACT_MERGE_GRAD=1 (default) enables ring-attention-style EXACT
 # gradients through the LSE merge; =0 falls back to the legacy detached-LSE
 # semantics (identical to FA2 history) everywhere.
+#
+# Backend-agnostic: the merged-stats trick only needs a "raw" flash backward
+# that accepts (q, k, v, out, dout, lse) — both FA4 (flash_attn.cute
+# _flash_attn_bwd) and FA2 (flash_attn_interface._flash_attn_backward /
+# _flash_attn_varlen_backward) expose one. FA2 is the common case on the
+# training pods (no nvidia-cutlass-dsl), so it is a first-class path here,
+# not a fallback that silently degrades to detached-LSE gradients.
 _EXACT_MERGE_GRAD = os.environ.get("DAT_EXACT_MERGE_GRAD", "1") == "1"
 _fa4_raw_bwd = None
+_fa2_raw_bwd = None
+_fa2_raw_varlen_bwd = None
 if _USE_FA4:
     try:
         from flash_attn.cute.interface import _flash_attn_bwd as _fa4_raw_bwd
     except Exception as _raw_err:  # pragma: no cover
-        print(f"[DAT-LSE/qwen3_5] FA4 raw bwd unavailable ({_raw_err}); "
-              f"exact merge gradients disabled")
-if _EXACT_MERGE_GRAD and _fa4_raw_bwd is not None:
-    print("[DAT-LSE/qwen3_5] exact merge gradients ENABLED "
-          "(merged-stats backward, requires hd_gate=None)")
+        print(f"[DAT-LSE/qwen3_5] FA4 raw bwd unavailable ({_raw_err})")
+if _fa4_raw_bwd is None:
+    try:
+        from flash_attn.flash_attn_interface import (
+            _flash_attn_backward as _fa2_raw_bwd,
+            _flash_attn_varlen_backward as _fa2_raw_varlen_bwd,
+        )
+    except Exception as _raw_err:  # pragma: no cover
+        print(f"[DAT-LSE/qwen3_5] FA2 raw bwd unavailable ({_raw_err})")
+
+_EXACT_BWD_BACKEND: Optional[str] = (
+    "fa4" if _fa4_raw_bwd is not None
+    else "fa2" if _fa2_raw_bwd is not None
+    else None
+)
+_EXACT_MERGE_AVAILABLE = _EXACT_MERGE_GRAD and _EXACT_BWD_BACKEND is not None
+if _EXACT_MERGE_AVAILABLE:
+    print(f"[DAT-LSE/qwen3_5] exact merge gradients ENABLED via {_EXACT_BWD_BACKEND.upper()} "
+          f"raw backward (merged-stats, requires hd_gate=None)")
+elif _EXACT_MERGE_GRAD:
+    print("[DAT-LSE/qwen3_5] WARNING: DAT_EXACT_MERGE_GRAD=1 but no raw flash backward "
+          "is importable — training will REFUSE to run the two-pass merge (set "
+          "DAT_EXACT_MERGE_GRAD=0 to knowingly accept legacy detached-LSE gradients)")
+else:
+    print("[DAT-LSE/qwen3_5] exact merge gradients DISABLED by DAT_EXACT_MERGE_GRAD=0 "
+          "(legacy detached-LSE semantics)")
+
+
+def _raw_attn_fwd(q_t, k_t, v_t, causal: bool):
+    """Dense attention fwd in flash layout. q/k/v: [B, N, H, D] -> (out [B,N,H,D], lse [B,H,N] fp32)."""
+    if _USE_FA4:
+        return _fa4_func(q_t, k_t, v_t, causal=causal, return_lse=True)
+    if _FA_HAS_SOFTMAX_LSE:
+        return _flash_attn_func(q_t, k_t, v_t, causal=causal, return_softmax_lse=True)
+    out, lse, _ = _flash_attn_func(q_t, k_t, v_t, causal=causal, return_attn_probs=True)
+    return out, lse
+
+
+def _raw_attn_varlen_fwd(q_p, k_p, v_p, cu_q, cu_k, max_q, max_k, causal: bool):
+    """Varlen attention fwd. q/k/v packed [total, H, D] -> (out [total,H,D], lse [H,total] fp32)."""
+    if _USE_FA4:
+        return _fa4_varlen_func(
+            q_p, k_p, v_p,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q, max_seqlen_k=max_k,
+            causal=causal, return_lse=True,
+        )
+    if _FA_HAS_SOFTMAX_LSE:
+        return _flash_attn_varlen_func(
+            q_p, k_p, v_p, cu_q, cu_k, max_q, max_k,
+            causal=causal, return_softmax_lse=True,
+        )
+    out, lse, _ = _flash_attn_varlen_func(
+        q_p, k_p, v_p, cu_q, cu_k, max_q, max_k,
+        causal=causal, return_attn_probs=True,
+    )
+    return out, lse
+
+
+def _raw_attn_bwd(q_t, k_t, v_t, out, dout, lse, causal: bool):
+    """Dense raw flash backward with caller-supplied (out, lse) row stats.
+
+    Feeding MERGED (out*, lse*) here makes the kernel reconstruct the
+    union-softmax probabilities p = exp(s - lse*) and use D = g·out*, which is
+    exactly the merged-attention gradient (ring-attention backward).
+    Returns (dq, dk, dv) in flash layout, same dtype as q/k/v.
+    """
+    if _EXACT_BWD_BACKEND == "fa4":
+        return _fa4_raw_bwd(q_t, k_t, v_t, out, dout, lse, causal=causal)
+    # FA2: raw kernel needs preallocated dq/dk/dv and an explicit softmax scale
+    # (the public API defaults it to head_dim**-0.5; the raw op does not).
+    dq = torch.empty_like(q_t)
+    dk = torch.empty_like(k_t)
+    dv = torch.empty_like(v_t)
+    _fa2_raw_bwd(
+        dout.contiguous(), q_t, k_t, v_t, out.contiguous(), lse.contiguous(),
+        dq, dk, dv,
+        0.0,                          # dropout_p
+        q_t.shape[-1] ** -0.5,        # softmax_scale
+        causal,
+        -1, -1,                       # window_size_left / right
+        0.0,                          # softcap
+        None,                         # alibi_slopes
+        False,                        # deterministic
+        None,                         # rng_state
+    )
+    return dq, dk, dv
+
+
+def _raw_attn_varlen_bwd(q_p, k_p, v_p, out, dout, lse, cu_q, cu_k, max_q, max_k, causal: bool):
+    """Varlen raw flash backward with caller-supplied (out, lse). lse: [H, total] fp32."""
+    if _EXACT_BWD_BACKEND == "fa4":
+        return _fa4_raw_bwd(
+            q_p, k_p, v_p, out, dout, lse,
+            causal=causal,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q, max_seqlen_k=max_k,
+        )
+    dq = torch.empty_like(q_p)
+    dk = torch.empty_like(k_p)
+    dv = torch.empty_like(v_p)
+    _fa2_raw_varlen_bwd(
+        dout.contiguous(), q_p, k_p, v_p, out.contiguous(), lse.contiguous(),
+        dq, dk, dv,
+        cu_q, cu_k, int(max_q), int(max_k),
+        0.0,                          # dropout_p
+        q_p.shape[-1] ** -0.5,        # softmax_scale
+        causal,
+        -1, -1,                       # window_size_left / right
+        0.0,                          # softcap
+        None,                         # alibi_slopes
+        False,                        # deterministic
+        None,                         # rng_state
+        False,                        # zero_tensors
+    )
+    return dq, dk, dv
 
 
 class _TwoPassMergedAttnFn(torch.autograd.Function):
@@ -262,7 +382,8 @@ class _TwoPassMergedAttnFn(torch.autograd.Function):
     attention over the concatenated KV set. This is the standard ring-
     attention / context-parallel merged backward. No dlse is involved, so
     FA4's "SM100 backward with head_dim=256 does not support dlse" assert is
-    never hit.
+    never hit, and FA2's silent dlse drop is irrelevant. Works on either
+    backend (see _raw_attn_bwd / _raw_attn_varlen_bwd).
 
     Constraints:
       - segments must be row-disjoint (guaranteed by construction: answer /
@@ -282,13 +403,16 @@ class _TwoPassMergedAttnFn(torch.autograd.Function):
         k_t = k.transpose(1, 2).contiguous()
         v_t = v.transpose(1, 2).contiguous()
 
-        out1, lse1 = _fa4_func(q_t, k_t, v_t, causal=True, return_lse=True)
-        out2p, lse2p = _fa4_varlen_func(
-            q2p, k2p, v2p,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
-            max_seqlen_q=max_q, max_seqlen_k=max_k,
-            causal=False, return_lse=True,
+        q2p = q2p.contiguous()
+        k2p = k2p.contiguous()
+        v2p = v2p.contiguous()
+
+        out1, lse1 = _raw_attn_fwd(q_t, k_t, v_t, causal=True)
+        out2p, lse2p = _raw_attn_varlen_fwd(
+            q2p, k2p, v2p, cu_q, cu_k, max_q, max_k, causal=False,
         )
+        lse1 = lse1.float()
+        lse2p = lse2p.float()
 
         # Row-disjoint merge; also build the per-row merged stats that the
         # backward feeds to both raw kernels.
@@ -335,17 +459,15 @@ class _TwoPassMergedAttnFn(torch.autograd.Function):
         # (out*, lse*): the kernel's reconstructed p becomes the union-softmax
         # probability restricted to sequence keys, and its D-term uses g·out*.
         # Non-merged rows carry their own (out1, lse1) — plain exact backward.
-        dq_t, dk_t, dv_t = _fa4_raw_bwd(q_t, k_t, v_t, out, g, lse_c, causal=True)
+        dq_t, dk_t, dv_t = _raw_attn_bwd(q_t, k_t, v_t, out, g, lse_c, causal=True)
 
         # Pass 2 backward, same merged stats gathered per segment row.
         out2s = torch.cat([out[b, s:s + n] for (b, s, n) in seg_meta], dim=0).contiguous()
         g2s = torch.cat([g[b, s:s + n] for (b, s, n) in seg_meta], dim=0).contiguous()
         lse2s = torch.cat([lse_c[b, :, s:s + n] for (b, s, n) in seg_meta], dim=1).contiguous()
-        dq2p, dk2p, dv2p = _fa4_raw_bwd(
+        dq2p, dk2p, dv2p = _raw_attn_varlen_bwd(
             q2p, k2p, v2p, out2s, g2s, lse2s,
-            causal=False,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
-            max_seqlen_q=ctx.max_q, max_seqlen_k=ctx.max_k,
+            cu_q, cu_k, ctx.max_q, ctx.max_k, causal=False,
         )
 
         return (dq_t.transpose(1, 2), dk_t.transpose(1, 2), dv_t.transpose(1, 2),
@@ -1444,15 +1566,31 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # Exact path (training default): one autograd Function owns Pass 1 +
         # Pass 2 + merge and implements the merged-stats backward — gradients
         # are exactly those of a single attention over the concatenated KV
-        # set. Legacy path (inference / hd_gate / FA4-less / kill switch):
-        # detached-LSE merge, FA2-historical stop-gradient semantics.
+        # set. Legacy path (inference / hd_gate / kill switch): detached-LSE
+        # merge, FA2-historical stop-gradient semantics.
         use_exact_merge = (
-            _EXACT_MERGE_GRAD
-            and _fa4_raw_bwd is not None
+            _EXACT_MERGE_AVAILABLE
             and self.hd_gate is None
             and torch.is_grad_enabled()
             and bool(seg_q_list)
         )
+        if (
+            not use_exact_merge
+            and _EXACT_MERGE_GRAD
+            and _EXACT_BWD_BACKEND is None
+            and self.training
+            and torch.is_grad_enabled()
+            and bool(seg_q_list)
+        ):
+            # Refuse to train with silently-degraded gradients: this is the
+            # exact failure mode that starved k_proj_hd/v_proj_hd historically.
+            raise RuntimeError(
+                "[DAT-LSE/qwen3_5] DAT_EXACT_MERGE_GRAD=1 but no raw flash backward "
+                "(FA2 flash_attn_interface._flash_attn_backward or FA4 "
+                "flash_attn.cute._flash_attn_bwd) is importable. Fix the flash_attn "
+                "install, or set DAT_EXACT_MERGE_GRAD=0 to knowingly train with legacy "
+                "detached-LSE gradients."
+            )
 
         if use_exact_merge:
             q2_packed = torch.cat(seg_q_list, dim=0)

@@ -7,9 +7,13 @@ fp32 eager reference that computes ONE softmax over the concatenated key set
 backward claims to be exactly equal to. Also reports how far the legacy
 detached-LSE gradients deviate, so the effect of the fix is visible.
 
-Needs an FA4-capable GPU (sm90+, flash_attn.cute importable). Run on the
-training pod:
+Backend-agnostic: uses whatever raw flash backward the model module picked
+(FA2 flash_attn_interface._flash_attn_backward on ordinary pods, FA4
+flash_attn.cute._flash_attn_bwd when nvidia-cutlass-dsl is installed). Run
+on the training pod:
 
+  python scripts/_test_exact_merge_grad.py                  # auto backend
+  DAT_ATTN_BACKEND=fa2 python scripts/_test_exact_merge_grad.py
   DAT_ATTN_BACKEND=fa4 python scripts/_test_exact_merge_grad.py
 """
 
@@ -20,9 +24,11 @@ import torch
 
 from llava.model.language_model import modeling_qwen3_5_dat as M
 
-if not M._USE_FA4 or M._fa4_raw_bwd is None:
-    sys.exit("FA4 (flash_attn.cute) not available — the exact-merge path is disabled here; "
-             "training on this machine would silently use detached-LSE gradients.")
+if not M._EXACT_MERGE_AVAILABLE:
+    sys.exit(f"exact-merge path unavailable here (backend={M._EXACT_BWD_BACKEND}, "
+             f"DAT_EXACT_MERGE_GRAD={int(M._EXACT_MERGE_GRAD)}); nothing to test.")
+print(f"[test] exact-merge backend: {M._EXACT_BWD_BACKEND.upper()} "
+      f"(forward via {'FA4' if M._USE_FA4 else 'FA2 v' + str(M._fa_ver)})")
 
 torch.manual_seed(0)
 dev = "cuda"
