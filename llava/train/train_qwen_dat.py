@@ -99,11 +99,14 @@ IGNORE_INDEX = -100
 
 local_rank = None
 
-# DAT parameter patterns (must match modeling_qwen2vl_dat.py)
+# DAT parameter patterns (superset across families; must cover every
+# modeling_*_dat.py DAT_KEYS_MATCH). 'proj_film' / 'spatial_gain' exist only
+# in Qwen3.5 DAT with dat_intention_inject='film'.
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
+    'proj_film', 'spatial_gain',
 ]
 
 
