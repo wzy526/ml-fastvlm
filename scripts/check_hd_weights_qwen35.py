@@ -124,8 +124,8 @@ def main():
 
     print(f"ckpt: {args.model_path}")
     print(f"DAT layers: {dat_layers}\n")
-    hdr = (f"{'layer':>5} | {'|Wk_hd|':>8} {'|Wk|':>8} {'k_hd/init':>9} | "
-           f"{'|Wv_hd|':>8} {'|Wv|':>8} {'v_hd/v':>7} {'erank_v':>7} | "
+    hdr = (f"{'layer':>5} | {'|Wk_hd|':>8} {'|Wk|':>8} {'k_hd/init':>9} {'k_drift':>8} | "
+           f"{'|Wv_hd|':>8} {'|Wv|':>8} {'v_hd/v':>7} {'v_drift':>8} {'erank_v':>7} | "
            f"{'ln_w mean':>9} {'ln_w std':>8} | {'|off|':>8} {'gate':>6}")
     print(hdr); print("-" * len(hdr))
 
@@ -149,25 +149,43 @@ def main():
         gate = L.get("hd_gate.param")
         gate_s = f"{torch.sigmoid(gate.float()).item():.3f}" if gate is not None else "  none"
         er_v = eff_rank(wv_hd)
+        # Warm-start drift: since a2ff336 k/v_proj_hd are COPIED from the layer's
+        # own k/v_proj at init, so ||W_hd - W|| / ||W|| is "how far HD moved from
+        # its init" (the LLM is frozen in stage 1, so k_proj/v_proj == init copy).
+        k_drift = ((wk_hd - wk).norm() / wk.norm()).item() if wk.shape == wk_hd.shape and nk > 0 else float("nan")
+        v_drift = ((wv_hd - wv).norm() / wv.norm()).item() if wv.shape == wv_hd.shape and nv > 0 else float("nan")
 
         report[lid] = dict(k_hd_norm=nk_hd, k_norm=nk, k_hd_over_init=nk_hd / k_init_expect,
+                           k_drift_from_kproj=k_drift,
                            v_hd_norm=nv_hd, v_norm=nv,
                            v_hd_over_v=(nv_hd / nv if nv > 0 else float("nan")),
+                           v_drift_from_vproj=v_drift,
                            v_hd_eff_rank=er_v, ln_mean=ln_mean, ln_std=ln_std,
                            off_norm=n_off, gate=gate_s.strip())
-        print(f"{lid:>5} | {nk_hd:>8.2f} {nk:>8.2f} {nk_hd / k_init_expect:>9.3f} | "
-              f"{nv_hd:>8.3f} {nv:>8.2f} {report[lid]['v_hd_over_v']:>7.3f} {er_v:>7.1f} | "
+        print(f"{lid:>5} | {nk_hd:>8.2f} {nk:>8.2f} {nk_hd / k_init_expect:>9.3f} {k_drift:>8.4f} | "
+              f"{nv_hd:>8.3f} {nv:>8.2f} {report[lid]['v_hd_over_v']:>7.3f} {v_drift:>8.4f} {er_v:>7.1f} | "
               f"{ln_mean:>9.3f} {ln_std:>8.3f} | {n_off:>8.4f} {gate_s:>6}")
 
     print("\nhow to read:")
-    print("  v_hd/v  ~0 (e.g. <0.05)  -> v_proj_hd never left zero-init: HD values ~0, branch")
-    print("                              is pure dilution, content-blind by construction")
-    print("  k_hd/init ~1.0            -> k_proj_hd still at random Kaiming init (no K learning;")
-    print("                              expected when V~0 since dK ∝ V)")
+    print("  ZERO-INIT ckpts (<= 0826):")
+    print("    v_hd/v  ~0 (e.g. <0.05)  -> v_proj_hd never left zero-init: HD values ~0, branch")
+    print("                                is pure dilution, content-blind by construction")
+    print("    k_hd/init ~1.0            -> k_proj_hd still at random Kaiming init (no K learning;")
+    print("                                expected when V~0 since dK ∝ V)")
+    print("  WARM-START ckpts (>= 0908, k/v_hd copied from k/v_proj):")
+    print("    k_drift / v_drift = ||W_hd - W|| / ||W||; 0 = still the copy, should GROW with")
+    print("                                steps (a few e-2 after 1k steps is real learning;")
+    print("                                k_drift == 0 while v_drift > 0 = old K starvation)")
     print("  erank_v small (<10)       -> whatever V learned is a near-constant direction")
     print("  |off| ~0                  -> offsets never learned: sampling = fixed regular grid")
 
     if layers_b is not None:
+        # Base (non-DAT) ckpt as B: fall back to its k_proj/v_proj as the reference
+        # for k_proj_hd/v_proj_hd (== the warm-start init).
+        for lid in layers_b:
+            if "k_proj_hd.weight" not in layers_b[lid] and "k_proj.weight" in layers_b[lid]:
+                layers_b[lid]["k_proj_hd.weight"] = layers_b[lid]["k_proj.weight"]
+                layers_b[lid]["v_proj_hd.weight"] = layers_b[lid]["v_proj.weight"]
         compare(layers, layers_b)
 
     if args.out:
