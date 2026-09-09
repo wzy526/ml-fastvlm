@@ -35,6 +35,7 @@ Usage (single GPU, on the eval cluster):
 
 import argparse
 import base64
+import glob
 import io
 import json
 import math
@@ -81,7 +82,18 @@ def load_samples(args):
 
     from datasets import load_dataset
     split = {"hrbench4k": "hrbench_4k", "hrbench8k": "hrbench_8k"}[args.dataset]
-    ds = load_dataset("DreamMr/HR-Bench", "hrbench_version_split", split=split)
+    # Prefer the parquet already sitting in the HF hub cache (or an explicit
+    # --hrbench_parquet): load_dataset("DreamMr/HR-Bench") always phones the
+    # Hub to resolve the repo first, which hangs for HF_HUB_DOWNLOAD_TIMEOUT
+    # when the mirror is slow and fails outright under HF_HUB_OFFLINE=1 once
+    # the ~/.cache/huggingface/datasets arrow cache has been wiped.
+    pq = args.hrbench_parquet or _local_hrbench_parquet(split)
+    if pq:
+        print(f"[probe] HR-Bench from local parquet: {pq}")
+        ds = load_dataset("parquet", data_files=pq, split="train")
+    else:
+        print("[probe] HR-Bench parquet not in local hub cache; resolving via the Hub")
+        ds = load_dataset("DreamMr/HR-Bench", "hrbench_version_split", split=split)
     for doc in ds:
         if len(samples) >= args.max_samples:
             break
@@ -96,6 +108,16 @@ def load_samples(args):
             "category": str(doc.get("category", "n/a")),
         })
     return samples
+
+
+def _local_hrbench_parquet(split):
+    """Locate hr_bench_{4k,8k}.parquet inside the HF hub cache, if downloaded."""
+    fname = {"hrbench_4k": "hr_bench_4k.parquet", "hrbench_8k": "hr_bench_8k.parquet"}[split]
+    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+    hits = sorted(glob.glob(os.path.join(hub, "datasets--DreamMr--HR-Bench", "snapshots", "*", fname)),
+                  key=os.path.getmtime)
+    return hits[-1] if hits else None
 
 
 def extract_letter(text):
@@ -210,6 +232,8 @@ def main():
     ap.add_argument("--processor_path", default=None)
     ap.add_argument("--dataset", choices=["hrbench4k", "hrbench8k"], default="hrbench4k")
     ap.add_argument("--image_folder", default=None)
+    ap.add_argument("--hrbench_parquet", default=None,
+                    help="explicit path to hr_bench_4k/8k.parquet (skips the Hub entirely)")
     ap.add_argument("--tok_budget", type=int, default=256,
                     help="LR LLM-visual-token budget (lr_max_pixels = tok*1024)")
     ap.add_argument("--min_pixels", type=int, default=28224)
