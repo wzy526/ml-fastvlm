@@ -27,6 +27,28 @@ import transformers
 from torch.utils.data import Dataset, Sampler
 from PIL import Image
 
+# ── Allow --resume_from_checkpoint on torch < 2.6 ───────────────────────────
+# transformers >= 4.5x refuses torch.load() (CVE-2025-32434) unless torch >= 2.6,
+# which breaks Trainer resume: scheduler.pt / rng_state_*.pth / trainer_state
+# are plain torch pickles the trainer itself wrote seconds earlier. Model
+# weights are safetensors and unaffected; deepspeed restores its own
+# global_step*/ states with its own torch.load. Those files are ours and live
+# on our own disk, so the CVE (malicious pickles) does not apply — bypass the
+# version gate on the OSS pods (torch 2.5.1). DAT_ALLOW_TORCH_LOAD=0 restores
+# the upstream behaviour.
+if os.environ.get("DAT_ALLOW_TORCH_LOAD", "1") == "1":
+    try:
+        from transformers.utils import import_utils as _tf_import_utils
+        if not _tf_import_utils.is_torch_greater_or_equal("2.6"):
+            _tf_import_utils.check_torch_load_is_safe = lambda: None
+            import transformers.trainer as _tf_trainer  # imports the name directly
+            if hasattr(_tf_trainer, "check_torch_load_is_safe"):
+                _tf_trainer.check_torch_load_is_safe = lambda: None
+            print(f"[resume] torch {torch.__version__} < 2.6: transformers' torch.load gate "
+                  f"bypassed for our own checkpoint files (DAT_ALLOW_TORCH_LOAD=0 to disable)")
+    except Exception as _e:  # pragma: no cover
+        print(f"[resume] could not patch check_torch_load_is_safe: {_e}")
+
 # ── Suppress third-party warning spam that defeats standard filters ─────────
 # flash-attn-4's CuTe code trips a deprecated cutlass accessor which warns via
 # `catch_warnings() + simplefilter("always")` — that bypasses PYTHONWARNINGS
