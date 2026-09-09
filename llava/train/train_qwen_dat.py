@@ -44,8 +44,27 @@ if os.environ.get("DAT_ALLOW_TORCH_LOAD", "1") == "1":
             import transformers.trainer as _tf_trainer  # imports the name directly
             if hasattr(_tf_trainer, "check_torch_load_is_safe"):
                 _tf_trainer.check_torch_load_is_safe = lambda: None
+            # rng_state_*.pth holds np.random.get_state() (an ndarray). torch >= 2.6
+            # allowlists the numpy globals for weights_only=True by default; 2.5
+            # does not ("Unsupported global: numpy.core.multiarray._reconstruct").
+            # Mirror the 2.6 default allowlist.
+            import numpy as _np
+            _np_safe = [_np.ndarray, _np.dtype]
+            for _mod in ("numpy.core.multiarray", "numpy._core.multiarray"):
+                try:
+                    _m = __import__(_mod, fromlist=["_reconstruct", "scalar"])
+                    _np_safe += [getattr(_m, _n) for _n in ("_reconstruct", "scalar") if hasattr(_m, _n)]
+                except Exception:
+                    pass
+            try:
+                import numpy.dtypes as _npd
+                _np_safe += [getattr(_npd, _n) for _n in dir(_npd) if _n.endswith("DType")]
+            except Exception:
+                pass
+            torch.serialization.add_safe_globals(_np_safe)
             print(f"[resume] torch {torch.__version__} < 2.6: transformers' torch.load gate "
-                  f"bypassed for our own checkpoint files (DAT_ALLOW_TORCH_LOAD=0 to disable)")
+                  f"bypassed and {len(_np_safe)} numpy globals allowlisted for our own "
+                  f"checkpoint files (DAT_ALLOW_TORCH_LOAD=0 to disable)")
     except Exception as _e:  # pragma: no cover
         print(f"[resume] could not patch check_torch_load_is_safe: {_e}")
 
