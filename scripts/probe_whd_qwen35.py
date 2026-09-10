@@ -261,6 +261,31 @@ def install_merge_hook():
 
 
 KHD = defaultdict(list)          # layer_idx -> [(shared/resid ratio, mean |offset|), ...]
+KLR = defaultdict(list)          # layer_idx -> [shared/resid ratio of the LR image keys, ...]
+
+
+def install_lr_key_hook(model):
+    """Baseline for KHD: the same shared/resid ratio on the base k_proj output
+    restricted to LR image tokens of the prefill, so the HD number has a
+    same-layer reference instead of being read in a vacuum."""
+    from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5AttentionDAT
+
+    def make_hook(layer_idx):
+        def hook(mod, inp, out):
+            mask = STATE.get("img_mask")
+            if not STATE["record"] or mask is None or out.shape[1] != mask.numel():
+                return
+            with torch.no_grad():
+                k = out[0][mask.to(out.device)].float()      # [N_lr, D]
+                mu = k.mean(0, keepdim=True)
+                shared = mu.norm().item()
+                resid = (k - mu).norm(dim=-1).mean().item()
+                KLR[layer_idx].append(shared / max(resid, 1e-6))
+        return hook
+
+    for m in model.modules():
+        if isinstance(m, Qwen3_5AttentionDAT) and getattr(m, "hd_proj", False):
+            m.k_proj.register_forward_hook(make_hook(m.layer_idx))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -303,6 +328,8 @@ def main():
         args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
         attn_implementation=args.attn,
     ).eval()
+    install_lr_key_hook(model)
+    image_token_id = getattr(model.config, "image_token_id", None)
     ppath = args.processor_path or args.model_path
     processor = AutoProcessor.from_pretrained(
         ppath, min_pixels=args.min_pixels, max_pixels=args.tok_budget * TOK_PX)
@@ -328,6 +355,9 @@ def main():
     for i, s in enumerate(tqdm(samples, desc="probe")):
         base_inputs, hd_extra = build_inputs(
             s, i, samples, processor, hr_processor, args, device, dtype)
+
+        STATE["img_mask"] = (base_inputs["input_ids"][0] == image_token_id) \
+            if image_token_id is not None else None
 
         STATE["bias"] = 0.0
         t = gen(base_inputs)
@@ -382,19 +412,24 @@ def main():
             print(f"{c:>16} : fixed {fixed:>3}   broke {broke:>3}   net {fixed - broke:+d}")
 
     print(f"\n==== w_hd per DAT layer  (source={args.hd_source}, bias={record_bias:+g}) ====")
-    print(f"{'layer':>6} | {'mean':>8} | {'p90':>8} | {'max':>8} | {'Khd shared/resid':>16} | {'|off|':>6}")
-    print("-" * 70)
+    print(f"{'layer':>6} | {'mean':>8} | {'p90':>8} | {'max':>8} | {'Khd shared/resid':>16} | "
+          f"{'Klr shared/resid':>16} | {'|off|':>6}")
+    print("-" * 90)
     layer_whd = {}
     for lid in sorted(WHD):
         ms, p9, mx = zip(*WHD[lid])
         layer_whd[lid] = {"mean": sum(ms) / len(ms), "p90": sum(p9) / len(p9), "max": max(mx)}
         st = layer_whd[lid]
-        extra = f"{'n/a':>16} | {'n/a':>6}"
+        extra = f"{'n/a':>16} | {'n/a':>16} | {'n/a':>6}"
         if KHD.get(lid):
             rs, offs = zip(*KHD[lid])
             st["k_shared_over_resid"] = sum(rs) / len(rs)
             st["mean_abs_offset"] = sum(offs) / len(offs)
-            extra = f"{st['k_shared_over_resid']:>16.3f} | {st['mean_abs_offset']:>6.3f}"
+            lr_cell = f"{'n/a':>16}"
+            if KLR.get(lid):
+                st["k_lr_shared_over_resid"] = sum(KLR[lid]) / len(KLR[lid])
+                lr_cell = f"{st['k_lr_shared_over_resid']:>16.3f}"
+            extra = f"{st['k_shared_over_resid']:>16.3f} | {lr_cell} | {st['mean_abs_offset']:>6.3f}"
         print(f"{lid:>6} | {st['mean']:>8.4f} | {st['p90']:>8.4f} | {st['max']:>8.4f} | {extra}")
 
     if args.out:
