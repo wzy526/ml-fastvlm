@@ -152,8 +152,15 @@ def make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, source):
         return (img.resize((lr_w_px, lr_h_px), Image.BICUBIC)
                    .resize((hd_w, hd_h), Image.BICUBIC))
     if source == "shuffle":
-        other = samples[(idx + 1) % len(samples)]["image"]
-        return other.resize((hd_w, hd_h), Image.BICUBIC)
+        # HR-Bench stores the 4 cyclic option permutations of one question as
+        # CONSECUTIVE rows sharing the same image, so idx+1 returns the SAME
+        # image 3 times out of 4. Jump half-way round and skip identical images.
+        n = len(samples)
+        for step in range(n // 2, n // 2 + 8):
+            other = samples[(idx + step) % n]["image"]
+            if other.size != img.size or other.tobytes()[:4096] != img.tobytes()[:4096]:
+                return other.resize((hd_w, hd_h), Image.BICUBIC)
+        raise RuntimeError(f"shuffle: could not find a different image for sample {idx}")
     if source == "noise":
         rng = np.random.RandomState(idx)
         arr = rng.randint(0, 256, size=(hd_h, hd_w, 3), dtype=np.uint8)
