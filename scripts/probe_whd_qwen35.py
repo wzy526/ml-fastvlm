@@ -230,6 +230,38 @@ def install_merge_hook():
 
     Qwen3_5AttentionDAT._merge_two_pass_lse = patched
 
+    # K_hd "sink-ness": how much of every HD key is a direction shared by all
+    # Ns tokens (content-free, attracts the same logit for every query) versus
+    # token-specific residual. ratio >> 1 means the HD keys are near-identical
+    # and act as one big sink; ratio << 1 means they carry per-token content.
+    # Also records how far sampling points moved off the uniform reference grid.
+    orig_sample = Qwen3_5AttentionDAT._sample_hd_from_off_guide
+
+    def patched_sample(self, *a, **kw):
+        key_hd, value_hd, locs = orig_sample(self, *a, **kw)
+        if STATE["record"]:
+            with torch.no_grad():
+                k = key_hd.float()                       # [Lp, Ns, D]
+                mu = k.mean(1, keepdim=True)
+                shared = mu.norm(dim=-1).mean().item()
+                resid = (k - mu).norm(dim=-1).mean().item()
+                gh, gw = locs.shape[2], locs.shape[3]
+                my, mx = 1.0 / max(gh - 1, 1), 1.0 / max(gw - 1, 1)
+                gy, gx = torch.meshgrid(
+                    torch.linspace(-1 + my, 1 - my, gh, device=locs.device),
+                    torch.linspace(-1 + mx, 1 - mx, gw, device=locs.device),
+                    indexing="ij")                       # same half-cell-margin grid as _grid_generate
+                l = locs.float()
+                off = min((l - torch.stack([gx, gy], -1)).abs().mean().item(),
+                          (l - torch.stack([gy, gx], -1)).abs().mean().item())
+                KHD[self.layer_idx].append((shared / max(resid, 1e-6), off))
+        return key_hd, value_hd, locs
+
+    Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
+
+
+KHD = defaultdict(list)          # layer_idx -> [(shared/resid ratio, mean |offset|), ...]
+
 
 # ──────────────────────────────────────────────────────────────
 
@@ -350,14 +382,20 @@ def main():
             print(f"{c:>16} : fixed {fixed:>3}   broke {broke:>3}   net {fixed - broke:+d}")
 
     print(f"\n==== w_hd per DAT layer  (source={args.hd_source}, bias={record_bias:+g}) ====")
-    print(f"{'layer':>6} | {'mean':>8} | {'p90':>8} | {'max':>8}")
-    print("-" * 40)
+    print(f"{'layer':>6} | {'mean':>8} | {'p90':>8} | {'max':>8} | {'Khd shared/resid':>16} | {'|off|':>6}")
+    print("-" * 70)
     layer_whd = {}
     for lid in sorted(WHD):
         ms, p9, mx = zip(*WHD[lid])
         layer_whd[lid] = {"mean": sum(ms) / len(ms), "p90": sum(p9) / len(p9), "max": max(mx)}
         st = layer_whd[lid]
-        print(f"{lid:>6} | {st['mean']:>8.4f} | {st['p90']:>8.4f} | {st['max']:>8.4f}")
+        extra = f"{'n/a':>16} | {'n/a':>6}"
+        if KHD.get(lid):
+            rs, offs = zip(*KHD[lid])
+            st["k_shared_over_resid"] = sum(rs) / len(rs)
+            st["mean_abs_offset"] = sum(offs) / len(offs)
+            extra = f"{st['k_shared_over_resid']:>16.3f} | {st['mean_abs_offset']:>6.3f}"
+        print(f"{lid:>6} | {st['mean']:>8.4f} | {st['p90']:>8.4f} | {st['max']:>8.4f} | {extra}")
 
     if args.out:
         json.dump({
