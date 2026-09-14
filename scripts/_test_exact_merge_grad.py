@@ -50,6 +50,9 @@ def make():
     return q, k, v, k2, v2, gw
 
 
+LSE_BIAS = 0.0   # set by the bias case below; added to every HD logit
+
+
 def run_exact(q, k, v, k2, v2, gw):
     q2p = torch.cat([q[b, :, s:s + n].transpose(0, 1) for (b, s, n, _) in SEGS], 0)  # [tot,H,D]
     k2p, v2p = torch.cat(k2, 0), torch.cat(v2, 0)
@@ -59,7 +62,7 @@ def run_exact(q, k, v, k2, v2, gw):
     cu_k = torch.tensor([0] + list(torch.cumsum(torch.tensor(nk), 0)), dtype=torch.int32, device=dev)
     seg_meta = tuple((b, s, n) for (b, s, n, _) in SEGS)
     out = M._TwoPassMergedAttnFn.apply(q, k, v, q2p, k2p, v2p, cu_q, cu_k,
-                                       max(nq), max(nk), seg_meta, None)   # [B,N,H,D]
+                                       max(nq), max(nk), seg_meta, None, LSE_BIAS)   # [B,N,H,D]
     (out.float() * gw).sum().backward()
     return out.detach().float(), [t.grad.float() for t in (q, k, v)], \
         [t.grad.float() for t in k2], [t.grad.float() for t in v2]
@@ -101,6 +104,8 @@ def run_reference(q, k, v, k2, v2, gw):
             mask[s:s + n, off:off + nk] = True
             off += nk
         S = S.masked_fill(~mask, float("-inf"))
+        if LSE_BIAS != 0.0:
+            S = torch.cat([S[:, :, :N], S[:, :, N:] + LSE_BIAS], dim=-1)   # bias on HD logits only
         P = S.softmax(-1)
         outs.append(torch.einsum("hnm,hmd->hnd", P, V).transpose(0, 1))                   # [N, H, D]
     out = torch.stack(outs, 0)
@@ -144,6 +149,17 @@ print(f"\nworst rel err: exact={worst_exact:.3e}  legacy={worst_legacy:.3e}  (to
 if worst_exact > TOL:
     sys.exit("FAIL: exact-merge gradients deviate from the concatenated-KV reference")
 print("PASS: exact-merge forward+backward match single-softmax-over-union reference")
+
+# hd_lse_bias case: a constant on the HD logits must stay exact in fwd + bwd
+LSE_BIAS = 3.0
+ref_b = run_reference(*fresh())
+exact_b = run_exact(*fresh())
+worst_bias = report(f"EXACT with lse2_bias={LSE_BIAS:+g}", exact_b, ref_b)
+if worst_bias > TOL:
+    sys.exit("FAIL: exact-merge with lse2_bias deviates from the biased-logit reference")
+print(f"PASS: exact-merge with lse2_bias={LSE_BIAS:+g} matches the reference")
+LSE_BIAS = 0.0
+
 if worst_legacy <= TOL:
     print("note: legacy grads also within tol on this random instance — the two paths differ "
           "only through dlse terms, which are small when w_hd is small; the exactness claim "

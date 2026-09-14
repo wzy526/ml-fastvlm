@@ -394,11 +394,15 @@ class _TwoPassMergedAttnFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, q2p, k2p, v2p, cu_q, cu_k, max_q, max_k, seg_meta,
-                stats_sink=None):
+                stats_sink=None, lse2_bias=0.0):
         # q/k/v: [B, H, N, D] (GQA already repeated); q2p/k2p/v2p: packed
         # [total, H, D]; seg_meta: tuple of (b_idx, row_start, n_rows);
         # stats_sink: attention module to stash w2 (HD attention-mass share)
         # diagnostics on during training (harvested by DATMonitor).
+        # lse2_bias: constant added to every pass-2 logit (hd_lse_bias). It
+        # leaves the within-pass-2 softmax (out2) unchanged and only shifts
+        # the merge weights; the backward feeds pass 2 `lse* - bias` so the
+        # kernel reconstructs exp(s + bias - lse*) — still exact.
         q_t = q.transpose(1, 2).contiguous()
         k_t = k.transpose(1, 2).contiguous()
         v_t = v.transpose(1, 2).contiguous()
@@ -424,7 +428,7 @@ class _TwoPassMergedAttnFn(torch.autograd.Function):
         qoff = 0
         for (b, s, n) in seg_meta:
             l1 = lse1[b, :, s:s + n]                    # [H, n] fp32
-            l2 = lse2p[:, qoff:qoff + n]                # [H, n] fp32
+            l2 = lse2p[:, qoff:qoff + n] + lse2_bias    # [H, n] fp32
             lm = torch.logaddexp(l1, l2)
             w1 = (l1 - lm).exp().transpose(0, 1).unsqueeze(-1)   # [n, H, 1]
             w2 = (l2 - lm).exp().transpose(0, 1).unsqueeze(-1)
@@ -447,6 +451,7 @@ class _TwoPassMergedAttnFn(torch.autograd.Function):
         ctx.seg_meta = seg_meta
         ctx.max_q = max_q
         ctx.max_k = max_k
+        ctx.lse2_bias = float(lse2_bias)
         return out
 
     @staticmethod
@@ -464,14 +469,17 @@ class _TwoPassMergedAttnFn(torch.autograd.Function):
         # Pass 2 backward, same merged stats gathered per segment row.
         out2s = torch.cat([out[b, s:s + n] for (b, s, n) in seg_meta], dim=0).contiguous()
         g2s = torch.cat([g[b, s:s + n] for (b, s, n) in seg_meta], dim=0).contiguous()
-        lse2s = torch.cat([lse_c[b, :, s:s + n] for (b, s, n) in seg_meta], dim=1).contiguous()
+        lse2s = torch.cat([lse_c[b, :, s:s + n] for (b, s, n) in seg_meta], dim=1)
+        if ctx.lse2_bias != 0.0:
+            lse2s = lse2s - ctx.lse2_bias
+        lse2s = lse2s.contiguous()
         dq2p, dk2p, dv2p = _raw_attn_varlen_bwd(
             q2p, k2p, v2p, out2s, g2s, lse2s,
             cu_q, cu_k, ctx.max_q, ctx.max_k, causal=False,
         )
 
         return (dq_t.transpose(1, 2), dk_t.transpose(1, 2), dv_t.transpose(1, 2),
-                dq2p, dk2p, dv2p, None, None, None, None, None, None)
+                dq2p, dk2p, dv2p, None, None, None, None, None, None, None)
 
 
 logger = logging.getLogger(__name__)
@@ -1844,6 +1852,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 cu_q, cu_k, max(nq_lens), max(nk_lens),
                 tuple(seg_meta),
                 self if self.training else None,
+                float(self.hd_lse_bias),
             )  # [B, Nq, H, D]
         else:
             out1, lse1 = _dat_attn_with_lse(

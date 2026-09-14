@@ -123,6 +123,11 @@ def main():
     ap.add_argument("--max_answer_tokens", type=int, default=128)
     ap.add_argument("--attn", default="flash_attention_2")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--question_hd", action="store_true",
+                    help="add setting E: question tokens also read (image-conditioned) HD K/V "
+                         "(dat_image_hd_for_question=True at runtime; needs intention_as_gate)")
+    ap.add_argument("--lse_bias", type=float, default=0.0,
+                    help="add setting F: constant added to lse_hd (training-time curriculum knob)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -155,13 +160,27 @@ def main():
     device = next(model.parameters()).device
     dtype = torch.bfloat16
 
-    settings = [("A full LR, HD on", False, True),
-                ("B LR drop, HD on", True, True),
-                ("C LR drop, HD off", True, False),
-                ("D full LR, HD off", False, False)]
+    # (name, lr_drop, hd_on, question_readers, lse_bias)
+    settings = [("A full LR, HD on", False, True, False, 0.0),
+                ("B LR drop, HD on", True, True, False, 0.0),
+                ("C LR drop, HD off", True, False, False, 0.0),
+                ("D full LR, HD off", False, False, False, 0.0)]
+    if args.question_hd:
+        settings.append(("E +question readers", False, True, True, 0.0))
+    if args.lse_bias != 0.0:
+        settings.append((f"F lse_bias={args.lse_bias:+g}", False, True, False, args.lse_bias))
+    if args.question_hd and args.lse_bias != 0.0:
+        settings.append(("G question+bias", False, True, True, args.lse_bias))
     rec = {s[0]: {"loss": [], "g_kvhd": [], "g_kvlr": [], "g_off": [], "lr_drop_frac": []}
            for s in settings}
     os.environ["DAT_LR_DROP_RATIO"] = str(args.ratio)
+
+    dat_mods = [model.get_submodule(n) for n in sorted(dat_layer_prefixes)]
+
+    def set_knobs(q_hd, bias):
+        for m in dat_mods:
+            m.dat_image_hd_for_question = bool(q_hd)
+            m.hd_lse_bias = float(bias)
 
     for i, item in enumerate(tqdm(items, desc="samples")):
         try:
@@ -172,8 +191,9 @@ def main():
         # HD ViT once per sample (frozen, no grad); the 4 settings share the features
         with torch.no_grad():
             hd_feats = model._generate_hd_features(hd["pixel_values_hd"], hd["image_grid_thw_hd"])
-        for name, drop, hd_on in settings:
+        for name, drop, hd_on, q_hd, bias in settings:
             os.environ["DAT_LR_DROP_FORCE"] = "1" if drop else "0"
+            set_knobs(q_hd, bias)
             torch.manual_seed(args.seed * 100003 + i)      # identical mask for B and C
             model.zero_grad(set_to_none=True)
             inputs = {**base, "image_hd_features": hd_feats} if hd_on else dict(base)
@@ -187,6 +207,7 @@ def main():
             r["lr_drop_frac"].append(float(getattr(model, "_lr_drop_frac", 0.0)))
         model.zero_grad(set_to_none=True)
     os.environ.pop("DAT_LR_DROP_FORCE", None)
+    set_knobs(False, 0.0)
 
     mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
     print(f"\n==== LR-dropout leverage  (n={len(rec[settings[0][0]]['loss'])}, "
@@ -195,7 +216,7 @@ def main():
           f"{'grad offset':>11} | {'hd/lr':>6} | {'lr_drop':>7}")
     print("-" * 95)
     summ = {}
-    for name, _, hd_on in settings:
+    for name, _, hd_on, _, _ in settings:
         r = rec[name]
         s = {k: mean(v) for k, v in r.items()}
         s["hd_over_lr"] = s["g_kvhd"] / s["g_kvlr"] if s["g_kvlr"] > 0 else float("nan")
@@ -205,7 +226,7 @@ def main():
         print(f"{name:>20} | {s['loss']:>7.4f} | {kv} | {s['g_kvlr']:>11.4f} | "
               f"{s['g_off']:>11.4f} | {ratio} | {s['lr_drop_frac']:>7.3f}")
 
-    A, B, C, D = (summ[s[0]] for s in settings)
+    A, B, C, D = (summ[s[0]] for s in settings[:4])
     lever = B["g_kvhd"] / A["g_kvhd"] if A["g_kvhd"] > 0 else float("nan")
     pa = [c - b for b, c in zip(rec[settings[1][0]]["loss"], rec[settings[2][0]]["loss"])]
     pd = [d - a for a, d in zip(rec[settings[0][0]]["loss"], rec[settings[3][0]]["loss"])]
@@ -214,6 +235,10 @@ def main():
     print(f"HD help under starvation loss(C)-(B): {mean(pa):+.4f}  (paired mean; >0 = HD recovers blanked content)")
     print(f"HD help today        loss(D)-(A)   : {mean(pd):+.4f}  (paired mean; ~0 = HD contributes nothing now)")
     print(f"starvation cost      loss(B)-(A)   : {B['loss']-A['loss']:+.4f}")
+    for s in settings[4:]:
+        X = summ[s[0]]
+        print(f"{s[0]:>20}  grad(k/v_hd) x{X['g_kvhd']/A['g_kvhd']:5.2f} vs A   hd/lr {X['hd_over_lr']:.3f} "
+              f"(A {A['hd_over_lr']:.3f})   loss {X['loss']-A['loss']:+.4f} vs A")
 
     if args.out:
         json.dump({"args": vars(args), "summary": summ, "per_sample": rec,
