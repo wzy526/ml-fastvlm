@@ -16,6 +16,7 @@ effective HR/LR edge ratio (should be hr_scale=3 unless hr_cap or the image's
 native size binds).
 """
 import argparse
+import base64
 import glob
 import io
 import math
@@ -56,6 +57,8 @@ def main():
         row = pd.read_parquet(hits[0]).iloc[0]
         blob = row["image"]
         blob = blob["bytes"] if isinstance(blob, dict) else blob
+        if isinstance(blob, str):          # HR-Bench stores images as base64 text
+            blob = base64.b64decode(blob)
         img = Image.open(io.BytesIO(blob)).convert("RGB")
     W, H = img.size
     print(f"image {W}x{H} = {W*H/1e6:.2f} MP")
