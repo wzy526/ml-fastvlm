@@ -80,8 +80,8 @@ def build(item, processor, hr_processor, args, device, dtype):
     labels[:, :n_prompt] = -100
     if args.max_answer_tokens > 0 and labels.shape[1] - n_prompt > args.max_answer_tokens:
         cut = n_prompt + args.max_answer_tokens
-        inputs = {k: (v[:, :cut] if k in ("input_ids", "attention_mask") else v)
-                  for k, v in inputs.items()}
+        seq_keys = ("input_ids", "attention_mask", "mm_token_type_ids", "position_ids")
+        inputs = {k: (v[:, :cut] if k in seq_keys else v) for k, v in inputs.items()}
         labels = labels[:, :cut]
 
     lr_thw = inputs["image_grid_thw"][0]
@@ -169,11 +169,14 @@ def main():
         except Exception as e:  # noqa: BLE001
             print(f"[lrdrop] skip {item[0]}: {e}")
             continue
+        # HD ViT once per sample (frozen, no grad); the 4 settings share the features
+        with torch.no_grad():
+            hd_feats = model._generate_hd_features(hd["pixel_values_hd"], hd["image_grid_thw_hd"])
         for name, drop, hd_on in settings:
             os.environ["DAT_LR_DROP_FORCE"] = "1" if drop else "0"
             torch.manual_seed(args.seed * 100003 + i)      # identical mask for B and C
             model.zero_grad(set_to_none=True)
-            inputs = {**base, **hd} if hd_on else dict(base)
+            inputs = {**base, "image_hd_features": hd_feats} if hd_on else dict(base)
             out = model(**inputs)
             out.loss.backward()
             r = rec[name]
