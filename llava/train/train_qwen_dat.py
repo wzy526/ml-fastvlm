@@ -360,6 +360,20 @@ class ModelArguments:
     )
     dat_qr_heads: int = field(default=4)
     dat_qr_layerscale_init: float = field(default=1e-2)
+    dat_hd_lse_bias: float = field(
+        default=0.0,
+        metadata={"help": "Constant added to the HD-side LSE in the two-pass merge, i.e. to every "
+                          "HD logit. >0 forces attention mass onto the HD K/V so k/v_proj_hd receive "
+                          "gradient (leverage test: +3 with question readers -> hd/lr grad 0.07->0.46). "
+                          "Used as the START value of a linear decay to 0 when "
+                          "dat_hd_lse_bias_decay_steps > 0; constant otherwise."}
+    )
+    dat_hd_lse_bias_decay_steps: int = field(
+        default=0,
+        metadata={"help": "Linearly decay dat_hd_lse_bias to 0 over this many optimizer steps "
+                          "(curriculum). The checkpoint config always records the CURRENT value, "
+                          "so a finished run ships with bias 0."}
+    )
     dat_lr_drop_prob: float = field(
         default=0.0,
         metadata={"help": "LR dropout: per-sample probability of blanking part of the LR "
@@ -1616,6 +1630,69 @@ class LengthGroupedSampler(torch.utils.data.Sampler):
                 self.lengths, self.batch_size, self.world_size, generator=self.generator
             )
         return iter(indices)
+
+
+# ---------------------------------------------------------------------------
+# HD LSE-bias curriculum
+# ---------------------------------------------------------------------------
+class HDLseBiasScheduleCallback(transformers.TrainerCallback):
+    """Linearly decay hd_lse_bias from `start` to 0 over `decay_steps`.
+
+    Why: k/v_proj_hd only receive gradient in proportion to the attention
+    mass the readers put on the HD K/V. A positive bias on the HD logits
+    forces that mass early on (the no-training leverage test measured
+    grad(k/v_hd)/grad(k/v_lr) 0.07 -> 0.46 with +3 and question readers), so
+    the HD projections are trained while the bias is large; decaying it to 0
+    returns the model to the unbiased merge it will be evaluated with.
+
+    The current value is written to model.config.dat_extra_args['hd_lse_bias']
+    on every step so any saved checkpoint (intermediate or final) carries the
+    bias that was in effect, and a finished run ships with 0.
+    """
+
+    def __init__(self, start: float, decay_steps: int):
+        self.start = float(start)
+        self.decay_steps = int(decay_steps)
+        self._mods = None
+        self._cfg = None
+
+    def _bind(self, model):
+        if self._mods is not None:
+            return
+        base = model
+        while hasattr(base, 'module'):
+            base = base.module
+        self._mods = [m for m in base.modules() if hasattr(m, 'hd_lse_bias')]
+        cfg = getattr(base, 'config', None)
+        if cfg is None and hasattr(base, 'base_model'):
+            cfg = getattr(base.base_model, 'config', None)
+        self._cfg = cfg
+        rank0_print(f"[HDLseBias] bound {len(self._mods)} DAT modules; "
+                    f"start={self.start:+g} decay_steps={self.decay_steps}")
+
+    def value(self, step):
+        if self.decay_steps <= 0:
+            return self.start
+        return self.start * max(0.0, 1.0 - step / self.decay_steps)
+
+    def _apply(self, model, step):
+        self._bind(model)
+        b = self.value(step)
+        for m in self._mods:
+            m.hd_lse_bias = b
+        if self._cfg is not None and hasattr(self._cfg, 'dat_extra_args'):
+            self._cfg.dat_extra_args['hd_lse_bias'] = b
+        return b
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        self._apply(model, state.global_step)
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        self._apply(model, state.global_step)
+
+    def on_log(self, args, state, control, logs=None, model=None, **kwargs):
+        if logs is not None:
+            logs["dat/hd_lse_bias"] = self.value(state.global_step)
 
 
 # ---------------------------------------------------------------------------
@@ -3082,6 +3159,7 @@ def train():
             'qr_layerscale_init': model_args.dat_qr_layerscale_init,
             'lr_drop_prob': model_args.dat_lr_drop_prob,
             'lr_drop_ratio': model_args.dat_lr_drop_ratio,
+            'hd_lse_bias': model_args.dat_hd_lse_bias,
             'off_grps': model_args.dat_off_grps,
             'inter_size': model_args.dat_inter_size,
             'hr_scale': model_args.dat_hr_scale,
@@ -3361,6 +3439,11 @@ def train():
     if model_args.use_dat:
         dat_monitor = WandbDATMonitorCallback(use_kvhd=model_args.dat_hd_proj)
         callbacks.append(dat_monitor)
+    if model_args.use_dat and model_args.dat_hd_lse_bias != 0.0:
+        callbacks.append(HDLseBiasScheduleCallback(
+            start=model_args.dat_hd_lse_bias,
+            decay_steps=model_args.dat_hd_lse_bias_decay_steps,
+        ))
     # Both the LSE two-pass path (modeling_qwen2_5vl_dat.py) and the manual-
     # attention path (modeling_qwen2_5vl_dat_manual.py) store _dat_vis_data on
     # DAT attention modules when _dat_request_vis=True.  The LSE path omits
