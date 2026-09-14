@@ -597,6 +597,15 @@ class Qwen2VLTrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Separate learning rate for LoRA adapter parameters"}
     )
     visualization_every_n_steps: int = 10
+    hd_content_gap_every: int = field(
+        default=100,
+        metadata={"help": "Every N optimizer steps run two extra no-grad forwards on the current "
+                          "micro-batch, one with each sample's HD image swapped for another "
+                          "sample's (roll by one), and log dat/hd_content_gap = "
+                          "loss(shuffled HD) - loss(real HD). >0 means the HD pathway is actually "
+                          "reading image content; the 0908 run sat at 0 (content-blind). "
+                          "0 disables."}
+    )
     # ---- Online layer-wise Knowledge Distillation (KD) ----
     kd_on: bool = field(
         default=False,
@@ -2979,6 +2988,75 @@ class Qwen2VLTrainer(transformers.Trainer):
                 student_inputs[k] = v
         return student_inputs, teacher_extras
 
+    # ------------------------------------------------------------------
+    # HD content-sensitivity probe: loss(shuffled HD) - loss(real HD)
+    # ------------------------------------------------------------------
+    _hd_gap_last_step = -1
+
+    def _maybe_log_hd_content_gap(self, model, inputs, num_items_in_batch):
+        every = int(getattr(self.args, 'hd_content_gap_every', 0) or 0)
+        if every <= 0 or not self.model.training:
+            return
+        step = int(self.state.global_step)
+        # compute_loss runs once per micro-batch; probe only the first one of
+        # a logging step (gradient accumulation) and never twice per step.
+        if step % every != 0 or step == self._hd_gap_last_step:
+            return
+        # Everything above is rank-consistent (depends only on global_step);
+        # from here on every rank must reach the all_reduce below, so a rank
+        # whose micro-batch has <2 HD images contributes (0, 0, n=0).
+        self._hd_gap_last_step = step
+        device = next(model.parameters()).device
+        acc = torch.zeros(3, device=device, dtype=torch.float32)  # [gap, loss_real, n]
+
+        pv_hd = inputs.get('pixel_values_hd', None)
+        grid_hd = inputs.get('image_grid_thw_hd', None)
+        if pv_hd is not None and grid_hd is not None and grid_hd.shape[0] >= 2:
+            # Roll HD images by one so every sample sees another sample's HD map;
+            # pixel_values_hd is the flat concat of per-image patch rows, so split
+            # by each image's t*h*w and re-concatenate in the rolled order.
+            sizes = (grid_hd[:, 0] * grid_hd[:, 1] * grid_hd[:, 2]).tolist()
+            segs = list(torch.split(pv_hd, sizes, dim=0))
+            rolled = dict(inputs)
+            rolled['pixel_values_hd'] = torch.cat(segs[-1:] + segs[:-1], dim=0)
+            rolled['image_grid_thw_hd'] = torch.roll(grid_hd, shifts=1, dims=0)
+
+            # eval() keeps the two forwards deterministic and identical in mode
+            # (no stats-sink writes, no LR-drop), so the difference is content
+            # only. hd_lse_bias is a module attribute and applies in both modes.
+            model.eval()
+            try:
+                with torch.no_grad():
+                    l_real = self._plain_loss(model, dict(inputs), num_items_in_batch)
+                    l_shuf = self._plain_loss(model, rolled, num_items_in_batch)
+            finally:
+                model.train()
+            acc[0] = (l_shuf - l_real).detach().float()
+            acc[1] = l_real.detach().float()
+            acc[2] = 1.0
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(acc, op=torch.distributed.ReduceOp.SUM)
+        if acc[2].item() < 1:
+            return
+        gap, l_real = acc[0] / acc[2], acc[1] / acc[2]
+        if self.state.is_world_process_zero:
+            metrics = {"dat/hd_content_gap": gap.item(),
+                       "dat/hd_content_gap_rel": gap.item() / max(l_real.item(), 1e-6)}
+            if wandb is not None and wandb.run is not None:
+                _define_wandb_step_metric()
+                wandb.log({**metrics, "train/global_step": step}, commit=False)
+            rank0_print(f"[HDContentGap] step {step}: loss(shuffle)-loss(real)={gap.item():+.4f} "
+                        f"({metrics['dat/hd_content_gap_rel']:+.2%} of loss {l_real.item():.4f})")
+
+    def _plain_loss(self, model, inputs, num_items_in_batch):
+        try:
+            out = super().compute_loss(model, inputs, return_outputs=False,
+                                       num_items_in_batch=num_items_in_batch)
+        except TypeError:
+            out = super().compute_loss(model, inputs, return_outputs=False)
+        return out
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         """Override HF default compute_loss to optionally inject online KD from a
         pure base-VLM teacher (``self.kd_teacher``).  If KD is disabled, the
@@ -2992,6 +3070,7 @@ class Qwen2VLTrainer(transformers.Trainer):
 
         kd_on = getattr(self.args, 'kd_on', False)
         if (not kd_on) or (self.kd_teacher is None):
+            self._maybe_log_hd_content_gap(model, student_inputs, num_items_in_batch)
             try:
                 return super().compute_loss(
                     model, student_inputs,
