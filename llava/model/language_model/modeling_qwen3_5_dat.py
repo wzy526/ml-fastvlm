@@ -494,6 +494,9 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             'use_intention_branch': True,
             'intention_as_gate': True,
             'intention_inject': 'gate',   # 'gate' (legacy) | 'film' (post-norm)
+            'question_inject': 'none',    # 'none' (legacy) | 'xattn' (question->cell cross-attn residual)
+            'qr_heads': 4,                # xattn: number of attention heads
+            'qr_layerscale_init': 1e-2,   # xattn: initial per-channel LayerScale on the residual
             'off_range': 0.0,             # 0 = legacy clamp; >0 = off_range*tanh
             'off_penalty': 0.0,           # >0 = honest clamp + out-of-range pull-back
             'hd_gate_init': None,
@@ -562,7 +565,12 @@ def compute_image_range_list(input_ids, labels, image_token_id,
     Returns:
         List per batch of:
             [[(lr_start, lr_end, lr_h, lr_w), ...per image...],
-             [ans1_start, ans1_end, intention_idx], ...]
+             [ans1_start, ans1_end, intention_idx, q_start, q_end], ...]
+
+    Each answer range carries its question span (q_start, q_end): the tokens
+    from the end of the previous segment (image / prior answer) up to where the
+    turn's answer begins (training) or the assistant <|im_start|> (inference).
+    Consumed by the 'xattn' question-conditioned offset readout.
     """
     batch_size = input_ids.shape[0]
     result = []
@@ -609,19 +617,31 @@ def compute_image_range_list(input_ids, labels, image_token_id,
             ans_mask = (lab != -100)
             if ans_mask.any():
                 ans_indices = torch.where(ans_mask)[0]
+                # Question span bookkeeping: starts after the (last) image, and
+                # after each answer for subsequent multi-turn questions.
+                img_end = lr_tuples[-1][1] if lr_tuples else 0
+                q_prev_end = img_end
                 seg_start = ans_indices[0].item()
                 for i in range(1, len(ans_indices)):
                     if ans_indices[i] - ans_indices[i - 1] > 1:
                         seg_end = ans_indices[i - 1].item()
                         intention_idx = _find_im_start_backward(ids, seg_start, im_start_token_id)
-                        ranges.append([seg_start, seg_end, intention_idx])
+                        q_start = q_prev_end
+                        q_end = seg_start if seg_start >= q_prev_end else q_prev_end
+                        ranges.append([seg_start, seg_end, intention_idx, q_start, q_end])
+                        q_prev_end = seg_end + 1
                         seg_start = ans_indices[i].item()
                 intention_idx = _find_im_start_backward(ids, seg_start, im_start_token_id)
-                ranges.append([seg_start, ans_indices[-1].item(), intention_idx])
+                q_start = q_prev_end
+                q_end = seg_start if seg_start >= q_prev_end else q_prev_end
+                ranges.append([seg_start, ans_indices[-1].item(), intention_idx, q_start, q_end])
         else:
             seq_len = ids.shape[0]
             intention_idx = _find_im_start_backward(ids, seq_len, im_start_token_id)
-            ranges.append([seq_len, -1, intention_idx])
+            img_end = lr_tuples[-1][1] if lr_tuples else 0
+            q_start = img_end
+            q_end = (intention_idx + 1) if (intention_idx is not None and intention_idx + 1 > img_end) else seq_len
+            ranges.append([seq_len, -1, intention_idx, q_start, q_end])
 
         result.append(ranges)
 
@@ -637,6 +657,135 @@ def compute_image_range_list(input_ids, labels, image_token_id,
 # left their random init. 0.005 puts the initial offsets at ~0.3 grid pitch
 # (ln_2 output ~N(0,1) over 128 channels -> std(offset) ~= 6.8 * std).
 OFF_PROJ_INIT_STD = 0.005
+
+
+class QuestionReadout(nn.Module):
+    """A second LR readout that cross-attends grid cells to the question span.
+
+    The offset head reads a pooled LR grid (``embed_lr``: [off_grps, C, gs, gs]).
+    The only spatially-resolved, content-addressed path from the question to the
+    per-cell sampling offsets is this module: each grid cell is a *query* that
+    reads content from the variable-length question hidden states (*key/value*),
+    and the readout is added back to the cell feature as a small, per-channel
+    LayerScale-gated residual (CaiT-style)::
+
+        off_guide = embed_lr + layerscale ⊙ o_proj( softmax(Q Kᵀ) V )
+
+    Because the fusion is a residual into the feature the offset head already
+    consumes (not an extra concatenated column that a fixed 1x1 conv must read
+    out), the question can steer *where* a cell samples: cell (i,j) chooses
+    which question tokens to attend to, so different questions move different
+    cells to different offsets. ``layerscale`` starts small and ``pos_emb``
+    starts at zero, so a checkpoint warm-started from a non-xattn run begins
+    ≈ LR-only and escapes the zero-readout deadlock without a discontinuous
+    jump, while each channel's residual can grow independently as needed.
+
+    Attention math runs in fp32; parameters stay in the module dtype (the small
+    residual then passes through the fp32 ``conv_off_proj`` downstream).
+    """
+
+    def __init__(self, cell_dim, hidden_size, grid_size, num_heads=4, layerscale_init=1e-2):
+        super().__init__()
+        d = cell_dim
+        if num_heads <= 0 or d % num_heads != 0:
+            num_heads = 1
+        self.num_heads = num_heads
+        self.head_dim = d // num_heads
+        self.cell_dim = d
+        self.grid_size = grid_size
+        self.q_ln = nn.LayerNorm(hidden_size)
+        self.c_ln = nn.LayerNorm(d)
+        self.q_proj = nn.Linear(d, d, bias=False)
+        self.k_proj = nn.Linear(hidden_size, d, bias=False)
+        self.v_proj = nn.Linear(hidden_size, d, bias=False)
+        self.o_proj = nn.Linear(d, d, bias=False)
+        self.pos_emb = nn.Parameter(torch.zeros(d, grid_size, grid_size))
+        # CaiT LayerScale: per-channel diagonal gate on the residual branch.
+        self.layerscale = nn.Parameter(torch.full((d,), float(layerscale_init)))
+        self._layerscale_init = float(layerscale_init)
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        """Full, self-contained (re)initialization of EVERY parameter.
+
+        Called from both DAT init paths (`_init_dat_weights` at construction and
+        the monkey-patched `_dat_init_weights` that `from_pretrained` runs for
+        missing keys). Crucial for the meta-device from_pretrained flow: there
+        the constructor's `torch.full`/`torch.zeros` values are NEVER
+        materialized, and the base `_init_weights` covers only nn.Linear /
+        RMSNorm — so the bare `pos_emb`/`layerscale` Parameters and the two
+        nn.LayerNorm modules would otherwise stay as uninitialized garbage
+        (observed: layerscale ~1e37 -> off_guide NaN on the first forward)."""
+        for lin in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
+            nn.init.xavier_uniform_(lin.weight)
+            if lin.bias is not None:
+                nn.init.zeros_(lin.bias)
+        for ln in (self.q_ln, self.c_ln):
+            nn.init.ones_(ln.weight)
+            nn.init.zeros_(ln.bias)
+        nn.init.zeros_(self.pos_emb)
+        # Small non-zero per-channel gate: question residual starts small
+        # (warm-start ≈ LR-only) but each channel is independently trainable.
+        self.layerscale.data.fill_(self._layerscale_init)
+
+    def forward(self, cells, q_hidden_list, off_grps):
+        """cells: [(Lp*G), C, gs, gs]; q_hidden_list: len-Lp list of [Lq, hidden]
+        (or empty tensors for turns with no question span). Returns the residual
+        layerscale ⊙ readout, shape [(Lp*G), C, gs, gs]."""
+        LpG, C, gs, _ = cells.shape
+        G = off_grps
+        Lp = LpG // G
+        H, hd, N = self.num_heads, self.head_dim, gs * gs
+
+        # Env-gated per-stage NaN probe (DAT_QR_PROBE=1). Zero cost when unset.
+        # First healthy call prints every stage (baseline); later calls print only
+        # a stage that is already non-finite -> pinpoints the exact op on real data.
+        _qrp = os.environ.get("DAT_QR_PROBE")
+        _qrp_first = bool(_qrp) and getattr(self, "_qrp_n", 0) == 0
+
+        def _p(tag, t):
+            if not _qrp:
+                return
+            tf = t.detach().float()
+            nan = bool(torch.isnan(tf).any())
+            inf = bool(torch.isinf(tf).any())
+            if nan or inf or _qrp_first:
+                amax = float(tf.abs().max()) if tf.numel() else 0.0
+                print(f"[QRP {'BAD' if (nan or inf) else 'ok '}] "
+                      f"{tag:12s} shape={tuple(t.shape)} "
+                      f"dt={str(t.dtype).replace('torch.', '')} "
+                      f"nan={nan} inf={inf} absmax={amax:.4g}", flush=True)
+
+        x = cells + self.pos_emb.to(cells.dtype).unsqueeze(0)     # [(Lp*G), C, gs, gs]
+        xt = self.c_ln(x.flatten(2).transpose(1, 2))              # [(Lp*G), N, C]
+        q = self.q_proj(xt).float()                               # [(Lp*G), N, C]
+        _p("cells", cells); _p("xt(c_ln)", xt); _p("q", q)
+
+        delta = cells.new_zeros(LpG, N, C)
+        for l in range(Lp):
+            Hq = q_hidden_list[l] if l < len(q_hidden_list) else None
+            if Hq is None or Hq.shape[0] == 0:
+                continue
+            Hn = self.q_ln(Hq)
+            k = self.k_proj(Hn).float()                           # [Lq, C]
+            v = self.v_proj(Hn).float()                           # [Lq, C]
+            Lq = k.shape[0]
+            sl = slice(l * G, (l + 1) * G)
+            qh = q[sl].reshape(G, N, H, hd).permute(0, 2, 1, 3)   # [G, H, N, hd]
+            kh = k.reshape(Lq, H, hd).permute(1, 0, 2) * (hd ** -0.5)   # [H, Lq, hd]
+            vh = v.reshape(Lq, H, hd).permute(1, 0, 2)            # [H, Lq, hd]
+            scores = torch.einsum('ghnd,hld->ghnl', qh, kh)
+            attn = F.softmax(scores, dim=3)
+            oh = torch.einsum('ghnl,hld->ghnd', attn, vh)         # [G, H, N, hd]
+            o = oh.permute(0, 2, 1, 3).reshape(G, N, C)           # [G, N, C]
+            delta[sl] = self.o_proj(o.to(xt.dtype))
+            _p(f"Hq[{l}]", Hq); _p(f"Hn[{l}]", Hn); _p(f"k[{l}]", k)
+            _p(f"v[{l}]", v); _p(f"scores[{l}]", scores)
+            _p(f"attn[{l}]", attn); _p(f"delta[{l}]", delta[sl])
+        delta = delta.transpose(1, 2).reshape(LpG, C, gs, gs)
+        if _qrp:
+            self._qrp_n = getattr(self, "_qrp_n", 0) + 1
+        return self.layerscale.to(cells.dtype).view(1, C, 1, 1) * delta
 
 
 class Qwen3_5AttentionDAT(Qwen3_5Attention):
@@ -707,6 +856,13 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # bit-identical outputs and can be warm-started.
         self.intention_inject = dat.get('intention_inject', 'gate')
 
+        # Question conditioning by a second LR readout that cross-attends the
+        # grid cells to the full question span (residual-injected into embed_lr).
+        # 'none' = disabled (bit-identical to legacy gate/film ckpts); 'xattn'
+        # = enabled. See QuestionReadout. Uses the single-width offset head
+        # (conv_off_proj: inter_size -> 2), so it does NOT concat / gate.
+        self.question_inject = dat.get('question_inject', 'none')
+
         # Offset magnitude. With the legacy straight-through clamp nothing
         # penalizes an offset that overshoots [-1,1]: the forward value is
         # capped while the gradient keeps pushing outward. Measured on the 0901
@@ -731,7 +887,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         self.hd_lse_bias = float(dat.get('hd_lse_bias', 0.0))
 
         # Offset prediction
-        if self.intention_as_gate:
+        if self.intention_as_gate or self.question_inject == 'xattn':
             self.ln_2 = _FP32WeightLayerNorm2d(self.inter_size)
             self.conv_off_proj = _FP32WeightConv2d(
                 self.inter_size, 2, kernel_size=1, stride=1, padding=0, bias=False,
@@ -749,6 +905,16 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         else:
             self.proj_film = None
             self.spatial_gain = None
+
+        # Question-conditioned LR readout (residual cross-attention).
+        if self.question_inject == 'xattn':
+            self.q_readout = QuestionReadout(
+                self.inter_size, self.hidden_size, self.grid_size,
+                num_heads=int(dat.get('qr_heads', 4)),
+                layerscale_init=float(dat.get('qr_layerscale_init', 1e-2)),
+            )
+        else:
+            self.q_readout = None
 
         # HD feature KV projection
         if self.hd_proj:
@@ -833,6 +999,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             nn.init.zeros_(self.proj_film.weight)
             nn.init.zeros_(self.proj_film.bias)
             nn.init.zeros_(self.spatial_gain)
+        if self.q_readout is not None:
+            self.q_readout.reset_parameters()
         self._init_hd_proj_weights()
 
     @torch.no_grad()
@@ -923,6 +1091,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         offsets = self.conv_off_proj(F.silu(h)).float()
         if self.off_range > 0:
             offsets = self.off_range * torch.tanh(offsets)
+        self._fn_chk("sample.offsets", offsets)
         if self.training:
             self._dat_offset_stats = (
                 offsets.detach().mean().item(),
@@ -959,7 +1128,13 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 x.register_hook(lambda g, o=over, c=coef: g + c * o)
             sample_locs = x.clamp(-1, 1).permute(0, 2, 3, 1)
         else:
-            sample_locs = (x + (x.clamp(-1, 1) - x).detach()).permute(0, 2, 3, 1)
+            # Plain clamp: the straight-through gradient this branch used to
+            # pass to out-of-bounds points kept pushing them further out (they
+            # accumulate on the border with zero pull-back and whole layers
+            # collapse onto a corner). Zero gradient outside is the truthful
+            # signal; the reference grid half-cell margin keeps edge points
+            # useful.
+            sample_locs = x.clamp(-1, 1).permute(0, 2, 3, 1)
 
         hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
         img_hr = einops.rearrange(
@@ -969,8 +1144,11 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         img_hr = einops.repeat(img_hr, 'g c h w -> (l g) c h w', l=Lp)
 
         orig_dtype = img_hr.dtype
+        # _grid_generate stores coordinates as (x, y), which is exactly the
+        # convention grid_sample expects in its last dimension. The previous
+        # (1, 0) indexing transposed the sampling geometry on rectangular maps.
         sampled_hr = F.grid_sample(
-            img_hr.float(), sample_locs[..., (1, 0)],
+            img_hr.float(), sample_locs,
             mode='bilinear', align_corners=True,
         ).to(orig_dtype)
 
@@ -981,9 +1159,13 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         )
 
         if self.hd_proj:
+            self._fn_chk("sample.sampled_hr(pre_ln)", sampled_hr)
             sampled_hr = self.hd_input_layernorm(sampled_hr)
+            self._fn_chk("sample.hd_input_layernorm", sampled_hr)
             key_hd = self.k_proj_hd(sampled_hr)
             value_hd = self.v_proj_hd(sampled_hr)
+            self._fn_chk("sample.key_hd", key_hd)
+            self._fn_chk("sample.value_hd", value_hd)
         else:
             # Fallback: reuse base projections (k_proj input dim must match)
             key_hd = self.k_proj(sampled_hr)
@@ -994,6 +1176,23 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         ).clone().detach()
 
         return key_hd, value_hd, sampling_locs_out
+
+    def _fn_chk(self, tag, t, b_idx=None):
+        """DAT_FWD_NAN: print the FIRST non-finite intermediate (ordered by
+        forward execution) so the first-forward init-NaN can be localized to an
+        exact stage/layer. Prints ONLY when the tensor is non-finite."""
+        if not os.environ.get("DAT_FWD_NAN") or not torch.is_tensor(t):
+            return
+        tf = t.detach().float()
+        nan = bool(torch.isnan(tf).any()); inf = bool(torch.isinf(tf).any())
+        if not (nan or inf):
+            return
+        fin = tf[torch.isfinite(tf)]
+        fmax = float(fin.abs().max()) if fin.numel() else float("nan")
+        print(f"[FN-BAD] L{getattr(self, 'layer_idx', '?')} b={b_idx} {tag} "
+              f"shape={tuple(t.shape)} nan={nan} inf={inf} "
+              f"finabsmax={fmax:.4g} nan_frac={float(torch.isnan(tf).float().mean()):.3g}",
+              flush=True)
 
     def _generate_offsets_and_sample(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idxs, want_image=False):
         """Generate intention-conditioned sampling offsets and sample HD K/V.
@@ -1057,9 +1256,12 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 g=self.off_grps, c=self.off_dim, h=lr_h, w=lr_w,
             )
             local_embed_lr = self.conv_lr_dw(img_lr)
+            self._fn_chk("conv_lr_dw", local_embed_lr, b_idx)
             local_embed_lr = F.silu(self.ln_1(local_embed_lr))
+            self._fn_chk("silu(ln_1)", local_embed_lr, b_idx)
             embed_lr = self.conv_lr_proj(local_embed_lr)
             embed_lr = F.adaptive_avg_pool2d(embed_lr, (self.grid_size, self.grid_size))
+            self._fn_chk("embed_lr", embed_lr, b_idx)
 
             embed_lr_rep = einops.repeat(
                 embed_lr, 'g c h w -> (l g) c h w', l=Lp,
@@ -1088,7 +1290,29 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 else:
                     embed_lr_rep = embed_lr_rep * spatial_guide_rep.to(embed_lr_rep.dtype)
 
-            if self.use_intention_branch:
+            if self.question_inject == 'xattn':
+                # Grid cells cross-attend to the full question span; the readout
+                # is residual-injected into embed_lr (see QuestionReadout). This
+                # is the only spatially-resolved question->offset path.
+                q_hidden_list = [
+                    query_states[b_idx, ar[3]:ar[4]]
+                    if len(ar) > 4 and ar[4] > ar[3]
+                    else query_states.new_zeros((0, query_states.shape[-1]))
+                    for ar in answer_ranges
+                ]
+                if os.environ.get("DAT_QR_PROBE"):
+                    _qs = query_states[b_idx].detach().float()
+                    _spans = [(int(ar[3]), int(ar[4])) for ar in answer_ranges if len(ar) > 4]
+                    print(f"[QRP-SRC] L{getattr(self, 'layer_idx', '?')} b={b_idx} "
+                          f"query_states nan={bool(torch.isnan(_qs).any())} "
+                          f"inf={bool(torch.isinf(_qs).any())} "
+                          f"absmax={float(_qs.abs().max()):.4g} spans={_spans}", flush=True)
+                off_guide = embed_lr_rep + self.q_readout(
+                    embed_lr_rep, q_hidden_list, self.off_grps,
+                )
+                self._fn_chk("xattn.embed_lr_rep", embed_lr_rep, b_idx)
+                self._fn_chk("xattn.off_guide", off_guide, b_idx)
+            elif self.use_intention_branch:
                 if self.intention_as_gate:
                     gate = embed_intention.sigmoid()
                     off_guide = embed_lr_rep * (gate * 2.0)
@@ -1259,6 +1483,10 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        self._fn_chk("base.query_states", query_states)
+        self._fn_chk("base.key_states", key_states)
+        self._fn_chk("base.value_states", value_states)
+
         if query_states.device.type == "cuda":
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
@@ -1320,7 +1548,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             if self.dat_image_hd_for_question and M == 1:
                 _q_prev_end = lr_list[0][1]
                 for _ar in image_range_list[b_idx][1:]:
-                    _a_s, _a_e, _a_int = _ar
+                    _a_s, _a_e, _a_int = _ar[0], _ar[1], _ar[2]
                     if _a_e > 0:
                         _q_ans_start = _a_s
                         _next_prev = _a_e
@@ -1513,8 +1741,11 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # Gate is computed from Q-side hidden states only, so applying it after
         # the LSE merge is exactly equivalent to the official single-pass order.
         attn_output = out_final.reshape(*input_shape, -1).contiguous()
+        self._fn_chk("out_final", out_final)
+        self._fn_chk("out_gate", out_gate)
         attn_output = attn_output * torch.sigmoid(out_gate)
         attn_output = self.o_proj(attn_output)
+        self._fn_chk("attn_output(post_o_proj)", attn_output)
 
         return attn_output, None
 
@@ -1595,16 +1826,48 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
-        """Override to post-fix raw nn.Parameter loading for hd_gate."""
+        """Override to re-assert the on-disk DAT weights as the final load step.
+
+        HF's post-load init pass (_initialize_weights -> _dat_init_weights) re-runs
+        the full DAT init on every DAT attention module AFTER the checkpoint is
+        loaded, clobbering already-loaded DAT params back to their init values
+        (q_readout.layerscale -> 1e-2, hd_gate -> hd_gate_init, and — depending on
+        HF's meta-materialization order — potentially the convs / hd_proj too).
+        _manual_load_dat_raw_params copies the on-disk DAT tensors back in as the
+        very last step, so a DAT checkpoint (stage-1 CPT -> stage-2 SFT) keeps its
+        trained adapters. A fresh base conversion has no DAT keys on disk, so it is
+        a no-op there and the fresh init stands.
+        """
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         cls._manual_load_dat_raw_params(model, pretrained_model_name_or_path)
         return model
 
-    @staticmethod
-    def _manual_load_dat_raw_params(model, path):
-        """Post-load fix for raw nn.Parameter attributes not covered by HF key remapping."""
+    # substrings that mark a DAT-specific param that _dat_init_weights (re)inits;
+    # base-attention keys (q_proj/k_proj/v_proj/o_proj/q_norm/k_norm) match none of
+    # these, so a fresh base conversion collects nothing here.
+    _DAT_REINIT_MARKERS = (
+        '.conv_lr_dw.', '.conv_lr_proj.', '.conv_off_proj.',
+        '.proj_intention.', '.proj_film.', '.spatial_gain',
+        '.k_proj_hd.', '.v_proj_hd.', '.hd_input_layernorm.',
+        '.hd_gate', '.q_readout.', '.ln_1.', '.ln_2.',
+    )
+
+    @classmethod
+    def _manual_load_dat_raw_params(cls, model, path):
+        """Re-copy the on-disk DAT params over whatever HF's post-load init left.
+
+        Needed because HF re-runs _dat_init_weights on the DAT attention modules
+        after loading and re-initializes params it should have left alone (proven:
+        q_readout.layerscale reverts to its 1e-2 init on every SFT reload even
+        though the checkpoint holds the trained value and HF reports missing=0).
+        Running last, this makes the checkpoint authoritative regardless of HF's
+        init ordering. No-op for a fresh base conversion (no DAT keys on disk).
+        """
         if not isinstance(path, str) or not os.path.isdir(path):
             return
+
+        def _is_dat_key(k):
+            return '.self_attn.' in k and any(m in k for m in cls._DAT_REINIT_MARKERS)
 
         weights: dict = {}
         try:
@@ -1617,43 +1880,34 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             if fn.endswith('.safetensors') and safe_open is not None:
                 with safe_open(full, framework='pt') as st:
                     for k in st.keys():
-                        if 'hd_gate' in k:
+                        if _is_dat_key(k):
                             weights[k] = st.get_tensor(k)
             elif fn in ('pytorch_model.bin', 'model.bin'):
                 sd = torch.load(full, map_location='cpu')
                 for k, v in sd.items():
-                    if 'hd_gate' in k:
+                    if _is_dat_key(k):
                         weights[k] = v
 
         if not weights:
             return
 
-        if hasattr(model.model, 'language_model'):
-            text_model = model.model.language_model
-        else:
-            text_model = model.model
+        targets = dict(model.named_parameters())
+        targets.update(model.named_buffers())
 
         n_loaded = 0
         for k, v in weights.items():
-            if not k.endswith('.self_attn.hd_gate'):
+            tgt = targets.get(k)
+            if tgt is None or tuple(tgt.shape) != tuple(v.shape):
                 continue
-            parts = k.split('.')
-            try:
-                layer_idx = int(parts[parts.index('layers') + 1])
-            except (ValueError, IndexError):
-                continue
-            if layer_idx >= len(text_model.layers):
-                continue
-            attn = getattr(text_model.layers[layer_idx], 'self_attn', None)
-            if attn is not None and hasattr(attn, 'hd_gate') and attn.hd_gate is not None:
-                with torch.no_grad():
-                    attn.hd_gate.data.copy_(
-                        v.to(attn.hd_gate.dtype).to(attn.hd_gate.device)
-                    )
-                n_loaded += 1
+            with torch.no_grad():
+                tgt.data.copy_(v.to(tgt.dtype).to(tgt.device))
+            n_loaded += 1
 
         if n_loaded > 0:
-            logger.info(f"[DAT post-load] manually loaded hd_gate for {n_loaded} DAT layers")
+            logger.info(
+                f"[DAT post-load] re-asserted {n_loaded} on-disk DAT params "
+                f"over HF's post-load re-init (incl. q_readout.layerscale, hd_gate)"
+            )
 
     def _patch_text_model_init_weights(self):
         """Monkey-patch text model's _init_weights for DAT-specific initialization."""
@@ -1681,6 +1935,13 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     if module.proj_intention.bias is not None:
                         nn.init.zeros_(module.proj_intention.bias)
                 module._init_hd_proj_weights()
+                if module.q_readout is not None:
+                    # QuestionReadout carries bare nn.Parameter (pos_emb,
+                    # layerscale) and nn.LayerNorm that neither base _init_weights
+                    # (Linear/RMSNorm only) nor the block above covers — on the
+                    # meta-device from_pretrained flow these stay uninitialized
+                    # (layerscale ~1e37 -> off_guide NaN). Init them explicitly.
+                    module.q_readout.reset_parameters()
             elif isinstance(module, _FP32WeightRMSNorm):
                 nn.init.ones_(module.weight)
 
@@ -2096,6 +2357,15 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)
             loss = F.cross_entropy(shift_logits, shift_labels)
+            if os.environ.get("DAT_LOSS_PROBE"):
+                _nv = int((shift_labels != -100).sum())
+                _lf = bool(torch.isfinite(logits.detach()).all())
+                _hf = bool(torch.isfinite(hidden_states.detach()).all())
+                _lam = float(logits.detach().abs().max())
+                _ham = float(hidden_states.detach().abs().max())
+                print(f"[LOSSPROBE] loss={float(loss):.6g} finite_logits={_lf} "
+                      f"finite_hidden={_hf} n_valid={_nv}/{shift_labels.numel()} "
+                      f"logits_absmax={_lam:.4g} hidden_absmax={_ham:.4g}", flush=True)
 
         return Qwen3_5CausalLMOutputWithPast(
             loss=loss,
@@ -2114,7 +2384,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
-    'hd_gate', 'hd_input_layernorm',
+    'hd_gate', 'hd_input_layernorm', 'q_readout',
 ]
 
 
@@ -2225,6 +2495,109 @@ def convert_qwen3_5_to_dat(base_model_or_path, dat_extra_args, torch_dtype=None,
             f"[DAT] Forced {n_fixed} DAT scalar/near-unity params back to fp32 "
             f"after from_pretrained (anti-bf16-roundoff)."
         )
+
+    # --- env-gated NaN origin tracer (DAT_NAN_TRACE=1) --------------------
+    # Registers a forward hook on every submodule; on the FIRST forward whose
+    # output contains NaN/Inf, prints the module name + whether its inputs were
+    # already non-finite. The first module printed with in_bad=False (in forward
+    # execution order) is the ORIGIN. Zero overhead when the env var is unset.
+    if os.environ.get('DAT_NAN_TRACE'):
+        import sys as _sys
+        _nt_seen = {}
+        _nt_budget = [200]
+
+        def _nt_bad(t):
+            return torch.is_tensor(t) and t.is_floating_point() and \
+                not torch.isfinite(t.detach()).all()
+
+        def _nt_make(name, mod):
+            def _hook(m, inp, out):
+                if _nt_budget[0] <= 0 or name in _nt_seen:
+                    return
+                outs = out if isinstance(out, (tuple, list)) else (out,)
+                if not any(_nt_bad(t) for t in outs if torch.is_tensor(t)):
+                    return
+                ins = inp if isinstance(inp, (tuple, list)) else (inp,)
+                in_bad = any(_nt_bad(t) for t in ins if torch.is_tensor(t))
+                _nt_seen[name] = 1
+                _nt_budget[0] -= 1
+                print(f"[NANTRACE] {name} <{type(m).__name__}> out=NON-FINITE "
+                      f"in_bad={in_bad}", file=_sys.stderr, flush=True)
+            return _hook
+
+        n_hooks = 0
+        for _name, _mod in dat_model.named_modules():
+            if _name:
+                _mod.register_forward_hook(_nt_make(_name, _mod))
+                n_hooks += 1
+        print(f"[NANTRACE] registered {n_hooks} forward hooks (DAT_NAN_TRACE on)",
+              file=_sys.stderr, flush=True)
+
+    # --- env-gated backward NaN origin tracer (DAT_BWD_TRACE=1) -----------
+    # The forward is clean but the DAT-branch GRADIENT goes NaN at step 1.
+    # register_full_backward_hook fires during the real backward (works with
+    # use_reentrant=False checkpointing). The FIRST module (in backward order)
+    # with grad_IN=NaN while grad_out is finite MANUFACTURED the NaN gradient.
+    # Param hooks additionally flag which weight's .grad first goes NaN.
+    if os.environ.get('DAT_BWD_TRACE'):
+        import sys as _sys
+        _bt_seen = {}
+        _bt_budget = [400]
+
+        def _bt_bad(t):
+            return torch.is_tensor(t) and t.is_floating_point() and \
+                not torch.isfinite(t.detach()).all()
+
+        def _bt_make(name, mod):
+            def _hook(m, grad_in, grad_out):
+                if _bt_budget[0] <= 0 or name in _bt_seen:
+                    return
+                gis = grad_in if isinstance(grad_in, (tuple, list)) else (grad_in,)
+                if not any(_bt_bad(t) for t in gis if torch.is_tensor(t)):
+                    return
+                gos = grad_out if isinstance(grad_out, (tuple, list)) else (grad_out,)
+                go_bad = any(_bt_bad(t) for t in gos if torch.is_tensor(t))
+                _bt_seen[name] = 1
+                _bt_budget[0] -= 1
+                print(f"[BWDTRACE] {name} <{type(m).__name__}> grad_IN=NaN "
+                      f"grad_out_bad={go_bad}", file=_sys.stderr, flush=True)
+            return _hook
+
+        def _pt_make(pname):
+            def _phook(g):
+                key = "param:" + pname
+                if _bt_budget[0] <= 0 or key in _bt_seen:
+                    return
+                if _bt_bad(g):
+                    _bt_seen[key] = 1
+                    _bt_budget[0] -= 1
+                    print(f"[BWDTRACE] {key} grad=NaN", file=_sys.stderr, flush=True)
+            return _phook
+
+        n_bh = n_ph = 0
+        for _name, _mod in dat_model.named_modules():
+            if _name:
+                _mod.register_full_backward_hook(_bt_make(_name, _mod))
+                n_bh += 1
+        for _pn, _p in dat_model.named_parameters():
+            if _p.requires_grad:
+                try:
+                    _p.register_hook(_pt_make(_pn))
+                    n_ph += 1
+                except RuntimeError:
+                    pass
+        print(f"[BWDTRACE] registered {n_bh} bwd hooks + {n_ph} param hooks "
+              "(DAT_BWD_TRACE on)", file=_sys.stderr, flush=True)
+
+    # --- env-gated autograd anomaly detection (DAT_ANOMALY=1) -------------
+    # Raises at the first backward op that emits NaN, with the FORWARD traceback
+    # of the offending op. The most precise localizer (op + source line). Slow —
+    # 1-step diagnostic only.
+    if os.environ.get('DAT_ANOMALY'):
+        import sys as _sys
+        torch.autograd.set_detect_anomaly(True)
+        print("[ANOMALY] set_detect_anomaly(True) — backward raises at first NaN op",
+              file=_sys.stderr, flush=True)
 
     return dat_model
 

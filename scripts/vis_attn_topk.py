@@ -90,8 +90,8 @@ def main():
         axes = np.atleast_2d(axes)
 
         for c, (r, a, p) in enumerate(zip(recs, A, P)):
-            x = (p[:, 1] + 1) * 0.5 * W
-            y = (p[:, 0] + 1) * 0.5 * H
+            x = (p[:, 0] + 1) * 0.5 * W
+            y = (p[:, 1] + 1) * 0.5 * H
             idx = np.argsort(a)[::-1][: args.topk]
 
             ax = axes[0, c]

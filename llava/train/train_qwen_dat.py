@@ -101,7 +101,7 @@ local_rank = None
 
 # DAT parameter patterns (must match modeling_qwen2vl_dat.py)
 DAT_KEYS_MATCH = [
-    'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
+    'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention', 'q_readout',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
 ]
@@ -310,6 +310,12 @@ class ModelArguments:
     )
     dat_grid_size: int = field(default=6)
     dat_off_ksize: int = field(default=3)
+    dat_question_inject: str = field(
+        default="none",
+        metadata={"help": "none|xattn: question-conditioned offset readout (QuestionReadout)"}
+    )
+    dat_qr_heads: int = field(default=4)
+    dat_qr_layerscale_init: float = field(default=1e-2)
     dat_off_grps: int = field(default=1)
     dat_inter_size: int = field(default=64)
     dat_hr_scale: int = field(default=3)
@@ -331,9 +337,9 @@ class ModelArguments:
     )
     dat_off_range: float = field(
         default=0.0,
-        metadata={"help": "Bound sampling offsets to off_range*tanh(raw) instead of the "
-                          "legacy straight-through clamp. 0 keeps legacy behaviour. On the "
-                          "0901 4B ckpt the legacy path pins 53.6%% of sampling points to "
+        metadata={"help": "Bound sampling offsets to off_range*tanh(raw) before the "
+                          "final plain clamp. 0 keeps unbounded raw offsets. On the "
+                          "0901 4B ckpt the former straight-through path pinned 53.6%% of sampling points to "
                           "the [-1,1] border and 69.8%% of HD attention mass lands there. "
                           "Suggested 0.2-0.4 (2-4x the grid pitch of 0.0997 at grid=20)."}
     )
@@ -3005,6 +3011,9 @@ def train():
         dat_extra_args = {
             'grid_size': model_args.dat_grid_size,
             'off_ksize': model_args.dat_off_ksize,
+            'question_inject': model_args.dat_question_inject,
+            'qr_heads': model_args.dat_qr_heads,
+            'qr_layerscale_init': model_args.dat_qr_layerscale_init,
             'off_grps': model_args.dat_off_grps,
             'inter_size': model_args.dat_inter_size,
             'hr_scale': model_args.dat_hr_scale,

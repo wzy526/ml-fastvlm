@@ -28,9 +28,9 @@ Image.MAX_IMAGE_PIXELS = None
 
 
 def to_pixels(locs, w, h):
-    """[..., 2] normalized (y, x) in [-1,1] -> (x_px, y_px) on a w*h image."""
-    y = (locs[..., 0] + 1.0) * 0.5 * h
-    x = (locs[..., 1] + 1.0) * 0.5 * w
+    """[..., 2] normalized (x, y) in [-1,1] -> (x_px, y_px) on a w*h image."""
+    x = (locs[..., 0] + 1.0) * 0.5 * w
+    y = (locs[..., 1] + 1.0) * 0.5 * h
     return x, y
 
 

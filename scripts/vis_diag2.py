@@ -36,8 +36,8 @@ grps = 8
 grid = int(round(np.sqrt(P / grps)))
 
 # Reference grid, mirroring _grid_generate exactly: half-cell margin off the
-# [-1,1] border, meshgrid(indexing='ij'), stacked as (x, y) -- note the channel
-# order is x-first, and grid_sample is later fed locs[..., (1,0)].
+# [-1,1] border, meshgrid(indexing='ij'), stacked as (x, y), which is passed
+# directly to grid_sample.
 m = 1.0 / max(grid - 1, 1)
 ax = np.linspace(-1.0 + m, 1.0 - m, grid)
 pitch = float(ax[1] - ax[0])

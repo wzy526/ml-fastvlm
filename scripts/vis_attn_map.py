@@ -70,9 +70,9 @@ def read_map(rec, layer, heads, shape, bins):
     H, W = shape
     a = rec["attn"][layer][heads].mean(0)                 # [Ns]
     a = a / a.sum()
-    p = rec["locs"][layer]                                # [G, Ns, 2]  (y, x)
-    y = ((p[..., 0] + 1) * 0.5 * (H - 1)).ravel()
-    x = ((p[..., 1] + 1) * 0.5 * (W - 1)).ravel()
+    p = rec["locs"][layer]                                # [G, Ns, 2]  (x, y)
+    x = ((p[..., 0] + 1) * 0.5 * (W - 1)).ravel()
+    y = ((p[..., 1] + 1) * 0.5 * (H - 1)).ravel()
     w = np.tile(a, (p.shape[0],))                         # same mass at each group's source
     hist, _, _ = np.histogram2d(
         y, x, bins=bins, range=[[0, H - 1], [0, W - 1]], weights=w)

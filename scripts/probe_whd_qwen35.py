@@ -81,7 +81,21 @@ def load_samples(args):
 
     from datasets import load_dataset
     split = {"hrbench4k": "hrbench_4k", "hrbench8k": "hrbench_8k"}[args.dataset]
-    ds = load_dataset("DreamMr/HR-Bench", "hrbench_version_split", split=split)
+    try:
+        ds = load_dataset("DreamMr/HR-Bench", "hrbench_version_split", split=split)
+    except Exception:
+        # Offline pod (HF_HUB_OFFLINE=1): this script-less parquet dataset cannot
+        # be resolved via the repo id (dataset_module_factory needs the Hub).
+        # Fall back to the cached snapshot dir, which load_dataset reads offline.
+        import glob
+        hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+            os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+            "hub")
+        snaps = sorted(glob.glob(os.path.join(
+            hub, "datasets--DreamMr--HR-Bench", "snapshots", "*")))
+        if not snaps:
+            raise
+        ds = load_dataset(snaps[-1], "hrbench_version_split", split=split)
     for doc in ds:
         if len(samples) >= args.max_samples:
             break

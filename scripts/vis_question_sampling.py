@@ -23,8 +23,8 @@ on ``self.training`` and therefore unreachable at eval time):
 
 ``locs``   [Lp, off_grps, grid, grid, 2]
     Final sampling locations on the HD feature map, normalized to [-1, 1].
-    Channel 0 is y, channel 1 is x -- ``grid_sample`` is fed ``locs[..., (1,0)]``
-    with ``align_corners=True``.
+    Channel 0 is x and channel 1 is y, matching ``grid_sample``'s native
+    convention with ``align_corners=True``.
 
 Only the prefill call is kept; decode steps re-enter the layer with no image
 segment and would otherwise append duplicates.
@@ -107,6 +107,7 @@ def load_multi_question_images(parquet_glob, wanted=None):
     return out
 
 
+
 def install_capture(dat_cls, mod):
     """Patch the sampling + attention entry points.
 
@@ -124,11 +125,18 @@ def install_capture(dat_cls, mod):
     Returns (store, reset, uninstall).
     """
     store = {"guide": defaultdict(list), "locs": defaultdict(list),
-             "attn": [], "w_hd": defaultdict(list)}
+             "attn": [], "w_hd": defaultdict(list), "qr_attn": defaultdict(list),
+             "qr_n": 0}
     orig_gen = dat_cls._generate_offsets_and_sample
     orig_sample = dat_cls._sample_hd_from_off_guide
     orig_cross = mod._dat_cross_attn_varlen
     orig_merge = dat_cls._merge_two_pass_lse
+    orig_readout = None
+    try:
+        from llava.model.language_model.modeling_qwen3_5_dat import QuestionReadout
+        orig_readout = QuestionReadout.forward
+    except (ImportError, AttributeError):
+        pass
 
     def patched_cross(q_list, k_list, v_list):
         for q, k in zip(q_list, k_list):
@@ -158,6 +166,42 @@ def install_capture(dat_cls, mod):
         return orig_gen(self, query_states, image_hd_features, image_range_list,
                         b_idx, hd_feat_idxs, want_image=want_image)
 
+    # xattn path: capture QuestionReadout's internal cross-attn by re-running
+    # the readout's attention from the SAME inputs the module just used:
+    # cheap (gs^2 x Lq x C) and exact.
+    def patched_readout(self, cells, q_hidden_list, off_grps):
+        out = orig_readout(self, cells, q_hidden_list, off_grps)
+        try:
+            import torch.nn.functional as _F
+            G = off_grps
+            gs = self.grid_size
+            H = self.num_heads
+            hd = self.head_dim
+            x = cells + self.pos_emb.to(cells.dtype).unsqueeze(0)
+            xt = self.c_ln(x.flatten(2).transpose(1, 2))
+            q = self.q_proj(xt).float()
+            for l, Hq in enumerate(q_hidden_list):
+                if Hq is None or Hq.shape[0] == 0:
+                    continue
+                Hn = self.q_ln(Hq)
+                k = self.k_proj(Hn).float()
+                Lq = k.shape[0]
+                sl = slice(l * G, (l + 1) * G)
+                qh = q[sl].reshape(G, gs * gs, H, hd).permute(0, 2, 1, 3)
+                kh = k.reshape(Lq, H, hd).permute(1, 0, 2) * (hd ** -0.5)
+                scores = torch.einsum('ghnd,hld->ghnl', qh, kh)
+                attn = _F.softmax(scores, dim=3)      # [G, H, N, Lq]
+                # mean over groups & heads -> [N, Lq]: which question tokens
+                # the sampling grid reads, per grid cell. QuestionReadout has
+                # no layer_idx; use a running counter keyed by insertion.
+                n = store["qr_n"]
+                store["qr_attn"][n].append(
+                    attn.mean(dim=(0, 1)).detach().float().cpu().numpy())
+                store["qr_n"] = n + 1
+        except Exception as e:      # viz must never break the run
+            print(f"[vis][warn] qr_attn capture failed: {e}", flush=True)
+        return out
+
     def patched_sample(self, off_guide, image_hd_features, hd_feat_idx, Lp, device, **kw):
         key, value, locs = orig_sample(self, off_guide, image_hd_features,
                                        hd_feat_idx, Lp, device, **kw)
@@ -168,18 +212,26 @@ def install_capture(dat_cls, mod):
     dat_cls._sample_hd_from_off_guide = patched_sample
     mod._dat_cross_attn_varlen = patched_cross
     dat_cls._merge_two_pass_lse = patched_merge
+    if orig_readout is not None:
+        from llava.model.language_model.modeling_qwen3_5_dat import QuestionReadout
+        QuestionReadout.forward = patched_readout
 
     def reset():
         store["guide"].clear()
         store["locs"].clear()
         store["w_hd"].clear()
         store["attn"].clear()
+        store["qr_attn"].clear()
+        store["qr_n"] = 0
 
     def uninstall():
         dat_cls._generate_offsets_and_sample = orig_gen
         dat_cls._sample_hd_from_off_guide = orig_sample
         mod._dat_cross_attn_varlen = orig_cross
         dat_cls._merge_two_pass_lse = orig_merge
+        if orig_readout is not None:
+            from llava.model.language_model.modeling_qwen3_5_dat import QuestionReadout
+            QuestionReadout.forward = orig_readout
 
     return store, reset, uninstall
 
@@ -216,7 +268,7 @@ def run_one(model, image, prompt, doc_id):
 
 
 def summarize(locs_by_layer):
-    """Stack per-layer prefill sampling locations -> [n_layer, n_point, 2] (y, x)."""
+    """Stack per-layer prefill sampling locations -> [n_layer, n_point, 2] (x, y)."""
     layers = sorted(locs_by_layer)
     pts = []
     for li in layers:
@@ -276,6 +328,10 @@ def main():
                 attn = np.stack(store["attn"][:nl]) if len(store["attn"]) >= nl else None
                 w_hd = np.stack([store["w_hd"][li][0] for li in layers]) \
                     if store["w_hd"] else None
+                # qr_attn keys are call order (DAT layers fire 0..7 in order
+                # during prefill), aligned with the sorted layer ids.
+                qr_attn = np.stack([store["qr_attn"][li][0] for li in range(nl)]) \
+                    if store["qr_attn"] and len(store["qr_attn"]) >= nl else None
 
                 np.savez_compressed(
                     os.path.join(sub, f"q{qi}.npz"),
@@ -284,6 +340,7 @@ def main():
                     **({"guide": guide.astype(np.float32)} if guide is not None else {}),
                     **({"attn": attn.astype(np.float32)} if attn is not None else {}),
                     **({"w_hd": w_hd.astype(np.float32)} if w_hd is not None else {}),
+                    **({"qr_attn": qr_attn.astype(np.float32)} if qr_attn is not None else {}),
                 )
                 rec["questions"].append({
                     "idx": qi, "question": q["question"], "category": q["category"],

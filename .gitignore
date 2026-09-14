@@ -173,6 +173,7 @@ PLAN.md
 test_output/
 
 _test_outputs/
+_hr_path_check/
 
 # bench logs
 bench_logs/
