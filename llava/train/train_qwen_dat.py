@@ -360,6 +360,16 @@ class ModelArguments:
     )
     dat_qr_heads: int = field(default=4)
     dat_qr_layerscale_init: float = field(default=1e-2)
+    dat_lr_drop_prob: float = field(
+        default=0.0,
+        metadata={"help": "LR dropout: per-sample probability of blanking part of the LR "
+                          "image tokens (training only). 0 = off."}
+    )
+    dat_lr_drop_ratio: float = field(
+        default=0.75,
+        metadata={"help": "LR dropout: fraction of a selected sample's LR image tokens "
+                          "replaced by the sample's mean LR embedding."}
+    )
     dat_off_grps: int = field(default=1)
     dat_inter_size: int = field(default=64)
     dat_hr_scale: int = field(default=3)
@@ -1994,6 +2004,13 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         if gate_means:
             self._gate_mean_buf.append(sum(gate_means) / len(gate_means))
             self._gate_std_buf.append(sum(gate_stds) / len(gate_stds))
+        # LR dropout: fraction of LR image tokens blanked this forward (0 when off)
+        for module in model.modules():
+            if hasattr(module, '_lr_drop_frac'):
+                if not hasattr(self, '_lr_drop_buf'):
+                    self._lr_drop_buf = []
+                self._lr_drop_buf.append(float(module._lr_drop_frac))
+                break
 
     def on_substep_end(self, args, state, control, model=None, **kwargs):
         self._flush_step(state)
@@ -2126,6 +2143,11 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         if self._offset_oob_buf:
             metrics["dat/offset_oob"] = sum(self._offset_oob_buf) / len(self._offset_oob_buf)
             self._offset_oob_buf.clear()
+
+        # LR dropout activity (fraction of LR image tokens blanked, averaged)
+        if getattr(self, '_lr_drop_buf', None):
+            metrics["dat/lr_drop_frac"] = sum(self._lr_drop_buf) / len(self._lr_drop_buf)
+            self._lr_drop_buf.clear()
 
         # 5. Gate value statistics (intention_as_gate sigmoid output)
         if self._gate_mean_buf:
@@ -3058,6 +3080,8 @@ def train():
             'question_inject': model_args.dat_question_inject,
             'qr_heads': model_args.dat_qr_heads,
             'qr_layerscale_init': model_args.dat_qr_layerscale_init,
+            'lr_drop_prob': model_args.dat_lr_drop_prob,
+            'lr_drop_ratio': model_args.dat_lr_drop_ratio,
             'off_grps': model_args.dat_off_grps,
             'inter_size': model_args.dat_inter_size,
             'hr_scale': model_args.dat_hr_scale,

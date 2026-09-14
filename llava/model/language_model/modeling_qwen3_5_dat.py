@@ -621,6 +621,13 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             'qr_layerscale_init': 1e-2,   # xattn: initial per-channel LayerScale on the residual
             'off_range': 0.0,             # 0 = legacy clamp; >0 = off_range*tanh
             'off_penalty': 0.0,           # >0 = honest clamp + out-of-range pull-back
+            # LR dropout (training-only regulariser): with prob lr_drop_prob per
+            # sample, replace lr_drop_ratio of that sample's LR image-token
+            # embeddings by the sample's mean LR embedding (content-free, scale
+            # matched). Positions are kept, so layout/offsets survive while fine
+            # content can only be recovered from the HD path.
+            'lr_drop_prob': 0.0,
+            'lr_drop_ratio': 0.75,
             'hd_gate_init': None,
             'hd_gate_freeze': False,
             'use_fused_vit': False,
@@ -1962,6 +1969,58 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
         self._patch_text_model_init_weights()
 
+        # LR dropout: the mask is decided in forward() (where input_ids are
+        # known) and applied on the language model's inputs_embeds, AFTER the
+        # ViT features have been scattered in. A pre-hook covers all three ViT
+        # paths (default / fused / shared) without touching HF's merge code.
+        self._lr_drop_mask = None
+        self._lr_drop_frac = 0.0
+        self.model.language_model.register_forward_pre_hook(
+            self._lr_drop_pre_hook, with_kwargs=True,
+        )
+
+    # ------------------------------------------------------------------
+    # LR dropout
+    # ------------------------------------------------------------------
+    def _make_lr_drop_mask(self, input_ids):
+        """Decide which LR image tokens to blank for this forward. Returns None
+        when LR dropout is inactive. DAT_LR_DROP_FORCE=1 activates it regardless
+        of training mode / lr_drop_prob (for the no-training leverage test)."""
+        dat_args = self.config.dat_extra_args
+        prob = float(dat_args.get('lr_drop_prob', 0.0))
+        ratio = float(dat_args.get('lr_drop_ratio', 0.75))
+        force = os.environ.get('DAT_LR_DROP_FORCE') == '1'
+        if force:
+            ratio = float(os.environ.get('DAT_LR_DROP_RATIO', ratio))
+        if input_ids is None or ratio <= 0 or not (force or (self.training and prob > 0)):
+            self._lr_drop_frac = 0.0
+            return None
+        img = input_ids == self.config.image_token_id                      # [B, L]
+        if not img.any():
+            self._lr_drop_frac = 0.0
+            return None
+        B = input_ids.shape[0]
+        sel = torch.rand(B, device=input_ids.device) < (1.0 if force else prob)
+        rnd = torch.rand(input_ids.shape, device=input_ids.device)
+        drop = img & sel[:, None] & (rnd < ratio)
+        self._lr_drop_frac = float(drop.sum()) / float(img.sum())
+        return drop if bool(drop.any()) else None
+
+    def _lr_drop_pre_hook(self, module, args, kwargs):
+        drop = self._lr_drop_mask
+        if drop is None:
+            return None
+        self._lr_drop_mask = None                     # one-shot
+        emb = kwargs.get('inputs_embeds')
+        if emb is None or emb.shape[:2] != drop.shape:
+            return None
+        img = self._lr_drop_img_mask                  # [B, L] all LR image tokens
+        # per-sample mean LR embedding (detached: the fill carries no gradient)
+        w = img.to(emb.dtype).unsqueeze(-1)
+        fill = (emb.detach() * w).sum(1, keepdim=True) / w.sum(1, keepdim=True).clamp_min(1.0)
+        kwargs['inputs_embeds'] = torch.where(drop.unsqueeze(-1), fill.to(emb.dtype), emb)
+        return args, kwargs
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         """Override to re-assert the on-disk DAT weights as the final load step.
@@ -2442,6 +2501,11 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 mrope_position_ids = position_ids[1:]
             elif position_ids.shape[0] == 3:
                 mrope_position_ids = position_ids
+
+        # === Step 3b: LR dropout mask (applied by the language_model pre-hook) ===
+        self._lr_drop_mask = self._make_lr_drop_mask(input_ids)
+        if self._lr_drop_mask is not None:
+            self._lr_drop_img_mask = input_ids == self.config.image_token_id
 
         # === Step 4: Call base model with DAT kwargs ===
         # DAT kwargs flow through: Model → TextModel → DecoderLayer → Attention.
