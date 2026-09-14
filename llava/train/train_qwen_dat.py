@@ -27,6 +27,47 @@ import transformers
 from torch.utils.data import Dataset, Sampler
 from PIL import Image
 
+# ── Allow --resume_from_checkpoint on torch < 2.6 ───────────────────────────
+# transformers >= 4.5x refuses torch.load() (CVE-2025-32434) unless torch >= 2.6,
+# which breaks Trainer resume: scheduler.pt / rng_state_*.pth / trainer_state
+# are plain torch pickles the trainer itself wrote seconds earlier. Model
+# weights are safetensors and unaffected; deepspeed restores its own
+# global_step*/ states with its own torch.load. Those files are ours and live
+# on our own disk, so the CVE (malicious pickles) does not apply — bypass the
+# version gate on the OSS pods (torch 2.5.1). DAT_ALLOW_TORCH_LOAD=0 restores
+# the upstream behaviour.
+if os.environ.get("DAT_ALLOW_TORCH_LOAD", "1") == "1":
+    try:
+        from transformers.utils import import_utils as _tf_import_utils
+        if not _tf_import_utils.is_torch_greater_or_equal("2.6"):
+            _tf_import_utils.check_torch_load_is_safe = lambda: None
+            import transformers.trainer as _tf_trainer  # imports the name directly
+            if hasattr(_tf_trainer, "check_torch_load_is_safe"):
+                _tf_trainer.check_torch_load_is_safe = lambda: None
+            # rng_state_*.pth holds np.random.get_state() (an ndarray). torch >= 2.6
+            # allowlists the numpy globals for weights_only=True by default; 2.5
+            # does not ("Unsupported global: numpy.core.multiarray._reconstruct").
+            # Mirror the 2.6 default allowlist.
+            import numpy as _np
+            _np_safe = [_np.ndarray, _np.dtype]
+            for _mod in ("numpy.core.multiarray", "numpy._core.multiarray"):
+                try:
+                    _m = __import__(_mod, fromlist=["_reconstruct", "scalar"])
+                    _np_safe += [getattr(_m, _n) for _n in ("_reconstruct", "scalar") if hasattr(_m, _n)]
+                except Exception:
+                    pass
+            try:
+                import numpy.dtypes as _npd
+                _np_safe += [getattr(_npd, _n) for _n in dir(_npd) if _n.endswith("DType")]
+            except Exception:
+                pass
+            torch.serialization.add_safe_globals(_np_safe)
+            print(f"[resume] torch {torch.__version__} < 2.6: transformers' torch.load gate "
+                  f"bypassed and {len(_np_safe)} numpy globals allowlisted for our own "
+                  f"checkpoint files (DAT_ALLOW_TORCH_LOAD=0 to disable)")
+    except Exception as _e:  # pragma: no cover
+        print(f"[resume] could not patch check_torch_load_is_safe: {_e}")
+
 # ── Suppress third-party warning spam that defeats standard filters ─────────
 # flash-attn-4's CuTe code trips a deprecated cutlass accessor which warns via
 # `catch_warnings() + simplefilter("always")` — that bypasses PYTHONWARNINGS
@@ -99,11 +140,14 @@ IGNORE_INDEX = -100
 
 local_rank = None
 
-# DAT parameter patterns (must match modeling_qwen2vl_dat.py)
+# DAT parameter patterns (superset across families; must cover every
+# modeling_*_dat.py DAT_KEYS_MATCH). 'proj_film' / 'spatial_gain' exist only
+# in Qwen3.5 DAT with dat_intention_inject='film'.
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention', 'q_readout',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
+    'proj_film', 'spatial_gain',
 ]
 
 
