@@ -1691,8 +1691,17 @@ class HDLseBiasScheduleCallback(transformers.TrainerCallback):
         self._apply(model, state.global_step)
 
     def on_log(self, args, state, control, logs=None, model=None, **kwargs):
-        if logs is not None:
-            logs["dat/hd_lse_bias"] = self.value(state.global_step)
+        # HF's WandbCallback.on_log runs BEFORE user callbacks, so mutating
+        # `logs` here never reaches wandb; log directly like WandbDATMonitor.
+        if not state.is_world_process_zero:
+            return
+        b = self.value(state.global_step)
+        if wandb is not None and wandb.run is not None:
+            _define_wandb_step_metric()
+            wandb.log({"dat/hd_lse_bias": b, "train/global_step": state.global_step},
+                      commit=False)
+        if state.global_step % max(1, 50 * args.logging_steps) == 0:
+            rank0_print(f"[HDLseBias] step {state.global_step}: hd_lse_bias={b:.4f}")
 
 
 # ---------------------------------------------------------------------------
