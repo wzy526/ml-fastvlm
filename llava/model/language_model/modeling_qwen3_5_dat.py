@@ -1022,6 +1022,11 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         self.off_penalty = float(dat.get('off_penalty', 0.0))
         # See _merge_two_pass_lse; 0 = off (all trained checkpoints).
         self.hd_lse_bias = float(dat.get('hd_lse_bias', 0.0))
+        # Probe hook (scripts/probe_whd_qwen35.py --hd_source oracle*): when set
+        # to a [Ns, 2] tensor of (x, y) in [-1, 1], the learned offsets are
+        # ignored and HD is sampled at exactly these locations; the HD position
+        # ids follow them too. None = normal operation.
+        self._dat_force_locs = None
 
         # Offset prediction
         if self.intention_as_gate or self.question_inject == 'xattn':
@@ -1190,6 +1195,17 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         w_min = lr_pos[2].min()
         w_max = lr_pos[2].max()
 
+        if self._dat_force_locs is not None:
+            # Positions follow the forced sampling locations (row-major, same
+            # order as the sampled tokens), mapped from [-1, 1] onto the LR range.
+            fl = self._dat_force_locs.to(device=device).float()
+            fx = (fl[:, 0] + 1.0) * 0.5
+            fy = (fl[:, 1] + 1.0) * 0.5
+            h_grid = (fy * (h_max - h_min).float() + h_min.float()).round().long()
+            w_grid = (fx * (w_max - w_min).float() + w_min.float()).round().long()
+            t_grid = t_val.expand(Ns).long()
+            return torch.stack([t_grid, h_grid, w_grid])  # [3, Ns]
+
         grid_y = torch.linspace(0, 1, self.grid_size, device=device, dtype=torch.float32)
         grid_x = torch.linspace(0, 1, self.grid_size, device=device, dtype=torch.float32)
 
@@ -1237,6 +1253,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device)
 
         x = references + offsets
+        if self._dat_force_locs is not None:
+            fl = self._dat_force_locs.to(device=x.device, dtype=x.dtype)   # [Ns, 2] (x, y)
+            x = fl.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
         if self.training:
             self._dat_offset_oob = (x.abs() > 1.0).float().mean().item()
 

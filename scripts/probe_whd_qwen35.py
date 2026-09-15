@@ -80,6 +80,9 @@ def load_samples(args):
             })
         return samples
 
+    if args.dataset == "vstar":
+        return load_vstar(args)
+
     from datasets import load_dataset
     split = {"hrbench4k": "hrbench_4k", "hrbench8k": "hrbench_8k"}[args.dataset]
     # Prefer the parquet already sitting in the HF hub cache (or an explicit
@@ -107,6 +110,41 @@ def load_samples(args):
             "gt": str(doc["answer"]).strip().upper(),
             "category": str(doc.get("category", "n/a")),
         })
+    return samples
+
+
+def load_vstar(args):
+    """V* Bench from the craigwu/vstar_bench layout: <root>/test_questions.jsonl
+    plus <root>/<category>/<name>.jpg and a sidecar <name>.json holding
+    ``target_object`` and ``bbox`` ([x, y, w, h] in original-image pixels).
+    The bboxes are what the oracle sampling sources use."""
+    root = os.path.expanduser(args.vstar_root)
+    qfile = os.path.join(root, "test_questions.jsonl")
+    if not os.path.isfile(qfile):
+        raise FileNotFoundError(
+            f"{qfile} not found. Download with:\n"
+            "  HF_ENDPOINT=https://hf-mirror.com huggingface-cli download --repo-type dataset "
+            f"craigwu/vstar_bench --local-dir {root}")
+    samples = []
+    with open(qfile) as f:
+        for line in f:
+            if len(samples) >= args.max_samples:
+                break
+            doc = json.loads(line)
+            img_path = os.path.join(root, doc["image"])
+            side = os.path.splitext(img_path)[0] + ".json"
+            bboxes = []
+            if os.path.isfile(side):
+                bboxes = json.load(open(side)).get("bbox", []) or []
+            samples.append({
+                "image": Image.open(img_path).convert("RGB"),
+                "prompt": doc["text"].strip(),
+                "gt": str(doc["label"]).strip().upper(),
+                "category": str(doc.get("category", "n/a")),
+                "bboxes": [list(map(float, b)) for b in bboxes],
+            })
+    n_box = sum(1 for s in samples if s["bboxes"])
+    print(f"[probe] V* Bench: {len(samples)} questions, {n_box} with target bboxes")
     return samples
 
 
@@ -143,7 +181,7 @@ def hd_target_size(image, lr_grid_thw, hr_scale, hd_cap):
 def make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, source):
     """Build the HD-side image under the requested ablation source."""
     img = sample["image"]
-    if source == "real":
+    if source in ("real", "oracle", "oracle_rand"):
         return img.resize((hd_w, hd_h), Image.BICUBIC)
     if source == "lr_up":
         # exactly what the LR branch sees (patch grid * 16 px), blown back up
@@ -166,6 +204,62 @@ def make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, source):
         arr = rng.randint(0, 256, size=(hd_h, hd_w, 3), dtype=np.uint8)
         return Image.fromarray(arr, "RGB")
     raise ValueError(source)
+
+
+def oracle_locs(sample, idx, hd_w, hd_h, grid_size, min_cells, source):
+    """Forced sampling grid for the oracle sources, as [Ns, 2] (x, y) in [-1, 1].
+
+    oracle:      grid_size x grid_size uniform points over a window centred on
+                 the union of the GT target bboxes, at least `min_cells` HD
+                 feature cells (32 px of the HD image) per side so that a tiny
+                 target still comes with context and the window is sampled at
+                 full HD resolution.
+    oracle_rand: a window of the SAME size at a random location whose window
+                 does not overlap the GT bbox — controls for "any focused
+                 window helps" vs "the right location helps".
+    Returns None when the sample has no bbox (falls back to learned offsets).
+    """
+    boxes = sample.get("bboxes") or []
+    if not boxes:
+        return None
+    W, H = sample["image"].size
+    x0 = min(b[0] for b in boxes) / W
+    y0 = min(b[1] for b in boxes) / H
+    x1 = max(b[0] + b[2] for b in boxes) / W
+    y1 = max(b[1] + b[3] for b in boxes) / H
+    # window size in normalised [0, 1] image fractions
+    ww = max(x1 - x0, min_cells * FACTOR / hd_w)
+    wh = max(y1 - y0, min_cells * FACTOR / hd_h)
+    ww, wh = min(ww, 1.0), min(wh, 1.0)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    if source == "oracle_rand":
+        rng = np.random.RandomState(1000 + idx)
+        best, best_d = None, -1.0
+        for _ in range(64):
+            rx, ry = rng.uniform(ww / 2, 1 - ww / 2), rng.uniform(wh / 2, 1 - wh / 2)
+            # no overlap between the random window and the GT union box
+            if (abs(rx - cx) >= (ww + (x1 - x0)) / 2) or (abs(ry - cy) >= (wh + (y1 - y0)) / 2):
+                best = (rx, ry)
+                break
+            d = (rx - cx) ** 2 + (ry - cy) ** 2
+            if d > best_d:
+                best, best_d = (rx, ry), d
+        cx, cy = best
+    # clamp the window inside the image
+    cx = min(max(cx, ww / 2), 1 - ww / 2)
+    cy = min(max(cy, wh / 2), 1 - wh / 2)
+    gx = torch.linspace(cx - ww / 2, cx + ww / 2, grid_size)
+    gy = torch.linspace(cy - wh / 2, cy + wh / 2, grid_size)
+    gy, gx = torch.meshgrid(gy, gx, indexing="ij")           # row-major like _grid_generate
+    locs = torch.stack([gx, gy], dim=-1).reshape(-1, 2) * 2.0 - 1.0
+    return locs.clamp(-1.0, 1.0)
+
+
+def set_force_locs(model, locs):
+    from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5AttentionDAT
+    for m in model.modules():
+        if isinstance(m, Qwen3_5AttentionDAT):
+            m._dat_force_locs = locs
 
 
 def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dtype):
@@ -198,7 +292,11 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
         "pixel_values_hd": hr_inputs["pixel_values"].to(device=device, dtype=dtype),
         "image_grid_thw_hd": hr_inputs["image_grid_thw"].to(device),
     }
-    return moved, hd_extra
+    locs = None
+    if args.hd_source.startswith("oracle"):
+        locs = oracle_locs(sample, idx, hd_w, hd_h, args.grid_size,
+                           args.oracle_min_cells, args.hd_source)
+    return moved, hd_extra, locs
 
 
 # ──────────────────────────────────────────────────────────────
@@ -294,7 +392,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--processor_path", default=None)
-    ap.add_argument("--dataset", choices=["hrbench4k", "hrbench8k"], default="hrbench4k")
+    ap.add_argument("--dataset", choices=["hrbench4k", "hrbench8k", "vstar"], default="hrbench4k")
+    ap.add_argument("--vstar_root", default="~/data/vstar_bench",
+                    help="craigwu/vstar_bench checkout (test_questions.jsonl + <category>/*.jpg|.json)")
+    ap.add_argument("--oracle_min_cells", type=int, default=20,
+                    help="oracle window >= this many HD feature cells (32 px) per side; "
+                         "20 = the 20x20 grid samples the window at full HD resolution")
     ap.add_argument("--image_folder", default=None)
     ap.add_argument("--hrbench_parquet", default=None,
                     help="explicit path to hr_bench_4k/8k.parquet (skips the Hub entirely)")
@@ -303,8 +406,12 @@ def main():
     ap.add_argument("--min_pixels", type=int, default=28224)
     ap.add_argument("--hd_cap", type=int, default=5017600)
     ap.add_argument("--hr_scale", type=int, default=3)
-    ap.add_argument("--hd_source", choices=["real", "lr_up", "shuffle", "noise"],
-                    default="real")
+    ap.add_argument("--hd_source",
+                    choices=["real", "lr_up", "shuffle", "noise", "oracle", "oracle_rand"],
+                    default="real",
+                    help="oracle/oracle_rand need --dataset vstar (GT bboxes): HD is the real "
+                         "image but the 400 sampling points are forced onto a window around the "
+                         "target (oracle) or a same-size window elsewhere (oracle_rand)")
     ap.add_argument("--hd_bias", type=float, nargs="+", default=[0.0],
                     help="constant(s) added to lse_hd; several values = sweep")
     ap.add_argument("--attn", default="flash_attention_2")
@@ -330,6 +437,9 @@ def main():
     ).eval()
     install_lr_key_hook(model)
     image_token_id = getattr(model.config, "image_token_id", None)
+    args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
+    if args.hd_source.startswith("oracle") and args.dataset != "vstar":
+        raise SystemExit("--hd_source oracle/oracle_rand needs --dataset vstar (GT bboxes)")
     ppath = args.processor_path or args.model_path
     processor = AutoProcessor.from_pretrained(
         ppath, min_pixels=args.min_pixels, max_pixels=args.tok_budget * TOK_PX)
@@ -352,24 +462,32 @@ def main():
         n_in = inputs["input_ids"].shape[1]
         return processor.tokenizer.decode(out[0][n_in:], skip_special_tokens=True).strip()
 
+    n_forced = 0
     for i, s in enumerate(tqdm(samples, desc="probe")):
-        base_inputs, hd_extra = build_inputs(
+        base_inputs, hd_extra, locs = build_inputs(
             s, i, samples, processor, hr_processor, args, device, dtype)
 
         STATE["img_mask"] = (base_inputs["input_ids"][0] == image_token_id) \
             if image_token_id is not None else None
 
         STATE["bias"] = 0.0
+        set_force_locs(model, None)
         t = gen(base_inputs)
         raw["off"].append(t); preds["off"].append(extract_letter(t))
 
+        set_force_locs(model, locs)          # None -> learned offsets (non-oracle sources)
+        n_forced += locs is not None
         for b, cname in zip(args.hd_bias, configs[1:]):
             STATE["bias"] = float(b)
             STATE["record"] = (b == record_bias)
             t = gen({**base_inputs, **hd_extra})
             STATE["record"] = False
             raw[cname].append(t); preds[cname].append(extract_letter(t))
+        set_force_locs(model, None)
     STATE["bias"] = 0.0
+    if args.hd_source.startswith("oracle"):
+        print(f"[probe] forced sampling window on {n_forced}/{len(samples)} samples "
+              f"(min {args.oracle_min_cells} HD cells per side)")
 
     # ── report ────────────────────────────────────────────────
     cats = sorted({s["category"] for s in samples})
