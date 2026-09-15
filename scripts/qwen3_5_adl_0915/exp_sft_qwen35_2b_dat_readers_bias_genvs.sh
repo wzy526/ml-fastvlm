@@ -106,8 +106,10 @@ PY
 
 mkdir -p "$CKPT_ROOT/$EXP_NAME"
 
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$CACHE_ROOT/triton}"
-export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$CACHE_ROOT/torchinductor}"
+# Compiled caches are PER HOST: the home is a shared JuiceFS, and a
+# __triton_launcher.so built on a glibc-2.34 box fails to load on an older one.
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$CACHE_ROOT/triton-$(hostname -s)}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$CACHE_ROOT/torchinductor-$(hostname -s)}"
 export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-$CACHE_ROOT/cuda}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$CACHE_ROOT/xdg}"
 mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$CUDA_CACHE_PATH" "$XDG_CACHE_HOME"
