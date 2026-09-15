@@ -1170,9 +1170,12 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         same token order as the reference grid). None -> None."""
         if win is None:
             return None
+        # No torch.linspace(w[0], w[2]) here: tensor endpoints go through
+        # .item() -> a GPU sync per call, which stalls the launch queue.
         w = win.to(device=device).float()
-        gx = torch.linspace(w[0], w[2], self.grid_size, device=device)
-        gy = torch.linspace(w[1], w[3], self.grid_size, device=device)
+        u = torch.linspace(0.0, 1.0, self.grid_size, device=device)
+        gx = w[0] + (w[2] - w[0]) * u
+        gy = w[1] + (w[3] - w[1]) * u
         gy, gx = torch.meshgrid(gy, gx, indexing='ij')
         return (torch.stack([gx, gy], dim=-1).reshape(-1, 2) * 2.0 - 1.0).clamp(-1.0, 1.0)
 
@@ -1694,10 +1697,10 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
         for b_idx in range(B):
             if self._dat_force_batch is not None:
-                # teacher forcing: this sample's window (or None -> learned offsets)
-                self._dat_force_locs = self._window_to_locs(
-                    self._dat_force_batch[b_idx] if b_idx < len(self._dat_force_batch) else None,
-                    device)
+                # teacher forcing: this sample's forced grid [Ns, 2] (None -> learned offsets);
+                # converted from the window once per forward in the top-level model.
+                self._dat_force_locs = self._dat_force_batch[b_idx] \
+                    if b_idx < len(self._dat_force_batch) else None
             if len(image_range_list[b_idx]) <= 1:
                 continue
 
@@ -2569,8 +2572,14 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         # windows. A fresh forward overwrites it, so nothing leaks across batches.
         if not hasattr(self, '_dat_attn_modules'):
             self._dat_attn_modules = [m for m in self.modules() if hasattr(m, '_dat_force_batch')]
+        _force_locs = None
+        if dat_force_window is not None and self._dat_attn_modules:
+            # window -> [Ns, 2] grid once per forward (shared by all DAT layers)
+            _dev = inputs_embeds.device if inputs_embeds is not None else input_ids.device
+            _force_locs = [self._dat_attn_modules[0]._window_to_locs(w, _dev)
+                           for w in dat_force_window]
         for _m in self._dat_attn_modules:
-            _m._dat_force_batch = dat_force_window
+            _m._dat_force_batch = _force_locs
         self._dat_tf_frac = 0.0 if dat_force_window is None else \
             sum(w is not None for w in dat_force_window) / max(1, len(dat_force_window))
 
