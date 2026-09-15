@@ -1027,6 +1027,11 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # ignored and HD is sampled at exactly these locations; the HD position
         # ids follow them too. None = normal operation.
         self._dat_force_locs = None
+        # Training-time teacher forcing (dat_force_window kwarg of the top-level
+        # forward): per-sample window [x0, y0, x1, y1] in [0, 1] image fractions
+        # (or None). Converted to a grid of forced locations per b_idx inside
+        # the attention forward; samples with None keep their learned offsets.
+        self._dat_force_batch = None
 
         # Offset prediction
         if self.intention_as_gate or self.question_inject == 'xattn':
@@ -1158,6 +1163,18 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             nn.init.zeros_(self.v_proj_hd.bias)
         if self.hd_input_layernorm is not None:
             nn.init.ones_(self.hd_input_layernorm.weight)
+
+    def _window_to_locs(self, win, device):
+        """[x0, y0, x1, y1] in [0, 1] image fractions -> [Ns, 2] (x, y) in [-1, 1]:
+        a grid_size x grid_size uniform grid over the window (row-major, the
+        same token order as the reference grid). None -> None."""
+        if win is None:
+            return None
+        w = win.to(device=device).float()
+        gx = torch.linspace(w[0], w[2], self.grid_size, device=device)
+        gy = torch.linspace(w[1], w[3], self.grid_size, device=device)
+        gy, gx = torch.meshgrid(gy, gx, indexing='ij')
+        return (torch.stack([gx, gy], dim=-1).reshape(-1, 2) * 2.0 - 1.0).clamp(-1.0, 1.0)
 
     def _grid_generate(self, h, w, n_repeats, device):
         """Generate reference sampling grid with half-cell margin from [-1,1] boundary."""
@@ -1676,6 +1693,11 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         seg_meta: List[Tuple[int, int, int]] = []
 
         for b_idx in range(B):
+            if self._dat_force_batch is not None:
+                # teacher forcing: this sample's window (or None -> learned offsets)
+                self._dat_force_locs = self._window_to_locs(
+                    self._dat_force_batch[b_idx] if b_idx < len(self._dat_force_batch) else None,
+                    device)
             if len(image_range_list[b_idx]) <= 1:
                 continue
 
@@ -1823,6 +1845,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     seg_k_list.append(k_hd_l_first[_m * Ns:(_m + 1) * Ns])
                     seg_v_list.append(v_hd_l_first[_m * Ns:(_m + 1) * Ns])
                     seg_meta.append((b_idx, _s, Nlr))
+
+        if self._dat_force_batch is not None:
+            self._dat_force_locs = None     # per-sample forcing ends with the loop
 
         # Phase 2b/2c: cross-attention + LSE merge.
         # Exact path (training default): one autograd Function owns Pass 1 +
@@ -2445,6 +2470,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         image_grid_thw_hd: Optional[torch.LongTensor] = None,
         image_hd_features: Optional[List[torch.Tensor]] = None,
         image_range_list: Optional[List[List]] = None,
+        dat_force_window: Optional[List[Optional[torch.Tensor]]] = None,
         **kwargs,
     ) -> Union[Tuple, Qwen3_5CausalLMOutputWithPast]:
         """Forward pass with DAT HD feature injection.
@@ -2534,6 +2560,19 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self._lr_drop_mask = self._make_lr_drop_mask(input_ids)
         if self._lr_drop_mask is not None:
             self._lr_drop_img_mask = input_ids == self.config.image_token_id
+
+        # === Step 3c: teacher-forced sampling windows (training data with bboxes) ===
+        # A per-sample list; DAT attention modules read it per b_idx. Set on
+        # EVERY forward (None when absent) rather than reset afterwards: with
+        # gradient checkpointing the layer forward is recomputed during
+        # backward, after this call returned, and must still see this batch's
+        # windows. A fresh forward overwrites it, so nothing leaks across batches.
+        if not hasattr(self, '_dat_attn_modules'):
+            self._dat_attn_modules = [m for m in self.modules() if hasattr(m, '_dat_force_batch')]
+        for _m in self._dat_attn_modules:
+            _m._dat_force_batch = dat_force_window
+        self._dat_tf_frac = 0.0 if dat_force_window is None else \
+            sum(w is not None for w in dat_force_window) / max(1, len(dat_force_window))
 
         # === Step 4: Call base model with DAT kwargs ===
         # DAT kwargs flow through: Model → TextModel → DecoderLayer → Attention.

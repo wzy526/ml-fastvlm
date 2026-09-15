@@ -23,6 +23,13 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # $CKPT_ROOT/$EXP_NAME-merged (merge_lora_dat_weights.py auto-detects the
 # qwen3_5_dat family from the ckpt config).
 #
+# Teacher-forced HD sampling (bbox windows) variant — same recipe, data built by
+# scripts/build_tf_bbox_data.py (VG "describe this region [box]" turns exploded
+# into singles carrying `bbox`):
+#   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_tfbox.json TF_PROB=1 \
+#   EXP_NAME=0915_sft_qwen35_2b_dat_readers_bias_tfbox bash <this script>
+# wandb: dat/tf_frac = fraction of samples forced per step (~0.15 expected).
+#
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)
 #   [patch-geometry] PATCH_SIZE=16 ... factor=32
@@ -152,6 +159,8 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_image_hd_for_question "${QUESTION_HD:-True}" \
     --dat_hd_lse_bias "${HD_LSE_BIAS:-0}" \
     --dat_hd_lse_bias_decay_steps "${HD_LSE_BIAS_DECAY:-0}" \
+    --dat_tf_prob "${TF_PROB:-0}" \
+    --dat_tf_min_cells "${TF_MIN_CELLS:-20}" \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \

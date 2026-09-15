@@ -521,6 +521,24 @@ class DataArguments:
     lr_min_pixels: int = field(default=200704)    # 256*28*28
     lr_max_pixels: int = field(default=501760)    # 640*28*28 (~640 tokens)
 
+    # ---- Teacher-forced HD sampling (samples carrying a target bbox) ----
+    # Oracle probe on the 0915 ckpt (V*): forcing the 400 points onto the GT box
+    # changed nothing, i.e. the readout never learned to use localized detail
+    # because it never received detail at the right place. Samples whose json
+    # entry has `bbox` = [x0, y0, x1, y1] (fractions of the image, or pixels)
+    # get their sampling grid forced onto a window around that box; the rest
+    # keep the learned offsets. Box-in-question tasks (VG "describe this
+    # region [box]") are the intended source — the box is not the answer.
+    dat_tf_prob: float = field(
+        default=1.0,
+        metadata={"help": "Probability of teacher-forcing a bbox-carrying sample (0 = off)."}
+    )
+    dat_tf_min_cells: int = field(
+        default=20,
+        metadata={"help": "Forced window is at least this many HD feature cells (32 px) per "
+                          "side; 20 = the 20x20 grid samples the window at full HD resolution."}
+    )
+
     # ---- HR-first resize (DEPRECATED: kept for ablation but not recommended) ----
     # When True, HR is the anchor: HR processor smart_resizes to [hr_min, hr_max] first,
     # then LR_thw is derived as floor(HR_thw / dat_hr_scale) aligned to spatial_merge=2,
@@ -1195,6 +1213,42 @@ class Qwen2VLCoupledDATDataset(Dataset):
                 else:
                     raise RuntimeError(f"Failed after {MAX_RETRIES} attempts: {e}")
 
+    def _teacher_force_window(self, item, img, hd_thw):
+        """[x0, y0, x1, y1] window (fractions of the image) for teacher-forced
+        HD sampling, or None. Built from item['bbox'] (fractions, or pixels if
+        any value > 1; several boxes -> their union), expanded to at least
+        dat_tf_min_cells HD feature cells per side and clamped into the image."""
+        box = item.get("bbox")
+        if not box or img is None:
+            return None
+        p = float(getattr(self.data_args, "dat_tf_prob", 0.0) or 0.0)
+        if p <= 0.0 or (p < 1.0 and random.random() >= p):
+            return None
+        boxes = box if isinstance(box[0], (list, tuple)) else [box]
+        W, H = img.size
+        xs0, ys0, xs1, ys1 = [], [], [], []
+        for b in boxes:
+            if len(b) != 4:
+                continue
+            x0, y0, x1, y1 = map(float, b)
+            if max(x0, y0, x1, y1) > 1.0:            # pixel coords
+                x0, x1, y0, y1 = x0 / W, x1 / W, y0 / H, y1 / H
+            xs0.append(x0); ys0.append(y0); xs1.append(x1); ys1.append(y1)
+        if not xs0:
+            return None
+        x0, y0, x1, y1 = min(xs0), min(ys0), max(xs1), max(ys1)
+        if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+            return None
+        cells_h = max(1, int(hd_thw[1]) // 2)      # merged 32-px cells of the HD map
+        cells_w = max(1, int(hd_thw[2]) // 2)
+        mc = int(getattr(self.data_args, "dat_tf_min_cells", 20))
+        ww = min(1.0, max(x1 - x0, mc / cells_w))
+        wh = min(1.0, max(y1 - y0, mc / cells_h))
+        cx = min(max((x0 + x1) / 2, ww / 2), 1 - ww / 2)
+        cy = min(max((y0 + y1) / 2, wh / 2), 1 - wh / 2)
+        return torch.tensor([cx - ww / 2, cy - wh / 2, cx + ww / 2, cy + wh / 2],
+                            dtype=torch.float32)
+
     def _get_item(self, i):
         item = self.list_data_dict[i]
         messages, image_path = _build_messages(
@@ -1313,6 +1367,9 @@ class Qwen2VLCoupledDATDataset(Dataset):
         if inputs_hd is not None:
             result["pixel_values_hd"] = inputs_hd["pixel_values"]
             result["image_grid_thw_hd"] = inputs_hd["image_grid_thw"]
+            win = self._teacher_force_window(item, img, inputs_hd["image_grid_thw"][0])
+            if win is not None:
+                result["dat_force_window"] = win
 
         # ---- Optional KD teacher input: higher resolution for the pure base VLM ----
         # Teacher typically sees the full HR image (processor default min/max pixels),
@@ -1536,6 +1593,12 @@ class Qwen2VLDataCollator:
         if pv_hd_list:
             batch["pixel_values_hd"] = torch.cat(pv_hd_list, dim=0)
             batch["image_grid_thw_hd"] = torch.cat(grid_hd_list, dim=0)
+
+        # Teacher-forced HD windows: per-sample list aligned with the batch (None
+        # = learned offsets). Only emitted when at least one sample carries one.
+        windows = [inst.get("dat_force_window") for inst in instances]
+        if any(w is not None for w in windows):
+            batch["dat_force_window"] = windows
 
         # ---- KD teacher: separate inputs with possibly different image resolution ----
         has_teacher = any("input_ids_teacher" in inst for inst in instances)
@@ -2106,6 +2169,13 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                     self._lr_drop_buf = []
                 self._lr_drop_buf.append(float(module._lr_drop_frac))
                 break
+        # Teacher forcing: fraction of samples whose HD grid was forced onto a bbox window
+        for module in model.modules():
+            if hasattr(module, '_dat_tf_frac'):
+                if not hasattr(self, '_tf_frac_buf'):
+                    self._tf_frac_buf = []
+                self._tf_frac_buf.append(float(module._dat_tf_frac))
+                break
 
     def on_substep_end(self, args, state, control, model=None, **kwargs):
         self._flush_step(state)
@@ -2243,6 +2313,9 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         if getattr(self, '_lr_drop_buf', None):
             metrics["dat/lr_drop_frac"] = sum(self._lr_drop_buf) / len(self._lr_drop_buf)
             self._lr_drop_buf.clear()
+        if getattr(self, '_tf_frac_buf', None):
+            metrics["dat/tf_frac"] = sum(self._tf_frac_buf) / len(self._tf_frac_buf)
+            self._tf_frac_buf.clear()
 
         # 5. Gate value statistics (intention_as_gate sigmoid output)
         if self._gate_mean_buf:
@@ -2606,7 +2679,7 @@ class Qwen2VLTrainer(transformers.Trainer):
     _TEACHER_DROP_KEYS = (
         'pixel_values_hd', 'image_grid_thw_hd',
         'image_hd_features', 'image_range_list',
-        'image_paths',
+        'image_paths', 'dat_force_window',
     )
 
     def __init__(self, *args, kd_teacher: Optional[torch.nn.Module] = None, **kwargs):
