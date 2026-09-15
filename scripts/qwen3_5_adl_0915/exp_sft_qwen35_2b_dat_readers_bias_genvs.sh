@@ -194,7 +194,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --gradient_checkpointing True \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --group_by_modality_length True \
-    --dataloader_num_workers 8 \
+    --dataloader_num_workers "${DATALOADER_WORKERS:-8}" \
     --dataloader_pin_memory True \
     --dataloader_prefetch_factor 2 \
     --dataloader_persistent_workers True \
