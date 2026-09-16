@@ -36,11 +36,15 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   loss += OFF_SUP_WEIGHT * mean(huber(ref + off - window_grid))  per DAT layer
 # Data: scripts/build_viscot_bbox_data.py (Visual-CoT answer-region boxes joined
 # onto our docvqa/infovqa images; ~40k, HD/LR ~6x, boxes <1% of the image):
-#   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_viscot.json TF_PROB=1 OFF_SUP_WEIGHT=1 \
+#   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_viscot.json TF_PROB=1 OFF_SUP_WEIGHT=10 \
 #   EXP_NAME=0916_sft_qwen35_2b_dat_readers_bias_offsup bash <this script>
+# Only the intention-conditioned slots are supervised; the question-agnostic
+# image slot of QUESTION_HD=True is left alone (it cannot know the target).
 # wandb: dat/off_sup_dist (mean point->target distance, grid units; a uniform
-# grid sits ~0.5-0.8, must fall), dat/off_sup_loss, dat/offset_std (must leave
-# the ~0.08 init floor), dat/tf_frac (= fraction of samples with a window).
+# grid sits ~0.5-0.8, must fall), dat/off_sup_grad_ratio (||pull||/||LM grad||
+# on the grid; aim ~1-10, raise OFF_SUP_WEIGHT if << 1), dat/off_sup_loss,
+# dat/offset_std (must leave the ~0.08 init floor), dat/tf_frac (= fraction of
+# samples with a window, ~0.13 with the viscot mix).
 #
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)

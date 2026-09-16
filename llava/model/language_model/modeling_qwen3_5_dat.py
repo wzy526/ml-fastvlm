@@ -1255,7 +1255,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         return torch.stack([t_grid, h_grid, w_grid])  # [3, Ns]
 
     def _sample_hd_from_off_guide(self, off_guide, image_hd_features, hd_feat_idx, Lp, device,
-                                  film=None, spatial=None):
+                                  film=None, spatial=None, n_unsup_lead=0):
         """Core deformable sampling: off_guide -> offsets -> grid_sample -> KV.
 
         Args:
@@ -1265,6 +1265,11 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             spatial: optional [Lp*off_grps, 1, gh, gw] map added after ln_2;
                      additive, because any multiplicative per-position scalar is
                      cancelled exactly by a channel-wise LayerNorm.
+            n_unsup_lead: leading slots (each off_grps rows) EXCLUDED from offset
+                     supervision -- the question-agnostic image-conditioned slot
+                     of the fused path cannot know where the answer is, so
+                     pulling it toward the bbox would only teach a mean location
+                     on the shared conv_off_proj.
 
         Returns:
             key_hd:        [Lp, Ns, kv_dim]
@@ -1304,9 +1309,11 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             # keep moving), L2-like near (no oscillation). The gradient of the
             # LM loss through grid_sample is added on top untouched, so once the
             # grid is on target the readout decides the fine placement.
+            r0 = n_unsup_lead * self.off_grps          # first supervised row
+            xs = x[r0:]                                 # [(Lp-n)*G, 2, gh, gw]
             tgt = self._dat_off_target.to(device=x.device, dtype=x.dtype)  # [Ns, 2] (x, y)
-            tgt = tgt.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
-            resid = (x - tgt).detach()
+            tgt = tgt.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(xs)
+            resid = (xs - tgt).detach()
             d = self.off_sup_delta
             # monitor: (weighted huber, mean point-to-target distance in grid
             # units) kept as 0-d GPU tensors -- no .item() here, one sync per
@@ -1320,10 +1327,24 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                                     resid.norm(dim=1).mean()]))
             if len(buf) > 512:                 # bounded if no monitor drains it
                 del buf[:-512]
-            if x.requires_grad:
-                coef = self.off_sup_weight / x.numel()
-                pull = (resid.clamp(-d, d) * coef)
-                x.register_hook(lambda g, p=pull: g + p)
+            if xs.numel() > 0 and x.requires_grad:
+                # loss = w * mean over supervised POINTS of huber summed over (x, y)
+                coef = self.off_sup_weight / (resid.numel() // 2)
+                pull = torch.zeros_like(x)
+                pull[r0:] = resid.clamp(-d, d) * coef
+                gbuf = getattr(self, '_dat_off_sup_grad_buf', None)
+                if gbuf is None:
+                    gbuf = self._dat_off_sup_grad_buf = []
+
+                def _hook(g, p=pull, r0=r0, gbuf=gbuf):
+                    # ||LM-loss grad on the supervised rows|| vs ||pull||: the
+                    # ratio tells whether off_sup_weight is large enough to be
+                    # seen through the LM gradient noise (wandb dat/off_sup_grad_ratio).
+                    gbuf.append(torch.stack([g[r0:].detach().norm(), p[r0:].norm()]))
+                    if len(gbuf) > 512:
+                        del gbuf[:-512]
+                    return g + p
+                x.register_hook(_hook)
         if self.training:
             self._dat_offset_oob = (x.abs() > 1.0).float().mean().item()
 
@@ -1568,7 +1589,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     spatial_all = torch.cat([pad, spatial_add], dim=0)
                 key_all, value_all, slocs_all = self._sample_hd_from_off_guide(
                     off_guide_all, image_hd_features, hd_feat_idx, Lp + 1, device,
-                    film=film_all, spatial=spatial_all,
+                    film=film_all, spatial=spatial_all, n_unsup_lead=1,
                 )
                 kimg_parts.append(key_all[0:1])
                 vimg_parts.append(value_all[0:1])
@@ -1749,10 +1770,10 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 # converted from the window once per forward in the top-level model.
                 self._dat_force_locs = self._dat_force_batch[b_idx] \
                     if b_idx < len(self._dat_force_batch) else None
-            if self._dat_off_target_batch is not None:
-                # offset supervision: this sample's target grid [Ns, 2] (or None)
-                self._dat_off_target = self._dat_off_target_batch[b_idx] \
-                    if b_idx < len(self._dat_off_target_batch) else None
+            # offset supervision: this sample's target grid [Ns, 2], or None.
+            # Unconditional so a target can never leak across batches/samples.
+            _tb = self._dat_off_target_batch
+            self._dat_off_target = _tb[b_idx] if _tb is not None and b_idx < len(_tb) else None
             if len(image_range_list[b_idx]) <= 1:
                 continue
 
@@ -1903,8 +1924,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
         if self._dat_force_batch is not None:
             self._dat_force_locs = None     # per-sample forcing ends with the loop
-        if self._dat_off_target_batch is not None:
-            self._dat_off_target = None
+        self._dat_off_target = None
 
         # Phase 2b/2c: cross-attention + LSE merge.
         # Exact path (training default): one autograd Function owns Pass 1 +

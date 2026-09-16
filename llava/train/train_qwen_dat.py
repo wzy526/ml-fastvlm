@@ -2227,6 +2227,17 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 self._off_sup_buf = []
             # one device->host copy for all (layer, sample) entries of this step
             self._off_sup_buf.extend(map(tuple, torch.stack(pending).float().tolist()))
+        # (||LM grad on x||, ||pull||) recorded inside the backward hook
+        pending = []
+        for module in model.modules():
+            gbuf = getattr(module, '_dat_off_sup_grad_buf', None)
+            if gbuf:
+                pending.extend(gbuf)
+                gbuf.clear()
+        if pending:
+            if not hasattr(self, '_off_sup_grad_buf'):
+                self._off_sup_grad_buf = []
+            self._off_sup_grad_buf.extend(map(tuple, torch.stack(pending).float().tolist()))
 
     def on_substep_end(self, args, state, control, model=None, **kwargs):
         self._flush_step(state)
@@ -2377,6 +2388,15 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             metrics["dat/off_sup_loss"] = sum(v[0] for v in self._off_sup_buf) / n
             metrics["dat/off_sup_dist"] = sum(v[1] for v in self._off_sup_buf) / n
             self._off_sup_buf.clear()
+        # ||pull|| / ||LM grad|| on the supervised sampling points. << 1 means the
+        # supervision is buried in LM-gradient noise (raise dat_off_sup_weight);
+        # >> 1 means the LM loss no longer has a say in where the grid goes.
+        if getattr(self, '_off_sup_grad_buf', None):
+            g_lm = sum(v[0] for v in self._off_sup_grad_buf)
+            g_pull = sum(v[1] for v in self._off_sup_grad_buf)
+            metrics["dat/off_sup_grad_lm"] = g_lm / len(self._off_sup_grad_buf)
+            metrics["dat/off_sup_grad_ratio"] = g_pull / max(g_lm, 1e-12)
+            self._off_sup_grad_buf.clear()
 
         # 5. Gate value statistics (intention_as_gate sigmoid output)
         if self._gate_mean_buf:
