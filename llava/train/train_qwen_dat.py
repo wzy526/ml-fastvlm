@@ -538,6 +538,19 @@ class DataArguments:
         metadata={"help": "Forced window is at least this many HD feature cells (32 px) per "
                           "side; 20 = the 20x20 grid samples the window at full HD resolution."}
     )
+    # Guards learned the hard way (0915 tfbox): VG images are ~500 px, so HD ==
+    # LR (hd_target is capped at the original pixels) and a 20-cell window
+    # covered the whole image -> forcing changed nothing the model saw. Skip
+    # forcing unless HD really carries more pixels than LR and the window is
+    # local; dat/tf_frac then counts only forcings that actually took effect.
+    dat_tf_min_hd_ratio: float = field(
+        default=2.0,
+        metadata={"help": "Force only if HD pixels / LR pixels >= this (area ratio)."}
+    )
+    dat_tf_max_window_frac: float = field(
+        default=0.5,
+        metadata={"help": "Force only if the window covers <= this fraction of the image area."}
+    )
 
     # ---- HR-first resize (DEPRECATED: kept for ablation but not recommended) ----
     # When True, HR is the anchor: HR processor smart_resizes to [hr_min, hr_max] first,
@@ -1213,14 +1226,22 @@ class Qwen2VLCoupledDATDataset(Dataset):
                 else:
                     raise RuntimeError(f"Failed after {MAX_RETRIES} attempts: {e}")
 
-    def _teacher_force_window(self, item, img, hd_thw):
+    def _teacher_force_window(self, item, img, hd_thw, lr_thw=None):
         """[x0, y0, x1, y1] window (fractions of the image) for teacher-forced
         HD sampling, or None. Built from item['bbox'] (fractions, or pixels if
         any value > 1; several boxes -> their union), expanded to at least
-        dat_tf_min_cells HD feature cells per side and clamped into the image."""
+        dat_tf_min_cells HD feature cells per side and clamped into the image.
+        Returns None (no forcing) when HD does not carry more pixels than LR or
+        the window would cover most of the image -- see dat_tf_min_hd_ratio."""
         box = item.get("bbox")
         if not box or img is None:
             return None
+        if lr_thw is not None:
+            hd_px = float(hd_thw[1] * hd_thw[2])
+            lr_px = float(lr_thw[1] * lr_thw[2])
+            if hd_px < float(getattr(self.data_args, "dat_tf_min_hd_ratio", 0.0) or 0.0) * lr_px:
+                self._tf_skip_ratio = getattr(self, "_tf_skip_ratio", 0) + 1
+                return None
         p = float(getattr(self.data_args, "dat_tf_prob", 0.0) or 0.0)
         if p <= 0.0 or (p < 1.0 and random.random() >= p):
             return None
@@ -1246,6 +1267,9 @@ class Qwen2VLCoupledDATDataset(Dataset):
         wh = min(1.0, max(y1 - y0, mc / cells_h))
         cx = min(max((x0 + x1) / 2, ww / 2), 1 - ww / 2)
         cy = min(max((y0 + y1) / 2, wh / 2), 1 - wh / 2)
+        if ww * wh > float(getattr(self.data_args, "dat_tf_max_window_frac", 1.0) or 1.0):
+            self._tf_skip_window = getattr(self, "_tf_skip_window", 0) + 1
+            return None
         return torch.tensor([cx - ww / 2, cy - wh / 2, cx + ww / 2, cy + wh / 2],
                             dtype=torch.float32)
 
@@ -1367,7 +1391,9 @@ class Qwen2VLCoupledDATDataset(Dataset):
         if inputs_hd is not None:
             result["pixel_values_hd"] = inputs_hd["pixel_values"]
             result["image_grid_thw_hd"] = inputs_hd["image_grid_thw"]
-            win = self._teacher_force_window(item, img, inputs_hd["image_grid_thw"][0])
+            win = self._teacher_force_window(
+                item, img, inputs_hd["image_grid_thw"][0],
+                inputs["image_grid_thw"][0] if "image_grid_thw" in inputs else None)
             if win is not None:
                 result["dat_force_window"] = win
 

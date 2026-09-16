@@ -82,6 +82,8 @@ def load_samples(args):
 
     if args.dataset == "vstar":
         return load_vstar(args)
+    if args.dataset == "synth":
+        return load_synth(args)
 
     from datasets import load_dataset
     split = {"hrbench4k": "hrbench_4k", "hrbench8k": "hrbench_8k"}[args.dataset]
@@ -146,6 +148,36 @@ def load_vstar(args):
     n_box = sum(1 for s in samples if s["bboxes"])
     print(f"[probe] V* Bench: {len(samples)} questions, {n_box} with target bboxes")
     return samples
+
+
+def load_synth(args):
+    """Held-out split written by scripts/build_synth_hd_text_data.py
+    (<train>.json.heldout.json): small text pasted on high-res images, with
+    `bbox` in image fractions. gt is the text; scoring = normalized containment.
+    The text is sized to be unreadable at the LR budget and readable at HD, so
+    HD-on vs off here is a direct unit test of the readout; oracle vs
+    oracle_rand tests whether it reads the *window* or just any HD content."""
+    if not args.synth_json:
+        raise SystemExit("--dataset synth needs --synth_json <...heldout.json>")
+    root = os.path.expanduser(args.synth_image_root or "")
+    samples = []
+    for doc in json.load(open(os.path.expanduser(args.synth_json)))[: args.max_samples]:
+        img = Image.open(os.path.join(root, doc["image"])).convert("RGB")
+        W, H = img.size
+        x0, y0, x1, y1 = doc["bbox"]
+        samples.append({
+            "image": img,
+            "prompt": doc["question"].strip(),
+            "gt": norm_text(doc["answer"]),
+            "category": "code" if any(ch.isdigit() for ch in doc["answer"]) else "word",
+            "bboxes": [[x0 * W, y0 * H, (x1 - x0) * W, (y1 - y0) * H]],   # V* style [x, y, w, h] px
+        })
+    print(f"[probe] synth text: {len(samples)} samples from {args.synth_json}")
+    return samples
+
+
+def norm_text(t):
+    return re.sub(r"[^a-z0-9]", "", t.lower())
 
 
 def _local_hrbench_parquet(split):
@@ -392,7 +424,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--processor_path", default=None)
-    ap.add_argument("--dataset", choices=["hrbench4k", "hrbench8k", "vstar"], default="hrbench4k")
+    ap.add_argument("--dataset", choices=["hrbench4k", "hrbench8k", "vstar", "synth"], default="hrbench4k")
+    ap.add_argument("--synth_json", default=None,
+                    help="--dataset synth: the *.heldout.json from build_synth_hd_text_data.py")
+    ap.add_argument("--synth_image_root", default=None,
+                    help="--dataset synth: dir that contains the json's image paths (train_split farm)")
     ap.add_argument("--vstar_root", default="~/data/vstar_bench",
                     help="craigwu/vstar_bench checkout (test_questions.jsonl + <category>/*.jpg|.json)")
     ap.add_argument("--oracle_min_cells", type=int, default=20,
@@ -438,8 +474,15 @@ def main():
     install_lr_key_hook(model)
     image_token_id = getattr(model.config, "image_token_id", None)
     args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
-    if args.hd_source.startswith("oracle") and args.dataset != "vstar":
-        raise SystemExit("--hd_source oracle/oracle_rand needs --dataset vstar (GT bboxes)")
+    if args.hd_source.startswith("oracle") and args.dataset not in ("vstar", "synth"):
+        raise SystemExit("--hd_source oracle/oracle_rand needs --dataset vstar or synth (GT bboxes)")
+    # Free-text datasets: normalized containment instead of MCQ letter matching,
+    # and room for a short sentence answer.
+    free_text = args.dataset == "synth"
+    extract = norm_text if free_text else extract_letter
+    hit = (lambda p, g: bool(g) and g in p) if free_text else (lambda p, g: p == g)
+    if free_text and args.max_new_tokens < 24:
+        args.max_new_tokens = 24
     ppath = args.processor_path or args.model_path
     processor = AutoProcessor.from_pretrained(
         ppath, min_pixels=args.min_pixels, max_pixels=args.tok_budget * TOK_PX)
@@ -473,7 +516,7 @@ def main():
         STATE["bias"] = 0.0
         set_force_locs(model, None)
         t = gen(base_inputs)
-        raw["off"].append(t); preds["off"].append(extract_letter(t))
+        raw["off"].append(t); preds["off"].append(extract(t))
 
         set_force_locs(model, locs)          # None -> learned offsets (non-oracle sources)
         n_forced += locs is not None
@@ -482,7 +525,7 @@ def main():
             STATE["record"] = (b == record_bias)
             t = gen({**base_inputs, **hd_extra})
             STATE["record"] = False
-            raw[cname].append(t); preds[cname].append(extract_letter(t))
+            raw[cname].append(t); preds[cname].append(extract(t))
         set_force_locs(model, None)
     STATE["bias"] = 0.0
     if args.hd_source.startswith("oracle"):
@@ -498,7 +541,7 @@ def main():
         idx = [k for k in range(n) if mask is None or mask[k]]
         if not idx:
             return float("nan")
-        return 100.0 * sum(letters[k] == gts[k] for k in idx) / len(idx)
+        return 100.0 * sum(hit(letters[k], gts[k]) for k in idx) / len(idx)
 
     print(f"\n==== accuracy on {n} samples  (tok_budget={args.tok_budget}, "
           f"hd_source={args.hd_source}) ====")
@@ -512,7 +555,7 @@ def main():
             mask = [s["category"] == cat for s in samples]
             row[f"acc_{cat}"] = acc(preds[c], mask) if has_gt else None
         row["flip_vs_off"] = sum(p != q for p, q in zip(preds[c], preds["off"]))
-        row["unresolved"] = sum(p == "Z" for p in preds[c])
+        row["unresolved"] = sum(p == "Z" for p in preds[c]) if not free_text else 0
         summary[c] = row
         cat_cells = " ".join(
             f"{row[f'acc_{cat}']:>8.2f}" if has_gt else f"{'—':>8}" for cat in cats)
@@ -524,8 +567,8 @@ def main():
         # right->wrong / wrong->right decomposition for each HD config vs off
         print("\n==== flips vs off (HD-on made it ...) ====")
         for c in configs[1:]:
-            fixed = sum(preds[c][k] == gts[k] != preds["off"][k] for k in range(n))
-            broke = sum(preds["off"][k] == gts[k] != preds[c][k] for k in range(n))
+            fixed = sum(hit(preds[c][k], gts[k]) and not hit(preds["off"][k], gts[k]) for k in range(n))
+            broke = sum(hit(preds["off"][k], gts[k]) and not hit(preds[c][k], gts[k]) for k in range(n))
             summary[c]["fixed"] = fixed; summary[c]["broke"] = broke
             print(f"{c:>16} : fixed {fixed:>3}   broke {broke:>3}   net {fixed - broke:+d}")
 

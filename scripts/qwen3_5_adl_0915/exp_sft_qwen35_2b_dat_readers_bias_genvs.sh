@@ -163,6 +163,8 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_hd_lse_bias_decay_steps "${HD_LSE_BIAS_DECAY:-0}" \
     --dat_tf_prob "${TF_PROB:-0}" \
     --dat_tf_min_cells "${TF_MIN_CELLS:-20}" \
+    --dat_tf_min_hd_ratio "${TF_MIN_HD_RATIO:-2.0}" \
+    --dat_tf_max_window_frac "${TF_MAX_WINDOW_FRAC:-0.5}" \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \
