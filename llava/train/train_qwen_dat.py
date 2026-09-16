@@ -403,6 +403,18 @@ class ModelArguments:
                           "supplies the pull-back a bare clamp lacks. Mutually exclusive "
                           "with dat_off_range; suggested 1.0."}
     )
+    dat_off_sup_weight: float = field(
+        default=0.0,
+        metadata={"help": "Offset supervision on bbox samples: loss += w * mean(huber(ref+off - "
+                          "target)) per DAT layer, target = grid over the sample's bbox window "
+                          "(same window _teacher_force_window builds; set dat_tf_prob 1.0). "
+                          ">0 switches the window from teacher forcing (grid replaced) to "
+                          "supervision (grid learned, pulled toward the window). 0 = off."}
+    )
+    dat_off_sup_delta: float = field(
+        default=0.1,
+        metadata={"help": "Huber transition for dat_off_sup_weight, in [-1, 1] grid units."}
+    )
     dat_off_range: float = field(
         default=0.0,
         metadata={"help": "Bound sampling offsets to off_range*tanh(raw) before the "
@@ -2195,13 +2207,26 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                     self._lr_drop_buf = []
                 self._lr_drop_buf.append(float(module._lr_drop_frac))
                 break
-        # Teacher forcing: fraction of samples whose HD grid was forced onto a bbox window
+        # Teacher forcing / offset supervision: fraction of samples carrying a bbox window
         for module in model.modules():
             if hasattr(module, '_dat_tf_frac'):
                 if not hasattr(self, '_tf_frac_buf'):
                     self._tf_frac_buf = []
                 self._tf_frac_buf.append(float(module._dat_tf_frac))
                 break
+        # Offset supervision: (weighted huber, mean point->target distance) per
+        # (layer, sample) with a target this forward; drained here.
+        pending = []
+        for module in model.modules():
+            buf = getattr(module, '_dat_off_sup_buf', None)
+            if buf:
+                pending.extend(buf)
+                buf.clear()
+        if pending:
+            if not hasattr(self, '_off_sup_buf'):
+                self._off_sup_buf = []
+            # one device->host copy for all (layer, sample) entries of this step
+            self._off_sup_buf.extend(map(tuple, torch.stack(pending).float().tolist()))
 
     def on_substep_end(self, args, state, control, model=None, **kwargs):
         self._flush_step(state)
@@ -2342,6 +2367,16 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
         if getattr(self, '_tf_frac_buf', None):
             metrics["dat/tf_frac"] = sum(self._tf_frac_buf) / len(self._tf_frac_buf)
             self._tf_frac_buf.clear()
+        # Offset supervision: off_sup_loss is the weighted huber term (what the
+        # hook injects); off_sup_dist the mean distance of a sampling point to
+        # its target in [-1, 1] grid units (2.0 = full image width). A learned
+        # grid that stays uniform sits at ~0.5-0.8 on small windows; falling
+        # dist is the first direct evidence that offsets move toward targets.
+        if getattr(self, '_off_sup_buf', None):
+            n = len(self._off_sup_buf)
+            metrics["dat/off_sup_loss"] = sum(v[0] for v in self._off_sup_buf) / n
+            metrics["dat/off_sup_dist"] = sum(v[1] for v in self._off_sup_buf) / n
+            self._off_sup_buf.clear()
 
         # 5. Gate value statistics (intention_as_gate sigmoid output)
         if self._gate_mean_buf:
@@ -3358,6 +3393,8 @@ def train():
             'intention_inject': model_args.dat_intention_inject,
             'off_range': model_args.dat_off_range,
             'off_penalty': model_args.dat_off_penalty,
+            'off_sup_weight': model_args.dat_off_sup_weight,
+            'off_sup_delta': model_args.dat_off_sup_delta,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'inject_lr_image': model_args.dat_inject_lr_image,

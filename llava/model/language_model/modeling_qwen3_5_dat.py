@@ -629,6 +629,14 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             'qr_layerscale_init': 1e-2,   # xattn: initial per-channel LayerScale on the residual
             'off_range': 0.0,             # 0 = legacy clamp; >0 = off_range*tanh
             'off_penalty': 0.0,           # >0 = honest clamp + out-of-range pull-back
+            # Offset supervision (training-only, bbox samples): >0 turns the
+            # dat_force_window of a sample into a regression TARGET for the
+            # learned sampling grid instead of replacing it. Equivalent to
+            #   loss += off_sup_weight * mean(huber_delta(ref + off - target))
+            # summed over DAT layers; gives conv_off_proj / intention / readout
+            # the first direct, non-local gradient toward "where to look".
+            'off_sup_weight': 0.0,
+            'off_sup_delta': 0.1,         # huber transition, in [-1, 1] grid units
             # LR dropout (training-only regulariser): with prob lr_drop_prob per
             # sample, replace lr_drop_ratio of that sample's LR image-token
             # embeddings by the sample's mean LR embedding (content-free, scale
@@ -1032,6 +1040,14 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # (or None). Converted to a grid of forced locations per b_idx inside
         # the attention forward; samples with None keep their learned offsets.
         self._dat_force_batch = None
+        # Offset supervision (off_sup_weight > 0): the same per-sample windows,
+        # but used as a regression target for the learned grid (see
+        # _sample_hd_from_off_guide). _dat_off_target is the current sample's
+        # [Ns, 2] target or None; _dat_off_target_batch the per-batch list.
+        self.off_sup_weight = float(dat.get('off_sup_weight', 0.0))
+        self.off_sup_delta = float(dat.get('off_sup_delta', 0.1))
+        self._dat_off_target = None
+        self._dat_off_target_batch = None
 
         # Offset prediction
         if self.intention_as_gate or self.question_inject == 'xattn':
@@ -1276,6 +1292,38 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         if self._dat_force_locs is not None:
             fl = self._dat_force_locs.to(device=x.device, dtype=x.dtype)   # [Ns, 2] (x, y)
             x = fl.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
+        elif self._dat_off_target is not None and self.off_sup_weight > 0 and self.training:
+            # Offset supervision: pull the learned grid toward the target grid
+            # (a grid_size x grid_size grid over the sample's bbox window).
+            #   loss_sup = off_sup_weight * mean_i huber_delta(x_i - t_i)
+            # Injected as a gradient like off_penalty (a stashed loss would
+            # carry no grad_fn under gradient checkpointing):
+            #   d huber_delta(r) / dr = clamp(r, -delta, delta)
+            # so the pull has constant magnitude until a point is within delta
+            # of its target, then fades linearly -- L1-like far away (points
+            # keep moving), L2-like near (no oscillation). The gradient of the
+            # LM loss through grid_sample is added on top untouched, so once the
+            # grid is on target the readout decides the fine placement.
+            tgt = self._dat_off_target.to(device=x.device, dtype=x.dtype)  # [Ns, 2] (x, y)
+            tgt = tgt.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
+            resid = (x - tgt).detach()
+            d = self.off_sup_delta
+            # monitor: (weighted huber, mean point-to-target distance in grid
+            # units) kept as 0-d GPU tensors -- no .item() here, one sync per
+            # (layer, sample) would stall the launch queue like the linspace
+            # sync did in the 0915 tfbox run; the DATMonitor drains and reads them.
+            hub = torch.where(resid.abs() <= d, 0.5 * resid ** 2, d * (resid.abs() - 0.5 * d))
+            buf = getattr(self, '_dat_off_sup_buf', None)
+            if buf is None:
+                buf = self._dat_off_sup_buf = []
+            buf.append(torch.stack([self.off_sup_weight * hub.mean(),
+                                    resid.norm(dim=1).mean()]))
+            if len(buf) > 512:                 # bounded if no monitor drains it
+                del buf[:-512]
+            if x.requires_grad:
+                coef = self.off_sup_weight / x.numel()
+                pull = (resid.clamp(-d, d) * coef)
+                x.register_hook(lambda g, p=pull: g + p)
         if self.training:
             self._dat_offset_oob = (x.abs() > 1.0).float().mean().item()
 
@@ -1701,6 +1749,10 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 # converted from the window once per forward in the top-level model.
                 self._dat_force_locs = self._dat_force_batch[b_idx] \
                     if b_idx < len(self._dat_force_batch) else None
+            if self._dat_off_target_batch is not None:
+                # offset supervision: this sample's target grid [Ns, 2] (or None)
+                self._dat_off_target = self._dat_off_target_batch[b_idx] \
+                    if b_idx < len(self._dat_off_target_batch) else None
             if len(image_range_list[b_idx]) <= 1:
                 continue
 
@@ -1851,6 +1903,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
         if self._dat_force_batch is not None:
             self._dat_force_locs = None     # per-sample forcing ends with the loop
+        if self._dat_off_target_batch is not None:
+            self._dat_off_target = None
 
         # Phase 2b/2c: cross-attention + LSE merge.
         # Exact path (training default): one autograd Function owns Pass 1 +
@@ -2572,14 +2626,20 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         # windows. A fresh forward overwrites it, so nothing leaks across batches.
         if not hasattr(self, '_dat_attn_modules'):
             self._dat_attn_modules = [m for m in self.modules() if hasattr(m, '_dat_force_batch')]
-        _force_locs = None
+        _win_locs = None
         if dat_force_window is not None and self._dat_attn_modules:
             # window -> [Ns, 2] grid once per forward (shared by all DAT layers)
             _dev = inputs_embeds.device if inputs_embeds is not None else input_ids.device
-            _force_locs = [self._dat_attn_modules[0]._window_to_locs(w, _dev)
-                           for w in dat_force_window]
+            _win_locs = [self._dat_attn_modules[0]._window_to_locs(w, _dev)
+                         for w in dat_force_window]
+        # Routing: with off_sup_weight > 0 the windows supervise the learned
+        # grid (regression target, sampling stays the model's own); otherwise
+        # they replace it (teacher forcing). Never both for the same sample.
+        _supervise = bool(self._dat_attn_modules) and self._dat_attn_modules[0].off_sup_weight > 0
         for _m in self._dat_attn_modules:
-            _m._dat_force_batch = _force_locs
+            _m._dat_force_batch = None if _supervise else _win_locs
+            _m._dat_off_target_batch = _win_locs if _supervise else None
+        # fraction of samples carrying a window (forced or supervised)
         self._dat_tf_frac = 0.0 if dat_force_window is None else \
             sum(w is not None for w in dat_force_window) / max(1, len(dat_force_window))
 

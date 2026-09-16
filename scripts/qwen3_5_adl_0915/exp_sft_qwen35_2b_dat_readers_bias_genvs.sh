@@ -30,6 +30,18 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   EXP_NAME=0915_sft_qwen35_2b_dat_readers_bias_tfbox bash <this script>
 # wandb: dat/tf_frac = fraction of samples forced per step (~0.15 expected).
 #
+# Offset supervision variant (0916) — the bbox windows become a regression
+# TARGET for the learned sampling grid instead of replacing it, i.e. the
+# intention/offset path is trained directly to find the region:
+#   loss += OFF_SUP_WEIGHT * mean(huber(ref + off - window_grid))  per DAT layer
+# Data: scripts/build_viscot_bbox_data.py (Visual-CoT answer-region boxes joined
+# onto our docvqa/infovqa images; ~40k, HD/LR ~6x, boxes <1% of the image):
+#   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_viscot.json TF_PROB=1 OFF_SUP_WEIGHT=1 \
+#   EXP_NAME=0916_sft_qwen35_2b_dat_readers_bias_offsup bash <this script>
+# wandb: dat/off_sup_dist (mean point->target distance, grid units; a uniform
+# grid sits ~0.5-0.8, must fall), dat/off_sup_loss, dat/offset_std (must leave
+# the ~0.08 init floor), dat/tf_frac (= fraction of samples with a window).
+#
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)
 #   [patch-geometry] PATCH_SIZE=16 ... factor=32
@@ -165,6 +177,8 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_tf_min_cells "${TF_MIN_CELLS:-20}" \
     --dat_tf_min_hd_ratio "${TF_MIN_HD_RATIO:-2.0}" \
     --dat_tf_max_window_frac "${TF_MAX_WINDOW_FRAC:-0.5}" \
+    --dat_off_sup_weight "${OFF_SUP_WEIGHT:-0}" \
+    --dat_off_sup_delta "${OFF_SUP_DELTA:-0.1}" \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \
