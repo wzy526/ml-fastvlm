@@ -32,6 +32,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import urllib.request
 
 from PIL import Image
@@ -52,10 +53,24 @@ def fetch_meta(meta_dir, name):
     path = os.path.join(meta_dir, f"{name}_cot_train.jsonl")
     if not os.path.exists(path):
         os.makedirs(meta_dir, exist_ok=True)
-        endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com").rstrip("/")
-        url = META_URL.format(endpoint=endpoint, name=name)
-        print(f"  downloading {url}")
-        urllib.request.urlretrieve(url, path)
+        rel = f"metadata/{name}_cot_train.jsonl"
+        # hf_hub_download follows the mirror's redirects the way the cluster
+        # allows (all previous dataset pulls went through it); plain urllib got
+        # a 403 after the 302 on the OSS cluster.
+        try:
+            from huggingface_hub import hf_hub_download
+            import shutil
+            src = hf_hub_download("deepcs233/Visual-CoT", rel, repo_type="dataset")
+            shutil.copyfile(src, path)
+            print(f"  fetched {rel} via huggingface_hub")
+        except Exception as e:
+            print(f"  huggingface_hub failed ({e!r}); falling back to urllib")
+            endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com").rstrip("/")
+            url = META_URL.format(endpoint=endpoint, name=name)
+            print(f"  downloading {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=120) as r, open(path, "wb") as f:
+                shutil.copyfileobj(r, f)
     with open(path) as f:
         return [json.loads(l) for l in f if l.strip()]
 
