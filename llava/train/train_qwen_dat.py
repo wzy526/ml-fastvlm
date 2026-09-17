@@ -415,6 +415,14 @@ class ModelArguments:
         default=0.1,
         metadata={"help": "Huber transition for dat_off_sup_weight, in [-1, 1] grid units."}
     )
+    dat_off_head_trunk_grad: float = field(
+        default=1.0,
+        metadata={"help": "Scale on gradients flowing from the DAT offset head back into the LLM "
+                          "trunk (LR image hidden states, intention token, question span). "
+                          "1 = legacy. 0 = the head learns from trunk features as they are; "
+                          "required with dat_off_sup_weight > 0 -- at 1 the 0916 offsup run's "
+                          "pull rewrote the LR features and HD-off V* fell 55.5 -> 50.3."}
+    )
     dat_off_range: float = field(
         default=0.0,
         metadata={"help": "Bound sampling offsets to off_range*tanh(raw) before the "
@@ -3415,6 +3423,7 @@ def train():
             'off_penalty': model_args.dat_off_penalty,
             'off_sup_weight': model_args.dat_off_sup_weight,
             'off_sup_delta': model_args.dat_off_sup_delta,
+            'off_head_trunk_grad': model_args.dat_off_head_trunk_grad,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'inject_lr_image': model_args.dat_inject_lr_image,

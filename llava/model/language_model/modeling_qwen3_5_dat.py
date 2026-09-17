@@ -503,6 +503,32 @@ def _find_im_start_backward(ids, ans_start, im_start_token_id=IM_START_TOKEN_ID)
 # FP32 Weight Helpers (anti-bf16-roundoff)
 # ============================================================================
 
+class _GradScaleFn(torch.autograd.Function):
+    """Identity forward; backward multiplies the gradient by `scale`."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g * ctx.scale, None
+
+
+def _grad_scale(x, scale):
+    """x with its upstream gradient scaled by `scale` (1 = no-op, 0 = detach
+    that keeps the tensor in the graph). Used at the trunk inputs of the DAT
+    offset head so the offset-supervision pull trains the head without
+    rewriting the LLM's image features (0916 offsup: HD-off V* 55.5 -> 50.3,
+    DocVQA 69 -> 36 when the pull reached the trunk at full strength)."""
+    if scale == 1.0 or not torch.is_grad_enabled() or not x.requires_grad:
+        return x
+    if scale == 0.0:
+        return x.detach()
+    return _GradScaleFn.apply(x, float(scale))
+
+
 class _FP32WeightRMSNorm(nn.Module):
     """Standard `w * rmsnorm(x)` with fp32 weight storage.
 
@@ -637,6 +663,13 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             # the first direct, non-local gradient toward "where to look".
             'off_sup_weight': 0.0,
             'off_sup_delta': 0.1,         # huber transition, in [-1, 1] grid units
+            # Gradient scale on the offset head's trunk inputs (LR image hidden
+            # states, intention token, question span). 1 = legacy: whatever
+            # trains the head also trains the LLM; 0 = the head decodes from
+            # the trunk's features as they are. Applies to LM and supervision
+            # gradients alike (the LM gradient through the head never taught
+            # the offsets anything, so nothing is lost).
+            'off_head_trunk_grad': 1.0,
             # LR dropout (training-only regulariser): with prob lr_drop_prob per
             # sample, replace lr_drop_ratio of that sample's LR image-token
             # embeddings by the sample's mean LR embedding (content-free, scale
@@ -1046,6 +1079,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # [Ns, 2] target or None; _dat_off_target_batch the per-batch list.
         self.off_sup_weight = float(dat.get('off_sup_weight', 0.0))
         self.off_sup_delta = float(dat.get('off_sup_delta', 0.1))
+        self.off_head_trunk_grad = float(dat.get('off_head_trunk_grad', 1.0))
         self._dat_off_target = None
         self._dat_off_target_batch = None
 
@@ -1457,12 +1491,16 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         answer_ranges = image_range_list[b_idx][1:]
         Lp = len(answer_ranges)
 
+        # Every read of the trunk (query_states) by the offset head goes through
+        # this; see off_head_trunk_grad. The sampled HD K/V path is untouched.
+        _tg = self.off_head_trunk_grad
+
         intention_indices = None
         embed_intention = None
         film = None            # post-norm channel modulation (intention_inject='film')
         if self.use_intention_branch:
             intention_indices = [ar[2] for ar in answer_ranges]
-            intention_tokens = query_states[b_idx, intention_indices]
+            intention_tokens = _grad_scale(query_states[b_idx, intention_indices], _tg)
             intention_per_group = einops.rearrange(
                 intention_tokens, 'l (g c) -> l g c',
                 g=self.off_grps, c=self.off_dim,
@@ -1496,7 +1534,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
             image_range_index = torch.arange(lr_start, lr_end, device=device)
             img_lr = einops.rearrange(
-                query_states[b_idx, image_range_index],
+                _grad_scale(query_states[b_idx, image_range_index], _tg),
                 '(h w) (g c) -> g c h w',
                 g=self.off_grps, c=self.off_dim, h=lr_h, w=lr_w,
             )
@@ -1514,8 +1552,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
             spatial_add = None
             if self.use_intention_branch and self.use_spatial_attn_guide:
-                q_lr_flat = query_states[b_idx, image_range_index]
-                q_int_flat = query_states[b_idx, intention_indices]
+                q_lr_flat = _grad_scale(query_states[b_idx, image_range_index], _tg)
+                q_int_flat = _grad_scale(query_states[b_idx, intention_indices], _tg)
                 spatial_attn = torch.matmul(
                     q_int_flat.float(), q_lr_flat.float().transpose(0, 1),
                 ) / math.sqrt(q_lr_flat.shape[-1])
@@ -1540,7 +1578,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 # is residual-injected into embed_lr (see QuestionReadout). This
                 # is the only spatially-resolved question->offset path.
                 q_hidden_list = [
-                    query_states[b_idx, ar[3]:ar[4]]
+                    _grad_scale(query_states[b_idx, ar[3]:ar[4]], _tg)
                     if len(ar) > 4 and ar[4] > ar[3]
                     else query_states.new_zeros((0, query_states.shape[-1]))
                     for ar in answer_ranges

@@ -37,9 +37,12 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # Data: scripts/build_viscot_bbox_data.py (Visual-CoT answer-region boxes joined
 # onto our docvqa/infovqa images; ~40k, HD/LR ~6x, boxes <1% of the image):
 #   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_viscot.json TF_PROB=1 OFF_SUP_WEIGHT=10 \
-#   EXP_NAME=0916_sft_qwen35_2b_dat_readers_bias_offsup bash <this script>
+#   OFF_HEAD_TRUNK_GRAD=0 EXP_NAME=0917_sft_qwen35_2b_dat_readers_bias_offsup_v2 bash <this script>
 # Only the intention-conditioned slots are supervised; the question-agnostic
 # image slot of QUESTION_HD=True is left alone (it cannot know the target).
+# OFF_HEAD_TRUNK_GRAD=0 keeps the pull inside the offset head: at 1 (0916 run)
+# it rewrote the LLM's LR image features -- offsets moved (|off| 0.08 -> 0.45,
+# dist ratio 0.6 on docvqa) but HD-off V* fell 55.5 -> 50.3, DocVQA 69 -> 36.
 # wandb: dat/off_sup_dist (mean point->target distance, grid units; a uniform
 # grid sits ~0.5-0.8, must fall), dat/off_sup_grad_ratio (||pull||/||LM grad||
 # on the grid; aim ~1-10, raise OFF_SUP_WEIGHT if << 1), dat/off_sup_loss,
@@ -183,6 +186,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_tf_max_window_frac "${TF_MAX_WINDOW_FRAC:-0.5}" \
     --dat_off_sup_weight "${OFF_SUP_WEIGHT:-0}" \
     --dat_off_sup_delta "${OFF_SUP_DELTA:-0.1}" \
+    --dat_off_head_trunk_grad "${OFF_HEAD_TRUNK_GRAD:-1.0}" \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \
