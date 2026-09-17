@@ -328,6 +328,18 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
     if args.hd_source.startswith("oracle"):
         locs = oracle_locs(sample, idx, hd_w, hd_h, args.grid_size,
                            args.oracle_min_cells, args.hd_source)
+    # Localisation target for the learned grid (any source): the oracle window
+    # grid (= the training target of --dat_off_sup_weight) and the raw GT box
+    # in [-1, 1] coords. None when the sample has no bbox.
+    STATE["target"] = None
+    if sample.get("bboxes"):
+        W, H = sample["image"].size
+        bs = sample["bboxes"]
+        box = torch.tensor([min(b[0] for b in bs) / W, min(b[1] for b in bs) / H,
+                            max(b[0] + b[2] for b in bs) / W, max(b[1] + b[3] for b in bs) / H])
+        STATE["target"] = (oracle_locs(sample, idx, hd_w, hd_h, args.grid_size,
+                                       args.oracle_min_cells, "oracle"),
+                           box * 2.0 - 1.0)
     return moved, hd_extra, locs
 
 
@@ -382,9 +394,27 @@ def install_merge_hook():
                     torch.linspace(-1 + mx, 1 - mx, gw, device=locs.device),
                     indexing="ij")                       # same half-cell-margin grid as _grid_generate
                 l = locs.float()
-                off = min((l - torch.stack([gx, gy], -1)).abs().mean().item(),
+                ref = torch.stack([gx, gy], -1)              # [gh, gw, 2] (x, y)
+                off = min((l - ref).abs().mean().item(),
                           (l - torch.stack([gy, gx], -1)).abs().mean().item())
                 KHD[self.layer_idx].append((shared / max(resid, 1e-6), off))
+                # Localisation: did the learned grid move toward the GT region?
+                #   dist   = mean point->target-grid distance (training's off_sup_dist)
+                #   in_box = fraction of sampling points inside the raw GT box
+                # each with the uniform reference grid as the "did not move" baseline.
+                if STATE.get("target") is not None:
+                    tgt, box = STATE["target"]
+                    tgt = tgt.to(l.device).view(gh, gw, 2)
+                    box = box.to(l.device)
+                    pts = l.reshape(-1, gh, gw, 2)           # [Lp*G, gh, gw, 2]
+
+                    def in_box(p):
+                        return ((p[..., 0] >= box[0]) & (p[..., 0] <= box[2]) &
+                                (p[..., 1] >= box[1]) & (p[..., 1] <= box[3])).float().mean().item()
+                    LOC[self.layer_idx].append((
+                        (pts - tgt).norm(dim=-1).mean().item(),
+                        (ref - tgt).norm(dim=-1).mean().item(),
+                        in_box(pts), in_box(ref)))
         return key_hd, value_hd, locs
 
     Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
@@ -392,6 +422,7 @@ def install_merge_hook():
 
 KHD = defaultdict(list)          # layer_idx -> [(shared/resid ratio, mean |offset|), ...]
 KLR = defaultdict(list)          # layer_idx -> [shared/resid ratio of the LR image keys, ...]
+LOC = defaultdict(list)          # layer_idx -> [(dist, dist_uniform, in_box, in_box_uniform), ...]
 
 
 def install_lr_key_hook(model):
@@ -593,6 +624,22 @@ def main():
             extra = f"{st['k_shared_over_resid']:>16.3f} | {lr_cell} | {st['mean_abs_offset']:>6.3f}"
         print(f"{lid:>6} | {st['mean']:>8.4f} | {st['p90']:>8.4f} | {st['max']:>8.4f} | {extra}")
 
+    layer_loc = {}
+    if LOC:
+        # Learned-grid localisation against the GT box (bbox datasets only).
+        # dist/uniform < 1: the grid moved toward the target; in_box above the
+        # uniform value: more sampling points actually land on the target.
+        print(f"\n==== learned grid vs GT box  (source={args.hd_source}; uniform grid = no movement) ====")
+        print(f"{'layer':>6} | {'dist':>7} | {'uniform':>7} | {'ratio':>6} | "
+              f"{'in_box':>7} | {'uniform':>7} | {'n':>5}")
+        print("-" * 66)
+        for lid in sorted(LOC):
+            d, du, ib, ibu = (sum(v) / len(v) for v in zip(*LOC[lid]))
+            layer_loc[lid] = {"dist": d, "dist_uniform": du, "in_box": ib,
+                              "in_box_uniform": ibu, "n": len(LOC[lid])}
+            print(f"{lid:>6} | {d:>7.3f} | {du:>7.3f} | {d / max(du, 1e-6):>6.3f} | "
+                  f"{ib:>7.3f} | {ibu:>7.3f} | {len(LOC[lid]):>5}")
+
     if args.out:
         json.dump({
             "model_path": args.model_path,
@@ -603,6 +650,7 @@ def main():
             "num_samples": n,
             "summary": summary,
             "layer_whd": layer_whd,
+            "layer_loc": layer_loc,
             "per_sample": [
                 {"gt": gts[k], "category": samples[k]["category"],
                  **{c: raw[c][k] for c in configs}}
