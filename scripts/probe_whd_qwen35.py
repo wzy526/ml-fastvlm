@@ -165,11 +165,18 @@ def load_synth(args):
         img = Image.open(os.path.join(root, doc["image"])).convert("RGB")
         W, H = img.size
         x0, y0, x1, y1 = doc["bbox"]
+        if "conversations" in doc:      # LLaVA-format bbox data (build_viscot_bbox_data.py)
+            question = doc["conversations"][0]["value"].replace("<image>", "").strip()
+            answer = doc["conversations"][1]["value"]
+            category = doc.get("source", "bbox")
+        else:                            # build_synth_hd_text_data.py heldout format
+            question, answer = doc["question"].strip(), doc["answer"]
+            category = "code" if any(ch.isdigit() for ch in answer) else "word"
         samples.append({
             "image": img,
-            "prompt": doc["question"].strip(),
-            "gt": norm_text(doc["answer"]),
-            "category": "code" if any(ch.isdigit() for ch in doc["answer"]) else "word",
+            "prompt": question,
+            "gt": norm_text(answer),
+            "category": category,
             "bboxes": [[x0 * W, y0 * H, (x1 - x0) * W, (y1 - y0) * H]],   # V* style [x, y, w, h] px
         })
     print(f"[probe] synth text: {len(samples)} samples from {args.synth_json}")
