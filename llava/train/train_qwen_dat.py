@@ -148,6 +148,7 @@ DAT_KEYS_MATCH = [
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
     'proj_film', 'spatial_gain',
+    'conv_glob',   # Qwen3.5 DAT with dat_use_global_offset
 ]
 
 
@@ -422,6 +423,19 @@ class ModelArguments:
                           "1 = legacy. 0 = the head learns from trunk features as they are; "
                           "required with dat_off_sup_weight > 0 -- at 1 the 0916 offsup run's "
                           "pull rewrote the LR features and HD-off V* fell 55.5 -> 50.3."}
+    )
+    dat_use_global_offset: bool = field(
+        default=False,
+        metadata={"help": "Add a global localisation term to the DAT offset head: a per-cell "
+                          "relevance map (1x1 conv, zero-init) whose soft-argmax translates "
+                          "the sampling grid and whose spread shrinks it, on top of the "
+                          "3x3-local per-point offsets (which alone plateau at "
+                          "dat/off_sup_dist ~0.5 -- 0916/0917). Zero-init = legacy grid; "
+                          "safe to enable on a checkpoint trained without it."}
+    )
+    dat_glob_min_scale: float = field(
+        default=0.1,
+        metadata={"help": "Floor on the per-axis grid scale of dat_use_global_offset."}
     )
     dat_off_range: float = field(
         default=0.0,
@@ -2246,6 +2260,17 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             if not hasattr(self, '_off_sup_grad_buf'):
                 self._off_sup_grad_buf = []
             self._off_sup_grad_buf.extend(map(tuple, torch.stack(pending).float().tolist()))
+        # (mean |global shift|, mean grid scale) from dat_use_global_offset
+        pending = []
+        for module in model.modules():
+            gb = getattr(module, '_dat_glob_buf', None)
+            if gb:
+                pending.extend(gb)
+                gb.clear()
+        if pending:
+            if not hasattr(self, '_glob_buf'):
+                self._glob_buf = []
+            self._glob_buf.extend(map(tuple, torch.stack(pending).float().tolist()))
 
     def on_substep_end(self, args, state, control, model=None, **kwargs):
         self._flush_step(state)
@@ -2405,6 +2430,16 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             metrics["dat/off_sup_grad_lm"] = g_lm / len(self._off_sup_grad_buf)
             metrics["dat/off_sup_grad_ratio"] = g_pull / max(g_lm, 1e-12)
             self._off_sup_grad_buf.clear()
+        # Global localisation term: glob_shift = mean |grid centroid| in [-1, 1]
+        # units (0 = grid centred, as at init); glob_scale = mean per-axis grid
+        # scale (1 = full image, as at init). Supervised windows are ~0.3-0.4 of
+        # the image side, so a head that has learned to localise shows
+        # glob_shift rising off 0 and glob_scale falling toward ~0.3-0.5.
+        if getattr(self, '_glob_buf', None):
+            n = len(self._glob_buf)
+            metrics["dat/glob_shift"] = sum(v[0] for v in self._glob_buf) / n
+            metrics["dat/glob_scale"] = sum(v[1] for v in self._glob_buf) / n
+            self._glob_buf.clear()
 
         # 5. Gate value statistics (intention_as_gate sigmoid output)
         if self._gate_mean_buf:
@@ -3424,6 +3459,8 @@ def train():
             'off_sup_weight': model_args.dat_off_sup_weight,
             'off_sup_delta': model_args.dat_off_sup_delta,
             'off_head_trunk_grad': model_args.dat_off_head_trunk_grad,
+            'use_global_offset': model_args.dat_use_global_offset,
+            'glob_min_scale': model_args.dat_glob_min_scale,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'inject_lr_image': model_args.dat_inject_lr_image,

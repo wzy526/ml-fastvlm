@@ -49,6 +49,22 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # dat/offset_std (must leave the ~0.08 init floor), dat/tf_frac (= fraction of
 # samples with a window, ~0.13 with the viscot mix).
 #
+# Global localisation variant (0917 v3) — with the pull confined to the head
+# (v2), off_sup_dist STILL plateaus at ~0.5 like 0916: the per-point offset
+# head is 3x3-local, a point far from the target has no information about
+# which way to go. GLOBAL_OFFSET=1 adds a per-cell relevance map (1x1 conv on
+# the intention-gated features, zero-init = uniform) whose soft-argmax
+# translates the whole grid and whose spread shrinks it:
+#   x = centroid + scale * ref + local_off
+# a signal every point shares. Zero-init reproduces the legacy grid exactly,
+# so it loads onto the 0915 pretrain (conv_glob is the only new param).
+#   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_viscot.json TF_PROB=1 OFF_SUP_WEIGHT=10 \
+#   OFF_HEAD_TRUNK_GRAD=0 GLOBAL_OFFSET=1 \
+#   EXP_NAME=0917_sft_qwen35_2b_dat_readers_bias_offsup_glob bash <this script>
+# wandb: dat/glob_shift (mean |centroid|, 0 at init, must rise), dat/glob_scale
+# (mean grid scale, 1 at init; windows are ~0.3-0.4 of the image so it should
+# fall toward ~0.3-0.5), and off_sup_dist should finally break below 0.4.
+#
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)
 #   [patch-geometry] PATCH_SIZE=16 ... factor=32
@@ -187,6 +203,8 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_off_sup_weight "${OFF_SUP_WEIGHT:-0}" \
     --dat_off_sup_delta "${OFF_SUP_DELTA:-0.1}" \
     --dat_off_head_trunk_grad "${OFF_HEAD_TRUNK_GRAD:-1.0}" \
+    --dat_use_global_offset "$([ "${GLOBAL_OFFSET:-0}" = 1 ] && echo True || echo False)" \
+    --dat_glob_min_scale "${GLOB_MIN_SCALE:-0.1}" \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \

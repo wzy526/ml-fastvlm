@@ -32,7 +32,7 @@ import torch
 
 PAT = re.compile(
     r"layers\.(\d+)\.self_attn\.(k_proj_hd|v_proj_hd|hd_input_layernorm|"
-    r"conv_off_proj|conv_lr_proj|conv_lr_dw|proj_intention|k_proj|v_proj|hd_gate)"
+    r"conv_off_proj|conv_glob|conv_lr_proj|conv_lr_dw|proj_intention|k_proj|v_proj|hd_gate)"
     r"(?:\.(weight|bias))?$"
 )
 
@@ -126,7 +126,7 @@ def main():
     print(f"DAT layers: {dat_layers}\n")
     hdr = (f"{'layer':>5} | {'|Wk_hd|':>8} {'|Wk|':>8} {'k_hd/init':>9} {'k_drift':>8} | "
            f"{'|Wv_hd|':>8} {'|Wv|':>8} {'v_hd/v':>7} {'v_drift':>8} {'erank_v':>7} | "
-           f"{'ln_w mean':>9} {'ln_w std':>8} | {'|off|':>8} {'gate':>6}")
+           f"{'ln_w mean':>9} {'ln_w std':>8} | {'|off|':>8} {'|glob|':>8} {'gate':>6}")
     print(hdr); print("-" * len(hdr))
 
     report = {}
@@ -146,6 +146,8 @@ def main():
         ln_std = ln.float().std().item() if ln is not None else float("nan")
         off = L.get("conv_off_proj.weight")
         n_off = off.float().norm().item() if off is not None else float("nan")
+        glob = L.get("conv_glob.weight")      # dat_use_global_offset relevance head (init 0)
+        n_glob = glob.float().norm().item() if glob is not None else float("nan")
         gate = L.get("hd_gate.param")
         gate_s = f"{torch.sigmoid(gate.float()).item():.3f}" if gate is not None else "  none"
         er_v = eff_rank(wv_hd)
@@ -161,10 +163,10 @@ def main():
                            v_hd_over_v=(nv_hd / nv if nv > 0 else float("nan")),
                            v_drift_from_vproj=v_drift,
                            v_hd_eff_rank=er_v, ln_mean=ln_mean, ln_std=ln_std,
-                           off_norm=n_off, gate=gate_s.strip())
+                           off_norm=n_off, glob_norm=n_glob, gate=gate_s.strip())
         print(f"{lid:>5} | {nk_hd:>8.2f} {nk:>8.2f} {nk_hd / k_init_expect:>9.3f} {k_drift:>8.4f} | "
               f"{nv_hd:>8.3f} {nv:>8.2f} {report[lid]['v_hd_over_v']:>7.3f} {v_drift:>8.4f} {er_v:>7.1f} | "
-              f"{ln_mean:>9.3f} {ln_std:>8.3f} | {n_off:>8.4f} {gate_s:>6}")
+              f"{ln_mean:>9.3f} {ln_std:>8.3f} | {n_off:>8.4f} {n_glob:>8.4f} {gate_s:>6}")
 
     print("\nhow to read:")
     print("  ZERO-INIT ckpts (<= 0826):")
@@ -178,6 +180,8 @@ def main():
     print("                                k_drift == 0 while v_drift > 0 = old K starvation)")
     print("  erank_v small (<10)       -> whatever V learned is a near-constant direction")
     print("  |off| ~0                  -> offsets never learned: sampling = fixed regular grid")
+    print("  |glob| (nan unless dat_use_global_offset) ~0 -> relevance map still uniform: no")
+    print("                                global shift/scale learned, grid == legacy")
 
     if layers_b is not None:
         # Base (non-DAT) ckpt as B: fall back to its k_proj/v_proj as the reference

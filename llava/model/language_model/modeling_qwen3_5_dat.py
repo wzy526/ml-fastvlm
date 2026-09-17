@@ -670,6 +670,19 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             # gradients alike (the LM gradient through the head never taught
             # the offsets anything, so nothing is lost).
             'off_head_trunk_grad': 1.0,
+            # Global localisation term in the offset head. The per-point offset
+            # head is local (3x3 dw conv + 1x1): a point far from the target has
+            # no information about which way to move, so supervised offsets only
+            # ever travel part of the way (0916/0917: off_sup_dist plateaus at
+            # ~0.5). With this on, a 1x1 conv on the intention-gated cell
+            # features gives a relevance logit per LR cell; its softmax is a
+            # spatial distribution whose mean translates the whole grid and
+            # whose per-axis std (relative to the uniform grid's) shrinks it:
+            #   x = centroid + scale * reference + local_offset
+            # Zero-init => uniform relevance => centroid 0, scale 1 => exactly
+            # the legacy grid at load time (warm-start safe).
+            'use_global_offset': False,
+            'glob_min_scale': 0.1,        # floor on the per-axis grid scale
             # LR dropout (training-only regulariser): with prob lr_drop_prob per
             # sample, replace lr_drop_ratio of that sample's LR image-token
             # embeddings by the sample's mean LR embedding (content-free, scale
@@ -1103,6 +1116,18 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             self.proj_film = None
             self.spatial_gain = None
 
+        # Global localisation head (see 'use_global_offset' in the defaults):
+        # one relevance logit per cell from the same post-ln_2 features that
+        # feed conv_off_proj. Zero-init = uniform = identity on the grid.
+        self.use_global_offset = bool(dat.get('use_global_offset', False))
+        self.glob_min_scale = float(dat.get('glob_min_scale', 0.1))
+        if self.use_global_offset:
+            self.conv_glob = _FP32WeightConv2d(
+                self.ln_2.weight.numel(), 1, kernel_size=1, stride=1, padding=0, bias=True,
+            )
+        else:
+            self.conv_glob = None
+
         # Question-conditioned LR readout (residual cross-attention).
         if self.question_inject == 'xattn':
             self.q_readout = QuestionReadout(
@@ -1170,7 +1195,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 self.spatial_gain.data = self.spatial_gain.data.to(torch.float32)
         for sub in (self.conv_lr_dw, self.ln_1, self.conv_lr_proj,
                     self.proj_intention, self.ln_2, self.conv_off_proj,
-                    self.proj_film):
+                    self.proj_film, self.conv_glob):
             if not isinstance(sub, nn.Module):
                 continue
             for p in sub.parameters(recurse=False):
@@ -1198,6 +1223,10 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             nn.init.zeros_(self.spatial_gain)
         if self.q_readout is not None:
             self.q_readout.reset_parameters()
+        if self.conv_glob is not None:
+            # zero => uniform relevance => centroid 0, scale 1 => legacy grid
+            nn.init.zeros_(self.conv_glob.weight)
+            nn.init.zeros_(self.conv_glob.bias)
         self._init_hd_proj_weights()
 
     @torch.no_grad()
@@ -1327,7 +1356,37 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             )
         references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device)
 
-        x = references + offsets
+        if self.conv_glob is not None:
+            # Global localisation: soft-argmax over a per-cell relevance map
+            # translates the grid to the relevant region and its spread shrinks
+            # the grid onto it; the local offsets then refine per point.
+            #   x = c + s * reference + offset,   c = E_p[g],  s = std_p[g] / std_u[g]
+            # p = softmax(relevance) over the gh*gw cells, g = cell coordinates,
+            # std_u = std of the uniform grid (so a flat map gives s = 1 exactly).
+            # Both c and s are differentiable through p, so the offset
+            # supervision (and the LM loss via grid_sample) train conv_glob to
+            # put mass on the cells that matter -- a signal every point of the
+            # grid shares, unlike the 3x3-local per-point offsets.
+            logits = self.conv_glob(F.silu(h)).float().flatten(1)          # [R, N]
+            p = torch.softmax(logits, dim=-1).unsqueeze(1)                 # [R, 1, N]
+            g = references[:1].flatten(2)                                  # [1, 2, N]
+            c = (p * g).sum(-1)                                            # [R, 2]
+            var = (p * (g - c.unsqueeze(-1)) ** 2).sum(-1)                 # [R, 2]
+            var_u = g.var(dim=-1, unbiased=False)                          # [1, 2]
+            s = (var / var_u).clamp_min(1e-12).sqrt().clamp(self.glob_min_scale, 1.0)
+            x = (c.unsqueeze(-1).unsqueeze(-1)
+                 + s.unsqueeze(-1).unsqueeze(-1) * references + offsets)
+            self._fn_chk("sample.glob", x)
+            if self.training:
+                gb = getattr(self, '_dat_glob_buf', None)
+                if gb is None:
+                    gb = self._dat_glob_buf = []
+                # (mean |shift|, mean scale): no .item(), drained by DATMonitor
+                gb.append(torch.stack([c.detach().norm(dim=1).mean(), s.detach().mean()]))
+                if len(gb) > 512:
+                    del gb[:-512]
+        else:
+            x = references + offsets
         if self._dat_force_locs is not None:
             fl = self._dat_force_locs.to(device=x.device, dtype=x.dtype)   # [Ns, 2] (x, y)
             x = fl.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
@@ -2214,7 +2273,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         '.conv_lr_dw.', '.conv_lr_proj.', '.conv_off_proj.',
         '.proj_intention.', '.proj_film.', '.spatial_gain',
         '.k_proj_hd.', '.v_proj_hd.', '.hd_input_layernorm.',
-        '.hd_gate', '.q_readout.', '.ln_1.', '.ln_2.',
+        '.hd_gate', '.q_readout.', '.ln_1.', '.ln_2.', '.conv_glob.',
     )
 
     @classmethod
@@ -2307,6 +2366,13 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     # meta-device from_pretrained flow these stay uninitialized
                     # (layerscale ~1e37 -> off_guide NaN). Init them explicitly.
                     module.q_readout.reset_parameters()
+                if module.conv_glob is not None:
+                    # zero = uniform relevance = identity on the grid; base
+                    # _init_weights would give it a normal init (=> a random
+                    # global shift at step 0). _manual_load_dat_raw_params
+                    # restores trained values afterwards when present on disk.
+                    nn.init.zeros_(module.conv_glob.weight)
+                    nn.init.zeros_(module.conv_glob.bias)
             elif isinstance(module, _FP32WeightRMSNorm):
                 nn.init.ones_(module.weight)
 
@@ -2783,6 +2849,8 @@ DAT_KEYS_MATCH = [
     'hd_gate', 'hd_input_layernorm', 'q_readout',
     # intention_inject='film' extras (None unless enabled)
     'proj_film', 'spatial_gain',
+    # use_global_offset extra (None unless enabled)
+    'conv_glob',
 ]
 
 
