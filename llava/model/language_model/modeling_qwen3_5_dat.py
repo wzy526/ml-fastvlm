@@ -1382,6 +1382,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             # probe_whd_qwen35.py can read it per layer at inference.
             gstat = torch.stack([c.detach().norm(dim=1).mean(), s.detach().mean()])
             self._dat_glob_last = gstat
+            self._dat_glob_last_cs = (c.detach(), s.detach())   # [R, 2] each, for the probe
             if self.training:
                 gb = getattr(self, '_dat_glob_buf', None)
                 if gb is None:

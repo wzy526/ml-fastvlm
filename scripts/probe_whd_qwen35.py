@@ -427,6 +427,21 @@ def install_merge_hook():
                         (pts - tgt).norm(dim=-1).mean().item(),
                         (ref - tgt).norm(dim=-1).mean().item(),
                         in_box(pts), in_box(ref)))
+                    # Is the global term sample-dependent or a constant prior?
+                    # Per sample: predicted grid centroid / scale (question slot
+                    # rows only) vs the GT window's centre / scale.
+                    cs = getattr(self, "_dat_glob_last_cs", None)
+                    if cs is not None:
+                        c, s = cs
+                        G = self.off_grps
+                        if c.size(0) > G:                      # drop the image-only lead slot
+                            c, s = c[G:], s[G:]
+                        t2 = tgt.reshape(-1, 2)
+                        r2 = ref.reshape(-1, 2)
+                        tc = t2.mean(0)
+                        ts = t2.std(0, unbiased=False) / r2.std(0, unbiased=False)
+                        GLOBC[self.layer_idx].append(
+                            c.mean(0).tolist() + s.mean(0).tolist() + tc.tolist() + ts.tolist())
         return key_hd, value_hd, locs
 
     Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
@@ -436,6 +451,7 @@ KHD = defaultdict(list)          # layer_idx -> [(shared/resid ratio, mean |offs
 KLR = defaultdict(list)          # layer_idx -> [shared/resid ratio of the LR image keys, ...]
 LOC = defaultdict(list)          # layer_idx -> [(dist, dist_uniform, in_box, in_box_uniform), ...]
 GLOB = defaultdict(list)         # layer_idx -> [(mean |centroid|, mean scale), ...]  (global offset term)
+GLOBC = defaultdict(list)        # layer_idx -> [(cx, cy, sx, sy, tcx, tcy, tsx, tsy), ...] per sample
 
 
 def install_lr_key_hook(model):
@@ -666,6 +682,42 @@ def main():
             sh, sc = (sum(v) / len(v) for v in zip(*GLOB[lid]))
             layer_glob[lid] = {"shift": sh, "scale": sc, "n": len(GLOB[lid])}
             print(f"{lid:>6} | {sh:>7.3f} | {sc:>7.3f} | {len(GLOB[lid]):>5}")
+
+    if GLOBC:
+        # Sample-dependence of the global term. r = Pearson correlation across
+        # samples between the predicted centroid (scale) and the GT window's
+        # centre (scale) per axis; |c-t| = mean centroid->window-centre distance
+        # of the prediction vs. of the best CONSTANT centroid (sample mean, the
+        # question-blind prior). std(c) = spread of the prediction across samples.
+        # r ~ 0 and |c-t| ~ const -> the head learned a fixed prior, it does not
+        # read the question/image; r >> 0 and |c-t| < const -> it localises.
+        def _corr(a, b):
+            a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+            if len(a) < 3 or a.std() < 1e-9 or b.std() < 1e-9:
+                return float("nan")
+            return float(np.corrcoef(a, b)[0, 1])
+
+        print(f"\n==== global term: sample-dependence  (r = corr(pred, GT) across samples) ====")
+        print(f"{'layer':>6} | {'r_cx':>6} {'r_cy':>6} | {'r_sx':>6} {'r_sy':>6} | "
+              f"{'|c-t|':>6} {'const':>6} | {'std(c)':>6} | {'mean s':>6} {'GT s':>6}")
+        print("-" * 84)
+        for lid in sorted(GLOBC):
+            cols = list(zip(*GLOBC[lid]))
+            cx, cy, sx, sy, tcx, tcy, tsx, tsy = cols
+            n_ = len(cx)
+            mcx, mcy = sum(cx) / n_, sum(cy) / n_
+            d_pred = sum(math.hypot(a - b, c - d) for a, b, c, d in zip(cx, tcx, cy, tcy)) / n_
+            d_const = sum(math.hypot(mcx - b, mcy - d) for b, d in zip(tcx, tcy)) / n_
+            std_c = math.hypot(float(np.std(cx)), float(np.std(cy)))
+            layer_glob.setdefault(lid, {}).update({
+                "r_cx": _corr(cx, tcx), "r_cy": _corr(cy, tcy),
+                "r_sx": _corr(sx, tsx), "r_sy": _corr(sy, tsy),
+                "centroid_err": d_pred, "centroid_err_const": d_const, "centroid_std": std_c,
+                "scale_mean": (sum(sx) + sum(sy)) / (2 * n_), "scale_gt": (sum(tsx) + sum(tsy)) / (2 * n_),
+            })
+            g = layer_glob[lid]
+            print(f"{lid:>6} | {g['r_cx']:>6.3f} {g['r_cy']:>6.3f} | {g['r_sx']:>6.3f} {g['r_sy']:>6.3f} | "
+                  f"{d_pred:>6.3f} {d_const:>6.3f} | {std_c:>6.3f} | {g['scale_mean']:>6.3f} {g['scale_gt']:>6.3f}")
 
     if args.out:
         json.dump({
