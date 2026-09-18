@@ -405,6 +405,11 @@ def install_merge_hook():
                 off = min((l - ref).abs().mean().item(),
                           (l - torch.stack([gy, gx], -1)).abs().mean().item())
                 KHD[self.layer_idx].append((shared / max(resid, 1e-6), off))
+                # dat_use_global_offset: (mean |grid centroid|, mean grid scale)
+                # of this call; 0 / 1 = the global term is still the identity.
+                gl = getattr(self, "_dat_glob_last", None)
+                if gl is not None:
+                    GLOB[self.layer_idx].append(tuple(gl.float().tolist()))
                 # Localisation: did the learned grid move toward the GT region?
                 #   dist   = mean point->target-grid distance (training's off_sup_dist)
                 #   in_box = fraction of sampling points inside the raw GT box
@@ -430,6 +435,7 @@ def install_merge_hook():
 KHD = defaultdict(list)          # layer_idx -> [(shared/resid ratio, mean |offset|), ...]
 KLR = defaultdict(list)          # layer_idx -> [shared/resid ratio of the LR image keys, ...]
 LOC = defaultdict(list)          # layer_idx -> [(dist, dist_uniform, in_box, in_box_uniform), ...]
+GLOB = defaultdict(list)         # layer_idx -> [(mean |centroid|, mean scale), ...]  (global offset term)
 
 
 def install_lr_key_hook(model):
@@ -647,6 +653,20 @@ def main():
             print(f"{lid:>6} | {d:>7.3f} | {du:>7.3f} | {d / max(du, 1e-6):>6.3f} | "
                   f"{ib:>7.3f} | {ibu:>7.3f} | {len(LOC[lid]):>5}")
 
+    layer_glob = {}
+    if GLOB:
+        # dat_use_global_offset: how much of the movement is the global term.
+        # shift = mean |grid centroid| (0 = centred as at init; a supervised
+        # window centre sits ~0.3-0.6 away on average); scale = mean grid scale
+        # (1 = full image as at init; windows are ~0.3-0.4 of the image side).
+        print(f"\n==== global offset term  (shift 0 / scale 1 = identity, i.e. legacy grid) ====")
+        print(f"{'layer':>6} | {'shift':>7} | {'scale':>7} | {'n':>5}")
+        print("-" * 36)
+        for lid in sorted(GLOB):
+            sh, sc = (sum(v) / len(v) for v in zip(*GLOB[lid]))
+            layer_glob[lid] = {"shift": sh, "scale": sc, "n": len(GLOB[lid])}
+            print(f"{lid:>6} | {sh:>7.3f} | {sc:>7.3f} | {len(GLOB[lid]):>5}")
+
     if args.out:
         json.dump({
             "model_path": args.model_path,
@@ -658,6 +678,7 @@ def main():
             "summary": summary,
             "layer_whd": layer_whd,
             "layer_loc": layer_loc,
+            "layer_glob": layer_glob,
             "per_sample": [
                 {"gt": gts[k], "category": samples[k]["category"],
                  **{c: raw[c][k] for c in configs}}

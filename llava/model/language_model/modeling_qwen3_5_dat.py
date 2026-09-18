@@ -1377,12 +1377,16 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             x = (c.unsqueeze(-1).unsqueeze(-1)
                  + s.unsqueeze(-1).unsqueeze(-1) * references + offsets)
             self._fn_chk("sample.glob", x)
+            # (mean |shift|, mean scale): no .item(). Training: appended to a
+            # buffer the DATMonitor drains; always: kept as the last value so
+            # probe_whd_qwen35.py can read it per layer at inference.
+            gstat = torch.stack([c.detach().norm(dim=1).mean(), s.detach().mean()])
+            self._dat_glob_last = gstat
             if self.training:
                 gb = getattr(self, '_dat_glob_buf', None)
                 if gb is None:
                     gb = self._dat_glob_buf = []
-                # (mean |shift|, mean scale): no .item(), drained by DATMonitor
-                gb.append(torch.stack([c.detach().norm(dim=1).mean(), s.detach().mean()]))
+                gb.append(gstat)
                 if len(gb) > 512:
                     del gb[:-512]
         else:
