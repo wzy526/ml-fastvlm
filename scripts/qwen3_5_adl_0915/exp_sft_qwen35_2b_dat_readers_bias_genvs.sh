@@ -65,6 +65,19 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # (mean grid scale, 1 at init; windows are ~0.3-0.4 of the image so it should
 # fall toward ~0.3-0.5), and off_sup_dist should finally break below 0.4.
 #
+# v3 result: shift 0.17 / scale 0.76 / off_sup_dist ratio 0.78, and the probe's
+# sample-dependence table shows a near-constant prior (centroid corr with the
+# GT window r=0.35, |c-t| 0.47 vs 0.51 for the sample mean): the question only
+# reaches the 1x1 conv as a per-channel scalar gate, which cannot do content
+# matching. GLOB_REL=qk replaces the relevance source with question-cell
+# matching in the trunk's hidden space (W_q(intention) . W_k(LR token), W_q
+# zero-init = identity grid):
+#   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_viscot.json TF_PROB=1 OFF_SUP_WEIGHT=10 \
+#   OFF_HEAD_TRUNK_GRAD=0 GLOBAL_OFFSET=1 GLOB_REL=qk \
+#   EXP_NAME=0918_sft_qwen35_2b_dat_readers_bias_offsup_qk bash <this script>
+# Pass: probe sample-dependence r_cx/r_cy > 0.6, |c-t| well below const,
+# scale mean approaching GT s (~0.42); then in_box should leave the 3% floor.
+#
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)
 #   [patch-geometry] PATCH_SIZE=16 ... factor=32
@@ -205,6 +218,8 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_off_head_trunk_grad "${OFF_HEAD_TRUNK_GRAD:-1.0}" \
     --dat_use_global_offset "$([ "${GLOBAL_OFFSET:-0}" = 1 ] && echo True || echo False)" \
     --dat_glob_min_scale "${GLOB_MIN_SCALE:-0.1}" \
+    --dat_glob_relevance "${GLOB_REL:-conv}" \
+    --dat_glob_dim "${GLOB_DIM:-128}" \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \

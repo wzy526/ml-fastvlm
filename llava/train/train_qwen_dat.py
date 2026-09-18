@@ -148,7 +148,7 @@ DAT_KEYS_MATCH = [
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
     'proj_film', 'spatial_gain',
-    'conv_glob',   # Qwen3.5 DAT with dat_use_global_offset
+    'conv_glob', 'glob_q', 'glob_k',   # Qwen3.5 DAT with dat_use_global_offset
 ]
 
 
@@ -436,6 +436,18 @@ class ModelArguments:
     dat_glob_min_scale: float = field(
         default=0.1,
         metadata={"help": "Floor on the per-axis grid scale of dat_use_global_offset."}
+    )
+    dat_glob_relevance: str = field(
+        default="conv",
+        metadata={"help": "Relevance source of dat_use_global_offset: 'conv' (1x1 conv on the "
+                          "intention-gated cell features; 0917 v3 -- learned a near-constant "
+                          "prior, r=0.35 with the GT window), 'qk' (question-cell matching: "
+                          "W_q(intention token) . W_k(LR image token) from the trunk hidden "
+                          "states), or 'both' (sum)."}
+    )
+    dat_glob_dim: int = field(
+        default=128,
+        metadata={"help": "q/k projection width for dat_glob_relevance='qk'/'both'."}
     )
     dat_off_range: float = field(
         default=0.0,
@@ -3461,6 +3473,8 @@ def train():
             'off_head_trunk_grad': model_args.dat_off_head_trunk_grad,
             'use_global_offset': model_args.dat_use_global_offset,
             'glob_min_scale': model_args.dat_glob_min_scale,
+            'glob_relevance': model_args.dat_glob_relevance,
+            'glob_dim': model_args.dat_glob_dim,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'inject_lr_image': model_args.dat_inject_lr_image,

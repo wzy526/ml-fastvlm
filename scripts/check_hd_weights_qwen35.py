@@ -32,7 +32,7 @@ import torch
 
 PAT = re.compile(
     r"layers\.(\d+)\.self_attn\.(k_proj_hd|v_proj_hd|hd_input_layernorm|"
-    r"conv_off_proj|conv_glob|conv_lr_proj|conv_lr_dw|proj_intention|k_proj|v_proj|hd_gate)"
+    r"conv_off_proj|conv_glob|glob_q|glob_k|conv_lr_proj|conv_lr_dw|proj_intention|k_proj|v_proj|hd_gate)"
     r"(?:\.(weight|bias))?$"
 )
 
@@ -146,7 +146,8 @@ def main():
         ln_std = ln.float().std().item() if ln is not None else float("nan")
         off = L.get("conv_off_proj.weight")
         n_off = off.float().norm().item() if off is not None else float("nan")
-        glob = L.get("conv_glob.weight")      # dat_use_global_offset relevance head (init 0)
+        # dat_use_global_offset relevance head, init 0: conv_glob ('conv') or W_q ('qk')
+        glob = L.get("conv_glob.weight") if "conv_glob.weight" in L else L.get("glob_q.weight")
         n_glob = glob.float().norm().item() if glob is not None else float("nan")
         gate = L.get("hd_gate.param")
         gate_s = f"{torch.sigmoid(gate.float()).item():.3f}" if gate is not None else "  none"

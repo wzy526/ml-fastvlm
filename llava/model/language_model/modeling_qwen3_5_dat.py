@@ -683,6 +683,21 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             # the legacy grid at load time (warm-start safe).
             'use_global_offset': False,
             'glob_min_scale': 0.1,        # floor on the per-axis grid scale
+            # Where the relevance logits come from:
+            #   'conv': 1x1 conv on the post-ln_2 (intention-gated) cell features.
+            #           The question enters only as a per-channel scalar gate, so
+            #           this can ask "which channels were amplified" but not
+            #           "does this cell's content match the question" -- 0917 v3
+            #           learned a near-constant prior (centroid corr with the GT
+            #           window r=0.35, only 8% better than the sample mean).
+            #   'qk':   question-cell matching. q = W_q(intention token),
+            #           k_i = W_k(LR image token i), both from the trunk hidden
+            #           states (grad-scaled by off_head_trunk_grad), logits_i =
+            #           q.k_i / sqrt(d), pooled from the LR grid onto the offset
+            #           grid. W_q zero-init => uniform => identity at load.
+            #   'both': sum of the two.
+            'glob_relevance': 'conv',
+            'glob_dim': 128,              # q/k projection width for 'qk'
             # LR dropout (training-only regulariser): with prob lr_drop_prob per
             # sample, replace lr_drop_ratio of that sample's LR image-token
             # embeddings by the sample's mean LR embedding (content-free, scale
@@ -1121,12 +1136,22 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # feed conv_off_proj. Zero-init = uniform = identity on the grid.
         self.use_global_offset = bool(dat.get('use_global_offset', False))
         self.glob_min_scale = float(dat.get('glob_min_scale', 0.1))
-        if self.use_global_offset:
+        self.glob_relevance = str(dat.get('glob_relevance', 'conv'))
+        assert self.glob_relevance in ('conv', 'qk', 'both'), self.glob_relevance
+        self.glob_dim = int(dat.get('glob_dim', 128))
+        if self.use_global_offset and self.glob_relevance in ('conv', 'both'):
             self.conv_glob = _FP32WeightConv2d(
                 self.ln_2.weight.numel(), 1, kernel_size=1, stride=1, padding=0, bias=True,
             )
         else:
             self.conv_glob = None
+        if self.use_global_offset and self.glob_relevance in ('qk', 'both'):
+            assert self.use_intention_branch, "glob_relevance='qk' needs the intention token"
+            self.glob_q = _FP32WeightLinear(self.hidden_size, self.glob_dim, bias=False)
+            self.glob_k = _FP32WeightLinear(self.hidden_size, self.glob_dim, bias=False)
+        else:
+            self.glob_q = None
+            self.glob_k = None
 
         # Question-conditioned LR readout (residual cross-attention).
         if self.question_inject == 'xattn':
@@ -1195,7 +1220,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 self.spatial_gain.data = self.spatial_gain.data.to(torch.float32)
         for sub in (self.conv_lr_dw, self.ln_1, self.conv_lr_proj,
                     self.proj_intention, self.ln_2, self.conv_off_proj,
-                    self.proj_film, self.conv_glob):
+                    self.proj_film, self.conv_glob, self.glob_q, self.glob_k):
             if not isinstance(sub, nn.Module):
                 continue
             for p in sub.parameters(recurse=False):
@@ -1227,7 +1252,17 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             # zero => uniform relevance => centroid 0, scale 1 => legacy grid
             nn.init.zeros_(self.conv_glob.weight)
             nn.init.zeros_(self.conv_glob.bias)
+        self._init_glob_qk_weights()
         self._init_hd_proj_weights()
+
+    @torch.no_grad()
+    def _init_glob_qk_weights(self):
+        """'qk' relevance: W_q zero (=> uniform map => identity grid at load),
+        W_k small normal so the keys are already spread when W_q starts moving."""
+        if self.glob_q is None:
+            return
+        nn.init.zeros_(self.glob_q.weight)
+        nn.init.normal_(self.glob_k.weight, std=0.02)
 
     @torch.no_grad()
     def _init_hd_proj_weights(self):
@@ -1318,10 +1353,13 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         return torch.stack([t_grid, h_grid, w_grid])  # [3, Ns]
 
     def _sample_hd_from_off_guide(self, off_guide, image_hd_features, hd_feat_idx, Lp, device,
-                                  film=None, spatial=None, n_unsup_lead=0):
+                                  film=None, spatial=None, n_unsup_lead=0, glob_logits=None):
         """Core deformable sampling: off_guide -> offsets -> grid_sample -> KV.
 
         Args:
+            glob_logits: optional [Lp*off_grps, 1, gh, gw] question-cell relevance
+                     logits (glob_relevance 'qk'/'both'), added to the conv map
+                     (if any) before the soft-argmax of the global term.
             film:    optional (gamma, beta), each [Lp*off_grps, C, 1, 1]. Applied
                      after ln_2 so the channel modulation cannot be normalized
                      away (see the note in __init__).
@@ -1356,7 +1394,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             )
         references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device)
 
-        if self.conv_glob is not None:
+        if self.use_global_offset:
             # Global localisation: soft-argmax over a per-cell relevance map
             # translates the grid to the relevant region and its spread shrinks
             # the grid onto it; the local offsets then refine per point.
@@ -1364,10 +1402,16 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             # p = softmax(relevance) over the gh*gw cells, g = cell coordinates,
             # std_u = std of the uniform grid (so a flat map gives s = 1 exactly).
             # Both c and s are differentiable through p, so the offset
-            # supervision (and the LM loss via grid_sample) train conv_glob to
-            # put mass on the cells that matter -- a signal every point of the
-            # grid shares, unlike the 3x3-local per-point offsets.
-            logits = self.conv_glob(F.silu(h)).float().flatten(1)          # [R, N]
+            # supervision (and the LM loss via grid_sample) train the relevance
+            # head to put mass on the cells that matter -- a signal every point
+            # of the grid shares, unlike the 3x3-local per-point offsets.
+            logits = None
+            if self.conv_glob is not None:
+                logits = self.conv_glob(F.silu(h)).float().flatten(1)      # [R, N]
+            if glob_logits is not None:
+                gl = glob_logits.float().flatten(1)
+                logits = gl if logits is None else logits + gl
+            assert logits is not None, "use_global_offset without a relevance source"
             p = torch.softmax(logits, dim=-1).unsqueeze(1)                 # [R, 1, N]
             g = references[:1].flatten(2)                                  # [1, 2, N]
             c = (p * g).sum(-1)                                            # [R, 2]
@@ -1637,6 +1681,23 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 else:
                     embed_lr_rep = embed_lr_rep * spatial_guide_rep.to(embed_lr_rep.dtype)
 
+            glob_logits = None
+            if self.glob_q is not None:
+                # Question-cell relevance for the global offset term: the
+                # intention token asks, every LR image token answers. Both live
+                # in the trunk's hidden space at this layer; a parameter-free
+                # LayerNorm first so the outlier channels of the residual stream
+                # (attention-sink dims) cannot dominate the dot product.
+                q_int = _grad_scale(query_states[b_idx, intention_indices], _tg).float()
+                k_lr = _grad_scale(query_states[b_idx, image_range_index], _tg).float()
+                q = self.glob_q(F.layer_norm(q_int, q_int.shape[-1:]))       # [Lp, d]
+                k = self.glob_k(F.layer_norm(k_lr, k_lr.shape[-1:]))         # [N_lr, d]
+                rel = (q @ k.transpose(0, 1)) / math.sqrt(self.glob_dim)     # [Lp, N_lr]
+                rel = rel.view(Lp, 1, lr_h, lr_w)
+                rel = F.adaptive_avg_pool2d(rel, (self.grid_size, self.grid_size))
+                glob_logits = einops.repeat(rel, 'l 1 h w -> (l g) 1 h w', g=self.off_grps)
+                self._fn_chk("glob_qk", glob_logits, b_idx)
+
             if self.question_inject == 'xattn':
                 # Grid cells cross-attend to the full question span; the readout
                 # is residual-injected into embed_lr (see QuestionReadout). This
@@ -1689,9 +1750,15 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 if spatial_add is not None:
                     pad = spatial_add.new_zeros((self.off_grps,) + spatial_add.shape[1:])
                     spatial_all = torch.cat([pad, spatial_add], dim=0)
+                glob_all = glob_logits
+                if glob_logits is not None:
+                    # zeros = uniform relevance = identity grid for the image slot
+                    pad = glob_logits.new_zeros((self.off_grps,) + glob_logits.shape[1:])
+                    glob_all = torch.cat([pad, glob_logits], dim=0)
                 key_all, value_all, slocs_all = self._sample_hd_from_off_guide(
                     off_guide_all, image_hd_features, hd_feat_idx, Lp + 1, device,
                     film=film_all, spatial=spatial_all, n_unsup_lead=1,
+                    glob_logits=glob_all,
                 )
                 kimg_parts.append(key_all[0:1])
                 vimg_parts.append(value_all[0:1])
@@ -1702,7 +1769,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             else:
                 key_hd, value_hd, slocs = self._sample_hd_from_off_guide(
                     off_guide, image_hd_features, hd_feat_idx, Lp, device,
-                    film=film, spatial=spatial_add,
+                    film=film, spatial=spatial_add, glob_logits=glob_logits,
                 )
                 key_parts.append(key_hd)
                 value_parts.append(value_hd)
@@ -2278,7 +2345,8 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         '.conv_lr_dw.', '.conv_lr_proj.', '.conv_off_proj.',
         '.proj_intention.', '.proj_film.', '.spatial_gain',
         '.k_proj_hd.', '.v_proj_hd.', '.hd_input_layernorm.',
-        '.hd_gate', '.q_readout.', '.ln_1.', '.ln_2.', '.conv_glob.',
+        '.hd_gate', '.q_readout.', '.ln_1.', '.ln_2.',
+        '.conv_glob.', '.glob_q.', '.glob_k.',
     )
 
     @classmethod
@@ -2378,6 +2446,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     # restores trained values afterwards when present on disk.
                     nn.init.zeros_(module.conv_glob.weight)
                     nn.init.zeros_(module.conv_glob.bias)
+                module._init_glob_qk_weights()   # W_q zero => identity grid
             elif isinstance(module, _FP32WeightRMSNorm):
                 nn.init.ones_(module.weight)
 
@@ -2854,8 +2923,9 @@ DAT_KEYS_MATCH = [
     'hd_gate', 'hd_input_layernorm', 'q_readout',
     # intention_inject='film' extras (None unless enabled)
     'proj_film', 'spatial_gain',
-    # use_global_offset extra (None unless enabled)
-    'conv_glob',
+    # use_global_offset extras (None unless enabled; conv_glob for 'conv'/'both',
+    # glob_q/glob_k for 'qk'/'both')
+    'conv_glob', 'glob_q', 'glob_k',
 ]
 
 
