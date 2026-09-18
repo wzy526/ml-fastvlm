@@ -10,6 +10,21 @@ forward+backward under four settings and compare loss and gradient norms:
     C  LR drop,  HD off     (same blanked LR, no HD)   -> loss(C)-loss(B) = HD's help under starvation
     D  full LR,  HD off     ->  loss(D)-loss(A)  = HD's help today
 
+When the json carries a top-level `bbox` ([x0, y0, x1, y1] image fractions,
+scripts/build_viscot_bbox_data.py) three more settings isolate the READOUT
+from localisation (the learned grid in B is ~uniform, so HD may not even hold
+the answer there):
+
+    O  LR drop,  HD oracle  (grid laid on the GT box: HD holds the answer)
+    S  LR drop,  HD shuffle (another sample's image, same grid: wrong content)
+    P  full LR,  HD oracle  (loss-level version of the probe's oracle test)
+
+    loss(S)-loss(O) > 0  -> the LM reads HD content when starved (readout works,
+                            training just never needed it -> LR-dropout SFT)
+    loss(S) ~ loss(O)    -> nothing readable comes out of k/v_proj_hd today; then
+                            grad(k/v_hd) under O vs A says whether a training
+                            signal exists at all (x-several = learnable).
+
 The lever exists if grad_norm(k/v_proj_hd) under B is several x that under A.
 HD currently carries content iff loss(C) > loss(B) by a margin.
 
@@ -18,6 +33,10 @@ Usage (OSS pod):
         --model_path ~/vldat_experiments/0908_pretrain_qwen35_2b_dat_exactgrad \
         --data_json ~/sft_data/xxx.json --image_folder ~/sft_data \
         --n 32 --ratio 0.75 --out /tmp/lr_drop_leverage.json
+    # readout test with oracle windows (bbox json from build_viscot_bbox_data.py):
+    python scripts/_test_lr_drop_leverage.py --model_path <v2-merged> \
+        --data_json $OSS_DATA/extra_0916/viscot_bbox.json --image_folder ~/sft_data/train_split \
+        --n 64 --tok_budget 256 --out <v2-merged>/readout_leverage.json
 """
 
 import argparse
@@ -32,7 +51,9 @@ from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scripts.probe_whd_qwen35 import FACTOR, TOK_PX, SYSTEM_PROMPT, hd_target_size  # noqa: E402
+from scripts.probe_whd_qwen35 import (  # noqa: E402
+    FACTOR, TOK_PX, SYSTEM_PROMPT, hd_target_size, oracle_locs, set_force_locs,
+)
 
 KVHD_KEYS = ("k_proj_hd", "v_proj_hd")
 KVLR_KEYS = ("self_attn.k_proj.", "self_attn.v_proj.")
@@ -59,14 +80,26 @@ def load_items(path, image_folder, n, seed):
         a = conv[1]["value"].strip()
         if not q or not a:
             continue
-        items.append((p, q, a))
+        bbox = it.get("bbox")                     # [x0, y0, x1, y1] fractions, or None
+        items.append((p, q, a, bbox))
         if len(items) >= n:
             break
+    n_box = sum(1 for it in items if it[3])
+    if 0 < n_box < len(items):
+        print(f"[lrdrop] {len(items) - n_box} samples without bbox dropped (oracle settings need it)")
+        items = [it for it in items if it[3]]
     return items
 
 
-def build(item, processor, hr_processor, args, device, dtype):
-    path, q, a = item
+def hd_inputs(img, hd_w, hd_h, hr_processor, device, dtype):
+    hr = hr_processor.image_processor(images=[img.resize((hd_w, hd_h), Image.BICUBIC)],
+                                      return_tensors="pt")
+    return {"pixel_values_hd": hr["pixel_values"].to(device=device, dtype=dtype),
+            "image_grid_thw_hd": hr["image_grid_thw"].to(device)}
+
+
+def build(item, idx, processor, hr_processor, args, device, dtype, grid_size):
+    path, q, a, bbox = item
     img = Image.open(path).convert("RGB")
     user = [{"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": [{"type": "image", "image": img},
@@ -86,18 +119,22 @@ def build(item, processor, hr_processor, args, device, dtype):
 
     lr_thw = inputs["image_grid_thw"][0]
     hd_w, hd_h = hd_target_size(img, lr_thw, args.hr_scale, args.hd_cap)
-    hr = hr_processor.image_processor(images=[img.resize((hd_w, hd_h), Image.BICUBIC)],
-                                      return_tensors="pt")
     base = {}
     for k, v in inputs.items():
         if not isinstance(v, torch.Tensor):
             continue
         base[k] = v.to(device=device, dtype=dtype) if k == "pixel_values" else v.to(device)
     base["labels"] = labels.to(device)
-    hd = {"pixel_values_hd": hr["pixel_values"].to(device=device, dtype=dtype),
-          "image_grid_thw_hd": hr["image_grid_thw"].to(device)}
+    hd = hd_inputs(img, hd_w, hd_h, hr_processor, device, dtype)
+    locs = None
+    if bbox:
+        # same window construction as the probe's --hd_source oracle
+        W, H = img.size
+        x0, y0, x1, y1 = bbox
+        sample = {"image": img, "bboxes": [[x0 * W, y0 * H, (x1 - x0) * W, (y1 - y0) * H]]}
+        locs = oracle_locs(sample, idx, hd_w, hd_h, grid_size, args.oracle_min_cells, "oracle")
     n_ans = int((labels != -100).sum())
-    return base, hd, int(lr_thw[1] * lr_thw[2] // 4), n_ans
+    return base, hd, (hd_w, hd_h), locs, int(lr_thw[1] * lr_thw[2] // 4), n_ans
 
 
 def grad_norm(model, keys):
@@ -128,6 +165,10 @@ def main():
                          "(dat_image_hd_for_question=True at runtime; needs intention_as_gate)")
     ap.add_argument("--lse_bias", type=float, default=0.0,
                     help="add setting F: constant added to lse_hd (training-time curriculum knob)")
+    ap.add_argument("--oracle_min_cells", type=int, default=20,
+                    help="oracle window >= this many HD cells per side (probe default)")
+    ap.add_argument("--no_oracle", action="store_true",
+                    help="skip settings O/S/P even when the json has bboxes")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -160,20 +201,27 @@ def main():
     device = next(model.parameters()).device
     dtype = torch.bfloat16
 
-    # (name, lr_drop, hd_on, question_readers, lse_bias)
-    settings = [("A full LR, HD on", False, True, False, 0.0),
-                ("B LR drop, HD on", True, True, False, 0.0),
-                ("C LR drop, HD off", True, False, False, 0.0),
-                ("D full LR, HD off", False, False, False, 0.0)]
+    # (name, lr_drop, hd: off|real|oracle|shuffle, question_readers, lse_bias)
+    settings = [("A full LR, HD on", False, "real", False, 0.0),
+                ("B LR drop, HD on", True, "real", False, 0.0),
+                ("C LR drop, HD off", True, "off", False, 0.0),
+                ("D full LR, HD off", False, "off", False, 0.0)]
+    has_bbox = bool(items) and all(it[3] for it in items) and not args.no_oracle
+    if has_bbox:
+        settings += [("O LR drop, HD oracle", True, "oracle", False, 0.0),
+                     ("S LR drop, HD shuffle", True, "shuffle", False, 0.0),
+                     ("P full LR, HD oracle", False, "oracle", False, 0.0)]
     if args.question_hd:
-        settings.append(("E +question readers", False, True, True, 0.0))
+        settings.append(("E +question readers", False, "real", True, 0.0))
     if args.lse_bias != 0.0:
-        settings.append((f"F lse_bias={args.lse_bias:+g}", False, True, False, args.lse_bias))
+        settings.append((f"F lse_bias={args.lse_bias:+g}", False, "real", False, args.lse_bias))
     if args.question_hd and args.lse_bias != 0.0:
-        settings.append(("G question+bias", False, True, True, args.lse_bias))
+        settings.append(("G question+bias", False, "real", True, args.lse_bias))
     rec = {s[0]: {"loss": [], "g_kvhd": [], "g_kvlr": [], "g_off": [], "lr_drop_frac": []}
            for s in settings}
     os.environ["DAT_LR_DROP_RATIO"] = str(args.ratio)
+    grid_size = int(model.config.dat_extra_args.get("grid_size", 20))
+    print(f"[lrdrop] settings: {[s[0] for s in settings]}  grid_size={grid_size}")
 
     dat_mods = [model.get_submodule(n) for n in sorted(dat_layer_prefixes)]
 
@@ -184,19 +232,31 @@ def main():
 
     for i, item in enumerate(tqdm(items, desc="samples")):
         try:
-            base, hd, n_lr, n_ans = build(item, processor, hr_processor, args, device, dtype)
+            base, hd, (hd_w, hd_h), locs, n_lr, n_ans = build(
+                item, i, processor, hr_processor, args, device, dtype, grid_size)
         except Exception as e:  # noqa: BLE001
             print(f"[lrdrop] skip {item[0]}: {e}")
             continue
-        # HD ViT once per sample (frozen, no grad); the 4 settings share the features
+        # HD ViT once per sample (frozen, no grad); the settings share the features
         with torch.no_grad():
             hd_feats = model._generate_hd_features(hd["pixel_values_hd"], hd["image_grid_thw_hd"])
-        for name, drop, hd_on, q_hd, bias in settings:
+            hd_feats_shuf = None
+            if any(s[2] == "shuffle" for s in settings):
+                # another sample's image at the SAME HD geometry (probe's shuffle)
+                other = items[(i + len(items) // 2) % len(items)][0]
+                hd_o = hd_inputs(Image.open(other).convert("RGB"), hd_w, hd_h,
+                                 hr_processor, device, dtype)
+                hd_feats_shuf = model._generate_hd_features(hd_o["pixel_values_hd"],
+                                                            hd_o["image_grid_thw_hd"])
+        for name, drop, hd_mode, q_hd, bias in settings:
+            hd_on = hd_mode != "off"
             os.environ["DAT_LR_DROP_FORCE"] = "1" if drop else "0"
             set_knobs(q_hd, bias)
-            torch.manual_seed(args.seed * 100003 + i)      # identical mask for B and C
+            set_force_locs(model, locs if hd_mode in ("oracle", "shuffle") else None)
+            torch.manual_seed(args.seed * 100003 + i)      # identical mask for B/C/O/S
             model.zero_grad(set_to_none=True)
-            inputs = {**base, "image_hd_features": hd_feats} if hd_on else dict(base)
+            feats = hd_feats_shuf if hd_mode == "shuffle" else hd_feats
+            inputs = {**base, "image_hd_features": feats} if hd_on else dict(base)
             out = model(**inputs)
             out.loss.backward()
             r = rec[name]
@@ -208,6 +268,7 @@ def main():
         model.zero_grad(set_to_none=True)
     os.environ.pop("DAT_LR_DROP_FORCE", None)
     set_knobs(False, 0.0)
+    set_force_locs(model, None)
 
     mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
     print(f"\n==== LR-dropout leverage  (n={len(rec[settings[0][0]]['loss'])}, "
@@ -216,7 +277,8 @@ def main():
           f"{'grad offset':>11} | {'hd/lr':>6} | {'lr_drop':>7}")
     print("-" * 95)
     summ = {}
-    for name, _, hd_on, _, _ in settings:
+    for name, _, hd_mode, _, _ in settings:
+        hd_on = hd_mode != "off"
         r = rec[name]
         s = {k: mean(v) for k, v in r.items()}
         s["hd_over_lr"] = s["g_kvhd"] / s["g_kvlr"] if s["g_kvlr"] > 0 else float("nan")
@@ -235,14 +297,30 @@ def main():
     print(f"HD help under starvation loss(C)-(B): {mean(pa):+.4f}  (paired mean; >0 = HD recovers blanked content)")
     print(f"HD help today        loss(D)-(A)   : {mean(pd):+.4f}  (paired mean; ~0 = HD contributes nothing now)")
     print(f"starvation cost      loss(B)-(A)   : {B['loss']-A['loss']:+.4f}")
-    for s in settings[4:]:
+    if has_bbox:
+        L = lambda k: rec[k]["loss"]
+        so = [b_ - a_ for a_, b_ in zip(L("O LR drop, HD oracle"), L("S LR drop, HD shuffle"))]
+        co = [b_ - a_ for a_, b_ in zip(L("O LR drop, HD oracle"), L("C LR drop, HD off"))]
+        dp = [b_ - a_ for a_, b_ in zip(L("P full LR, HD oracle"), L("D full LR, HD off"))]
+        O = summ["O LR drop, HD oracle"]
+        print("\n==== read-out: readout vs localisation (bbox settings) ====")
+        print(f"content read, starved  loss(S)-(O) : {mean(so):+.4f}  (>0 = oracle HD beats wrong-image HD: the LM READS HD content)")
+        print(f"oracle help, starved   loss(C)-(O) : {mean(co):+.4f}  (>0 = HD on the answer recovers blanked LR)")
+        print(f"oracle help today      loss(D)-(P) : {mean(dp):+.4f}  (~0 = with LR intact the LM ignores even perfect HD)")
+        print(f"signal for training  grad(k/v_hd) O/A : {O['g_kvhd']/A['g_kvhd'] if A['g_kvhd'] > 0 else float('nan'):6.2f}x  "
+              f"(hd/lr {O['hd_over_lr']:.3f} vs A {A['hd_over_lr']:.3f}; x-several = learnable under LR-drop + TF)")
+    for s in settings[4 + (3 if has_bbox else 0):]:
         X = summ[s[0]]
         print(f"{s[0]:>20}  grad(k/v_hd) x{X['g_kvhd']/A['g_kvhd']:5.2f} vs A   hd/lr {X['hd_over_lr']:.3f} "
               f"(A {A['hd_over_lr']:.3f})   loss {X['loss']-A['loss']:+.4f} vs A")
 
     if args.out:
+        extra = {}
+        if has_bbox:
+            extra = {"content_read_starved": mean(so), "oracle_help_starved": mean(co),
+                     "oracle_help_today": mean(dp)}
         json.dump({"args": vars(args), "summary": summ, "per_sample": rec,
-                   "lever": lever, "hd_help_starved": mean(pa), "hd_help_today": mean(pd)},
+                   "lever": lever, "hd_help_starved": mean(pa), "hd_help_today": mean(pd), **extra},
                   open(args.out, "w"), indent=2)
         print(f"[lrdrop] saved -> {args.out}")
 

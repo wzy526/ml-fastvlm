@@ -93,6 +93,19 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # (must rise vs v2). Pass: probe viscot/V* with --hd_source oracle shows
 # HD-on > off by several points (first time any HD source moves accuracy).
 #
+# Mini readout SFT (1/20 of the above, ~1-2 h on 4-8 GPUs) — "can k/v_hd learn
+# to read at all when forced": start from v2-merged, train the DAT modules ONLY
+# (FREEZE_BASE=1, no LoRA, no projector), viscot bbox samples only, every
+# sample teacher-forced onto its box and LR-dropped, a few hundred steps. No
+# LoRA => the output dir itself is a full HF ckpt (auto-merge skips).
+#   DATA_JSON=$OSS_DATA/extra_0916/viscot_bbox.train.json \
+#   MODEL_PATH=~/vldat_experiments/0917_sft_qwen35_2b_dat_readers_bias_offsup_v2-merged \
+#   TF_PROB=1 OFF_SUP_WEIGHT=0 LR_DROP_PROB=1 LR_DROP_RATIO=0.75 OFF_HEAD_TRUNK_GRAD=0 \
+#   FREEZE_BASE=True LORA_ENABLE=False TUNE_MM_MLP=False MAX_STEPS=400 WARMUP_STEPS=20 \
+#   SAVE_STEPS=200 EXP_NAME=0919_mini_readout_tforacle_lrdrop bash <this script>
+# Then scripts/_test_lr_drop_leverage.py on the HELD-OUT split before/after:
+# loss(S)-loss(O) must open up (oracle HD beats wrong-image HD under LR drop).
+#
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)
 #   [patch-geometry] PATCH_SIZE=16 ... factor=32
@@ -215,7 +228,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_intention_as_gate True \
     --dat_use_spatial_attn_guide False \
     --dat_shared_vit False \
-    --dat_freeze_base False \
+    --dat_freeze_base "${FREEZE_BASE:-False}" \
     --dat_warmup_steps 0 \
     --dat_inject_lr_image False \
     --dat_off_penalty "${OFF_PENALTY:-1.0}" \
@@ -238,13 +251,13 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_glob_relevance "${GLOB_REL:-conv}" \
     --dat_glob_dim "${GLOB_DIM:-128}" \
     --dat_lr 1e-4 \
-    --lora_enable True \
+    --lora_enable "${LORA_ENABLE:-True}" \
     --lora_r 8 \
     --lora_alpha 16 \
     --lora_target_layers "all" \
     --lora_lr 2e-5 \
     --tune_mm_vision False \
-    --tune_mm_mlp True \
+    --tune_mm_mlp "${TUNE_MM_MLP:-True}" \
     --tune_mm_llm False \
     --mm_projector_lr 5e-6 \
     --kd_on False \
@@ -254,6 +267,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --ddp_timeout 7200 \
     --output_dir "$CKPT_ROOT/$EXP_NAME" \
     --num_train_epochs "${NUM_TRAIN_EPOCHS:-1}" \
+    --max_steps "${MAX_STEPS:--1}" \
     --per_device_train_batch_size "${PER_DEVICE_BATCH:-4}" \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps "${GRAD_ACCUM:-2}" \
