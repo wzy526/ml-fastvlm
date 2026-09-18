@@ -78,6 +78,21 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # Pass: probe sample-dependence r_cx/r_cy > 0.6, |c-t| well below const,
 # scale mean approaching GT s (~0.42); then in_box should leave the 3% floor.
 #
+# Readout arm (0919) — the V* oracle test on v2/v3 (400 points laid on the GT
+# box = perfect localisation) gave off 51.8 -> oracle 50.3 / 51.3 -> 51.3,
+# while shuffle (someone else's HD) gave +2.6: the readout does not use HD
+# content, so no localisation gain can reach the answer. LR dropout (per
+# sample, lr_drop_ratio of the LR image tokens replaced by their mean) removes
+# the LR shortcut so the LM must read the HD tokens; teacher forcing
+# (OFF_SUP_WEIGHT=0 + TF_PROB=1) puts those tokens on the answer region for
+# the bbox samples so what it reads is the answer:
+#   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_viscot.json TF_PROB=1 OFF_SUP_WEIGHT=0 \
+#   LR_DROP_PROB=0.5 LR_DROP_RATIO=0.75 OFF_HEAD_TRUNK_GRAD=0 \
+#   EXP_NAME=0919_sft_qwen35_2b_dat_readers_bias_tforacle_lrdrop bash <this script>
+# wandb: dat/lr_drop_frac (~0.5*0.75), dat/tf_frac (~0.13), kvhd_grad_norm
+# (must rise vs v2). Pass: probe viscot/V* with --hd_source oracle shows
+# HD-on > off by several points (first time any HD source moves accuracy).
+#
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)
 #   [patch-geometry] PATCH_SIZE=16 ... factor=32
@@ -213,6 +228,8 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_tf_min_cells "${TF_MIN_CELLS:-20}" \
     --dat_tf_min_hd_ratio "${TF_MIN_HD_RATIO:-2.0}" \
     --dat_tf_max_window_frac "${TF_MAX_WINDOW_FRAC:-0.5}" \
+    --dat_lr_drop_prob "${LR_DROP_PROB:-0}" \
+    --dat_lr_drop_ratio "${LR_DROP_RATIO:-0.75}" \
     --dat_off_sup_weight "${OFF_SUP_WEIGHT:-0}" \
     --dat_off_sup_delta "${OFF_SUP_DELTA:-0.1}" \
     --dat_off_head_trunk_grad "${OFF_HEAD_TRUNK_GRAD:-1.0}" \
