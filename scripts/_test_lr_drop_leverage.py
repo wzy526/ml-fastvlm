@@ -183,6 +183,10 @@ def main():
         attn_implementation=args.attn,
     )
     model.train()
+    # LR dropout is driven ONLY by DAT_LR_DROP_FORCE here. A ckpt trained with
+    # lr_drop_prob > 0 (0919 mini readout SFT) would otherwise keep dropping in
+    # train mode and contaminate the "full LR" settings A / D / P.
+    model.config.dat_extra_args['lr_drop_prob'] = 0.0
     # grads only where we measure them (base k/v of DAT layers as the reference)
     dat_layer_prefixes = set()
     for n, _ in model.named_modules():
