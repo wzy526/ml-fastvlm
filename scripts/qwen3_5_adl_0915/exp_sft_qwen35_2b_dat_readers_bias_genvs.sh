@@ -105,6 +105,25 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   SAVE_STEPS=200 EXP_NAME=0919_mini_readout_tforacle_lrdrop bash <this script>
 # Then scripts/_test_lr_drop_leverage.py on the HELD-OUT split before/after:
 # loss(S)-loss(O) must open up (oracle HD beats wrong-image HD under LR drop).
+# Result: loss(O) 1.38 -> 0.94, S-O 0.06 -> 0.71, full-LR D-P 0.018 -> 0.055,
+# held-out acc oracle +2.5 / shuffle -1. Readout is trainable; side effect:
+# over-trust (wrong-content HD worse than none) from 100% forcing.
+#
+# Combined arm (0920, "B") — readout + localisation on the same data. Windows
+# now do BOTH (TF_FORCE_PROB): every window supervises the learned grid
+# (OFF_SUP_WEIGHT) and TF_FORCE_PROB of them also replace it. Mini version
+# (DAT-only from v2, viscot train split, 600 steps) with a no-global-term
+# control on the other 4 GPUs:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC=4 DATA_JSON=$OSS_DATA/extra_0916/viscot_bbox.train.json \
+#   MODEL_PATH=<v2-merged> TF_PROB=1 TF_FORCE_PROB=0.5 OFF_SUP_WEIGHT=10 LR_DROP_PROB=0.5 \
+#   OFF_HEAD_TRUNK_GRAD=0 GLOBAL_OFFSET=1 GLOB_REL=qk FREEZE_BASE=True LORA_ENABLE=False \
+#   TUNE_MM_MLP=False MAX_STEPS=600 WARMUP_STEPS=20 SAVE_STEPS=300 \
+#   EXP_NAME=0920_miniB_qk bash <this script>
+#   (control: CUDA_VISIBLE_DEVICES=4,5,6,7 ... GLOBAL_OFFSET=0 EXP_NAME=0920_miniB_noglob)
+# wandb: dat/tf_frac ~1, dat/tf_forced_frac ~0.5, dat/off_sup_dist falling,
+# dat/glob_shift / glob_scale moving (qk arm). Verdict: leverage test (O, S-O,
+# D-P, and S <= C / A <= D for over-trust) + probe real/oracle/shuffle on the
+# held-out split + the sample-dependence table (r_cx/r_cy > 0.6).
 #
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)
@@ -209,7 +228,7 @@ DAT_LAYERS="${DAT_LAYERS:-auto}"
 
 echo "[0915-sft] qwen3_5 2B  dat_layers=$DAT_LAYERS  grid=20  nogate  exact_grad=1  data=$(basename "$DATA_JSON")"
 
-torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/train_qwen_dat.py \
+torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" llava/train/train_qwen_dat.py \
     --deepspeed ./scripts/zero_configs/zero2.json \
     --model_name_or_path "$MODEL_PATH" \
     --model_family qwen3_5 \
@@ -245,6 +264,7 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40993}" llava/train/tr
     --dat_lr_drop_ratio "${LR_DROP_RATIO:-0.75}" \
     --dat_off_sup_weight "${OFF_SUP_WEIGHT:-0}" \
     --dat_off_sup_delta "${OFF_SUP_DELTA:-0.1}" \
+    --dat_tf_force_prob "${TF_FORCE_PROB:--1}" \
     --dat_off_head_trunk_grad "${OFF_HEAD_TRUNK_GRAD:-1.0}" \
     --dat_use_global_offset "$([ "${GLOBAL_OFFSET:-0}" = 1 ] && echo True || echo False)" \
     --dat_glob_min_scale "${GLOB_MIN_SCALE:-0.1}" \

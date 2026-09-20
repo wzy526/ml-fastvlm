@@ -416,6 +416,14 @@ class ModelArguments:
         default=0.1,
         metadata={"help": "Huber transition for dat_off_sup_weight, in [-1, 1] grid units."}
     )
+    dat_tf_force_prob: float = field(
+        default=-1.0,
+        metadata={"help": "Window routing. <0 (default) = legacy either/or: dat_off_sup_weight > 0 "
+                          "-> windows supervise the learned grid, else they replace it. In [0, 1] "
+                          "= every window supervises (if dat_off_sup_weight > 0) AND this fraction "
+                          "of windowed samples is also teacher-forced, so readout and offset head "
+                          "train on the same data (0.5 recommended)."}
+    )
     dat_off_head_trunk_grad: float = field(
         default=1.0,
         metadata={"help": "Scale on gradients flowing from the DAT offset head back into the LLM "
@@ -2246,7 +2254,9 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             if hasattr(module, '_dat_tf_frac'):
                 if not hasattr(self, '_tf_frac_buf'):
                     self._tf_frac_buf = []
+                    self._tf_forced_frac_buf = []
                 self._tf_frac_buf.append(float(module._dat_tf_frac))
+                self._tf_forced_frac_buf.append(float(getattr(module, '_dat_tf_forced_frac', 0.0)))
                 break
         # Offset supervision: (weighted huber, mean point->target distance) per
         # (layer, sample) with a target this forward; drained here.
@@ -2421,8 +2431,12 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             metrics["dat/lr_drop_frac"] = sum(self._lr_drop_buf) / len(self._lr_drop_buf)
             self._lr_drop_buf.clear()
         if getattr(self, '_tf_frac_buf', None):
+            # tf_frac = samples carrying a window (supervised and/or forced);
+            # tf_forced_frac = samples whose grid was actually replaced.
             metrics["dat/tf_frac"] = sum(self._tf_frac_buf) / len(self._tf_frac_buf)
+            metrics["dat/tf_forced_frac"] = sum(self._tf_forced_frac_buf) / len(self._tf_forced_frac_buf)
             self._tf_frac_buf.clear()
+            self._tf_forced_frac_buf.clear()
         # Offset supervision: off_sup_loss is the weighted huber term (what the
         # hook injects); off_sup_dist the mean distance of a sampling point to
         # its target in [-1, 1] grid units (2.0 = full image width). A learned
@@ -3470,6 +3484,7 @@ def train():
             'off_penalty': model_args.dat_off_penalty,
             'off_sup_weight': model_args.dat_off_sup_weight,
             'off_sup_delta': model_args.dat_off_sup_delta,
+            'tf_force_prob': model_args.dat_tf_force_prob,
             'off_head_trunk_grad': model_args.dat_off_head_trunk_grad,
             'use_global_offset': model_args.dat_use_global_offset,
             'glob_min_scale': model_args.dat_glob_min_scale,

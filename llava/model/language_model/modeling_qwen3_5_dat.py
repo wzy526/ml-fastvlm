@@ -529,6 +529,23 @@ def _grad_scale(x, scale):
     return _GradScaleFn.apply(x, float(scale))
 
 
+class _InjectGradFn(torch.autograd.Function):
+    """Forward: exact zeros (shape of x). Backward: hands `pull` to x as its
+    gradient, whatever the incoming gradient is. Lets a tensor that leaves the
+    forward graph (the learned sampling grid under teacher forcing) still
+    receive a precomputed gradient (the offset-supervision pull)."""
+
+    @staticmethod
+    def forward(ctx, x, pull):
+        ctx.save_for_backward(pull)
+        return torch.zeros_like(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        (pull,) = ctx.saved_tensors
+        return pull, None
+
+
 class _FP32WeightRMSNorm(nn.Module):
     """Standard `w * rmsnorm(x)` with fp32 weight storage.
 
@@ -670,6 +687,11 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             # gradients alike (the LM gradient through the head never taught
             # the offsets anything, so nothing is lost).
             'off_head_trunk_grad': 1.0,
+            # Window routing (see the top-level forward). None = legacy
+            # either/or: off_sup_weight > 0 -> supervise, else teacher-force.
+            # A float in [0, 1] = supervise every window (if off_sup_weight > 0)
+            # AND teacher-force this fraction of the windowed samples.
+            'tf_force_prob': None,
             # Global localisation term in the offset head. The per-point offset
             # head is local (3x3 dw conv + 1x1): a point far from the target has
             # no information about which way to move, so supervised offsets only
@@ -1108,6 +1130,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         self.off_sup_weight = float(dat.get('off_sup_weight', 0.0))
         self.off_sup_delta = float(dat.get('off_sup_delta', 0.1))
         self.off_head_trunk_grad = float(dat.get('off_head_trunk_grad', 1.0))
+        _tfp = dat.get('tf_force_prob', None)
+        # trainer passes -1 for "unset" (dataclass floats cannot be None)
+        self.tf_force_prob = None if _tfp is None or float(_tfp) < 0 else float(_tfp)
         self._dat_off_target = None
         self._dat_off_target_batch = None
 
@@ -1436,22 +1461,23 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     del gb[:-512]
         else:
             x = references + offsets
-        if self._dat_force_locs is not None:
-            fl = self._dat_force_locs.to(device=x.device, dtype=x.dtype)   # [Ns, 2] (x, y)
-            x = fl.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
-        elif self._dat_off_target is not None and self.off_sup_weight > 0 and self.training:
-            # Offset supervision: pull the learned grid toward the target grid
-            # (a grid_size x grid_size grid over the sample's bbox window).
-            #   loss_sup = off_sup_weight * mean_i huber_delta(x_i - t_i)
-            # Injected as a gradient like off_penalty (a stashed loss would
-            # carry no grad_fn under gradient checkpointing):
-            #   d huber_delta(r) / dr = clamp(r, -delta, delta)
-            # so the pull has constant magnitude until a point is within delta
-            # of its target, then fades linearly -- L1-like far away (points
-            # keep moving), L2-like near (no oscillation). The gradient of the
-            # LM loss through grid_sample is added on top untouched, so once the
-            # grid is on target the readout decides the fine placement.
-            r0 = n_unsup_lead * self.off_grps          # first supervised row
+        # Offset supervision acts on the LEARNED grid x, computed before any
+        # teacher forcing replaces it, so the two can coexist on one sample
+        # (tf_force_prob routing): the pull trains the offset head, the forced
+        # grid trains the readout. Pull the learned grid toward the target grid
+        # (a grid_size x grid_size grid over the sample's bbox window):
+        #   loss_sup = off_sup_weight * mean_i huber_delta(x_i - t_i)
+        # Injected as a gradient like off_penalty (a stashed loss would carry
+        # no grad_fn under gradient checkpointing):
+        #   d huber_delta(r) / dr = clamp(r, -delta, delta)
+        # so the pull has constant magnitude until a point is within delta of
+        # its target, then fades linearly -- L1-like far away (points keep
+        # moving), L2-like near (no oscillation). The gradient of the LM loss
+        # through grid_sample is added on top untouched, so once the grid is on
+        # target the readout decides the fine placement.
+        pull = None
+        r0 = n_unsup_lead * self.off_grps              # first supervised row
+        if self._dat_off_target is not None and self.off_sup_weight > 0 and self.training:
             xs = x[r0:]                                 # [(Lp-n)*G, 2, gh, gw]
             tgt = self._dat_off_target.to(device=x.device, dtype=x.dtype)  # [Ns, 2] (x, y)
             tgt = tgt.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(xs)
@@ -1474,19 +1500,29 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 coef = self.off_sup_weight / (resid.numel() // 2)
                 pull = torch.zeros_like(x)
                 pull[r0:] = resid.clamp(-d, d) * coef
-                gbuf = getattr(self, '_dat_off_sup_grad_buf', None)
-                if gbuf is None:
-                    gbuf = self._dat_off_sup_grad_buf = []
 
-                def _hook(g, p=pull, r0=r0, gbuf=gbuf):
-                    # ||LM-loss grad on the supervised rows|| vs ||pull||: the
-                    # ratio tells whether off_sup_weight is large enough to be
-                    # seen through the LM gradient noise (wandb dat/off_sup_grad_ratio).
-                    gbuf.append(torch.stack([g[r0:].detach().norm(), p[r0:].norm()]))
-                    if len(gbuf) > 512:
-                        del gbuf[:-512]
-                    return g + p
-                x.register_hook(_hook)
+        if self._dat_force_locs is not None:
+            # Teacher forcing: sample on the window grid instead of the learned
+            # one. The learned x leaves the graph here, so a hook on it would
+            # never fire; _InjectGradFn returns exact zeros forward and hands
+            # `pull` to x backward, so the supervision still reaches the head.
+            fl = self._dat_force_locs.to(device=x.device, dtype=x.dtype)   # [Ns, 2] (x, y)
+            forced = fl.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
+            x = (forced + _InjectGradFn.apply(x, pull)) if pull is not None else forced
+        elif pull is not None:
+            gbuf = getattr(self, '_dat_off_sup_grad_buf', None)
+            if gbuf is None:
+                gbuf = self._dat_off_sup_grad_buf = []
+
+            def _hook(g, p=pull, r0=r0, gbuf=gbuf):
+                # ||LM-loss grad on the supervised rows|| vs ||pull||: the
+                # ratio tells whether off_sup_weight is large enough to be
+                # seen through the LM gradient noise (wandb dat/off_sup_grad_ratio).
+                gbuf.append(torch.stack([g[r0:].detach().norm(), p[r0:].norm()]))
+                if len(gbuf) > 512:
+                    del gbuf[:-512]
+                return g + p
+            x.register_hook(_hook)
         if self.training:
             self._dat_offset_oob = (x.abs() > 1.0).float().mean().item()
 
@@ -2830,16 +2866,43 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             _dev = inputs_embeds.device if inputs_embeds is not None else input_ids.device
             _win_locs = [self._dat_attn_modules[0]._window_to_locs(w, _dev)
                          for w in dat_force_window]
-        # Routing: with off_sup_weight > 0 the windows supervise the learned
-        # grid (regression target, sampling stays the model's own); otherwise
-        # they replace it (teacher forcing). Never both for the same sample.
-        _supervise = bool(self._dat_attn_modules) and self._dat_attn_modules[0].off_sup_weight > 0
+        # Routing of the windows.
+        #   tf_force_prob is None (legacy): with off_sup_weight > 0 the windows
+        #     supervise the learned grid (regression target, sampling stays the
+        #     model's own); otherwise they replace it (teacher forcing). Never
+        #     both for the same sample.
+        #   tf_force_prob set: every window supervises the learned grid (if
+        #     off_sup_weight > 0) AND, per sample with prob tf_force_prob, also
+        #     replaces the sampling grid. Forced samples train the readout on
+        #     HD that holds the answer; unforced ones train the head under the
+        #     LM gradient and show the readout a grid that is not on target
+        #     (0919 mini readout SFT at 100% forcing: wrong-content HD became
+        #     WORSE than no HD, loss(S) 1.65 > loss(C) 1.44).
+        _force_batch, _target_batch = None, None
+        _n_forced = 0
+        if self._dat_attn_modules:
+            _m0 = self._dat_attn_modules[0]
+            _sup = _m0.off_sup_weight > 0
+            if _m0.tf_force_prob is None:
+                _force_batch = None if _sup else _win_locs
+                _target_batch = _win_locs if _sup else None
+                if _force_batch is not None:
+                    _n_forced = sum(w is not None for w in _force_batch)
+            else:
+                _target_batch = _win_locs if _sup else None
+                if _win_locs is not None:
+                    _keep = torch.rand(len(_win_locs)) < float(_m0.tf_force_prob)
+                    _force_batch = [w if (w is not None and bool(_keep[i])) else None
+                                    for i, w in enumerate(_win_locs)]
+                    _n_forced = sum(w is not None for w in _force_batch)
         for _m in self._dat_attn_modules:
-            _m._dat_force_batch = None if _supervise else _win_locs
-            _m._dat_off_target_batch = _win_locs if _supervise else None
-        # fraction of samples carrying a window (forced or supervised)
+            _m._dat_force_batch = _force_batch
+            _m._dat_off_target_batch = _target_batch
+        # fraction of samples carrying a window (forced or supervised) / forced
+        _nb = max(1, len(dat_force_window)) if dat_force_window is not None else 1
         self._dat_tf_frac = 0.0 if dat_force_window is None else \
-            sum(w is not None for w in dat_force_window) / max(1, len(dat_force_window))
+            sum(w is not None for w in dat_force_window) / _nb
+        self._dat_tf_forced_frac = _n_forced / _nb
 
         # === Step 4: Call base model with DAT kwargs ===
         # DAT kwargs flow through: Model → TextModel → DecoderLayer → Attention.
