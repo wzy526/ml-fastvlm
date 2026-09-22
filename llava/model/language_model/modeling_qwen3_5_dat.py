@@ -546,6 +546,47 @@ class _InjectGradFn(torch.autograd.Function):
         return pull, None
 
 
+def _route_windows(win_locs, supervise, tf_force_prob, lr_dropped=None):
+    """Decide, per sample, what a bbox window does this forward.
+
+    win_locs      per-sample [Ns, 2] target grid or None (no window)
+    supervise     off_sup_weight > 0
+    tf_force_prob None = legacy either/or (supervise XOR force);
+                  float = supervise every window AND force this fraction
+    lr_dropped    per-sample bool (LR image tokens blanked this forward) or
+                  None. When given, a dropped sample is teacher-forced ONLY:
+                  its LR content is gone, so the qk relevance / offset head
+                  has nothing to match the question against and a pull on it
+                  can only push toward a prior (0920 miniB: r_cx 0.1-0.2 with
+                  half the samples dropped). Its HD must carry the answer for
+                  the readout, so it is forced. Samples with full LR keep the
+                  tf_force_prob routing (supervise + maybe force).
+    Returns (force_batch, target_batch, n_forced, n_supervised); a batch is
+    None when no sample in it is forced / supervised.
+    """
+    if win_locs is None:
+        return None, None, 0, 0
+    n = len(win_locs)
+    if tf_force_prob is None:
+        force = [not supervise] * n
+        sup = [supervise] * n
+    else:
+        keep = torch.rand(n) < float(tf_force_prob)
+        force = [bool(keep[i]) for i in range(n)]
+        sup = [supervise] * n
+    if lr_dropped is not None:
+        for i, d in enumerate(lr_dropped[:n]):
+            if d:
+                force[i], sup[i] = True, False
+    force_batch = [w if (w is not None and force[i]) else None for i, w in enumerate(win_locs)]
+    target_batch = [w if (w is not None and sup[i]) else None for i, w in enumerate(win_locs)]
+    n_forced = sum(w is not None for w in force_batch)
+    n_sup = sum(w is not None for w in target_batch)
+    return (force_batch if n_forced else None,
+            target_batch if n_sup else None,
+            n_forced, n_sup)
+
+
 class _FP32WeightRMSNorm(nn.Module):
     """Standard `w * rmsnorm(x)` with fp32 weight storage.
 
@@ -692,6 +733,12 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             # A float in [0, 1] = supervise every window (if off_sup_weight > 0)
             # AND teacher-force this fraction of the windowed samples.
             'tf_force_prob': None,
+            # Route windows by this forward's LR dropout: an LR-dropped sample
+            # is teacher-forced only (no offset supervision), a full-LR sample
+            # follows tf_force_prob. The pull needs LR content to be learnable
+            # (qk relevance matches the question against LR tokens); the
+            # readout needs the answer in HD when LR is gone. See _route_windows.
+            'route_by_lr_drop': False,
             # Global localisation term in the offset head. The per-point offset
             # head is local (3x3 dw conv + 1x1): a point far from the target has
             # no information about which way to move, so supervised offsets only
@@ -1133,6 +1180,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         _tfp = dat.get('tf_force_prob', None)
         # trainer passes -1 for "unset" (dataclass floats cannot be None)
         self.tf_force_prob = None if _tfp is None or float(_tfp) < 0 else float(_tfp)
+        self.route_by_lr_drop = bool(dat.get('route_by_lr_drop', False))
         self._dat_off_target = None
         self._dat_off_target_batch = None
 
@@ -2878,31 +2926,28 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         #     LM gradient and show the readout a grid that is not on target
         #     (0919 mini readout SFT at 100% forcing: wrong-content HD became
         #     WORSE than no HD, loss(S) 1.65 > loss(C) 1.44).
+        #   route_by_lr_drop: on top of either, a sample whose LR tokens are
+        #     blanked this forward is forced only (no pull: nothing to match
+        #     the question against), a full-LR sample follows the rule above.
         _force_batch, _target_batch = None, None
-        _n_forced = 0
-        if self._dat_attn_modules:
+        _n_forced, _n_sup = 0, 0
+        if self._dat_attn_modules and _win_locs is not None:
             _m0 = self._dat_attn_modules[0]
-            _sup = _m0.off_sup_weight > 0
-            if _m0.tf_force_prob is None:
-                _force_batch = None if _sup else _win_locs
-                _target_batch = _win_locs if _sup else None
-                if _force_batch is not None:
-                    _n_forced = sum(w is not None for w in _force_batch)
-            else:
-                _target_batch = _win_locs if _sup else None
-                if _win_locs is not None:
-                    _keep = torch.rand(len(_win_locs)) < float(_m0.tf_force_prob)
-                    _force_batch = [w if (w is not None and bool(_keep[i])) else None
-                                    for i, w in enumerate(_win_locs)]
-                    _n_forced = sum(w is not None for w in _force_batch)
+            _dropped = None
+            if _m0.route_by_lr_drop and self._lr_drop_mask is not None:
+                # one [B] host sync per forward, only on this path
+                _dropped = self._lr_drop_mask.any(dim=1).tolist()
+            _force_batch, _target_batch, _n_forced, _n_sup = _route_windows(
+                _win_locs, _m0.off_sup_weight > 0, _m0.tf_force_prob, _dropped)
         for _m in self._dat_attn_modules:
             _m._dat_force_batch = _force_batch
             _m._dat_off_target_batch = _target_batch
-        # fraction of samples carrying a window (forced or supervised) / forced
+        # fraction of samples carrying a window / forced / supervised
         _nb = max(1, len(dat_force_window)) if dat_force_window is not None else 1
         self._dat_tf_frac = 0.0 if dat_force_window is None else \
             sum(w is not None for w in dat_force_window) / _nb
         self._dat_tf_forced_frac = _n_forced / _nb
+        self._dat_tf_sup_frac = _n_sup / _nb
 
         # === Step 4: Call base model with DAT kwargs ===
         # DAT kwargs flow through: Model → TextModel → DecoderLayer → Attention.

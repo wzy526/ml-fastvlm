@@ -124,6 +124,26 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # dat/glob_shift / glob_scale moving (qk arm). Verdict: leverage test (O, S-O,
 # D-P, and S <= C / A <= D for over-trust) + probe real/oracle/shuffle on the
 # held-out split + the sample-dependence table (r_cx/r_cy > 0.6).
+# miniB result: readout held (O 0.97, S-O 0.63, D-P 0.06), held-out real 70.5
+# vs off 68.5 (first positive real), but qk localisation stayed weak (r_cx
+# 0.1-0.2, in_box 3.8%). LR dropout blanks exactly what the qk relevance reads:
+# half the windowed samples had no LR content to match, yet were pulled.
+#
+# Routing by LR dropout (ROUTE_BY_DROP=1): an LR-dropped sample is
+# teacher-forced only (readout: HD must hold the answer), a full-LR sample is
+# supervised (+ forced with TF_FORCE_PROB). Use it whenever LR_DROP_PROB > 0
+# and OFF_SUP_WEIGHT > 0 are both on. wandb: dat/tf_sup_frac (~1 - lr_drop_prob
+# of windowed samples), dat/tf_forced_frac (~lr_drop_prob + (1-lr_drop_prob) *
+# TF_FORCE_PROB). If the 0920 no-drop control (LR_DROP_PROB=0) shows the readout
+# does not need dropout, skip both and run LR_DROP_PROB=0 instead.
+#
+# Full 0920 combined run (data = 0817 mix + viscot doc boxes + synth_hd text on
+# SA-1B natural images (+ optional Visual-CoT natural-image boxes), built by
+# scripts/compose_sft_mix.py):
+#   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_bbox0920.json TF_PROB=1 TF_FORCE_PROB=0.5 \
+#   OFF_SUP_WEIGHT=10 LR_DROP_PROB=0.5 ROUTE_BY_DROP=1 OFF_HEAD_TRUNK_GRAD=0 \
+#   GLOBAL_OFFSET=1 GLOB_REL=qk \
+#   EXP_NAME=0920_sft_qwen35_2b_dat_readers_bias_readout_qk bash <this script>
 #
 # Sanity: in the startup log check
 #   [token-scheme] ... im_start=248045 (Qwen3.5 250k vocab resolved)
@@ -265,6 +285,7 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_off_sup_weight "${OFF_SUP_WEIGHT:-0}" \
     --dat_off_sup_delta "${OFF_SUP_DELTA:-0.1}" \
     --dat_tf_force_prob "${TF_FORCE_PROB:--1}" \
+    --dat_route_by_lr_drop "$([ "${ROUTE_BY_DROP:-0}" = 1 ] && echo True || echo False)" \
     --dat_off_head_trunk_grad "${OFF_HEAD_TRUNK_GRAD:-1.0}" \
     --dat_use_global_offset "$([ "${GLOBAL_OFFSET:-0}" = 1 ] && echo True || echo False)" \
     --dat_glob_min_scale "${GLOB_MIN_SCALE:-0.1}" \
