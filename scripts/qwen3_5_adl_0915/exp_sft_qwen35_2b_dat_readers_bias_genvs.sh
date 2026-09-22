@@ -137,11 +137,32 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # TF_FORCE_PROB). If the 0920 no-drop control (LR_DROP_PROB=0) shows the readout
 # does not need dropout, skip both and run LR_DROP_PROB=0 instead.
 #
+# nodrop control result (LR_DROP_PROB=0, else = miniB-qk): readout weaker in
+# the deployment setting (D-P 0.059 -> 0.031, C-B 0.12 -> 0.007), precision
+# within noise, localisation unchanged (r_cx 0.16-0.28, in_box 0.035) -- so
+# dropout stays at 0.5 and the localisation problem is independent of it. Both
+# runs' wandb show glob_shift jump to 0.1 in 50 steps and glob_scale to 0.9 in
+# 30, then flat: the relevance map learns a constant prior and nothing else.
+# The pull reaches it only through the centroid/spread of its softmax.
+#
+# Dense relevance supervision (REL_SUP_WEIGHT, needs GLOBAL_OFFSET=1): per DAT
+# layer, CE between the softmax over the 20x20 cells and the uniform
+# distribution over the cells inside the target window; every cell gets a
+# gradient. Mini check (8 GPUs, ~45 min, same as miniB-qk + this):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 GRAD_ACCUM=1 \
+#   DATA_JSON=$OSS_DATA/extra_0916/viscot_bbox.train.json MODEL_PATH=<v2-merged> \
+#   TF_PROB=1 TF_FORCE_PROB=0.5 OFF_SUP_WEIGHT=10 REL_SUP_WEIGHT=1 LR_DROP_PROB=0.5 ROUTE_BY_DROP=1 \
+#   OFF_HEAD_TRUNK_GRAD=0 GLOBAL_OFFSET=1 GLOB_REL=qk FREEZE_BASE=True LORA_ENABLE=False \
+#   TUNE_MM_MLP=False MAX_STEPS=600 WARMUP_STEPS=20 SAVE_STEPS=300 EXP_NAME=0922_miniC_relsup bash <this script>
+# wandb: dat/rel_sup_mass must climb well above dat/rel_sup_base (uniform map),
+# dat/glob_scale must keep falling past 0.85 toward ~0.5, glob_shift past 0.15.
+# Pass on the probe: r_cx/r_cy > 0.5, in_box well off 0.035.
+#
 # Full 0920 combined run (data = 0817 mix + viscot doc boxes + synth_hd text on
 # SA-1B natural images (+ optional Visual-CoT natural-image boxes), built by
 # scripts/compose_sft_mix.py):
 #   DATA_JSON=$OSS_DATA/llava_hr_gen_vs_0817_bbox0920.json TF_PROB=1 TF_FORCE_PROB=0.5 \
-#   OFF_SUP_WEIGHT=10 LR_DROP_PROB=0.5 ROUTE_BY_DROP=1 OFF_HEAD_TRUNK_GRAD=0 \
+#   OFF_SUP_WEIGHT=10 REL_SUP_WEIGHT=1 LR_DROP_PROB=0.5 ROUTE_BY_DROP=1 OFF_HEAD_TRUNK_GRAD=0 \
 #   GLOBAL_OFFSET=1 GLOB_REL=qk \
 #   EXP_NAME=0920_sft_qwen35_2b_dat_readers_bias_readout_qk bash <this script>
 #
@@ -291,6 +312,7 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_glob_min_scale "${GLOB_MIN_SCALE:-0.1}" \
     --dat_glob_relevance "${GLOB_REL:-conv}" \
     --dat_glob_dim "${GLOB_DIM:-128}" \
+    --dat_rel_sup_weight "${REL_SUP_WEIGHT:-0}" \
     --dat_lr 1e-4 \
     --lora_enable "${LORA_ENABLE:-True}" \
     --lora_r 8 \

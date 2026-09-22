@@ -466,6 +466,14 @@ class ModelArguments:
         default=128,
         metadata={"help": "q/k projection width for dat_glob_relevance='qk'/'both'."}
     )
+    dat_rel_sup_weight: float = field(
+        default=0.0,
+        metadata={"help": "Dense supervision of the dat_use_global_offset relevance map on bbox "
+                          "samples: loss += w * CE(softmax(relevance), uniform over the cells "
+                          "inside the target window), per DAT layer. The offset pull reaches the "
+                          "map only via its centroid/spread (0920 miniB/nodrop: glob_shift and "
+                          "glob_scale froze at a prior within 50 steps). 0 = off; try 1.0."}
+    )
     dat_off_range: float = field(
         default=0.0,
         metadata={"help": "Bound sampling offsets to off_range*tanh(raw) before the "
@@ -2304,6 +2312,17 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             if not hasattr(self, '_glob_buf'):
                 self._glob_buf = []
             self._glob_buf.extend(map(tuple, torch.stack(pending).float().tolist()))
+        # (weighted CE, p-mass inside the window, window cell fraction) from dat_rel_sup_weight
+        pending = []
+        for module in model.modules():
+            rb = getattr(module, '_dat_rel_sup_buf', None)
+            if rb:
+                pending.extend(rb)
+                rb.clear()
+        if pending:
+            if not hasattr(self, '_rel_sup_buf'):
+                self._rel_sup_buf = []
+            self._rel_sup_buf.extend(map(tuple, torch.stack(pending).float().tolist()))
 
     def on_substep_end(self, args, state, control, model=None, **kwargs):
         self._flush_step(state)
@@ -2480,6 +2499,15 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             metrics["dat/glob_shift"] = sum(v[0] for v in self._glob_buf) / n
             metrics["dat/glob_scale"] = sum(v[1] for v in self._glob_buf) / n
             self._glob_buf.clear()
+        # Dense relevance supervision: rel_sup_mass = softmax mass the map puts
+        # inside the target window; rel_sup_base = the window's share of the
+        # cells (= mass of a uniform map). mass >> base is the map localising.
+        if getattr(self, '_rel_sup_buf', None):
+            n = len(self._rel_sup_buf)
+            metrics["dat/rel_sup_loss"] = sum(v[0] for v in self._rel_sup_buf) / n
+            metrics["dat/rel_sup_mass"] = sum(v[1] for v in self._rel_sup_buf) / n
+            metrics["dat/rel_sup_base"] = sum(v[2] for v in self._rel_sup_buf) / n
+            self._rel_sup_buf.clear()
 
         # 5. Gate value statistics (intention_as_gate sigmoid output)
         if self._gate_mean_buf:
@@ -3505,6 +3533,7 @@ def train():
             'glob_min_scale': model_args.dat_glob_min_scale,
             'glob_relevance': model_args.dat_glob_relevance,
             'glob_dim': model_args.dat_glob_dim,
+            'rel_sup_weight': model_args.dat_rel_sup_weight,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
             'inject_lr_image': model_args.dat_inject_lr_image,

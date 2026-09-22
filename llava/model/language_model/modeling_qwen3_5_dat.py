@@ -767,6 +767,16 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             #   'both': sum of the two.
             'glob_relevance': 'conv',
             'glob_dim': 128,              # q/k projection width for 'qk'
+            # Dense supervision of the relevance map (training-only, bbox
+            # samples, needs use_global_offset): cross-entropy between the
+            # softmax p over the gh*gw cells and the uniform distribution over
+            # the cells inside the target window. The offset pull reaches the
+            # map only through the centroid / spread of p -- two scalars per
+            # row -- so a near-uniform map gets ~1/400 of gradient per cell and
+            # a prior is all it learns (0920 miniB / nodrop: glob_shift froze
+            # at 0.1 after 50 steps, glob_scale at 0.85; probe r_cx 0.2).
+            # Injected as d CE / d logits = p - t on the supervised rows.
+            'rel_sup_weight': 0.0,
             # LR dropout (training-only regulariser): with prob lr_drop_prob per
             # sample, replace lr_drop_ratio of that sample's LR image-token
             # embeddings by the sample's mean LR embedding (content-free, scale
@@ -1181,6 +1191,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # trainer passes -1 for "unset" (dataclass floats cannot be None)
         self.tf_force_prob = None if _tfp is None or float(_tfp) < 0 else float(_tfp)
         self.route_by_lr_drop = bool(dat.get('route_by_lr_drop', False))
+        self.rel_sup_weight = float(dat.get('rel_sup_weight', 0.0))
         self._dat_off_target = None
         self._dat_off_target_batch = None
 
@@ -1467,6 +1478,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             )
         references = self._grid_generate(offsets.size(2), offsets.size(3), Lp, device)
 
+        rel_sup_active = False      # dense relevance supervision hooked this call
         if self.use_global_offset:
             # Global localisation: soft-argmax over a per-cell relevance map
             # translates the grid to the relevant region and its spread shrinks
@@ -1494,6 +1506,38 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             x = (c.unsqueeze(-1).unsqueeze(-1)
                  + s.unsqueeze(-1).unsqueeze(-1) * references + offsets)
             self._fn_chk("sample.glob", x)
+            # Dense relevance supervision: CE(p, uniform over the cells inside
+            # the target window), gradient p - t injected on the supervised
+            # rows. Trains every cell of the map, not just its centroid/spread.
+            if (self._dat_off_target is not None and self.rel_sup_weight > 0
+                    and self.training and logits.requires_grad):
+                rs0 = n_unsup_lead * self.off_grps
+                tgt = self._dat_off_target.to(device=logits.device, dtype=torch.float32)  # [Ns, 2]
+                lo, hi = tgt.min(dim=0).values, tgt.max(dim=0).values                    # window in [-1, 1]
+                gx, gy = g[0, 0], g[0, 1]                                                # [N] cell centres
+                gw_, gh_ = x.size(3), x.size(2)
+                hx = 1.0 / gw_                                                           # half cell spacing
+                hy = 1.0 / gh_
+                inside = ((gx >= lo[0] - hx) & (gx <= hi[0] + hx)
+                          & (gy >= lo[1] - hy) & (gy <= hi[1] + hy))
+                ps = p[rs0:, 0]                                                          # [Rs, N]
+                # the +-half-cell margin tiles [-1, 1], so any window inside the
+                # image covers >= 1 cell: no .any() sync needed
+                if ps.size(0) > 0:
+                    t = inside.float() / inside.sum().clamp_min(1.0)
+                    ce = -(t * torch.log(ps.clamp_min(1e-9))).sum(-1).mean()
+                    mass = (ps * inside.float()).sum(-1).mean()                          # p inside window
+                    rbuf = getattr(self, '_dat_rel_sup_buf', None)
+                    if rbuf is None:
+                        rbuf = self._dat_rel_sup_buf = []
+                    rbuf.append(torch.stack([self.rel_sup_weight * ce.detach(), mass.detach(),
+                                             inside.float().mean()]))
+                    if len(rbuf) > 512:
+                        del rbuf[:-512]
+                    rel_grad = torch.zeros_like(logits)
+                    rel_grad[rs0:] = (ps.detach() - t) * (self.rel_sup_weight / ps.size(0))
+                    logits.register_hook(lambda gg, rg=rel_grad: gg + rg)
+                    rel_sup_active = True
             # (mean |shift|, mean scale): no .item(). Training: appended to a
             # buffer the DATMonitor drains; always: kept as the last value so
             # probe_whd_qwen35.py can read it per layer at inference.
@@ -1556,7 +1600,14 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             # `pull` to x backward, so the supervision still reaches the head.
             fl = self._dat_force_locs.to(device=x.device, dtype=x.dtype)   # [Ns, 2] (x, y)
             forced = fl.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
-            x = (forced + _InjectGradFn.apply(x, pull)) if pull is not None else forced
+            if pull is not None:
+                x = forced + _InjectGradFn.apply(x, pull)
+            elif rel_sup_active:
+                # no pull, but the relevance-map hook sits upstream of x: keep x
+                # in the graph with a zero gradient so backward reaches it
+                x = forced + _InjectGradFn.apply(x, torch.zeros_like(x))
+            else:
+                x = forced
         elif pull is not None:
             gbuf = getattr(self, '_dat_off_sup_grad_buf', None)
             if gbuf is None:
@@ -2937,8 +2988,11 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             if _m0.route_by_lr_drop and self._lr_drop_mask is not None:
                 # one [B] host sync per forward, only on this path
                 _dropped = self._lr_drop_mask.any(dim=1).tolist()
+            # a window is a supervision target for the offset pull and/or the
+            # dense relevance-map CE
+            _supervise = _m0.off_sup_weight > 0 or (_m0.use_global_offset and _m0.rel_sup_weight > 0)
             _force_batch, _target_batch, _n_forced, _n_sup = _route_windows(
-                _win_locs, _m0.off_sup_weight > 0, _m0.tf_force_prob, _dropped)
+                _win_locs, _supervise, _m0.tf_force_prob, _dropped)
         for _m in self._dat_attn_modules:
             _m._dat_force_batch = _force_batch
             _m._dat_off_target_batch = _target_batch
