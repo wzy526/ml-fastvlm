@@ -379,6 +379,43 @@ def install_merge_hook():
 
     Qwen3_5AttentionDAT._merge_two_pass_lse = patched
 
+    # The trunk's OWN attention as a relevance map (diagnostic 2): at each DAT
+    # layer, the intention token's attention over the LR image tokens (post-
+    # RoPE q/k of the base path, all heads averaged, softmax restricted to the
+    # LR tokens), pooled to the offset grid. Parameter-free reference for what
+    # the learned glob_q/glob_k relevance could at best read off these features.
+    import llava.model.language_model.modeling_qwen3_5_dat as _mod
+    orig_rope = _mod.apply_rotary_pos_emb
+
+    def patched_rope(q, k, cos, sin, *a, **kw):
+        q, k = orig_rope(q, k, cos, sin, *a, **kw)
+        if STATE["record"]:
+            STATE["last_qk"] = (q, k)
+        return q, k
+
+    _mod.apply_rotary_pos_emb = patched_rope
+    orig_gen = Qwen3_5AttentionDAT._generate_offsets_and_sample
+
+    def patched_gen(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idxs, *a, **kw):
+        self._probe_attn_map = None
+        qk = STATE.get("last_qk") if STATE["record"] else None
+        if qk is not None and len(image_range_list[b_idx]) > 1 and self.glob_q is not None:
+            with torch.no_grad():
+                q, k = qk
+                lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0][0]
+                idx = [ar[2] for ar in image_range_list[b_idx][1:]]
+                qi = q[b_idx, :, idx].float()                              # [H, L, D]
+                kl = k[b_idx, :, lr_start:lr_end].float()                  # [Hk, N, D]
+                kl = kl.repeat_interleave(qi.size(0) // kl.size(0), dim=0)  # [H, N, D]
+                att = torch.einsum('hld,hnd->hln', qi, kl) / math.sqrt(qi.size(-1))
+                att = att.softmax(-1).mean((0, 1))                          # [N] over LR tokens
+                gs = self.grid_size
+                att = F.adaptive_avg_pool2d(att.view(1, 1, lr_h, lr_w), (gs, gs)).flatten()
+                self._probe_attn_map = att / att.sum().clamp_min(1e-9)      # [gs*gs], sums to 1
+        return orig_gen(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idxs, *a, **kw)
+
+    Qwen3_5AttentionDAT._generate_offsets_and_sample = patched_gen
+
     # K_hd "sink-ness": how much of every HD key is a direction shared by all
     # Ns tokens (content-free, attracts the same logit for every query) versus
     # token-specific residual. ratio >> 1 means the HD keys are near-identical
@@ -459,8 +496,10 @@ def install_merge_hook():
                              (gc[1] >= lo[1] - hy) & (gc[1] <= hi[1] + hy))
                         mb = ((gc[0] >= box[0]) & (gc[0] <= box[2]) &
                               (gc[1] >= box[1]) & (gc[1] <= box[3]))
+                        am = getattr(self, "_probe_attn_map", None)
                         GLOBP[self.layer_idx].append((pm.mean(0).cpu().numpy(),
-                                                      m.cpu().numpy(), mb.cpu().numpy()))
+                                                      m.cpu().numpy(), mb.cpu().numpy(), (gh, gw),
+                                                      None if am is None else am.cpu().numpy()))
         return key_hd, value_hd, locs
 
     Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
@@ -779,6 +818,64 @@ def main():
             })
             print(f"{lid:>6} | {mass:>6.3f} {mass_prior:>6.3f} {base:>6.3f} | "
                   f"{argmax_in:>6.3f} {argmax_prior:>6.3f} {argmax_box:>6.3f} | {peak:>6.2f} | {n_:>4}")
+
+        # Diagnostic 2: the trunk's own intention->LR attention as the map, same
+        # columns. attn >> prior  -> the features carry the match, the learned
+        # qk head just did not pick it up (init glob_q/glob_k from q_proj/k_proj
+        # or use the attention directly); attn ~ prior -> the intention token
+        # does not know where the answer is at this layer, single-token qk is
+        # the wrong source.
+        # Coordinate check: the same window mass with the map mirrored in x, in
+        # y, or transposed. Any of these beating the identity by a clear margin
+        # means the map's cell order and the target's (x, y) disagree.
+        def _var(maps, hw, how):
+            gh_, gw_ = hw
+            m = maps.reshape(-1, gh_, gw_)
+            if how == "flipx":
+                m = m[:, :, ::-1]
+            elif how == "flipy":
+                m = m[:, ::-1, :]
+            elif how == "T":
+                m = m.transpose(0, 2, 1) if gh_ == gw_ else m
+            return m.reshape(maps.shape[0], -1)
+
+        print(f"\n==== trunk attention (intention -> LR cells) as relevance map;  coord check on the qk map ====")
+        print(f"{'layer':>6} | {'a.mass':>6} {'prior':>6} {'base':>6} | {'a.amax':>6} {'prior':>6} {'box':>6} | "
+              f"{'a.peak':>6} | {'qk:id':>6} {'flipx':>6} {'flipy':>6} {'T':>6} | {'att:id':>6} {'flipx':>6} {'flipy':>6} {'T':>6}")
+        print("-" * 128)
+        for lid in sorted(GLOBP):
+            rows = GLOBP[lid]
+            maps = np.stack([v[0] for v in rows]).astype(np.float64)
+            win = np.stack([v[1] for v in rows]).astype(np.float64)
+            bx = np.stack([v[2] for v in rows]).astype(np.float64)
+            hw = rows[0][3]
+            n_, N = maps.shape
+            qk_var = {h: float((_var(maps, hw, h) * win).sum(1).mean()) for h in ("id", "flipx", "flipy", "T")}
+            att_rows = [v[4] for v in rows if v[4] is not None]
+            if len(att_rows) == n_:
+                att = np.stack(att_rows).astype(np.float64)
+                prior = att.mean(0, keepdims=True)
+                a_mass = float((att * win).sum(1).mean())
+                a_prior = float((prior * win).sum(1).mean())
+                am = att.argmax(1)
+                a_amax = float(win[np.arange(n_), am].mean())
+                a_amax_prior = float(win[:, int(prior.argmax())].mean())
+                a_box = float(bx[np.arange(n_), am].mean())
+                a_peak = float((att.max(1) * N).mean())
+                att_var = {h: float((_var(att, hw, h) * win).sum(1).mean()) for h in ("id", "flipx", "flipy", "T")}
+                layer_glob.setdefault(lid, {}).update({
+                    "attn_mass": a_mass, "attn_mass_prior": a_prior, "attn_argmax_in": a_amax,
+                    "attn_argmax_prior": a_amax_prior, "attn_argmax_box": a_box, "attn_peak": a_peak,
+                    "attn_mass_flip": att_var, "map_mass_flip": qk_var,
+                })
+                print(f"{lid:>6} | {a_mass:>6.3f} {a_prior:>6.3f} {float(win.mean()):>6.3f} | "
+                      f"{a_amax:>6.3f} {a_amax_prior:>6.3f} {a_box:>6.3f} | {a_peak:>6.2f} | "
+                      f"{qk_var['id']:>6.3f} {qk_var['flipx']:>6.3f} {qk_var['flipy']:>6.3f} {qk_var['T']:>6.3f} | "
+                      f"{att_var['id']:>6.3f} {att_var['flipx']:>6.3f} {att_var['flipy']:>6.3f} {att_var['T']:>6.3f}")
+            else:
+                layer_glob.setdefault(lid, {}).update({"map_mass_flip": qk_var})
+                print(f"{lid:>6} | {'(no attention map recorded)':<42} | "
+                      f"{qk_var['id']:>6.3f} {qk_var['flipx']:>6.3f} {qk_var['flipy']:>6.3f} {qk_var['T']:>6.3f} |")
 
     if args.out:
         json.dump({
