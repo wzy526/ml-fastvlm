@@ -442,6 +442,25 @@ def install_merge_hook():
                         ts = t2.std(0, unbiased=False) / r2.std(0, unbiased=False)
                         GLOBC[self.layer_idx].append(
                             c.mean(0).tolist() + s.mean(0).tolist() + tc.tolist() + ts.tolist())
+                    # The relevance MAP itself (before the soft-argmax): per
+                    # sample, the question-slot rows' mean map over the N cells
+                    # and the mask of cells inside the GT window (training's
+                    # supervision region, +-half a cell like the trainer).
+                    pg = getattr(self, "_dat_glob_last_p", None)
+                    if pg is not None:
+                        pm, gc = pg                               # [R, N], [2, N]
+                        G = self.off_grps
+                        if pm.size(0) > G:
+                            pm = pm[G:]
+                        t2 = tgt.reshape(-1, 2)
+                        lo, hi = t2.min(0).values, t2.max(0).values
+                        hx, hy = 1.0 / gw, 1.0 / gh
+                        m = ((gc[0] >= lo[0] - hx) & (gc[0] <= hi[0] + hx) &
+                             (gc[1] >= lo[1] - hy) & (gc[1] <= hi[1] + hy))
+                        mb = ((gc[0] >= box[0]) & (gc[0] <= box[2]) &
+                              (gc[1] >= box[1]) & (gc[1] <= box[3]))
+                        GLOBP[self.layer_idx].append((pm.mean(0).cpu().numpy(),
+                                                      m.cpu().numpy(), mb.cpu().numpy()))
         return key_hd, value_hd, locs
 
     Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
@@ -452,6 +471,7 @@ KLR = defaultdict(list)          # layer_idx -> [shared/resid ratio of the LR im
 LOC = defaultdict(list)          # layer_idx -> [(dist, dist_uniform, in_box, in_box_uniform), ...]
 GLOB = defaultdict(list)         # layer_idx -> [(mean |centroid|, mean scale), ...]  (global offset term)
 GLOBC = defaultdict(list)        # layer_idx -> [(cx, cy, sx, sy, tcx, tcy, tsx, tsy), ...] per sample
+GLOBP = defaultdict(list)        # layer_idx -> [(relevance map [N], in-window mask [N], in-box mask [N]), ...]
 
 
 def install_lr_key_hook(model):
@@ -718,6 +738,47 @@ def main():
             g = layer_glob[lid]
             print(f"{lid:>6} | {g['r_cx']:>6.3f} {g['r_cy']:>6.3f} | {g['r_sx']:>6.3f} {g['r_sy']:>6.3f} | "
                   f"{d_pred:>6.3f} {d_const:>6.3f} | {std_c:>6.3f} | {g['scale_mean']:>6.3f} {g['scale_gt']:>6.3f}")
+
+    if GLOBP:
+        # The relevance map before the soft-argmax collapses it to centroid /
+        # spread. Separates "the map never learned content matching" from "the
+        # map is on target but the centroid aggregation loses it":
+        #   mass    = softmax mass inside the GT window (pred) vs the same for
+        #             the PRIOR map (mean map over all samples, question-blind)
+        #             vs a uniform map (base = window's share of the cells)
+        #   argmax  = fraction of samples whose peak cell is inside the window
+        #             (pred / prior / chance = base); box = inside the raw GT box
+        #   peak    = max p * N (1 = flat map)
+        # pred ~ prior ~ base, peak ~ 1  -> flat map + prior, W_q/W_k learned nothing:
+        #                                    the map needs its own dense signal
+        # pred ~ prior >> base           -> a peaky but constant map (prior)
+        # pred >> prior, but r_c low     -> map localises, soft-argmax aggregation
+        #                                    loses it (multi-modal): change the aggregation
+        print(f"\n==== relevance map vs GT window  (pred / prior=mean map / base=uniform) ====")
+        print(f"{'layer':>6} | {'mass':>6} {'prior':>6} {'base':>6} | {'argmax':>6} {'prior':>6} {'box':>6} | "
+              f"{'peak':>6} | {'n':>4}")
+        print("-" * 78)
+        for lid in sorted(GLOBP):
+            maps = np.stack([v[0] for v in GLOBP[lid]]).astype(np.float64)   # [n, N]
+            win = np.stack([v[1] for v in GLOBP[lid]]).astype(np.float64)    # [n, N]
+            bx = np.stack([v[2] for v in GLOBP[lid]]).astype(np.float64)
+            prior = maps.mean(0, keepdims=True)                             # [1, N]
+            n_, N = maps.shape
+            mass = float((maps * win).sum(1).mean())
+            mass_prior = float((prior * win).sum(1).mean())
+            base = float(win.mean())
+            am = maps.argmax(1)
+            argmax_in = float(win[np.arange(n_), am].mean())
+            argmax_prior = float(win[:, int(prior.argmax())].mean())
+            argmax_box = float(bx[np.arange(n_), am].mean())
+            peak = float((maps.max(1) * N).mean())
+            layer_glob.setdefault(lid, {}).update({
+                "map_mass": mass, "map_mass_prior": mass_prior, "map_mass_base": base,
+                "map_argmax_in": argmax_in, "map_argmax_prior": argmax_prior, "map_argmax_box": argmax_box,
+                "map_peak": peak,
+            })
+            print(f"{lid:>6} | {mass:>6.3f} {mass_prior:>6.3f} {base:>6.3f} | "
+                  f"{argmax_in:>6.3f} {argmax_prior:>6.3f} {argmax_box:>6.3f} | {peak:>6.2f} | {n_:>4}")
 
     if args.out:
         json.dump({

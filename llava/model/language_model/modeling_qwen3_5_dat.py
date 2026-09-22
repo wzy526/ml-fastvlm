@@ -1544,6 +1544,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             gstat = torch.stack([c.detach().norm(dim=1).mean(), s.detach().mean()])
             self._dat_glob_last = gstat
             self._dat_glob_last_cs = (c.detach(), s.detach())   # [R, 2] each, for the probe
+            # the relevance map itself + cell coordinates, for the probe's
+            # map-level diagnostics (argmax / mass inside the GT window)
+            self._dat_glob_last_p = (p.detach()[:, 0], g.detach()[0])   # [R, N], [2, N]
             if self.training:
                 gb = getattr(self, '_dat_glob_buf', None)
                 if gb is None:
