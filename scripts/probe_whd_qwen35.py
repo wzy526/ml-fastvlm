@@ -603,6 +603,12 @@ def main():
     ap.add_argument("--max_samples", type=int, default=200)
     ap.add_argument("--max_new_tokens", type=int, default=8)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--dump_maps", default=None,
+                    help="directory: write <layer>.png contact sheets (first --dump_n samples) with the "
+                         "learned qk map, the de-sinked trunk attention (query = prompt end) and the "
+                         "de-sinked attention from <|im_start|>, each over the image with GT box / window")
+    ap.add_argument("--dump_n", type=int, default=12)
+    ap.add_argument("--dump_layers", default="7,11,15,19")
     args = ap.parse_args()
 
     from transformers import AutoProcessor
@@ -925,6 +931,8 @@ def main():
 
         def _desink(m):                                    # m: [n, N] rows sum to 1
             prior = m.mean(0)
+            if m.shape[0] < 50:                            # too few samples: a single sharp
+                return m, 0                                # peak would look like a sink
             keep = (prior <= sink_x / m.shape[1]).astype(np.float64)
             m = m * keep
             return m / np.clip(m.sum(1, keepdims=True), 1e-9, None), int((keep == 0).sum())
@@ -984,6 +992,83 @@ def main():
             _print_head_table(f"trunk attention per head, query = {desc} [{kname}]",
                               lambda v, kn=kname: (v[6] or {}).get(kn) if len(v) > 6 else None,
                               f"attn_heads_{kname}")
+
+        if args.dump_maps:
+            # Visual check: per layer one contact sheet, one row per sample,
+            # three panels: learned qk map | de-sinked trunk attention with the
+            # query at the prompt end (asst_nl) | de-sinked attention from
+            # <|im_start|> (the current intention token). Green = GT box,
+            # yellow = supervision window. Heat = p / max(p) of that panel.
+            from PIL import ImageDraw
+            os.makedirs(args.dump_maps, exist_ok=True)
+            PW = 300
+            want = [int(x) for x in args.dump_layers.split(",") if x.strip()]
+
+            def _heat(img, pmap, hw, win, box_px, label):
+                gh_, gw_ = hw
+                W, H = img.size
+                sc = PW / W
+                base_img = img.resize((PW, int(H * sc))).convert("RGB")
+                heat = np.asarray(pmap, dtype=np.float64).reshape(gh_, gw_) * (gh_ * gw_) - 1.0
+                heat = np.clip(heat / max(float(heat.max()), 1e-9), 0.0, 1.0)   # 0 = uniform level
+                hm = Image.fromarray((heat * 255).astype(np.uint8)).resize(base_img.size, Image.BILINEAR)
+                red = Image.new("RGB", base_img.size, (255, 40, 0))
+                out = Image.composite(red, base_img, hm.point(lambda v: int(v * 0.75)))
+                d = ImageDraw.Draw(out)
+                # window cells
+                wm = np.asarray(win, dtype=bool).reshape(gh_, gw_)
+                ys, xs = np.where(wm)
+                if len(xs):
+                    d.rectangle([xs.min() / gw_ * out.width, ys.min() / gh_ * out.height,
+                                 (xs.max() + 1) / gw_ * out.width, (ys.max() + 1) / gh_ * out.height],
+                                outline=(255, 230, 0), width=2)
+                x, y, w, h = box_px
+                d.rectangle([x * sc, y * sc, (x + w) * sc, (y + h) * sc], outline=(0, 255, 0), width=2)
+                d.text((4, 2), label, fill=(255, 255, 255))
+                return out
+
+            for lid in want:
+                rows = GLOBP.get(lid)
+                if not rows or len(rows) != len(samples):
+                    print(f"[probe] dump_maps: layer {lid} has {0 if not rows else len(rows)} entries "
+                          f"for {len(samples)} samples, skipped")
+                    continue
+                hw = rows[0][3]
+                qk_all = np.stack([v[0] for v in rows]).astype(np.float64)
+                att_end = [((v[6] or {}).get("asst_nl") if len(v) > 6 else None) for v in rows]
+                att_im = [v[5] for v in rows]
+                if any(a is None for a in att_end) or any(a is None for a in att_im):
+                    print(f"[probe] dump_maps: layer {lid} lacks attention maps, skipped")
+                    continue
+                end_ds, _ = _desink(np.stack([a.mean(0) for a in att_end]).astype(np.float64))
+                im_ds, _ = _desink(np.stack([a.mean(0) for a in att_im]).astype(np.float64))
+                panels = []
+                for i in range(min(args.dump_n, len(rows))):
+                    s = samples[i]
+                    bx = s["bboxes"][0]
+                    win = rows[i][1]
+                    m_qk = float((qk_all[i] * win).sum())
+                    m_end = float((end_ds[i] * win).sum())
+                    m_im = float((im_ds[i] * win).sum())
+                    row = [
+                        _heat(s["image"], qk_all[i], hw, win, bx, f"qk  mass={m_qk:.2f}"),
+                        _heat(s["image"], end_ds[i], hw, win, bx, f"attn@prompt-end  mass={m_end:.2f}"),
+                        _heat(s["image"], im_ds[i], hw, win, bx, f"attn@<|im_start|>  mass={m_im:.2f}"),
+                    ]
+                    rh = max(p.height for p in row) + 14
+                    strip = Image.new("RGB", (PW * 3 + 8, rh), (20, 20, 20))
+                    for j, p in enumerate(row):
+                        strip.paste(p, (j * (PW + 4), 14))
+                    ImageDraw.Draw(strip).text((4, 1), f"[{i}] {s['prompt'][:120]}", fill=(200, 200, 200))
+                    panels.append(strip)
+                sheet = Image.new("RGB", (panels[0].width, sum(p.height for p in panels)), (20, 20, 20))
+                yy = 0
+                for p in panels:
+                    sheet.paste(p, (0, yy))
+                    yy += p.height
+                fn = os.path.join(args.dump_maps, f"layer{lid}.png")
+                sheet.save(fn)
+                print(f"[probe] dump_maps: wrote {fn}  ({len(panels)} samples)")
 
     if args.out:
         json.dump({
