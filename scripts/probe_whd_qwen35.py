@@ -399,22 +399,43 @@ def install_merge_hook():
     def patched_gen(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idxs, *a, **kw):
         self._probe_attn_map = None
         self._probe_attn_heads = None
+        self._probe_attn_alt = None
         qk = STATE.get("last_qk") if STATE["record"] else None
         if qk is not None and len(image_range_list[b_idx]) > 1 and self.glob_q is not None:
             with torch.no_grad():
                 q, k = qk
                 lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0][0]
                 idx = [ar[2] for ar in image_range_list[b_idx][1:]]
-                qi = q[b_idx, :, idx].float()                              # [H, L, D]
                 kl = k[b_idx, :, lr_start:lr_end].float()                  # [Hk, N, D]
-                kl = kl.repeat_interleave(qi.size(0) // kl.size(0), dim=0)  # [H, N, D]
-                att = torch.einsum('hld,hnd->hln', qi, kl) / math.sqrt(qi.size(-1))
-                att = att.softmax(-1).mean(1)                               # [H, N] over LR tokens
+                kl = kl.repeat_interleave(q.size(1) // kl.size(0), dim=0)   # [H, N, D]
                 gs = self.grid_size
-                heads = F.adaptive_avg_pool2d(att.view(-1, 1, lr_h, lr_w), (gs, gs)).flatten(1)
-                heads = heads / heads.sum(-1, keepdim=True).clamp_min(1e-9)  # [H, gs*gs], each sums to 1
+                T = q.size(2)
+
+                def heads_for(pos):
+                    pos = [p for p in pos if 0 <= p < T]
+                    if not pos:
+                        return None
+                    qi = q[b_idx, :, pos].float()                          # [H, L, D]
+                    att = torch.einsum('hld,hnd->hln', qi, kl) / math.sqrt(qi.size(-1))
+                    att = att.softmax(-1).mean(1)                           # [H, N] over LR tokens
+                    hh = F.adaptive_avg_pool2d(att.view(-1, 1, lr_h, lr_w), (gs, gs)).flatten(1)
+                    return hh / hh.sum(-1, keepdim=True).clamp_min(1e-9)    # [H, gs*gs], rows sum to 1
+
+                heads = heads_for(idx)
                 self._probe_attn_heads = heads
                 self._probe_attn_map = heads.mean(0)                        # head-averaged, sums to 1
+                # Diagnostic 4: which token should ask? Same maps with the query
+                # taken at other positions around the assistant <|im_start|> (t):
+                # the prompt ends "...question<|im_end|>\n<|im_start|>assistant\n",
+                # so t-3 = last question token, t-2 = <|im_end|>, t-1 = \n,
+                # t+1 = 'assistant', t+2 = its \n; q_mean = every question token.
+                t = idx[-1]
+                ar = image_range_list[b_idx][-1]
+                q_start = ar[3] if len(ar) > 3 else lr_end
+                alt = {"q_last": [t - 3], "im_end": [t - 2], "nl": [t - 1],
+                       "asst": [t + 1], "asst_nl": [t + 2],
+                       "q_mean": list(range(max(q_start, lr_end), max(q_start, lr_end, t - 2)))}
+                self._probe_attn_alt = {kname: heads_for(p) for kname, p in alt.items()}
         return orig_gen(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idxs, *a, **kw)
 
     Qwen3_5AttentionDAT._generate_offsets_and_sample = patched_gen
@@ -501,10 +522,14 @@ def install_merge_hook():
                               (gc[1] >= box[1]) & (gc[1] <= box[3]))
                         am = getattr(self, "_probe_attn_map", None)
                         ah = getattr(self, "_probe_attn_heads", None)
+                        alt = getattr(self, "_probe_attn_alt", None)
                         GLOBP[self.layer_idx].append((pm.mean(0).cpu().numpy(),
                                                       m.cpu().numpy(), mb.cpu().numpy(), (gh, gw),
                                                       None if am is None else am.cpu().numpy(),
-                                                      None if ah is None else ah.cpu().numpy()))
+                                                      None if ah is None else ah.cpu().numpy(),
+                                                      None if alt is None else
+                                                      {kk: (None if vv is None else vv.cpu().numpy())
+                                                       for kk, vv in alt.items()}))
         return key_hd, value_hd, locs
 
     Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
@@ -904,22 +929,11 @@ def main():
             m = m * keep
             return m / np.clip(m.sum(1, keepdims=True), 1e-9, None), int((keep == 0).sum())
 
-        print(f"\n==== trunk attention per head  (de-sinked: cells with mean > {sink_x:g}x uniform removed) ====")
-        print(f"{'layer':>6} | {'sinks':>5} | {'mean':>6} {'base':>6} | {'best':>4} {'mass':>6} {'prior':>6} "
-              f"{'amax':>6} {'box':>6} | {'n>base':>6}/{'H':<3}")
-        print("-" * 92)
-        for lid in sorted(GLOBP):
-            rows = GLOBP[lid]
-            heads_rows = [v[5] for v in rows if len(v) > 5 and v[5] is not None]
-            if len(heads_rows) != len(rows):
-                continue
-            heads = np.stack(heads_rows).astype(np.float64)              # [n, H, N]
-            win = np.stack([v[1] for v in rows]).astype(np.float64)
-            bx = np.stack([v[2] for v in rows]).astype(np.float64)
+        def _head_stats(heads, win, bx):
+            """heads [n, H, N] (rows sum to 1) -> de-sinked per-head window stats."""
             n_, H, N = heads.shape
             base = float(win.mean())
-            per_head = []
-            n_sinks = 0
+            per_head, n_sinks = [], 0
             for h in range(H):
                 m, ns = _desink(heads[:, h])
                 n_sinks = max(n_sinks, ns)
@@ -932,16 +946,44 @@ def main():
                     "box": float(bx[np.arange(n_), am].mean()),
                 })
             mean_ds, _ = _desink(heads.mean(1))
-            mean_mass = float((mean_ds * win).sum(1).mean())
             b = int(np.argmax([d["mass"] for d in per_head]))
-            n_good = sum(d["mass"] >= base + 0.05 for d in per_head)
-            layer_glob.setdefault(lid, {}).update({
-                "attn_desink_mean_mass": mean_mass, "attn_best_head": b, "attn_best": per_head[b],
-                "attn_heads_above_base": n_good, "attn_per_head_mass": [d["mass"] for d in per_head],
-            })
-            print(f"{lid:>6} | {n_sinks:>5} | {mean_mass:>6.3f} {base:>6.3f} | {b:>4} {per_head[b]['mass']:>6.3f} "
-                  f"{per_head[b]['prior']:>6.3f} {per_head[b]['amax']:>6.3f} {per_head[b]['box']:>6.3f} | "
-                  f"{n_good:>6}/{H:<3}")
+            return {
+                "sinks": n_sinks, "mean_mass": float((mean_ds * win).sum(1).mean()), "base": base,
+                "best_head": b, "best": per_head[b],
+                "n_above_base": sum(d["mass"] >= base + 0.05 for d in per_head),
+                "per_head_mass": [d["mass"] for d in per_head], "H": H,
+            }
+
+        def _print_head_table(title, get_heads, key):
+            print(f"\n==== {title}  (de-sinked: cells with mean > {sink_x:g}x uniform removed) ====")
+            print(f"{'layer':>6} | {'sinks':>5} | {'mean':>6} {'base':>6} | {'best':>4} {'mass':>6} {'prior':>6} "
+                  f"{'amax':>6} {'box':>6} | {'n>base':>6}/{'H':<3}")
+            print("-" * 92)
+            for lid in sorted(GLOBP):
+                rows = GLOBP[lid]
+                hr = [get_heads(v) for v in rows]
+                if any(h is None for h in hr) or not hr:
+                    continue
+                st = _head_stats(np.stack(hr).astype(np.float64),
+                                 np.stack([v[1] for v in rows]).astype(np.float64),
+                                 np.stack([v[2] for v in rows]).astype(np.float64))
+                layer_glob.setdefault(lid, {})[key] = st
+                bb = st["best"]
+                print(f"{lid:>6} | {st['sinks']:>5} | {st['mean_mass']:>6.3f} {st['base']:>6.3f} | {st['best_head']:>4} "
+                      f"{bb['mass']:>6.3f} {bb['prior']:>6.3f} {bb['amax']:>6.3f} {bb['box']:>6.3f} | "
+                      f"{st['n_above_base']:>6}/{st['H']:<3}")
+
+        _print_head_table("trunk attention per head, query = intention token <|im_start|>",
+                          lambda v: v[5] if len(v) > 5 else None, "attn_heads")
+        # Diagnostic 4: the same table with the query taken at other prompt
+        # positions. If one of them localises where <|im_start|> does not, the
+        # qk head asks the wrong token, not a trunk without the information.
+        for kname, desc in (("q_last", "last question token"), ("im_end", "<|im_end|>"),
+                            ("nl", "\\n after <|im_end|>"), ("asst", "'assistant'"),
+                            ("asst_nl", "\\n after 'assistant'"), ("q_mean", "mean over question tokens")):
+            _print_head_table(f"trunk attention per head, query = {desc} [{kname}]",
+                              lambda v, kn=kname: (v[6] or {}).get(kn) if len(v) > 6 else None,
+                              f"attn_heads_{kname}")
 
     if args.out:
         json.dump({
