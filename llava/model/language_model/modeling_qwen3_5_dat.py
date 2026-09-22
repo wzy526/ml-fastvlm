@@ -1603,12 +1603,18 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             # `pull` to x backward, so the supervision still reaches the head.
             fl = self._dat_force_locs.to(device=x.device, dtype=x.dtype)   # [Ns, 2] (x, y)
             forced = fl.t().reshape(1, 2, x.size(2), x.size(3)).expand_as(x)
-            if pull is not None:
-                x = forced + _InjectGradFn.apply(x, pull)
-            elif rel_sup_active:
-                # no pull, but the relevance-map hook sits upstream of x: keep x
-                # in the graph with a zero gradient so backward reaches it
-                x = forced + _InjectGradFn.apply(x, torch.zeros_like(x))
+            if x.requires_grad:
+                # ALWAYS keep the learned x in the graph, with the pull or an
+                # exact-zero gradient. Not only for the relevance hook upstream
+                # of x: a forced sample with no supervision (route_by_lr_drop
+                # on a dropped sample) would otherwise leave conv_off_proj /
+                # ln_2 / the relevance head without ANY grad, and a rank whose
+                # whole micro-batch is dropped then has a different set of
+                # grad-bearing params than the others -> ZeRO's gradient
+                # buckets differ in size and the ALLREDUCE hangs (0922 mini-C,
+                # died at step 4 with a NCCL watchdog timeout on one rank).
+                # A zero grad keeps the param set identical on every rank.
+                x = forced + _InjectGradFn.apply(x, pull if pull is not None else torch.zeros_like(x))
             else:
                 x = forced
         elif pull is not None:
