@@ -401,7 +401,7 @@ def install_merge_hook():
         self._probe_attn_heads = None
         self._probe_attn_alt = None
         qk = STATE.get("last_qk") if STATE["record"] else None
-        if qk is not None and len(image_range_list[b_idx]) > 1 and self.glob_q is not None:
+        if qk is not None and len(image_range_list[b_idx]) > 1 and getattr(self, "use_global_offset", False):
             with torch.no_grad():
                 q, k = qk
                 lr_start, lr_end, lr_h, lr_w = image_range_list[b_idx][0][0]

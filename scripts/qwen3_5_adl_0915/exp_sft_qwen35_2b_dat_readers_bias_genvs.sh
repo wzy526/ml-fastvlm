@@ -157,6 +157,35 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # wandb: dat/rel_sup_mass must climb well above dat/rel_sup_base (uniform map),
 # dat/glob_scale must keep falling past 0.85 toward ~0.5, glob_shift past 0.15.
 # Pass on the probe: r_cx/r_cy > 0.5, in_box well off 0.035.
+# miniC result: the map took the SHAPE of the target (peak 40x -> 5x = a
+# window-sized plateau) but not its place: window mass 0.33 of which 0.28 is
+# a constant prior; r_cx 0.2, in_box 0.031, real 69.0 ~ shuffle 69.5.
+#
+# Diagnosis (0922 probe, per-head trunk attention on the held-out split):
+# the intention token is the assistant <|im_start|> -- a FORMAT token; its
+# attention over the LR cells has no question information (window mass
+# 0.18-0.24 < 0.236 uniform, 0/8 heads). The token right before the answer
+# ('\n' after 'assistant' = last prompt token) DOES: de-sinked 8-head mean
+# mass 0.43-0.60 at layers 7-23, 8/8 heads above uniform, peak on the answer
+# text (contact sheets: probe --dump_maps). Both 'qk' and 'xattn' rebuilt a
+# text->cell matcher from scratch on top of a token that knows nothing, while
+# the trunk's own q_proj/k_proj already had it. Fix = ask the right token and
+# reuse the trunk's attention:
+#   GLOB_QPOS=ans_prev   query token = the token before the answer
+#   GLOB_REL=attn        map = the layer's own attention (heads averaged),
+#                        sink cells masked (running mean > GLOB_SINK_X/N),
+#                        tau*log p + per-cell bias (tau 1, bias 0 at init)
+# Mini D (verification, two arms, 4 GPUs each ~90 min or 8 GPUs ~45 min each):
+#   B (main):    ... GLOBAL_OFFSET=1 GLOB_REL=attn GLOB_QPOS=ans_prev REL_SUP_WEIGHT=1 \
+#                ROUTE_BY_DROP=1 EXP_NAME=0922_miniD_attn bash <this script>
+#   A (control): ... GLOBAL_OFFSET=1 GLOB_REL=qk   GLOB_QPOS=ans_prev REL_SUP_WEIGHT=1 \
+#                ROUTE_BY_DROP=1 EXP_NAME=0922_miniD_qk_ansprev bash <this script>
+#   (rest = miniC line above). wandb: dat/rel_sup_mass should START near 0.45
+#   for B (the de-sinked attention) and climb; dat/glob_sink_cells 5-20;
+#   dat/glob_tau; glob_shift > 0.2, glob_scale < 0.7.
+# Pass (held-out probe, decided before running): map mass >= 0.55, argmax
+# >= 0.7, box >= 0.15; r_cx/r_cy >= 0.5; in_box >= 0.08 (miniB 0.038);
+# oracle gain >= +4 and real clearly above shuffle. Only then the full run.
 #
 # Full 0920 combined run (data = 0817 mix + viscot doc boxes + synth_hd text on
 # SA-1B natural images (+ optional Visual-CoT natural-image boxes), built by
@@ -312,6 +341,8 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_glob_min_scale "${GLOB_MIN_SCALE:-0.1}" \
     --dat_glob_relevance "${GLOB_REL:-conv}" \
     --dat_glob_dim "${GLOB_DIM:-128}" \
+    --dat_glob_query_pos "${GLOB_QPOS:-im_start}" \
+    --dat_glob_sink_x "${GLOB_SINK_X:-5}" \
     --dat_rel_sup_weight "${REL_SUP_WEIGHT:-0}" \
     --dat_lr 1e-4 \
     --lora_enable "${LORA_ENABLE:-True}" \

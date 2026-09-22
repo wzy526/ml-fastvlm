@@ -149,6 +149,7 @@ DAT_KEYS_MATCH = [
     'hd_gate', 'hd_input_layernorm',
     'proj_film', 'spatial_gain',
     'conv_glob', 'glob_q', 'glob_k',   # Qwen3.5 DAT with dat_use_global_offset
+    'glob_tau', 'glob_cell_bias',      # dat_glob_relevance='attn' (+ buffer glob_attn_prior)
 ]
 
 
@@ -460,11 +461,25 @@ class ModelArguments:
                           "intention-gated cell features; 0917 v3 -- learned a near-constant "
                           "prior, r=0.35 with the GT window), 'qk' (question-cell matching: "
                           "W_q(intention token) . W_k(LR image token) from the trunk hidden "
-                          "states), or 'both' (sum)."}
+                          "states), 'both' (sum), 'attn' (the trunk's own attention from the query "
+                          "token over the LR image tokens, heads averaged, sink cells masked, "
+                          "tau*log p + cell bias; nothing learned from scratch) or 'attn+qk'."}
     )
     dat_glob_dim: int = field(
         default=128,
-        metadata={"help": "q/k projection width for dat_glob_relevance='qk'/'both'."}
+        metadata={"help": "q/k projection width for dat_glob_relevance='qk'/'both'/'attn+qk'."}
+    )
+    dat_glob_query_pos: str = field(
+        default="im_start",
+        metadata={"help": "Token that asks for the 'qk'/'attn' relevance map: 'im_start' (the "
+                          "assistant <|im_start|> intention token; legacy -- a format token whose "
+                          "attention over the LR cells carries no question information) or "
+                          "'ans_prev' (the token right before the answer: '\\n' after 'assistant' "
+                          "in training, the last prompt token at inference)."}
+    )
+    dat_glob_sink_x: float = field(
+        default=5.0,
+        metadata={"help": "'attn': mask cells whose running mean attention exceeds x / N_cells."}
     )
     dat_rel_sup_weight: float = field(
         default=0.0,
@@ -2499,6 +2514,19 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             metrics["dat/glob_shift"] = sum(v[0] for v in self._glob_buf) / n
             metrics["dat/glob_scale"] = sum(v[1] for v in self._glob_buf) / n
             self._glob_buf.clear()
+        # dat_glob_relevance='attn': cells currently masked as sinks (mean over
+        # DAT layers; 0922 probe saw 5-16 of 400 per layer) and the learned
+        # temperature on log p_attn (1 = the raw attention).
+        if self._model is not None:
+            sinks, taus = [], []
+            for module in self._model.modules():
+                s = getattr(module, '_dat_glob_sink_n', None)
+                if s is not None:
+                    sinks.append(float(s))
+                    taus.append(float(module.glob_tau.detach().float().mean()))
+            if sinks:
+                metrics["dat/glob_sink_cells"] = sum(sinks) / len(sinks)
+                metrics["dat/glob_tau"] = sum(taus) / len(taus)
         # Dense relevance supervision: rel_sup_mass = softmax mass the map puts
         # inside the target window; rel_sup_base = the window's share of the
         # cells (= mass of a uniform map). mass >> base is the map localising.
@@ -3533,6 +3561,8 @@ def train():
             'glob_min_scale': model_args.dat_glob_min_scale,
             'glob_relevance': model_args.dat_glob_relevance,
             'glob_dim': model_args.dat_glob_dim,
+            'glob_query_pos': model_args.dat_glob_query_pos,
+            'glob_sink_x': model_args.dat_glob_sink_x,
             'rel_sup_weight': model_args.dat_rel_sup_weight,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,

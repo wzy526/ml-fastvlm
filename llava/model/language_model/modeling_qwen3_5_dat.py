@@ -765,8 +765,34 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             #           q.k_i / sqrt(d), pooled from the LR grid onto the offset
             #           grid. W_q zero-init => uniform => identity at load.
             #   'both': sum of the two.
+            #   'attn': the trunk's OWN attention as the map: the layer's real
+            #           post-RoPE q at the query token (see glob_query_pos) against
+            #           the real k of the LR image tokens, per-head softmax over
+            #           the LR tokens, heads averaged, pooled onto the offset
+            #           grid -> p_attn. Question-blind "sink" cells (running mean
+            #           over samples > glob_sink_x / N, an EMA buffer) are masked
+            #           out. logits = tau * log p_attn + cell_bias, tau init 1,
+            #           bias init 0 => the map at load IS the de-sinked attention.
+            #           Nothing is learned from scratch: 0922 probe, heldout
+            #           Visual-CoT, query = prompt end: window mass 0.43-0.60 at
+            #           layers 7-23 vs 0.236 uniform, 8/8 heads above uniform,
+            #           the peak sits on the answer text; the from-scratch 'qk'
+            #           head reached 0.42 of which 0.32 was a constant prior.
+            #   'attn+qk': 'attn' plus the learned 'qk' term (zero-init) on top.
             'glob_relevance': 'conv',
             'glob_dim': 128,              # q/k projection width for 'qk'
+            # Which token asks, for 'qk' and 'attn':
+            #   'im_start': the intention token = the assistant <|im_start|>
+            #               (legacy). A format token: its attention over the LR
+            #               cells carries NO question information (0922 probe:
+            #               window mass 0.18-0.24, below uniform, 0/8 heads).
+            #   'ans_prev': the token right before the answer starts (training:
+            #               the '\n' after 'assistant'; inference: the last
+            #               prompt token). Causal, has read the whole question
+            #               and is about to answer: mass 0.43-0.60, 8/8 heads.
+            'glob_query_pos': 'im_start',
+            'glob_sink_x': 5.0,           # 'attn': mask cells with running mean > x / N
+            'glob_attn_ema': 0.95,        # 'attn': momentum of the running per-cell mean
             # Dense supervision of the relevance map (training-only, bbox
             # samples, needs use_global_offset): cross-entropy between the
             # softmax p over the gh*gw cells and the uniform distribution over
@@ -1221,21 +1247,39 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         self.use_global_offset = bool(dat.get('use_global_offset', False))
         self.glob_min_scale = float(dat.get('glob_min_scale', 0.1))
         self.glob_relevance = str(dat.get('glob_relevance', 'conv'))
-        assert self.glob_relevance in ('conv', 'qk', 'both'), self.glob_relevance
+        assert self.glob_relevance in ('conv', 'qk', 'both', 'attn', 'attn+qk'), self.glob_relevance
         self.glob_dim = int(dat.get('glob_dim', 128))
+        self.glob_query_pos = str(dat.get('glob_query_pos', 'im_start'))
+        assert self.glob_query_pos in ('im_start', 'ans_prev'), self.glob_query_pos
+        self.glob_sink_x = float(dat.get('glob_sink_x', 5.0))
+        self.glob_attn_ema = float(dat.get('glob_attn_ema', 0.95))
         if self.use_global_offset and self.glob_relevance in ('conv', 'both'):
             self.conv_glob = _FP32WeightConv2d(
                 self.ln_2.weight.numel(), 1, kernel_size=1, stride=1, padding=0, bias=True,
             )
         else:
             self.conv_glob = None
-        if self.use_global_offset and self.glob_relevance in ('qk', 'both'):
+        if self.use_global_offset and self.glob_relevance in ('qk', 'both', 'attn+qk'):
             assert self.use_intention_branch, "glob_relevance='qk' needs the intention token"
             self.glob_q = _FP32WeightLinear(self.hidden_size, self.glob_dim, bias=False)
             self.glob_k = _FP32WeightLinear(self.hidden_size, self.glob_dim, bias=False)
         else:
             self.glob_q = None
             self.glob_k = None
+        self.glob_use_attn = bool(self.use_global_offset and self.glob_relevance in ('attn', 'attn+qk'))
+        if self.glob_use_attn:
+            assert self.use_intention_branch, "glob_relevance='attn' needs the intention token"
+            _n = self.grid_size * self.grid_size
+            self.glob_tau = nn.Parameter(torch.ones(1, dtype=torch.float32))
+            self.glob_cell_bias = nn.Parameter(torch.zeros(_n, dtype=torch.float32))
+            # running per-cell mean of p_attn over training samples (question-
+            # blind prior); cells above glob_sink_x / N are masked. Saved with
+            # the checkpoint so inference masks the same cells.
+            self.register_buffer('glob_attn_prior', torch.full((_n,), 1.0 / _n, dtype=torch.float32))
+        else:
+            self.glob_tau = None
+            self.glob_cell_bias = None
+            self.glob_attn_prior = None
 
         # Question-conditioned LR readout (residual cross-attention).
         if self.question_inject == 'xattn':
@@ -1302,6 +1346,10 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         if self.spatial_gain is not None and self.spatial_gain.dtype != torch.float32:
             with torch.no_grad():
                 self.spatial_gain.data = self.spatial_gain.data.to(torch.float32)
+        for bare in (self.glob_tau, self.glob_cell_bias, self.glob_attn_prior):
+            if bare is not None and bare.dtype != torch.float32:
+                with torch.no_grad():
+                    bare.data = bare.data.to(torch.float32)
         for sub in (self.conv_lr_dw, self.ln_1, self.conv_lr_proj,
                     self.proj_intention, self.ln_2, self.conv_off_proj,
                     self.proj_film, self.conv_glob, self.glob_q, self.glob_k):
@@ -1342,11 +1390,16 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
     @torch.no_grad()
     def _init_glob_qk_weights(self):
         """'qk' relevance: W_q zero (=> uniform map => identity grid at load),
-        W_k small normal so the keys are already spread when W_q starts moving."""
-        if self.glob_q is None:
-            return
-        nn.init.zeros_(self.glob_q.weight)
-        nn.init.normal_(self.glob_k.weight, std=0.02)
+        W_k small normal so the keys are already spread when W_q starts moving.
+        'attn' relevance: tau 1, cell bias 0, running prior uniform (no cell
+        masked) => the map at load is exactly the trunk's attention."""
+        if self.glob_q is not None:
+            nn.init.zeros_(self.glob_q.weight)
+            nn.init.normal_(self.glob_k.weight, std=0.02)
+        if self.glob_tau is not None:
+            nn.init.ones_(self.glob_tau)
+            nn.init.zeros_(self.glob_cell_bias)
+            self.glob_attn_prior.fill_(1.0 / self.glob_attn_prior.numel())
 
     @torch.no_grad()
     def _init_hd_proj_weights(self):
@@ -1725,7 +1778,46 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
               f"finabsmax={fmax:.4g} nan_frac={float(torch.isnan(tf).float().mean()):.3g}",
               flush=True)
 
-    def _generate_offsets_and_sample(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idxs, want_image=False):
+    def _glob_query_indices(self, answer_ranges):
+        """Token that asks for the global relevance map (glob_query_pos)."""
+        if self.glob_query_pos == 'ans_prev':
+            out = []
+            for ar in answer_ranges:
+                # ar[0] = answer start (training) or seq_len (inference); the
+                # token before it is the '\n' after 'assistant' / last prompt
+                # token. Fall back to the intention token if the range is odd.
+                p = int(ar[0]) - 1
+                out.append(p if p > int(ar[2]) else int(ar[2]))
+            return out
+        return [ar[2] for ar in answer_ranges]
+
+    def _glob_attn_logits(self, attn_qk, b_idx, q_idx, lr_start, lr_end, lr_h, lr_w, Lp):
+        """'attn' relevance: the trunk's own attention from the query tokens over
+        the LR image tokens, heads averaged, pooled to the offset grid, sinks
+        masked, -> logits [Lp*off_grps, 1, gs, gs] (float32)."""
+        q_all, k_all = attn_qk                                       # [B,H,T,D] post-RoPE
+        _tg = self.off_head_trunk_grad
+        qi = _grad_scale(q_all[b_idx, :, q_idx], _tg).float()        # [H, Lp, D]
+        kl = _grad_scale(k_all[b_idx, :, lr_start:lr_end], _tg).float()   # [H, N_lr, D]
+        att = torch.einsum('hld,hnd->hln', qi, kl) / math.sqrt(qi.size(-1))
+        att = att.softmax(-1).mean(0)                                # [Lp, N_lr]
+        gs = self.grid_size
+        p = F.adaptive_avg_pool2d(att.view(Lp, 1, lr_h, lr_w), (gs, gs)).flatten(1)
+        p = p / p.sum(-1, keepdim=True).clamp_min(1e-9)              # [Lp, N]
+        n_cells = p.size(-1)
+        if self.training:
+            with torch.no_grad():
+                m = self.glob_attn_ema
+                self.glob_attn_prior.mul_(m).add_(p.detach().mean(0) * (1.0 - m))
+        sink = self.glob_attn_prior > (self.glob_sink_x / n_cells)   # [N] bool
+        logits = self.glob_tau * torch.log(p.clamp_min(1e-9)) + self.glob_cell_bias
+        logits = logits.masked_fill(sink.unsqueeze(0), -1e4)
+        if self.training:
+            self._dat_glob_sink_n = sink.sum()                       # 0-d, for the monitor
+        logits = logits.view(Lp, 1, gs, gs)
+        return einops.repeat(logits, 'l 1 h w -> (l g) 1 h w', g=self.off_grps)
+
+    def _generate_offsets_and_sample(self, query_states, image_hd_features, image_range_list, b_idx, hd_feat_idxs, want_image=False, attn_qk=None):
         """Generate intention-conditioned sampling offsets and sample HD K/V.
 
         Multi-image: each image is sampled independently and K/V are concatenated.
@@ -1826,13 +1918,16 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     embed_lr_rep = embed_lr_rep * spatial_guide_rep.to(embed_lr_rep.dtype)
 
             glob_logits = None
+            glob_q_idx = None
+            if self.glob_q is not None or self.glob_use_attn:
+                glob_q_idx = self._glob_query_indices(answer_ranges)
             if self.glob_q is not None:
-                # Question-cell relevance for the global offset term: the
-                # intention token asks, every LR image token answers. Both live
-                # in the trunk's hidden space at this layer; a parameter-free
+                # Question-cell relevance for the global offset term: the query
+                # token (glob_query_pos) asks, every LR image token answers. Both
+                # live in the trunk's hidden space at this layer; a parameter-free
                 # LayerNorm first so the outlier channels of the residual stream
                 # (attention-sink dims) cannot dominate the dot product.
-                q_int = _grad_scale(query_states[b_idx, intention_indices], _tg).float()
+                q_int = _grad_scale(query_states[b_idx, glob_q_idx], _tg).float()
                 k_lr = _grad_scale(query_states[b_idx, image_range_index], _tg).float()
                 q = self.glob_q(F.layer_norm(q_int, q_int.shape[-1:]))       # [Lp, d]
                 k = self.glob_k(F.layer_norm(k_lr, k_lr.shape[-1:]))         # [N_lr, d]
@@ -1841,6 +1936,12 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 rel = F.adaptive_avg_pool2d(rel, (self.grid_size, self.grid_size))
                 glob_logits = einops.repeat(rel, 'l 1 h w -> (l g) 1 h w', g=self.off_grps)
                 self._fn_chk("glob_qk", glob_logits, b_idx)
+            if self.glob_use_attn:
+                assert attn_qk is not None, "glob_relevance='attn' needs the layer's q/k (attn_qk)"
+                attn_logits = self._glob_attn_logits(
+                    attn_qk, b_idx, glob_q_idx, lr_start, lr_end, lr_h, lr_w, Lp)
+                self._fn_chk("glob_attn", attn_logits, b_idx)
+                glob_logits = attn_logits if glob_logits is None else glob_logits + attn_logits
 
             if self.question_inject == 'xattn':
                 # Grid cells cross-attend to the full question span; the readout
@@ -2131,6 +2232,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 self._generate_offsets_and_sample(
                     query_for_offsets, image_hd_features, image_range_list,
                     b_idx, hd_feat_idxs, want_image=bool(question_segs),
+                    # 'attn' relevance reads the layer's real post-RoPE q/k
+                    attn_qk=(query_states, key_states) if self.glob_use_attn else None,
                 )
 
             if _want_vis and _dat_vis_entry is None and _slocs is not None:
@@ -2491,6 +2594,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         '.k_proj_hd.', '.v_proj_hd.', '.hd_input_layernorm.',
         '.hd_gate', '.q_readout.', '.ln_1.', '.ln_2.',
         '.conv_glob.', '.glob_q.', '.glob_k.',
+        '.glob_tau', '.glob_cell_bias', '.glob_attn_prior',
     )
 
     @classmethod
@@ -3095,8 +3199,9 @@ DAT_KEYS_MATCH = [
     # intention_inject='film' extras (None unless enabled)
     'proj_film', 'spatial_gain',
     # use_global_offset extras (None unless enabled; conv_glob for 'conv'/'both',
-    # glob_q/glob_k for 'qk'/'both')
-    'conv_glob', 'glob_q', 'glob_k',
+    # glob_q/glob_k for 'qk'/'both'/'attn+qk'; glob_tau/glob_cell_bias/
+    # glob_attn_prior (buffer) for 'attn'/'attn+qk')
+    'conv_glob', 'glob_q', 'glob_k', 'glob_tau', 'glob_cell_bias', 'glob_attn_prior',
 ]
 
 
