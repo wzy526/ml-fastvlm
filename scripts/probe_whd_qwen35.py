@@ -1150,10 +1150,14 @@ def main():
                   f"layers agree (<=2 cells) on {agree.mean():.3f} of samples, of which in window {agree_in:.3f}")
             layer_glob.setdefault(-1, {})["fusion"] = fusion
 
-            # per-head oracle at the ans_prev query ('nl'): does SOME head peak in
-            # the window far more often than the head mean? (=> learn head weights)
+            # per-head oracle at the ans_prev query: the model's glob_query_pos
+            # 'ans_prev' is the token right before the answer = the '\n' after
+            # 'assistant' = alt key 'asst_nl' (t+2), NOT 'nl' (t-1, which has no
+            # signal). Does SOME head peak in the window far more often than the
+            # head mean? (=> learn head weights)
+            QPOS_KEY = "asst_nl"
             for l in good:
-                hr = [(v[6] or {}).get("nl") if len(v) > 6 else None for v in GLOBP[l]]
+                hr = [(v[6] or {}).get(QPOS_KEY) if len(v) > 6 else None for v in GLOBP[l]]
                 if any(h is None for h in hr):
                     continue
                 heads = np.stack(hr).astype(np.float64)                     # [n, H, N]
@@ -1166,7 +1170,7 @@ def main():
                 mean_h = heads.mean(1)
                 mean_h, _ = _desink(mean_h)
                 s_mean = float(win[np.arange(n_), mean_h.argmax(1)].mean())
-                print(f"  layer {l:>2} heads@nl: peak-in-window  mean-of-heads {s_mean:.3f} | "
+                print(f"  layer {l:>2} heads@{QPOS_KEY}: peak-in-window  mean-of-heads {s_mean:.3f} | "
                       f"best single head {hin.mean(1).max():.3f} | any head {hin.max(0).mean():.3f} | "
                       f">= half the heads {(hin.mean(0) >= 0.5).mean():.3f}")
 
@@ -1179,13 +1183,13 @@ def main():
             #   lse    = logsumexp over heads with temperature 0.1 (soft max)
             # Same columns as the fusion table; "model" = the trained map for reference.
             pools = ("mean", "max", "best", "conf", "lse")
-            print(f"\n==== head pooling (raw attention @ ans_prev, per-head de-sinked; base amax = {base:.3f}) ====")
+            print(f"\n==== head pooling (raw attention @ {QPOS_KEY} (= ans_prev), per-head de-sinked; base amax = {base:.3f}) ====")
             print(f"{'layer':>6} {'pool':>6} | {'mass':>6} {'amax':>6} {'box':>6} | {'|c-t|':>6} {'miss':>6}")
             print("-" * 60)
             pool_stats = {}
             pooled_by_layer = {}
             for l in good:
-                hr = [(v[6] or {}).get("nl") if len(v) > 6 else None for v in GLOBP[l]]
+                hr = [(v[6] or {}).get(QPOS_KEY) if len(v) > 6 else None for v in GLOBP[l]]
                 if any(h is None for h in hr):
                     continue
                 heads = np.stack(hr).astype(np.float64)                     # [n, H, N]
