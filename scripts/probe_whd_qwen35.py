@@ -671,6 +671,9 @@ def main():
                          "de-sinked attention from <|im_start|>, each over the image with GT box / window")
     ap.add_argument("--dump_n", type=int, default=12)
     ap.add_argument("--dump_layers", default="7,11,15,19")
+    ap.add_argument("--dump_select", choices=["first", "miss", "hit"], default="first",
+                    help="which samples go on the sheet: the first --dump_n, or only those whose "
+                         "model-map peak is > 0.5 from the GT centre (miss) / within it (hit)")
     ap.add_argument("--glob_readout", default=None,
                     help="inference-only swap of the relevance-map -> (c, s) readout: "
                          "'floor:<lam>' subtracts lam/N from p and renormalises before the "
@@ -1282,16 +1285,37 @@ def main():
                     continue
                 end_ds, _ = _desink(np.stack([a.mean(0) for a in att_end]).astype(np.float64))
                 im_ds, _ = _desink(np.stack([a.mean(0) for a in att_im]).astype(np.float64))
+                # which samples: first N, or only the model-map MISSES (peak
+                # > 0.5 from the GT window centre) / HITS, to see what the
+                # localiser fails on (diag 9: legible at LR or not?)
+                pk_d = None
+                if lid in GLOBC and len(GLOBC[lid]) == len(rows):
+                    Xg, Yg = _grid_xy(hw)
+                    am = qk_all.argmax(1)
+                    tcl = np.array([[r[4], r[5]] for r in GLOBC[lid]], dtype=np.float64)
+                    pk_d = np.linalg.norm(np.stack([Xg[am], Yg[am]], 1) - tcl, axis=1)
+                if args.dump_select == "first" or pk_d is None:
+                    sel = list(range(min(args.dump_n, len(rows))))
+                else:
+                    mask = pk_d > 0.5 if args.dump_select == "miss" else pk_d <= 0.5
+                    sel = [int(i) for i in np.where(mask)[0][:args.dump_n]]
+                    print(f"[probe] dump_maps: layer {lid} {args.dump_select}: {int(mask.sum())}/{len(rows)} samples")
                 panels = []
-                for i in range(min(args.dump_n, len(rows))):
+                for i in sel:
                     s = samples[i]
                     bx = s["bboxes"][0]
                     win = rows[i][1]
                     m_qk = float((qk_all[i] * win).sum())
                     m_end = float((end_ds[i] * win).sum())
                     m_im = float((im_ds[i] * win).sum())
+                    # GT box size in LR pixels (LR area ~ tok_budget * 1024 px):
+                    # text < ~10 px tall is unreadable at LR
+                    W_, H_ = s["image"].size
+                    lr_sc = math.sqrt(args.tok_budget * TOK_PX / max(W_ * H_, 1))
+                    box_lr = f"box@LR {bx[2] * lr_sc:.0f}x{bx[3] * lr_sc:.0f}px"
+                    dtxt = "" if pk_d is None else f"  peak-dist={pk_d[i]:.2f}"
                     row = [
-                        _heat(s["image"], qk_all[i], hw, win, bx, f"qk  mass={m_qk:.2f}"),
+                        _heat(s["image"], qk_all[i], hw, win, bx, f"model map  mass={m_qk:.2f}{dtxt}"),
                         _heat(s["image"], end_ds[i], hw, win, bx, f"attn@prompt-end  mass={m_end:.2f}"),
                         _heat(s["image"], im_ds[i], hw, win, bx, f"attn@<|im_start|>  mass={m_im:.2f}"),
                     ]
@@ -1299,8 +1323,13 @@ def main():
                     strip = Image.new("RGB", (PW * 3 + 8, rh), (20, 20, 20))
                     for j, p in enumerate(row):
                         strip.paste(p, (j * (PW + 4), 14))
-                    ImageDraw.Draw(strip).text((4, 1), f"[{i}] {s['prompt'][:120]}", fill=(200, 200, 200))
+                    gt_txt = str(s.get("gt", ""))[:40]
+                    ImageDraw.Draw(strip).text(
+                        (4, 1), f"[{i}] {box_lr}  gt='{gt_txt}'  {s['prompt'][:90]}", fill=(200, 200, 200))
                     panels.append(strip)
+                if not panels:
+                    print(f"[probe] dump_maps: layer {lid}: nothing selected")
+                    continue
                 sheet = Image.new("RGB", (panels[0].width, sum(p.height for p in panels)), (20, 20, 20))
                 yy = 0
                 for p in panels:
