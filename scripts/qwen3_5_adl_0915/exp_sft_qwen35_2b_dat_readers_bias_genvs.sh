@@ -172,12 +172,11 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # the trunk's own q_proj/k_proj already had it. Fix = ask the right token and
 # reuse the trunk's attention:
 #   GLOB_QPOS=ans_prev   query token = the token before the answer
-#   GLOB_REL=attn        map = the layer's own attention (heads averaged),
-#                        sink cells masked (running mean > GLOB_SINK_X/N);
-#                        parameter-free (0923: the learnable tau / cell bias
-#                        were removed -- miniD: tau drifted 1 -> 0.974, the
-#                        bias learned a dataset location prior, the raw
-#                        de-sinked attention scored the same or better)
+#   GLOB_REL=attn        map = the layer's own attention (heads averaged);
+#                        parameter-free (0923: the EMA sink mask and the
+#                        learnable tau / cell bias were removed -- miniD probe:
+#                        the mask changed nothing at layers 11-23, tau drifted
+#                        1 -> 0.974, the bias learned a dataset location prior)
 # Mini D result (0922, both arms 600 steps, held-out 500):
 #   map:   attn mass 0.61 / argmax 0.70 / box 0.165 (miniB-qk 0.42 / - / 0.07)
 #          -> passed; qk+ans_prev 0.42 / 0.69 / 0.11.
@@ -348,7 +347,6 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_glob_relevance "${GLOB_REL:-conv}" \
     --dat_glob_dim "${GLOB_DIM:-128}" \
     --dat_glob_query_pos "${GLOB_QPOS:-ans_prev}" \
-    --dat_glob_sink_x "${GLOB_SINK_X:-5}" \
     --dat_rel_sup_weight "${REL_SUP_WEIGHT:-0}" \
     --dat_lr 1e-4 \
     --lora_enable "${LORA_ENABLE:-True}" \

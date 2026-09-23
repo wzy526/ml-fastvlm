@@ -698,9 +698,6 @@ def main():
                          "floor then moments inside the k x k window around the argmax; "
                          "'gate:<k>:<thr>' = win:k when the floored mass in that window >= thr "
                          "(unimodal map), identity grid otherwise. Default: model as trained")
-    ap.add_argument("--glob_sink_x", type=float, default=None,
-                    help="inference-only override of the model's glob_sink_x (cells whose EMA prior "
-                         "> x/N are masked in the attn relevance map); default: as trained")
     ap.add_argument("--glob_layers", default=None,
                     help="comma list of DAT layers that keep the global term at inference; the "
                          "others get a flat map (c=0, s=1). Default: all")
@@ -728,13 +725,6 @@ def main():
         attn_implementation=args.attn,
     ).eval()
     install_lr_key_hook(model)
-    if args.glob_sink_x is not None:
-        from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5AttentionDAT as _DAT
-        n_set = 0
-        for m in model.modules():
-            if isinstance(m, _DAT) and hasattr(m, "glob_sink_x"):
-                m.glob_sink_x = float(args.glob_sink_x); n_set += 1
-        print(f"[probe] glob_sink_x override -> {args.glob_sink_x} on {n_set} DAT layers")
     image_token_id = getattr(model.config, "image_token_id", None)
     args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
     if args.hd_source.startswith("oracle") and args.dataset not in ("vstar", "synth"):

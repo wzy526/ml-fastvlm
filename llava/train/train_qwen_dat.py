@@ -455,7 +455,7 @@ class ModelArguments:
                           "prior, r=0.35 with the GT window), 'qk' (question-cell matching: "
                           "W_q(intention token) . W_k(LR image token) from the trunk hidden "
                           "states), 'both' (sum), 'attn' (the trunk's own attention from the query "
-                          "token over the LR image tokens, heads averaged, sink cells masked, "
+                          "token over the LR image tokens, heads averaged, "
                           "tau*log p + cell bias; nothing learned from scratch) or 'attn+qk'."}
     )
     dat_glob_dim: int = field(
@@ -469,10 +469,6 @@ class ModelArguments:
                           "attention over the LR cells carries no question information) or "
                           "'ans_prev' (the token right before the answer: '\\n' after 'assistant' "
                           "in training, the last prompt token at inference)."}
-    )
-    dat_glob_sink_x: float = field(
-        default=5.0,
-        metadata={"help": "'attn': mask cells whose running mean attention exceeds x / N_cells."}
     )
     dat_rel_sup_weight: float = field(
         default=0.0,
@@ -2507,16 +2503,6 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             metrics["dat/glob_shift"] = sum(v[0] for v in self._glob_buf) / n
             metrics["dat/glob_scale"] = sum(v[1] for v in self._glob_buf) / n
             self._glob_buf.clear()
-        # dat_glob_relevance='attn': cells currently masked as sinks (mean over
-        # DAT layers; 0922 probe saw 5-16 of 400 per layer).
-        if self._model is not None:
-            sinks = []
-            for module in self._model.modules():
-                s = getattr(module, '_dat_glob_sink_n', None)
-                if s is not None:
-                    sinks.append(float(s))
-            if sinks:
-                metrics["dat/glob_sink_cells"] = sum(sinks) / len(sinks)
         # Dense relevance supervision: rel_sup_mass = softmax mass the map puts
         # inside the target window; rel_sup_base = the window's share of the
         # cells (= mass of a uniform map). mass >> base is the map localising.
@@ -3549,7 +3535,6 @@ def train():
             'glob_relevance': model_args.dat_glob_relevance,
             'glob_dim': model_args.dat_glob_dim,
             'glob_query_pos': model_args.dat_glob_query_pos,
-            'glob_sink_x': model_args.dat_glob_sink_x,
             'rel_sup_weight': model_args.dat_rel_sup_weight,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
