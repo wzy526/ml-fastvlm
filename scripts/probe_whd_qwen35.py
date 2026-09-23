@@ -1170,6 +1170,65 @@ def main():
                       f"best single head {hin.mean(1).max():.3f} | any head {hin.max(0).mean():.3f} | "
                       f">= half the heads {(hin.mean(0) >= 0.5).mean():.3f}")
 
+            # Diagnostic 8: how to POOL the heads (raw trunk attention at the
+            # ans_prev query, each head de-sinked, no tau / cell_bias):
+            #   mean   = what the model does now
+            #   max    = per cell max over heads, renormalised (picks the sharpest head)
+            #   best   = the single head with the highest peak-in-window rate (static oracle)
+            #   conf   = per-sample convex mix, head weight = its peak value (sharper = trusted)
+            #   lse    = logsumexp over heads with temperature 0.1 (soft max)
+            # Same columns as the fusion table; "model" = the trained map for reference.
+            pools = ("mean", "max", "best", "conf", "lse")
+            print(f"\n==== head pooling (raw attention @ ans_prev, per-head de-sinked; base amax = {base:.3f}) ====")
+            print(f"{'layer':>6} {'pool':>6} | {'mass':>6} {'amax':>6} {'box':>6} | {'|c-t|':>6} {'miss':>6}")
+            print("-" * 60)
+            pool_stats = {}
+            pooled_by_layer = {}
+            for l in good:
+                hr = [(v[6] or {}).get("nl") if len(v) > 6 else None for v in GLOBP[l]]
+                if any(h is None for h in hr):
+                    continue
+                heads = np.stack(hr).astype(np.float64)                     # [n, H, N]
+                H = heads.shape[1]
+                ds = np.stack([_desink(heads[:, h])[0] for h in range(H)], 1)   # [n, H, N]
+                hin = np.stack([win[np.arange(n_), ds[:, h].argmax(1)] for h in range(H)])   # [H, n]
+                best_h = int(hin.mean(1).argmax())
+                conf_w = ds.max(2)                                           # [n, H]
+                conf_w = conf_w / conf_w.sum(1, keepdims=True)
+                lse = np.log(np.exp(np.log(np.clip(ds, 1e-9, None)) / 0.1).sum(1))   # [n, N]
+                cands = {
+                    "mean": ds.mean(1),
+                    "max": ds.max(1),
+                    "best": ds[:, best_h],
+                    "conf": (ds * conf_w[:, :, None]).sum(1),
+                    "lse": np.exp(lse - lse.max(1, keepdims=True)),
+                }
+                s_model = _set_stats(per[l], win, bx, tc, hw)
+                print(f"{l:>6} {'model':>6} | {s_model['mass']:>6.3f} {s_model['amax']:>6.3f} {s_model['box']:>6.3f} | "
+                      f"{s_model['cerr']:>6.3f} {s_model['miss']:>6.3f}")
+                pooled_by_layer[l] = {}
+                for name in pools:
+                    m = cands[name]
+                    m = m / np.clip(m.sum(1, keepdims=True), 1e-9, None)
+                    pooled_by_layer[l][name] = m
+                    s_ = _set_stats(m, win, bx, tc, hw)
+                    pool_stats[f"layer{l}_{name}"] = s_
+                    tag = f"{name}[{best_h}]" if name == "best" else name
+                    print(f"{'':>6} {tag:>6} | {s_['mass']:>6.3f} {s_['amax']:>6.3f} {s_['box']:>6.3f} | "
+                          f"{s_['cerr']:>6.3f} {s_['miss']:>6.3f}")
+            # each pooling fused (mean) over the good layers
+            if pooled_by_layer:
+                print("-" * 60)
+                for name in pools:
+                    ms = [pooled_by_layer[l][name] for l in pooled_by_layer]
+                    m = np.mean(ms, 0)
+                    m = m / m.sum(1, keepdims=True)
+                    s_ = _set_stats(m, win, bx, tc, hw)
+                    pool_stats[f"fused_{name}"] = s_
+                    print(f"{'fused':>6} {name:>6} | {s_['mass']:>6.3f} {s_['amax']:>6.3f} {s_['box']:>6.3f} | "
+                          f"{s_['cerr']:>6.3f} {s_['miss']:>6.3f}")
+            layer_glob.setdefault(-1, {})["head_pool"] = pool_stats
+
         if args.dump_maps:
             # Visual check: per layer one contact sheet, one row per sample,
             # three panels: learned qk map | de-sinked trunk attention with the
