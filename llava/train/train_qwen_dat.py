@@ -456,7 +456,7 @@ class ModelArguments:
                           "W_q(intention token) . W_k(LR image token) from the trunk hidden "
                           "states), 'both' (sum), 'attn' (the trunk's own attention from the query "
                           "token over the LR image tokens, heads averaged, "
-                          "tau*log p + cell bias; nothing learned from scratch) or 'attn+qk'."}
+                          "parameter-free) or 'attn+qk'."}
     )
     dat_glob_dim: int = field(
         default=128,
