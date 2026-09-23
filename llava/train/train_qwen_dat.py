@@ -144,7 +144,7 @@ local_rank = None
 # modeling_*_dat.py DAT_KEYS_MATCH). 'proj_film' / 'spatial_gain' exist only
 # in Qwen3.5 DAT with dat_intention_inject='film'.
 DAT_KEYS_MATCH = [
-    'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention', 'q_readout',
+    'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
     'proj_film', 'spatial_gain',
