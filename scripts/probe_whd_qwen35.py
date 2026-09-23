@@ -1071,6 +1071,105 @@ def main():
                               lambda v, kn=kname: (v[6] or {}).get(kn) if len(v) > 6 else None,
                               f"attn_heads_{kname}")
 
+        # Diagnostic 7: are the misses (peak far from the target, ~30% of the
+        # samples on miniD-attn) shared across layers / heads, or independent?
+        # If independent, fusing layers (mean / product of the maps) or picking
+        # heads cuts the miss rate without any new capacity. Per map set:
+        #   mass / amax = as above; |c-t| = soft-centroid error to the GT window
+        #   centre (the model's own c on the single-layer rows); miss = fraction
+        #   of samples whose peak is > 0.5 (a quarter of the image) from the
+        #   target centre.  Ceilings: any = some layer/head peaks in the window;
+        #   agree = layers' peaks within 2 cells of each other (and how often
+        #   an agreed peak is in the window).
+        def _grid_xy(hw):
+            gh_, gw_ = hw                                                 # same grid as patched_sample's ref
+            mx, my = 1.0 / max(gw_ - 1, 1), 1.0 / max(gh_ - 1, 1)
+            gx = np.linspace(-1 + mx, 1 - mx, gw_)
+            gy = np.linspace(-1 + my, 1 - my, gh_)
+            X, Y = np.meshgrid(gx, gy)                                   # [gh, gw]
+            return X.ravel(), Y.ravel()                                   # [N] each
+
+        def _set_stats(maps, win, bx, tc, hw):
+            n_, N = maps.shape
+            X, Y = _grid_xy(hw)
+            am = maps.argmax(1)
+            c = np.stack([(maps * X).sum(1), (maps * Y).sum(1)], 1)     # [n, 2]
+            cerr = float(np.linalg.norm(c - tc, axis=1).mean())
+            pk = np.stack([X[am], Y[am]], 1)
+            miss = float((np.linalg.norm(pk - tc, axis=1) > 0.5).mean())
+            return {"mass": float((maps * win).sum(1).mean()),
+                    "amax": float(win[np.arange(n_), am].mean()),
+                    "box": float(bx[np.arange(n_), am].mean()),
+                    "cerr": cerr, "miss": miss}
+
+        lids = [l for l in sorted(GLOBP) if l in GLOBC and len(GLOBC[l]) == len(GLOBP[l])]
+        if len(lids) >= 2:
+            n_ = len(GLOBP[lids[0]])
+            hw = GLOBP[lids[0]][0][3]
+            win = np.stack([v[1] for v in GLOBP[lids[0]]]).astype(np.float64)
+            bx = np.stack([v[2] for v in GLOBP[lids[0]]]).astype(np.float64)
+            tc = np.array([[r[4], r[5]] for r in GLOBC[lids[0]]], dtype=np.float64)   # GT window centre
+            per = {l: np.stack([v[0] for v in GLOBP[l]]).astype(np.float64) for l in lids}
+            base = float(win.mean())
+            good = [l for l in lids if float((per[l] * win).sum(1).mean()) >= base + 0.1]
+            if len(good) < 2:
+                good = lids[-max(2, len(lids) // 2):]
+            X, Y = _grid_xy(hw)
+
+            print(f"\n==== cross-layer fusion of the model's map  (layers used for fusion: {good};  "
+                  f"miss = peak > 0.5 from GT centre) ====")
+            print(f"{'map':>14} | {'mass':>6} {'amax':>6} {'box':>6} | {'|c-t|':>6} {'miss':>6}")
+            print("-" * 60)
+            fusion = {}
+            for l in lids:
+                s_ = _set_stats(per[l], win, bx, tc, hw)
+                fusion[f"layer{l}"] = s_
+                print(f"{'layer ' + str(l):>14} | {s_['mass']:>6.3f} {s_['amax']:>6.3f} {s_['box']:>6.3f} | "
+                      f"{s_['cerr']:>6.3f} {s_['miss']:>6.3f}")
+            mean_map = np.mean([per[l] for l in good], 0)
+            mean_map /= mean_map.sum(1, keepdims=True)
+            prod_map = np.exp(np.mean([np.log(np.clip(per[l], 1e-9, None)) for l in good], 0))
+            prod_map /= prod_map.sum(1, keepdims=True)
+            for name, m in (("mean", mean_map), ("geo-mean", prod_map)):
+                s_ = _set_stats(m, win, bx, tc, hw)
+                fusion[name] = s_
+                print(f"{name:>14} | {s_['mass']:>6.3f} {s_['amax']:>6.3f} {s_['box']:>6.3f} | "
+                      f"{s_['cerr']:>6.3f} {s_['miss']:>6.3f}")
+            # ceilings / agreement over the fused layers
+            ams = np.stack([per[l].argmax(1) for l in good])                        # [L, n]
+            in_win = np.stack([win[np.arange(n_), ams[i]] for i in range(len(good))])   # [L, n]
+            any_in = float(in_win.max(0).mean())
+            all_in = float(in_win.min(0).mean())
+            pk = np.stack([np.stack([X[ams[i]], Y[ams[i]]], 1) for i in range(len(good))])   # [L, n, 2]
+            spread = np.linalg.norm(pk - pk.mean(0, keepdims=True), axis=2).max(0)           # [n]
+            agree = spread <= 2.0 * (2.0 / hw[1])
+            agree_in = float(in_win.min(0)[agree].mean()) if agree.any() else float("nan")
+            fusion["ceiling"] = {"any_in": any_in, "all_in": all_in, "agree_frac": float(agree.mean()),
+                                 "agree_in": agree_in}
+            print(f"  peak in window: any layer {any_in:.3f} | all layers {all_in:.3f} | "
+                  f"layers agree (<=2 cells) on {agree.mean():.3f} of samples, of which in window {agree_in:.3f}")
+            layer_glob.setdefault(-1, {})["fusion"] = fusion
+
+            # per-head oracle at the ans_prev query ('nl'): does SOME head peak in
+            # the window far more often than the head mean? (=> learn head weights)
+            for l in good:
+                hr = [(v[6] or {}).get("nl") if len(v) > 6 else None for v in GLOBP[l]]
+                if any(h is None for h in hr):
+                    continue
+                heads = np.stack(hr).astype(np.float64)                     # [n, H, N]
+                H = heads.shape[1]
+                hin = []
+                for h in range(H):
+                    m, _ = _desink(heads[:, h])
+                    hin.append(win[np.arange(n_), m.argmax(1)])
+                hin = np.stack(hin)                                          # [H, n]
+                mean_h = heads.mean(1)
+                mean_h, _ = _desink(mean_h)
+                s_mean = float(win[np.arange(n_), mean_h.argmax(1)].mean())
+                print(f"  layer {l:>2} heads@nl: peak-in-window  mean-of-heads {s_mean:.3f} | "
+                      f"best single head {hin.mean(1).max():.3f} | any head {hin.max(0).mean():.3f} | "
+                      f">= half the heads {(hin.mean(0) >= 0.5).mean():.3f}")
+
         if args.dump_maps:
             # Visual check: per layer one contact sheet, one row per sample,
             # three panels: learned qk map | de-sinked trunk attention with the
