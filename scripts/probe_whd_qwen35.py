@@ -463,18 +463,43 @@ def install_merge_hook():
         layers = STATE.get("glob_layers")
         N = gs * gs
 
+        def floor(p, lam):
+            q = (p - lam / N).clamp_min(0.0)
+            z = q.sum(-1, keepdim=True)
+            return torch.where(z > 1e-9, q / z.clamp_min(1e-9), p)
+
+        def argmax_window(p, k):
+            # [R, N] mask of the k x k cell window centred on each row's argmax
+            # (clipped at the borders, so c moves inward there: the grid must
+            # stay inside the image anyway)
+            am = p.argmax(-1)                                   # [R]
+            ay, ax = am // gs, am % gs
+            ii = torch.arange(gs, device=p.device)
+            r = k // 2
+            my = ((ii[None, :] - ay[:, None]).abs() <= r)       # [R, gs]
+            mx = ((ii[None, :] - ax[:, None]).abs() <= r)
+            return (my[:, :, None] & mx[:, None, :]).flatten(1).float()   # [R, N]
+
         def f(x, dim=-1, *aa, **kk):
             p = orig_softmax(x, dim, *aa, **kk)
             if x.dim() != 2 or x.size(-1) != N:
                 return p
             if layers is not None and layer_idx not in layers:
                 return torch.full_like(p, 1.0 / N)
-            if mode and mode.startswith("floor:"):
-                lam = float(mode.split(":", 1)[1])
-                q = (p - lam / N).clamp_min(0.0)
+            if not mode:
+                return p
+            kind, _, rest = mode.partition(":")
+            if kind == "floor":                     # floor:<lam>
+                return floor(p, float(rest))
+            if kind == "win":                       # win:<k>  c = argmax cell, s ~ k/gs
+                m = argmax_window(p, int(rest))
+                return m / m.sum(-1, keepdim=True)
+            if kind == "local":                     # local:<k>:<lam>  moments inside k x k around argmax
+                k, lam = rest.split(":")
+                q = floor(p, float(lam)) * argmax_window(p, int(k))
                 z = q.sum(-1, keepdim=True)
                 return torch.where(z > 1e-9, q / z.clamp_min(1e-9), p)
-            return p
+            raise ValueError(f"unknown --glob_readout {mode}")
         return f
 
     def patched_sample(self, *a, **kw):
@@ -649,7 +674,10 @@ def main():
     ap.add_argument("--glob_readout", default=None,
                     help="inference-only swap of the relevance-map -> (c, s) readout: "
                          "'floor:<lam>' subtracts lam/N from p and renormalises before the "
-                         "moments (lam=1 removes the uniform background). Default: model as trained")
+                         "moments (lam=1 removes the uniform background); 'win:<k>' = uniform over the "
+                         "k x k cells around the argmax (c = argmax, s ~ k/gs); 'local:<k>:<lam>' = "
+                         "floor then moments inside the k x k window around the argmax. "
+                         "Default: model as trained")
     ap.add_argument("--glob_layers", default=None,
                     help="comma list of DAT layers that keep the global term at inference; the "
                          "others get a flat map (c=0, s=1). Default: all")
