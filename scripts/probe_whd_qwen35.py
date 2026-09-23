@@ -484,6 +484,7 @@ def install_merge_hook():
             p = orig_softmax(x, dim, *aa, **kk)
             if x.dim() != 2 or x.size(-1) != N:
                 return p
+            STATE["orig_p"] = p.detach()            # the model's own map, for the map tables / hit split
             if layers is not None and layer_idx not in layers:
                 return torch.full_like(p, 1.0 / N)
             if not mode:
@@ -499,16 +500,31 @@ def install_merge_hook():
                 q = floor(p, float(lam)) * argmax_window(p, int(k))
                 z = q.sum(-1, keepdim=True)
                 return torch.where(z > 1e-9, q / z.clamp_min(1e-9), p)
+            if kind == "gate":                      # gate:<k>:<thr>  unimodal -> win:k, else identity
+                k, thr = rest.split(":")
+                pf = floor(p, 1.0)
+                m = argmax_window(p, int(k))
+                conc = (pf * m).sum(-1, keepdim=True)              # floored mass around the peak
+                on = conc >= float(thr)
+                STATE.setdefault("gate_log", []).append(float(on.float().mean()))
+                return torch.where(on, m / m.sum(-1, keepdim=True), torch.full_like(p, 1.0 / N))
             raise ValueError(f"unknown --glob_readout {mode}")
         return f
 
     def patched_sample(self, *a, **kw):
         if STATE.get("glob_readout") or STATE.get("glob_layers") is not None:
+            STATE["orig_p"] = None
             torch.softmax = glob_softmax_for(self.layer_idx, self.grid_size)
             try:
                 key_hd, value_hd, locs = orig_sample(self, *a, **kw)
             finally:
                 torch.softmax = orig_softmax
+            # map-level tables and the hit/miss split always describe the
+            # model's OWN map; only c / s / the grid follow the override
+            op = STATE.get("orig_p")
+            lp = getattr(self, "_dat_glob_last_p", None)
+            if op is not None and lp is not None:
+                self._dat_glob_last_p = (op, lp[1])
         else:
             key_hd, value_hd, locs = orig_sample(self, *a, **kw)
         if STATE["record"]:
@@ -679,8 +695,9 @@ def main():
                          "'floor:<lam>' subtracts lam/N from p and renormalises before the "
                          "moments (lam=1 removes the uniform background); 'win:<k>' = uniform over the "
                          "k x k cells around the argmax (c = argmax, s ~ k/gs); 'local:<k>:<lam>' = "
-                         "floor then moments inside the k x k window around the argmax. "
-                         "Default: model as trained")
+                         "floor then moments inside the k x k window around the argmax; "
+                         "'gate:<k>:<thr>' = win:k when the floored mass in that window >= thr "
+                         "(unimodal map), identity grid otherwise. Default: model as trained")
     ap.add_argument("--glob_sink_x", type=float, default=None,
                     help="inference-only override of the model's glob_sink_x (cells whose EMA prior "
                          "> x/N are masked in the attn relevance map); default: as trained")
@@ -693,7 +710,7 @@ def main():
                             else {int(x) for x in args.glob_layers.split(",") if x.strip()})
     if args.glob_readout or args.glob_layers:
         print(f"[probe] glob readout override: {args.glob_readout}  layers={args.glob_layers}  "
-              f"(relevance-map table then shows the post-floor map)")
+              f"(map tables / hit split still use the model's own map; c, s, grid follow the override)")
 
     from transformers import AutoProcessor
     from llava.model.language_model.modeling_qwen3_5_dat import (
@@ -774,6 +791,9 @@ def main():
             raw[cname].append(t); preds[cname].append(extract(t))
         set_force_locs(model, None)
     STATE["bias"] = 0.0
+    if STATE.get("gate_log"):
+        print(f"[probe] gate readout: global term ON for {100 * float(np.mean(STATE['gate_log'])):.1f}% "
+              f"of (sample, layer) calls")
     if args.hd_source.startswith("oracle"):
         print(f"[probe] forced sampling window on {n_forced}/{len(samples)} samples "
               f"(min {args.oracle_min_cells} HD cells per side)")
