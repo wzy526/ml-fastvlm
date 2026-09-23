@@ -191,6 +191,15 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   readout only reads the grid distribution it was trained with -> must
 #   co-train (mini E). Head pooling (mean/max/best/conf/lse), cross-layer
 #   fusion and sink thresholds 5/3/2 changed nothing.
+# Mini E (0923; 8 GPUs, two arms in sequence, ~45 min each, from V2-merged):
+#   E1: GLOBAL_OFFSET=1 GLOB_REL=attn GLOB_FLOOR=1 GLOB_LAYERS=11,15,19,23 REL_SUP_WEIGHT=0
+#   E2: same without GLOB_FLOOR (control: layers + no rel_sup alone)
+#   (TF_PROB=1 TF_FORCE_PROB=0.5 OFF_SUP_WEIGHT=10 LR_DROP_PROB=0.5 ROUTE_BY_DROP=1
+#    OFF_HEAD_TRUNK_GRAD=0 FREEZE_BASE=True LORA_ENABLE=False MAX_STEPS=600 SAVE_STEPS=600)
+#   Synthetic check of the floor: a 60/40 map (9x9 window + flat rest) gives
+#   raw c = 0.6 x target, s 0.75-0.78; floored c = target, s 0.448 (= 9/20).
+#   Pass (held-out 500, probe 'by localisation outcome'): E1 hits real >= +3.0,
+#   overall >= +2.0, oracle >= +3.5, dat/glob_scale <= 0.6 in training.
 #
 # Full 0920 combined run (data = 0817 mix + viscot doc boxes + synth_hd text on
 # SA-1B natural images (+ optional Visual-CoT natural-image boxes), built by
@@ -347,6 +356,8 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_glob_relevance "${GLOB_REL:-conv}" \
     --dat_glob_dim "${GLOB_DIM:-128}" \
     --dat_glob_query_pos "${GLOB_QPOS:-ans_prev}" \
+    --dat_glob_floor "${GLOB_FLOOR:-0}" \
+    --dat_glob_layers "${GLOB_LAYERS:-}" \
     --dat_rel_sup_weight "${REL_SUP_WEIGHT:-0}" \
     --dat_lr 1e-4 \
     --lora_enable "${LORA_ENABLE:-True}" \

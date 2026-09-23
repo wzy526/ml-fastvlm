@@ -752,6 +752,22 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             # the legacy grid at load time (warm-start safe).
             'use_global_offset': False,
             'glob_min_scale': 0.1,        # floor on the per-axis grid scale
+            # Background floor before the moments (0 = off). With the map p over
+            # N cells, p <- relu(p - glob_floor / N) renormalised; 1.0 removes
+            # exactly the uniform level. Why: c = E_p[g], s = std_p / std_u
+            # over the WHOLE map -- on 0922 miniD-attn the map had ~60% of its
+            # mass in the target window and ~40% spread flat over the rest; that
+            # flat part alone puts s at 0.8-0.9 (and r(s, GT s) ~ 0) however
+            # sharp the peak is, so the grid never zoomed (in_box 0.035 vs
+            # oracle 0.098). Swapping this in at inference only made the
+            # readout worse (it only reads the grid distribution it was trained
+            # with), hence a training-time switch.
+            'glob_floor': 0.0,
+            # Comma list of DAT layer indices that get the global term; '' = all.
+            # miniD probe: layer 3's map is a fixed, question-blind peak (window
+            # mass 0.16 < 0.236 uniform, grid dist ratio 1.04 = worse than not
+            # moving), layer 7 weak (0.28); 11/15/19/23 carry the signal.
+            'glob_layers': '',
             # Where the relevance logits come from:
             #   'conv': 1x1 conv on the post-ln_2 (intention-gated) cell features.
             #           The question enters only as a per-channel scalar gate, so
@@ -1109,7 +1125,15 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # one relevance logit per cell from the same post-ln_2 features that
         # feed conv_off_proj. Zero-init = uniform = identity on the grid.
         self.use_global_offset = bool(dat.get('use_global_offset', False))
+        # glob_layers: restrict the global term to these DAT layers (others
+        # keep the legacy grid and build no glob params, so every rank still
+        # has the same parameter set). '' = every DAT layer.
+        _gl = str(dat.get('glob_layers', '') or '').strip()
+        if _gl and self.use_global_offset:
+            _keep = {int(x) for x in _gl.split(',') if x.strip()}
+            self.use_global_offset = layer_idx in _keep
         self.glob_min_scale = float(dat.get('glob_min_scale', 0.1))
+        self.glob_floor = float(dat.get('glob_floor', 0.0))
         self.glob_relevance = str(dat.get('glob_relevance', 'conv'))
         assert self.glob_relevance in ('conv', 'qk', 'both', 'attn', 'attn+qk'), self.glob_relevance
         self.glob_dim = int(dat.get('glob_dim', 128))
@@ -1381,6 +1405,14 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 logits = gl if logits is None else logits + gl
             assert logits is not None, "use_global_offset without a relevance source"
             p = torch.softmax(logits, dim=-1).unsqueeze(1)                 # [R, 1, N]
+            p_map = p                                                      # pre-floor map (probe, rel_sup)
+            if self.glob_floor > 0:
+                # drop the flat background below glob_floor x uniform before
+                # the moments (see 'glob_floor' in the defaults); rows that
+                # are entirely at/below the floor keep the raw map
+                q = (p - self.glob_floor / p.size(-1)).clamp_min(0.0)
+                z = q.sum(-1, keepdim=True)
+                p = torch.where(z > 1e-9, q / z.clamp_min(1e-9), p)
             g = references[:1].flatten(2)                                  # [1, 2, N]
             c = (p * g).sum(-1)                                            # [R, 2]
             var = (p * (g - c.unsqueeze(-1)) ** 2).sum(-1)                 # [R, 2]
@@ -1403,7 +1435,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 hy = 1.0 / gh_
                 inside = ((gx >= lo[0] - hx) & (gx <= hi[0] + hx)
                           & (gy >= lo[1] - hy) & (gy <= hi[1] + hy))
-                ps = p[rs0:, 0]                                                          # [Rs, N]
+                ps = p_map[rs0:, 0]                                # [Rs, N]; softmax(logits), so d CE / d logits = ps - t
                 # the +-half-cell margin tiles [-1, 1], so any window inside the
                 # image covers >= 1 cell: no .any() sync needed
                 if ps.size(0) > 0:
@@ -1429,7 +1461,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             self._dat_glob_last_cs = (c.detach(), s.detach())   # [R, 2] each, for the probe
             # the relevance map itself + cell coordinates, for the probe's
             # map-level diagnostics (argmax / mass inside the GT window)
-            self._dat_glob_last_p = (p.detach()[:, 0], g.detach()[0])   # [R, N], [2, N]
+            self._dat_glob_last_p = (p_map.detach()[:, 0], g.detach()[0])   # [R, N] pre-floor map, [2, N]
             if self.training:
                 gb = getattr(self, '_dat_glob_buf', None)
                 if gb is None:

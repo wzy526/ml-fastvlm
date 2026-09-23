@@ -470,6 +470,18 @@ class ModelArguments:
                           "'ans_prev' (the token right before the answer: '\\n' after 'assistant' "
                           "in training, the last prompt token at inference)."}
     )
+    dat_glob_floor: float = field(
+        default=0.0,
+        metadata={"help": "dat_use_global_offset: subtract this multiple of the uniform level from "
+                          "the relevance map (relu, renormalise) before its centroid / spread are "
+                          "taken; 1.0 removes the flat background that otherwise pins the grid "
+                          "scale at ~0.85. 0 = off."}
+    )
+    dat_glob_layers: str = field(
+        default="",
+        metadata={"help": "Comma list of DAT layer indices that get the global offset term "
+                          "(others keep the legacy grid, no glob params). '' = all DAT layers."}
+    )
     dat_rel_sup_weight: float = field(
         default=0.0,
         metadata={"help": "Dense supervision of the dat_use_global_offset relevance map on bbox "
@@ -3535,6 +3547,8 @@ def train():
             'glob_relevance': model_args.dat_glob_relevance,
             'glob_dim': model_args.dat_glob_dim,
             'glob_query_pos': model_args.dat_glob_query_pos,
+            'glob_floor': model_args.dat_glob_floor,
+            'glob_layers': model_args.dat_glob_layers,
             'rel_sup_weight': model_args.dat_rel_sup_weight,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,
