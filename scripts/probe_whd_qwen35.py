@@ -681,6 +681,9 @@ def main():
                          "k x k cells around the argmax (c = argmax, s ~ k/gs); 'local:<k>:<lam>' = "
                          "floor then moments inside the k x k window around the argmax. "
                          "Default: model as trained")
+    ap.add_argument("--glob_sink_x", type=float, default=None,
+                    help="inference-only override of the model's glob_sink_x (cells whose EMA prior "
+                         "> x/N are masked in the attn relevance map); default: as trained")
     ap.add_argument("--glob_layers", default=None,
                     help="comma list of DAT layers that keep the global term at inference; the "
                          "others get a flat map (c=0, s=1). Default: all")
@@ -708,6 +711,13 @@ def main():
         attn_implementation=args.attn,
     ).eval()
     install_lr_key_hook(model)
+    if args.glob_sink_x is not None:
+        from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5AttentionDAT as _DAT
+        n_set = 0
+        for m in model.modules():
+            if isinstance(m, _DAT) and hasattr(m, "glob_sink_x"):
+                m.glob_sink_x = float(args.glob_sink_x); n_set += 1
+        print(f"[probe] glob_sink_x override -> {args.glob_sink_x} on {n_set} DAT layers")
     image_token_id = getattr(model.config, "image_token_id", None)
     args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
     if args.hd_source.startswith("oracle") and args.dataset not in ("vstar", "synth"):
@@ -1235,6 +1245,56 @@ def main():
                     print(f"{'fused':>6} {name:>6} | {s_['mass']:>6.3f} {s_['amax']:>6.3f} {s_['box']:>6.3f} | "
                           f"{s_['cerr']:>6.3f} {s_['miss']:>6.3f}")
             layer_glob.setdefault(-1, {})["head_pool"] = pool_stats
+
+        # Diagnostic 10: split the samples by whether the model's map PEAK is
+        # inside the GT window at the reference layer (hit) or not (miss) and
+        # look at everything downstream per subset: readout accuracy off/on,
+        # grid scale s, in_box, dist ratio. Hits ~ oracle & misses ~ shuffle
+        # => the pipeline works and localisation is the only limit; hits not
+        # better than misses => the readout / grid scale is the limit.
+        # Also splits by GT-box height at LR (<10 px: text unreadable at LR).
+        if has_gt and len(GLOBP) >= 1:
+            ref_l = max(GLOBP, key=lambda l: layer_glob.get(l, {}).get("map_argmax_in", -1.0))
+            rows = GLOBP[ref_l]
+            if len(rows) == n:
+                maps = np.stack([v[0] for v in rows]).astype(np.float64)
+                win = np.stack([v[1] for v in rows]).astype(np.float64)
+                am = maps.argmax(1)
+                hitm = win[np.arange(n), am] > 0.5                          # peak inside window
+                lr_h = []
+                for s in samples:
+                    W_, H_ = s["image"].size
+                    lr_h.append(s["bboxes"][0][3] * math.sqrt(args.tok_budget * TOK_PX / max(W_ * H_, 1)))
+                lr_h = np.array(lr_h)
+                small = lr_h < 10.0
+                subsets = [("peak in win", hitm), ("peak out", ~hitm),
+                           ("box<10px@LR", small), ("box>=10px", ~small),
+                           ("in&>=10px", hitm & ~small), ("out&>=10px", ~hitm & ~small)]
+                on_c = configs[1] if len(configs) > 1 else None
+                print(f"\n==== by localisation outcome at layer {ref_l}  (peak in GT window = hit)  "
+                      f"and by GT box height at LR ====")
+                print(f"{'subset':>12} | {'n':>4} | {'off':>6} {'on':>6} {'delta':>6} | "
+                      f"{'s':>6} {'in_box':>6} {'ratio':>6}")
+                print("-" * 70)
+                subset_out = {}
+                for name, m in subsets:
+                    idx = [k for k in range(n) if m[k]]
+                    if not idx:
+                        continue
+                    a_off = acc(preds["off"], m)
+                    a_on = acc(preds[on_c], m) if on_c else float("nan")
+                    s_mean = float(np.mean([(GLOBC[ref_l][k][2] + GLOBC[ref_l][k][3]) / 2 for k in idx])) \
+                        if ref_l in GLOBC and len(GLOBC[ref_l]) == n else float("nan")
+                    if ref_l in LOC and len(LOC[ref_l]) == n:
+                        ib = float(np.mean([LOC[ref_l][k][2] for k in idx]))
+                        ratio = float(np.mean([LOC[ref_l][k][0] / max(LOC[ref_l][k][1], 1e-9) for k in idx]))
+                    else:
+                        ib = ratio = float("nan")
+                    subset_out[name] = {"n": len(idx), "off": a_off, "on": a_on, "s": s_mean,
+                                        "in_box": ib, "ratio": ratio}
+                    print(f"{name:>12} | {len(idx):>4} | {a_off:>6.2f} {a_on:>6.2f} {a_on - a_off:>+6.2f} | "
+                          f"{s_mean:>6.3f} {ib:>6.3f} {ratio:>6.3f}")
+                layer_glob.setdefault(-1, {})["by_outcome"] = {"ref_layer": ref_l, **subset_out}
 
         if args.dump_maps:
             # Visual check: per layer one contact sheet, one row per sample,
