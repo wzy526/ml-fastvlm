@@ -447,8 +447,45 @@ def install_merge_hook():
     # Also records how far sampling points moved off the uniform reference grid.
     orig_sample = Qwen3_5AttentionDAT._sample_hd_from_off_guide
 
+    # Diagnostic 5 (--glob_readout / --glob_layers): swap the map -> (c, s)
+    # readout at inference WITHOUT retraining. The model computes
+    # c = E_p[g], s = std_p/std_u over the whole map; a map with 60% mass in
+    # the window and 40% flat background gives s ~ 0.9 and a centroid pulled
+    # to the image centre. 'floor:<lam>' subtracts lam/N (lam = 1: the uniform
+    # level) from p and renormalises before the moments; layers not in
+    # --glob_layers get a flat map (c = 0, s = 1, i.e. the global term off).
+    # Implemented by intercepting the single torch.softmax call of
+    # _sample_hd_from_off_guide (the others there are F.softmax / .softmax()).
+    orig_softmax = torch.softmax
+
+    def glob_softmax_for(layer_idx, gs):
+        mode = STATE.get("glob_readout")
+        layers = STATE.get("glob_layers")
+        N = gs * gs
+
+        def f(x, dim=-1, *aa, **kk):
+            p = orig_softmax(x, dim, *aa, **kk)
+            if x.dim() != 2 or x.size(-1) != N:
+                return p
+            if layers is not None and layer_idx not in layers:
+                return torch.full_like(p, 1.0 / N)
+            if mode and mode.startswith("floor:"):
+                lam = float(mode.split(":", 1)[1])
+                q = (p - lam / N).clamp_min(0.0)
+                z = q.sum(-1, keepdim=True)
+                return torch.where(z > 1e-9, q / z.clamp_min(1e-9), p)
+            return p
+        return f
+
     def patched_sample(self, *a, **kw):
-        key_hd, value_hd, locs = orig_sample(self, *a, **kw)
+        if STATE.get("glob_readout") or STATE.get("glob_layers") is not None:
+            torch.softmax = glob_softmax_for(self.layer_idx, self.grid_size)
+            try:
+                key_hd, value_hd, locs = orig_sample(self, *a, **kw)
+            finally:
+                torch.softmax = orig_softmax
+        else:
+            key_hd, value_hd, locs = orig_sample(self, *a, **kw)
         if STATE["record"]:
             with torch.no_grad():
                 k = key_hd.float()                       # [Lp, Ns, D]
@@ -609,7 +646,20 @@ def main():
                          "de-sinked attention from <|im_start|>, each over the image with GT box / window")
     ap.add_argument("--dump_n", type=int, default=12)
     ap.add_argument("--dump_layers", default="7,11,15,19")
+    ap.add_argument("--glob_readout", default=None,
+                    help="inference-only swap of the relevance-map -> (c, s) readout: "
+                         "'floor:<lam>' subtracts lam/N from p and renormalises before the "
+                         "moments (lam=1 removes the uniform background). Default: model as trained")
+    ap.add_argument("--glob_layers", default=None,
+                    help="comma list of DAT layers that keep the global term at inference; the "
+                         "others get a flat map (c=0, s=1). Default: all")
     args = ap.parse_args()
+    STATE["glob_readout"] = args.glob_readout
+    STATE["glob_layers"] = (None if args.glob_layers is None
+                            else {int(x) for x in args.glob_layers.split(",") if x.strip()})
+    if args.glob_readout or args.glob_layers:
+        print(f"[probe] glob readout override: {args.glob_readout}  layers={args.glob_layers}  "
+              f"(relevance-map table then shows the post-floor map)")
 
     from transformers import AutoProcessor
     from llava.model.language_model.modeling_qwen3_5_dat import (
