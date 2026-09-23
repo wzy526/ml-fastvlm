@@ -149,7 +149,6 @@ DAT_KEYS_MATCH = [
     'hd_gate', 'hd_input_layernorm',
     'proj_film', 'spatial_gain',
     'conv_glob', 'glob_q', 'glob_k',   # Qwen3.5 DAT with dat_use_global_offset
-    'glob_tau', 'glob_cell_bias',      # dat_glob_relevance='attn' (+ buffer glob_attn_prior)
 ]
 
 
@@ -356,12 +355,6 @@ class ModelArguments:
     )
     dat_grid_size: int = field(default=6)
     dat_off_ksize: int = field(default=3)
-    dat_question_inject: str = field(
-        default="none",
-        metadata={"help": "none|xattn: question-conditioned offset readout (QuestionReadout)"}
-    )
-    dat_qr_heads: int = field(default=4)
-    dat_qr_layerscale_init: float = field(default=1e-2)
     dat_hd_lse_bias: float = field(
         default=0.0,
         metadata={"help": "Constant added to the HD-side LSE in the two-pass merge, i.e. to every "
@@ -2515,18 +2508,15 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             metrics["dat/glob_scale"] = sum(v[1] for v in self._glob_buf) / n
             self._glob_buf.clear()
         # dat_glob_relevance='attn': cells currently masked as sinks (mean over
-        # DAT layers; 0922 probe saw 5-16 of 400 per layer) and the learned
-        # temperature on log p_attn (1 = the raw attention).
+        # DAT layers; 0922 probe saw 5-16 of 400 per layer).
         if self._model is not None:
-            sinks, taus = [], []
+            sinks = []
             for module in self._model.modules():
                 s = getattr(module, '_dat_glob_sink_n', None)
                 if s is not None:
                     sinks.append(float(s))
-                    taus.append(float(module.glob_tau.detach().float().mean()))
             if sinks:
                 metrics["dat/glob_sink_cells"] = sum(sinks) / len(sinks)
-                metrics["dat/glob_tau"] = sum(taus) / len(taus)
         # Dense relevance supervision: rel_sup_mass = softmax mass the map puts
         # inside the target window; rel_sup_base = the window's share of the
         # cells (= mass of a uniform map). mass >> base is the map localising.
@@ -3535,9 +3525,6 @@ def train():
         dat_extra_args = {
             'grid_size': model_args.dat_grid_size,
             'off_ksize': model_args.dat_off_ksize,
-            'question_inject': model_args.dat_question_inject,
-            'qr_heads': model_args.dat_qr_heads,
-            'qr_layerscale_init': model_args.dat_qr_layerscale_init,
             'lr_drop_prob': model_args.dat_lr_drop_prob,
             'lr_drop_ratio': model_args.dat_lr_drop_ratio,
             'hd_lse_bias': model_args.dat_hd_lse_bias,

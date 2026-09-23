@@ -708,9 +708,9 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             'use_intention_branch': True,
             'intention_as_gate': True,
             'intention_inject': 'gate',   # 'gate' (legacy) | 'film' (post-norm)
-            'question_inject': 'none',    # 'none' (legacy) | 'xattn' (question->cell cross-attn residual)
-            'qr_heads': 4,                # xattn: number of attention heads
-            'qr_layerscale_init': 1e-2,   # xattn: initial per-channel LayerScale on the residual
+            # (removed 0923: 'question_inject'='xattn' -- a from-scratch
+            # cell->question cross-attention readout; never localised, see
+            # glob_relevance='attn' for what replaced it)
             'off_range': 0.0,             # 0 = legacy clamp; >0 = off_range*tanh
             'off_penalty': 0.0,           # >0 = honest clamp + out-of-range pull-back
             # Offset supervision (training-only, bbox samples): >0 turns the
@@ -881,7 +881,7 @@ def compute_image_range_list(input_ids, labels, image_token_id,
     Each answer range carries its question span (q_start, q_end): the tokens
     from the end of the previous segment (image / prior answer) up to where the
     turn's answer begins (training) or the assistant <|im_start|> (inference).
-    Consumed by the 'xattn' question-conditioned offset readout.
+    (Kept for the probe's per-position diagnostics; no model path reads it.)
     """
     batch_size = input_ids.shape[0]
     result = []
@@ -970,135 +970,6 @@ def compute_image_range_list(input_ids, labels, image_token_id,
 OFF_PROJ_INIT_STD = 0.005
 
 
-class QuestionReadout(nn.Module):
-    """A second LR readout that cross-attends grid cells to the question span.
-
-    The offset head reads a pooled LR grid (``embed_lr``: [off_grps, C, gs, gs]).
-    The only spatially-resolved, content-addressed path from the question to the
-    per-cell sampling offsets is this module: each grid cell is a *query* that
-    reads content from the variable-length question hidden states (*key/value*),
-    and the readout is added back to the cell feature as a small, per-channel
-    LayerScale-gated residual (CaiT-style)::
-
-        off_guide = embed_lr + layerscale ⊙ o_proj( softmax(Q Kᵀ) V )
-
-    Because the fusion is a residual into the feature the offset head already
-    consumes (not an extra concatenated column that a fixed 1x1 conv must read
-    out), the question can steer *where* a cell samples: cell (i,j) chooses
-    which question tokens to attend to, so different questions move different
-    cells to different offsets. ``layerscale`` starts small and ``pos_emb``
-    starts at zero, so a checkpoint warm-started from a non-xattn run begins
-    ≈ LR-only and escapes the zero-readout deadlock without a discontinuous
-    jump, while each channel's residual can grow independently as needed.
-
-    Attention math runs in fp32; parameters stay in the module dtype (the small
-    residual then passes through the fp32 ``conv_off_proj`` downstream).
-    """
-
-    def __init__(self, cell_dim, hidden_size, grid_size, num_heads=4, layerscale_init=1e-2):
-        super().__init__()
-        d = cell_dim
-        if num_heads <= 0 or d % num_heads != 0:
-            num_heads = 1
-        self.num_heads = num_heads
-        self.head_dim = d // num_heads
-        self.cell_dim = d
-        self.grid_size = grid_size
-        self.q_ln = nn.LayerNorm(hidden_size)
-        self.c_ln = nn.LayerNorm(d)
-        self.q_proj = nn.Linear(d, d, bias=False)
-        self.k_proj = nn.Linear(hidden_size, d, bias=False)
-        self.v_proj = nn.Linear(hidden_size, d, bias=False)
-        self.o_proj = nn.Linear(d, d, bias=False)
-        self.pos_emb = nn.Parameter(torch.zeros(d, grid_size, grid_size))
-        # CaiT LayerScale: per-channel diagonal gate on the residual branch.
-        self.layerscale = nn.Parameter(torch.full((d,), float(layerscale_init)))
-        self._layerscale_init = float(layerscale_init)
-
-    @torch.no_grad()
-    def reset_parameters(self):
-        """Full, self-contained (re)initialization of EVERY parameter.
-
-        Called from both DAT init paths (`_init_dat_weights` at construction and
-        the monkey-patched `_dat_init_weights` that `from_pretrained` runs for
-        missing keys). Crucial for the meta-device from_pretrained flow: there
-        the constructor's `torch.full`/`torch.zeros` values are NEVER
-        materialized, and the base `_init_weights` covers only nn.Linear /
-        RMSNorm — so the bare `pos_emb`/`layerscale` Parameters and the two
-        nn.LayerNorm modules would otherwise stay as uninitialized garbage
-        (observed: layerscale ~1e37 -> off_guide NaN on the first forward)."""
-        for lin in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
-            nn.init.xavier_uniform_(lin.weight)
-            if lin.bias is not None:
-                nn.init.zeros_(lin.bias)
-        for ln in (self.q_ln, self.c_ln):
-            nn.init.ones_(ln.weight)
-            nn.init.zeros_(ln.bias)
-        nn.init.zeros_(self.pos_emb)
-        # Small non-zero per-channel gate: question residual starts small
-        # (warm-start ≈ LR-only) but each channel is independently trainable.
-        self.layerscale.data.fill_(self._layerscale_init)
-
-    def forward(self, cells, q_hidden_list, off_grps):
-        """cells: [(Lp*G), C, gs, gs]; q_hidden_list: len-Lp list of [Lq, hidden]
-        (or empty tensors for turns with no question span). Returns the residual
-        layerscale ⊙ readout, shape [(Lp*G), C, gs, gs]."""
-        LpG, C, gs, _ = cells.shape
-        G = off_grps
-        Lp = LpG // G
-        H, hd, N = self.num_heads, self.head_dim, gs * gs
-
-        # Env-gated per-stage NaN probe (DAT_QR_PROBE=1). Zero cost when unset.
-        # First healthy call prints every stage (baseline); later calls print only
-        # a stage that is already non-finite -> pinpoints the exact op on real data.
-        _qrp = os.environ.get("DAT_QR_PROBE")
-        _qrp_first = bool(_qrp) and getattr(self, "_qrp_n", 0) == 0
-
-        def _p(tag, t):
-            if not _qrp:
-                return
-            tf = t.detach().float()
-            nan = bool(torch.isnan(tf).any())
-            inf = bool(torch.isinf(tf).any())
-            if nan or inf or _qrp_first:
-                amax = float(tf.abs().max()) if tf.numel() else 0.0
-                print(f"[QRP {'BAD' if (nan or inf) else 'ok '}] "
-                      f"{tag:12s} shape={tuple(t.shape)} "
-                      f"dt={str(t.dtype).replace('torch.', '')} "
-                      f"nan={nan} inf={inf} absmax={amax:.4g}", flush=True)
-
-        x = cells + self.pos_emb.to(cells.dtype).unsqueeze(0)     # [(Lp*G), C, gs, gs]
-        xt = self.c_ln(x.flatten(2).transpose(1, 2))              # [(Lp*G), N, C]
-        q = self.q_proj(xt).float()                               # [(Lp*G), N, C]
-        _p("cells", cells); _p("xt(c_ln)", xt); _p("q", q)
-
-        delta = cells.new_zeros(LpG, N, C)
-        for l in range(Lp):
-            Hq = q_hidden_list[l] if l < len(q_hidden_list) else None
-            if Hq is None or Hq.shape[0] == 0:
-                continue
-            Hn = self.q_ln(Hq)
-            k = self.k_proj(Hn).float()                           # [Lq, C]
-            v = self.v_proj(Hn).float()                           # [Lq, C]
-            Lq = k.shape[0]
-            sl = slice(l * G, (l + 1) * G)
-            qh = q[sl].reshape(G, N, H, hd).permute(0, 2, 1, 3)   # [G, H, N, hd]
-            kh = k.reshape(Lq, H, hd).permute(1, 0, 2) * (hd ** -0.5)   # [H, Lq, hd]
-            vh = v.reshape(Lq, H, hd).permute(1, 0, 2)            # [H, Lq, hd]
-            scores = torch.einsum('ghnd,hld->ghnl', qh, kh)
-            attn = F.softmax(scores, dim=3)
-            oh = torch.einsum('ghnl,hld->ghnd', attn, vh)         # [G, H, N, hd]
-            o = oh.permute(0, 2, 1, 3).reshape(G, N, C)           # [G, N, C]
-            delta[sl] = self.o_proj(o.to(xt.dtype))
-            _p(f"Hq[{l}]", Hq); _p(f"Hn[{l}]", Hn); _p(f"k[{l}]", k)
-            _p(f"v[{l}]", v); _p(f"scores[{l}]", scores)
-            _p(f"attn[{l}]", attn); _p(f"delta[{l}]", delta[sl])
-        delta = delta.transpose(1, 2).reshape(LpG, C, gs, gs)
-        if _qrp:
-            self._qrp_n = getattr(self, "_qrp_n", 0) + 1
-        return self.layerscale.to(cells.dtype).view(1, C, 1, 1) * delta
-
-
 class Qwen3_5AttentionDAT(Qwen3_5Attention):
     """
     Core DAT mechanism for Qwen3.5 (two-pass + LSE merge):
@@ -1166,13 +1037,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         # parameters are zero-init, so a checkpoint trained under 'gate' keeps
         # bit-identical outputs and can be warm-started.
         self.intention_inject = dat.get('intention_inject', 'gate')
-
-        # Question conditioning by a second LR readout that cross-attends the
-        # grid cells to the full question span (residual-injected into embed_lr).
-        # 'none' = disabled (bit-identical to legacy gate/film ckpts); 'xattn'
-        # = enabled. See QuestionReadout. Uses the single-width offset head
-        # (conv_off_proj: inter_size -> 2), so it does NOT concat / gate.
-        self.question_inject = dat.get('question_inject', 'none')
+        assert dat.get('question_inject', 'none') == 'none', \
+            "question_inject='xattn' was removed (0923); use glob_relevance='attn'"
 
         # Offset magnitude. With the legacy straight-through clamp nothing
         # penalizes an offset that overshoots [-1,1]: the forward value is
@@ -1222,7 +1088,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         self._dat_off_target_batch = None
 
         # Offset prediction
-        if self.intention_as_gate or self.question_inject == 'xattn':
+        if self.intention_as_gate:
             self.ln_2 = _FP32WeightLayerNorm2d(self.inter_size)
             self.conv_off_proj = _FP32WeightConv2d(
                 self.inter_size, 2, kernel_size=1, stride=1, padding=0, bias=False,
@@ -1270,26 +1136,16 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         if self.glob_use_attn:
             assert self.use_intention_branch, "glob_relevance='attn' needs the intention token"
             _n = self.grid_size * self.grid_size
-            self.glob_tau = nn.Parameter(torch.ones(1, dtype=torch.float32))
-            self.glob_cell_bias = nn.Parameter(torch.zeros(_n, dtype=torch.float32))
             # running per-cell mean of p_attn over training samples (question-
             # blind prior); cells above glob_sink_x / N are masked. Saved with
             # the checkpoint so inference masks the same cells.
+            # (0923: the learnable tau / cell_bias on top were removed -- in
+            # 0922 miniD tau drifted 1 -> 0.974 and cell_bias learned a
+            # dataset location prior; the raw de-sinked attention scored the
+            # same or better. The 'attn' map is parameter-free.)
             self.register_buffer('glob_attn_prior', torch.full((_n,), 1.0 / _n, dtype=torch.float32))
         else:
-            self.glob_tau = None
-            self.glob_cell_bias = None
             self.glob_attn_prior = None
-
-        # Question-conditioned LR readout (residual cross-attention).
-        if self.question_inject == 'xattn':
-            self.q_readout = QuestionReadout(
-                self.inter_size, self.hidden_size, self.grid_size,
-                num_heads=int(dat.get('qr_heads', 4)),
-                layerscale_init=float(dat.get('qr_layerscale_init', 1e-2)),
-            )
-        else:
-            self.q_readout = None
 
         # HD feature KV projection
         if self.hd_proj:
@@ -1346,10 +1202,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         if self.spatial_gain is not None and self.spatial_gain.dtype != torch.float32:
             with torch.no_grad():
                 self.spatial_gain.data = self.spatial_gain.data.to(torch.float32)
-        for bare in (self.glob_tau, self.glob_cell_bias, self.glob_attn_prior):
-            if bare is not None and bare.dtype != torch.float32:
-                with torch.no_grad():
-                    bare.data = bare.data.to(torch.float32)
+        if self.glob_attn_prior is not None and self.glob_attn_prior.dtype != torch.float32:
+            with torch.no_grad():
+                self.glob_attn_prior.data = self.glob_attn_prior.data.to(torch.float32)
         for sub in (self.conv_lr_dw, self.ln_1, self.conv_lr_proj,
                     self.proj_intention, self.ln_2, self.conv_off_proj,
                     self.proj_film, self.conv_glob, self.glob_q, self.glob_k):
@@ -1378,8 +1233,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             nn.init.zeros_(self.proj_film.weight)
             nn.init.zeros_(self.proj_film.bias)
             nn.init.zeros_(self.spatial_gain)
-        if self.q_readout is not None:
-            self.q_readout.reset_parameters()
         if self.conv_glob is not None:
             # zero => uniform relevance => centroid 0, scale 1 => legacy grid
             nn.init.zeros_(self.conv_glob.weight)
@@ -1391,14 +1244,12 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
     def _init_glob_qk_weights(self):
         """'qk' relevance: W_q zero (=> uniform map => identity grid at load),
         W_k small normal so the keys are already spread when W_q starts moving.
-        'attn' relevance: tau 1, cell bias 0, running prior uniform (no cell
-        masked) => the map at load is exactly the trunk's attention."""
+        'attn' relevance: running prior uniform (no cell masked) => the map at
+        load is exactly the trunk's attention."""
         if self.glob_q is not None:
             nn.init.zeros_(self.glob_q.weight)
             nn.init.normal_(self.glob_k.weight, std=0.02)
-        if self.glob_tau is not None:
-            nn.init.ones_(self.glob_tau)
-            nn.init.zeros_(self.glob_cell_bias)
+        if self.glob_attn_prior is not None:
             self.glob_attn_prior.fill_(1.0 / self.glob_attn_prior.numel())
 
     @torch.no_grad()
@@ -1810,7 +1661,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 m = self.glob_attn_ema
                 self.glob_attn_prior.mul_(m).add_(p.detach().mean(0) * (1.0 - m))
         sink = self.glob_attn_prior > (self.glob_sink_x / n_cells)   # [N] bool
-        logits = self.glob_tau * torch.log(p.clamp_min(1e-9)) + self.glob_cell_bias
+        logits = torch.log(p.clamp_min(1e-9))                        # softmax(logits) == p
         logits = logits.masked_fill(sink.unsqueeze(0), -1e4)
         if self.training:
             self._dat_glob_sink_n = sink.sum()                       # 0-d, for the monitor
@@ -1943,29 +1794,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 self._fn_chk("glob_attn", attn_logits, b_idx)
                 glob_logits = attn_logits if glob_logits is None else glob_logits + attn_logits
 
-            if self.question_inject == 'xattn':
-                # Grid cells cross-attend to the full question span; the readout
-                # is residual-injected into embed_lr (see QuestionReadout). This
-                # is the only spatially-resolved question->offset path.
-                q_hidden_list = [
-                    _grad_scale(query_states[b_idx, ar[3]:ar[4]], _tg)
-                    if len(ar) > 4 and ar[4] > ar[3]
-                    else query_states.new_zeros((0, query_states.shape[-1]))
-                    for ar in answer_ranges
-                ]
-                if os.environ.get("DAT_QR_PROBE"):
-                    _qs = query_states[b_idx].detach().float()
-                    _spans = [(int(ar[3]), int(ar[4])) for ar in answer_ranges if len(ar) > 4]
-                    print(f"[QRP-SRC] L{getattr(self, 'layer_idx', '?')} b={b_idx} "
-                          f"query_states nan={bool(torch.isnan(_qs).any())} "
-                          f"inf={bool(torch.isinf(_qs).any())} "
-                          f"absmax={float(_qs.abs().max()):.4g} spans={_spans}", flush=True)
-                off_guide = embed_lr_rep + self.q_readout(
-                    embed_lr_rep, q_hidden_list, self.off_grps,
-                )
-                self._fn_chk("xattn.embed_lr_rep", embed_lr_rep, b_idx)
-                self._fn_chk("xattn.off_guide", off_guide, b_idx)
-            elif self.use_intention_branch:
+            if self.use_intention_branch:
                 if self.intention_as_gate:
                     gate = embed_intention.sigmoid()
                     off_guide = embed_lr_rep * (gate * 2.0)
@@ -2574,8 +2403,8 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         HF's post-load init pass (_initialize_weights -> _dat_init_weights) re-runs
         the full DAT init on every DAT attention module AFTER the checkpoint is
         loaded, clobbering already-loaded DAT params back to their init values
-        (q_readout.layerscale -> 1e-2, hd_gate -> hd_gate_init, and — depending on
-        HF's meta-materialization order — potentially the convs / hd_proj too).
+        (hd_gate -> hd_gate_init, and — depending on HF's meta-materialization
+        order — potentially the convs / hd_proj too).
         _manual_load_dat_raw_params copies the on-disk DAT tensors back in as the
         very last step, so a DAT checkpoint (stage-1 CPT -> stage-2 SFT) keeps its
         trained adapters. A fresh base conversion has no DAT keys on disk, so it is
@@ -2592,9 +2421,8 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         '.conv_lr_dw.', '.conv_lr_proj.', '.conv_off_proj.',
         '.proj_intention.', '.proj_film.', '.spatial_gain',
         '.k_proj_hd.', '.v_proj_hd.', '.hd_input_layernorm.',
-        '.hd_gate', '.q_readout.', '.ln_1.', '.ln_2.',
-        '.conv_glob.', '.glob_q.', '.glob_k.',
-        '.glob_tau', '.glob_cell_bias', '.glob_attn_prior',
+        '.hd_gate', '.ln_1.', '.ln_2.',
+        '.conv_glob.', '.glob_q.', '.glob_k.', '.glob_attn_prior',
     )
 
     @classmethod
@@ -2602,9 +2430,10 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         """Re-copy the on-disk DAT params over whatever HF's post-load init left.
 
         Needed because HF re-runs _dat_init_weights on the DAT attention modules
-        after loading and re-initializes params it should have left alone (proven:
-        q_readout.layerscale reverts to its 1e-2 init on every SFT reload even
-        though the checkpoint holds the trained value and HF reports missing=0).
+        after loading and re-initializes params it should have left alone (proven
+        on the since-removed q_readout.layerscale: it reverted to its init on
+        every SFT reload although the checkpoint held the trained value and HF
+        reported missing=0).
         Running last, this makes the checkpoint authoritative regardless of HF's
         init ordering. No-op for a fresh base conversion (no DAT keys on disk).
         """
@@ -2651,7 +2480,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         if n_loaded > 0:
             logger.info(
                 f"[DAT post-load] re-asserted {n_loaded} on-disk DAT params "
-                f"over HF's post-load re-init (incl. q_readout.layerscale, hd_gate)"
+                f"over HF's post-load re-init (incl. hd_gate)"
             )
 
     def _patch_text_model_init_weights(self):
@@ -2680,13 +2509,6 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     if module.proj_intention.bias is not None:
                         nn.init.zeros_(module.proj_intention.bias)
                 module._init_hd_proj_weights()
-                if module.q_readout is not None:
-                    # QuestionReadout carries bare nn.Parameter (pos_emb,
-                    # layerscale) and nn.LayerNorm that neither base _init_weights
-                    # (Linear/RMSNorm only) nor the block above covers — on the
-                    # meta-device from_pretrained flow these stay uninitialized
-                    # (layerscale ~1e37 -> off_guide NaN). Init them explicitly.
-                    module.q_readout.reset_parameters()
                 if module.conv_glob is not None:
                     # zero = uniform relevance = identity on the grid; base
                     # _init_weights would give it a normal init (=> a random
@@ -3195,13 +3017,13 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
-    'hd_gate', 'hd_input_layernorm', 'q_readout',
+    'hd_gate', 'hd_input_layernorm',
     # intention_inject='film' extras (None unless enabled)
     'proj_film', 'spatial_gain',
     # use_global_offset extras (None unless enabled; conv_glob for 'conv'/'both',
-    # glob_q/glob_k for 'qk'/'both'/'attn+qk'; glob_tau/glob_cell_bias/
-    # glob_attn_prior (buffer) for 'attn'/'attn+qk')
-    'conv_glob', 'glob_q', 'glob_k', 'glob_tau', 'glob_cell_bias', 'glob_attn_prior',
+    # glob_q/glob_k for 'qk'/'both'/'attn+qk'; glob_attn_prior (buffer) for
+    # 'attn'/'attn+qk')
+    'conv_glob', 'glob_q', 'glob_k', 'glob_attn_prior',
 ]
 
 

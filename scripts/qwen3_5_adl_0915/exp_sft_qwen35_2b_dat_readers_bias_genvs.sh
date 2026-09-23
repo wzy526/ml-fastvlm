@@ -173,19 +173,25 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # reuse the trunk's attention:
 #   GLOB_QPOS=ans_prev   query token = the token before the answer
 #   GLOB_REL=attn        map = the layer's own attention (heads averaged),
-#                        sink cells masked (running mean > GLOB_SINK_X/N),
-#                        tau*log p + per-cell bias (tau 1, bias 0 at init)
-# Mini D (verification, two arms, 4 GPUs each ~90 min or 8 GPUs ~45 min each):
-#   B (main):    ... GLOBAL_OFFSET=1 GLOB_REL=attn GLOB_QPOS=ans_prev REL_SUP_WEIGHT=1 \
-#                ROUTE_BY_DROP=1 EXP_NAME=0922_miniD_attn bash <this script>
-#   A (control): ... GLOBAL_OFFSET=1 GLOB_REL=qk   GLOB_QPOS=ans_prev REL_SUP_WEIGHT=1 \
-#                ROUTE_BY_DROP=1 EXP_NAME=0922_miniD_qk_ansprev bash <this script>
-#   (rest = miniC line above). wandb: dat/rel_sup_mass should START near 0.45
-#   for B (the de-sinked attention) and climb; dat/glob_sink_cells 5-20;
-#   dat/glob_tau; glob_shift > 0.2, glob_scale < 0.7.
-# Pass (held-out probe, decided before running): map mass >= 0.55, argmax
-# >= 0.7, box >= 0.15; r_cx/r_cy >= 0.5; in_box >= 0.08 (miniB 0.038);
-# oracle gain >= +4 and real clearly above shuffle. Only then the full run.
+#                        sink cells masked (running mean > GLOB_SINK_X/N);
+#                        parameter-free (0923: the learnable tau / cell bias
+#                        were removed -- miniD: tau drifted 1 -> 0.974, the
+#                        bias learned a dataset location prior, the raw
+#                        de-sinked attention scored the same or better)
+# Mini D result (0922, both arms 600 steps, held-out 500):
+#   map:   attn mass 0.61 / argmax 0.70 / box 0.165 (miniB-qk 0.42 / - / 0.07)
+#          -> passed; qk+ans_prev 0.42 / 0.69 / 0.11.
+#   c:     r_cx 0.6 r_cy 0.77 both arms (miniB 0.1 / 0.45) -> ans_prev did it.
+#   s:     stuck at 0.80-0.93, r_s ~ 0: whole-map moments are inflated by the
+#          ~40% flat background; in_box 0.035 (unchanged), readout +0.8.
+#   By outcome (probe 'by localisation outcome'): 73% of samples have the peak
+#   in the window; on those real +1.9 / shuffle 0 / oracle +3.8; on the rest
+#   real -2.2 and ORACLE 0 (label noise / unanswerable) -> localisation rate is
+#   near its ceiling, the missing gain is on the hits. Every inference-only
+#   grid swap (floor, argmax, gate) made the hits WORSE (+0.8..1.1): the
+#   readout only reads the grid distribution it was trained with -> must
+#   co-train (mini E). Head pooling (mean/max/best/conf/lse), cross-layer
+#   fusion and sink thresholds 5/3/2 changed nothing.
 #
 # Full 0920 combined run (data = 0817 mix + viscot doc boxes + synth_hd text on
 # SA-1B natural images (+ optional Visual-CoT natural-image boxes), built by
@@ -341,7 +347,7 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_glob_min_scale "${GLOB_MIN_SCALE:-0.1}" \
     --dat_glob_relevance "${GLOB_REL:-conv}" \
     --dat_glob_dim "${GLOB_DIM:-128}" \
-    --dat_glob_query_pos "${GLOB_QPOS:-im_start}" \
+    --dat_glob_query_pos "${GLOB_QPOS:-ans_prev}" \
     --dat_glob_sink_x "${GLOB_SINK_X:-5}" \
     --dat_rel_sup_weight "${REL_SUP_WEIGHT:-0}" \
     --dat_lr 1e-4 \
