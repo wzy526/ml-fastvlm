@@ -615,7 +615,8 @@ def install_merge_hook():
                         aloc = locs[1].float().mean(0).reshape(-1, 2)      # [Ns, 2] (x, y), groups averaged
                         pib = ((aloc[:, 0] >= box[0]) & (aloc[:, 0] <= box[2]) &
                                (aloc[:, 1] >= box[1]) & (aloc[:, 1] <= box[3]))
-                        STATE["hd_ctx"] = (self.layer_idx, aloc, tgt.reshape(-1, 2).mean(0), box, pib)
+                        s_lr = float(s.mean()) if cs is not None else 1.0    # this layer's coarse scale
+                        STATE["hd_ctx"] = (self.layer_idx, aloc, tgt.reshape(-1, 2).mean(0), box, pib, s_lr)
         return key_hd, value_hd, locs
 
     Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
@@ -636,7 +637,7 @@ def install_merge_hook():
     def patched_xattn(seg_q_list, seg_k_list, seg_v_list, *a, **kw):
         ctx = STATE.pop("hd_ctx", None) if STATE["record"] else None
         if ctx is not None:
-            lid, aloc, tc, box, pib = ctx
+            lid, aloc, tc, box, pib, s_lr = ctx
             Ns = aloc.size(0)
             # the answer segment: HD keys of the answer slot (Ns rows) queried
             # by the few tokens after <|im_start|> ('assistant', '\n'); the
@@ -659,9 +660,16 @@ def install_merge_hook():
                     c_hdf = (wf[:, None] * al).sum(0)
                     pk = int(w.argmax())
                     pibd = pib.to(w.device)
+                    # spread of the HD attention in coarse-grid units: a fine
+                    # scale candidate (std of the attended positions / std of
+                    # the uniform reference grid)
+                    var_w = (wf[:, None] * (al - c_hdf) ** 2).sum(0)      # [2]
+                    var_u = (al - al.mean(0)).pow(2).mean(0).clamp_min(1e-9)
+                    s_hd = float((var_w / var_u).sqrt().mean()) * s_lr    # in whole-image units
                     HDC[lid].append((c_hd[0].item(), c_hd[1].item(), c_hdf[0].item(), c_hdf[1].item(),
                                      float(pibd[pk]), float((w * pibd).sum()), float(pibd.float().mean()),
-                                     tc[0].item(), tc[1].item()))
+                                     tc[0].item(), tc[1].item(),
+                                     box.float().cpu().tolist(), s_lr, s_hd))
         return orig_xattn(seg_q_list, seg_k_list, seg_v_list, *a, **kw)
 
     _mod._dat_cross_attn_varlen = patched_xattn
@@ -985,14 +993,33 @@ def main():
         # the HD keys know where the answer is, a coarse-to-fine c is worth
         # building; mass ~ pts -> the answer token does not single out the
         # right HD points either, the bottleneck is not localisation precision.
+        # in_box columns: fraction of a 20x20 grid's points inside the GT box
+        # when the grid is centred at c_hdF with scale s_lr/2 (half the coarse
+        # window) or s_hd (the HD attention's own spread), vs the model's grid
+        # (LOC) -- the quantity that tracked the readout gain so far (model
+        # 0.035-0.045 -> +2, oracle 0.10 -> +3.6).
+        _gs = args.grid_size
+        _m = 1.0 / max(_gs - 1, 1)
+        _lin = np.linspace(-1 + _m, 1 - _m, _gs)
+        _ref = np.stack(np.meshgrid(_lin, _lin, indexing="xy"), -1).reshape(-1, 2)   # [Ns, 2] (x, y)
+
+        def _grid_in_box(cx, cy, sc, bx):
+            p = np.array([cx, cy]) + sc * _ref
+            p = np.clip(p, -1, 1)
+            return float(((p[:, 0] >= bx[0]) & (p[:, 0] <= bx[2]) &
+                          (p[:, 1] >= bx[1]) & (p[:, 1] <= bx[3])).mean())
+
         print(f"\n==== HD-key refinement (diag 12): prompt-end attention over the sampled HD points ====")
         print(f"{'layer':>6} {'set':>8} | {'n':>4} | {'|c_hd-t|':>8} {'|c_hdF-t|':>9} {'|c_lr-t|':>8} {'const':>6} | "
-              f"{'r_cx':>6} {'r_cy':>6} | {'pk_box':>6} | {'mass':>6} {'pts':>6}")
-        print("-" * 108)
+              f"{'r_cx':>6} {'r_cy':>6} | {'pk_box':>6} | {'mass':>6} {'pts':>6} | "
+              f"{'ib_lr':>6} {'ib_s/2':>6} {'ib_shd':>6} {'s_hd':>5}")
+        print("-" * 140)
         for lid in sorted(HDC):
             rows = HDC[lid]
             clr = GLOBC.get(lid)
             clr = clr if clr is not None and len(clr) == len(rows) else None
+            loc_l = LOC.get(lid)
+            loc_l = loc_l if loc_l is not None and len(loc_l) == len(rows) else None
             for set_name, keep in (("all", lambda r: True), ("covered", lambda r: r[6] > 0)):
                 sel = [i for i, r in enumerate(rows) if keep(r)]
                 if len(sel) < 5:
@@ -1010,11 +1037,17 @@ def main():
                 pk = sum(r[4] for r in R) / n_
                 mass = sum(r[5] for r in R) / n_
                 pts = sum(r[6] for r in R) / n_
+                ib_lr = (sum(loc_l[i][2] for i in sel) / n_) if loc_l is not None else float("nan")
+                ib_half = sum(_grid_in_box(r[2], r[3], max(r[10] * 0.5, 0.1), r[9]) for r in R) / n_
+                ib_shd = sum(_grid_in_box(r[2], r[3], max(r[11], 0.1), r[9]) for r in R) / n_
+                s_hd = sum(r[11] for r in R) / n_
                 layer_glob.setdefault(lid, {})[f"hdc_{set_name}"] = {
                     "n": n_, "d_hd": d_hd, "d_hdf": d_hdf, "d_lr": d_lr, "d_const": d_const,
-                    "r_cx": r_cx, "r_cy": r_cy, "peak_in_box": pk, "mass_in_box": mass, "pts_in_box": pts}
+                    "r_cx": r_cx, "r_cy": r_cy, "peak_in_box": pk, "mass_in_box": mass, "pts_in_box": pts,
+                    "in_box_lr": ib_lr, "in_box_half": ib_half, "in_box_shd": ib_shd, "s_hd": s_hd}
                 print(f"{lid:>6} {set_name:>8} | {n_:>4} | {d_hd:>8.3f} {d_hdf:>9.3f} {d_lr:>8.3f} {d_const:>6.3f} | "
-                      f"{r_cx:>6.3f} {r_cy:>6.3f} | {pk:>6.3f} | {mass:>6.3f} {pts:>6.3f}")
+                      f"{r_cx:>6.3f} {r_cy:>6.3f} | {pk:>6.3f} | {mass:>6.3f} {pts:>6.3f} | "
+                      f"{ib_lr:>6.3f} {ib_half:>6.3f} {ib_shd:>6.3f} {s_hd:>5.2f}")
 
     if GLOBP:
         # The relevance map before the soft-argmax collapses it to centroid /
