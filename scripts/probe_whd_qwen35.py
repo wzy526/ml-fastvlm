@@ -608,9 +608,63 @@ def install_merge_hook():
                                                       None if alt is None else
                                                       {kk: (None if vv is None else vv.cpu().numpy())
                                                        for kk, vv in alt.items()}))
+                    # Diagnostic 12 (coarse-to-fine c): hand the answer slot's
+                    # sampling locations to the cross-attention wrapper below,
+                    # which sees this layer's HD keys and the prompt-end query.
+                    if locs.size(0) > 1:
+                        aloc = locs[1].float().mean(0).reshape(-1, 2)      # [Ns, 2] (x, y), groups averaged
+                        pib = ((aloc[:, 0] >= box[0]) & (aloc[:, 0] <= box[2]) &
+                               (aloc[:, 1] >= box[1]) & (aloc[:, 1] <= box[3]))
+                        STATE["hd_ctx"] = (self.layer_idx, aloc, tgt.reshape(-1, 2).mean(0), box, pib)
         return key_hd, value_hd, locs
 
     Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
+
+    # Diagnostic 12: could a SECOND localisation stage read c off the sampled
+    # HD keys? At each DAT layer the answer segment's query (prompt end =
+    # the model's ans_prev token) attends to the Ns HD keys sampled by this
+    # layer's coarse grid (c +- s). Its attention is a relevance map over HD
+    # POSITIONS (the sampling points, HD-cell precision) instead of LR cells:
+    # a centroid over it is confined to the coarse window but can, inside it,
+    # be as precise as the HD grid. Parameter-free, same q/k the model uses
+    # (post-RoPE, k_norm'ed HD keys). Recorded per sample:
+    #   c_hd  (head-mean attention centroid), c_hdF (same after the uniform
+    #   floor), argmax point in the GT box, attention mass in the box, and the
+    #   fraction of sampling points in the box (= what a flat attention gives).
+    orig_xattn = _mod._dat_cross_attn_varlen
+
+    def patched_xattn(seg_q_list, seg_k_list, seg_v_list, *a, **kw):
+        ctx = STATE.pop("hd_ctx", None) if STATE["record"] else None
+        if ctx is not None:
+            lid, aloc, tc, box, pib = ctx
+            Ns = aloc.size(0)
+            # the answer segment: HD keys of the answer slot (Ns rows) queried
+            # by the few tokens after <|im_start|> ('assistant', '\n'); the
+            # question segment has the same key count but a long query, the
+            # LR-inject segment a long query too.
+            cand = [(q, k) for q, k in zip(seg_q_list, seg_k_list)
+                    if k.shape[0] == Ns and q.shape[0] <= 8]
+            if cand:
+                with torch.no_grad():
+                    q, k = cand[-1]
+                    ql = q[-1].float()                                   # [H, D]  prompt-end token
+                    kk = k.float()                                       # [Ns, H, D]
+                    att = torch.einsum('hd,nhd->hn', ql, kk) / math.sqrt(ql.size(-1))
+                    att = att.softmax(-1)                                # [H, Ns]
+                    w = att.mean(0)                                      # [Ns]
+                    wf = (w - 1.0 / Ns).clamp_min(0)
+                    wf = wf / wf.sum().clamp_min(1e-9) if wf.sum() > 1e-9 else w
+                    al = aloc.to(w.device)
+                    c_hd = (w[:, None] * al).sum(0)
+                    c_hdf = (wf[:, None] * al).sum(0)
+                    pk = int(w.argmax())
+                    pibd = pib.to(w.device)
+                    HDC[lid].append((c_hd[0].item(), c_hd[1].item(), c_hdf[0].item(), c_hdf[1].item(),
+                                     float(pibd[pk]), float((w * pibd).sum()), float(pibd.float().mean()),
+                                     tc[0].item(), tc[1].item()))
+        return orig_xattn(seg_q_list, seg_k_list, seg_v_list, *a, **kw)
+
+    _mod._dat_cross_attn_varlen = patched_xattn
 
 
 KHD = defaultdict(list)          # layer_idx -> [(shared/resid ratio, mean |offset|), ...]
@@ -619,6 +673,7 @@ LOC = defaultdict(list)          # layer_idx -> [(dist, dist_uniform, in_box, in
 GLOB = defaultdict(list)         # layer_idx -> [(mean |centroid|, mean scale), ...]  (global offset term)
 GLOBC = defaultdict(list)        # layer_idx -> [(cx, cy, sx, sy, tcx, tcy, tsx, tsy), ...] per sample
 GLOBP = defaultdict(list)        # layer_idx -> [(relevance map [N], in-window mask [N], in-box mask [N]), ...]
+HDC = defaultdict(list)          # layer_idx -> [(c_hd x, y, c_hdF x, y, peak_in_box, mass_in_box, pts_in_box, tcx, tcy), ...]
 
 
 def install_lr_key_hook(model):
@@ -914,6 +969,52 @@ def main():
             g = layer_glob[lid]
             print(f"{lid:>6} | {g['r_cx']:>6.3f} {g['r_cy']:>6.3f} | {g['r_sx']:>6.3f} {g['r_sy']:>6.3f} | "
                   f"{d_pred:>6.3f} {d_const:>6.3f} | {std_c:>6.3f} | {g['scale_mean']:>6.3f} {g['scale_gt']:>6.3f}")
+
+    if HDC:
+        # Diagnostic 12: a second, HD-resolution localisation stage read off
+        # the sampled HD keys (see patched_xattn). Per layer:
+        #   |c_hd-t|  centroid of the prompt-end token's attention over the Ns
+        #             HD keys, at their sampling positions; F = after the
+        #             uniform floor; c_lr = the model's own c at this layer
+        #   pk_box    fraction of samples whose most-attended HD point is inside
+        #             the GT box;  mass = attention mass on in-box points vs
+        #             pts = fraction of sampling points in the box (flat attention)
+        # 'covered' = only samples whose coarse grid put >= 1 point in the box
+        # (a refinement stage can only find what the window contains).
+        # Read: |c_hdF-t| << |c_lr-t| on covered samples and mass >> pts ->
+        # the HD keys know where the answer is, a coarse-to-fine c is worth
+        # building; mass ~ pts -> the answer token does not single out the
+        # right HD points either, the bottleneck is not localisation precision.
+        print(f"\n==== HD-key refinement (diag 12): prompt-end attention over the sampled HD points ====")
+        print(f"{'layer':>6} {'set':>8} | {'n':>4} | {'|c_hd-t|':>8} {'|c_hdF-t|':>9} {'|c_lr-t|':>8} {'const':>6} | "
+              f"{'r_cx':>6} {'r_cy':>6} | {'pk_box':>6} | {'mass':>6} {'pts':>6}")
+        print("-" * 108)
+        for lid in sorted(HDC):
+            rows = HDC[lid]
+            clr = GLOBC.get(lid)
+            clr = clr if clr is not None and len(clr) == len(rows) else None
+            for set_name, keep in (("all", lambda r: True), ("covered", lambda r: r[6] > 0)):
+                sel = [i for i, r in enumerate(rows) if keep(r)]
+                if len(sel) < 5:
+                    continue
+                R = [rows[i] for i in sel]
+                n_ = len(R)
+                d_hd = sum(math.hypot(r[0] - r[7], r[1] - r[8]) for r in R) / n_
+                d_hdf = sum(math.hypot(r[2] - r[7], r[3] - r[8]) for r in R) / n_
+                mtx, mty = sum(r[7] for r in R) / n_, sum(r[8] for r in R) / n_
+                d_const = sum(math.hypot(mtx - r[7], mty - r[8]) for r in R) / n_
+                d_lr = (sum(math.hypot(clr[i][0] - clr[i][4], clr[i][1] - clr[i][5]) for i in sel) / n_
+                        if clr is not None else float("nan"))
+                r_cx = _corr([r[2] for r in R], [r[7] for r in R])
+                r_cy = _corr([r[3] for r in R], [r[8] for r in R])
+                pk = sum(r[4] for r in R) / n_
+                mass = sum(r[5] for r in R) / n_
+                pts = sum(r[6] for r in R) / n_
+                layer_glob.setdefault(lid, {})[f"hdc_{set_name}"] = {
+                    "n": n_, "d_hd": d_hd, "d_hdf": d_hdf, "d_lr": d_lr, "d_const": d_const,
+                    "r_cx": r_cx, "r_cy": r_cy, "peak_in_box": pk, "mass_in_box": mass, "pts_in_box": pts}
+                print(f"{lid:>6} {set_name:>8} | {n_:>4} | {d_hd:>8.3f} {d_hdf:>9.3f} {d_lr:>8.3f} {d_const:>6.3f} | "
+                      f"{r_cx:>6.3f} {r_cy:>6.3f} | {pk:>6.3f} | {mass:>6.3f} {pts:>6.3f}")
 
     if GLOBP:
         # The relevance map before the soft-argmax collapses it to centroid /
