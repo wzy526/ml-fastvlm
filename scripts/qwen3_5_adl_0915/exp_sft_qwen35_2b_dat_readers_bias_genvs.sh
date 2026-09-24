@@ -200,6 +200,20 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   raw c = 0.6 x target, s 0.75-0.78; floored c = target, s 0.448 (= 9/20).
 #   Pass (held-out 500, probe 'by localisation outcome'): E1 hits real >= +3.0,
 #   overall >= +2.0, oracle >= +3.5, dat/glob_scale <= 0.6 in training.
+# Mini E result (0924): floor works as predicted -- question-row s at layers
+#   15/19 0.495/0.485 (GT 0.463; E2 0.65/0.70); maps identical in both arms
+#   and flat over training (frozen trunk + parameter-free map = nothing on the
+#   c/s path is trainable). Hits real +2.21 (E2 +1.11, miniD +1.92), overall
+#   +1.40 (E2 +0.40), oracle hits +3.56; |c-t| 0.35 unchanged (const 0.50).
+#   -> s solved, the remaining gap to oracle is c (peak near, not on, the
+#   answer: argmax in window 0.72 but in box 0.13-0.18).
+# Mini F (0924): give c a trainable path -- LoRA on q_proj/k_proj of the four
+#   glob layers only, with the map's gradient reaching them:
+#   F1: E1 + LORA_ENABLE=True LORA_TARGET=qk:11,15,19,23 OFF_HEAD_TRUNK_GRAD=1
+#   F0 (control): same with OFF_HEAD_TRUNK_GRAD=0 (LoRA trained by the LM loss
+#       alone; separates 'off_sup pulled the map' from 'q/k LoRA per se')
+#   Pass: sample-dependence |c-t| <= 0.28 and r_cx/r_cy >= 0.75 at layers
+#   15/19, hits real >= +3.0, train loss not above E1's.
 #
 # Full 0920 combined run (data = 0817 mix + viscot doc boxes + synth_hd text on
 # SA-1B natural images (+ optional Visual-CoT natural-image boxes), built by
@@ -363,8 +377,8 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --lora_enable "${LORA_ENABLE:-True}" \
     --lora_r 8 \
     --lora_alpha 16 \
-    --lora_target_layers "all" \
-    --lora_lr 2e-5 \
+    --lora_target_layers "${LORA_TARGET:-all}" \
+    --lora_lr "${LORA_LR:-2e-5}" \
     --tune_mm_vision False \
     --tune_mm_mlp "${TUNE_MM_MLP:-True}" \
     --tune_mm_llm False \

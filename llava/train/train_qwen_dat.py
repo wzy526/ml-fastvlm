@@ -707,8 +707,9 @@ class Qwen2VLTrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.0
     lora_target_layers: str = field(
         default="all",
-        metadata={"help": "LoRA target scope: 'dat' (QKVO in DAT layers only) "
-                  "or 'all' (QKVO in all decoder layers)"}
+        metadata={"help": "LoRA target scope: 'dat' (QKVO in DAT layers only), "
+                  "'all' (QKVO in all decoder layers) or '<qk|qkvo>:<layers>' "
+                  "(e.g. 'qk:11,15,19,23' = q_proj/k_proj of those layers only)"}
     )
     lora_lr: Optional[float] = field(
         default=None,
@@ -843,6 +844,15 @@ def get_lora_target_modules(dat_layers_str, target_layers="all"):
         Regex pattern string for ``LoraConfig(target_modules=...)``.
     """
     qkvo = r"(q_proj|k_proj|v_proj|o_proj)"
+    if ":" in target_layers:
+        # '<mods>:<layers>', e.g. 'qk:11,15,19,23' = q_proj/k_proj of those
+        # decoder layers only (mini-F: the trunk attention that feeds the
+        # parameter-free 'attn' relevance map gets a trainable path while the
+        # rest of the LM stays frozen). mods: 'qk' or 'qkvo'.
+        mods, layers = target_layers.split(":", 1)
+        proj = {"qk": r"(q_proj|k_proj)", "qkvo": qkvo}[mods]
+        layer_pattern = "|".join(str(int(x)) for x in layers.split(",") if x.strip())
+        return rf"model\.language_model\.layers\.({layer_pattern})\.self_attn\.{proj}"
     if target_layers == "dat" and dat_layers_str:
         dat_indices = [str(i) for i, c in enumerate(dat_layers_str) if c == 'D']
         layer_pattern = "|".join(dat_indices)
