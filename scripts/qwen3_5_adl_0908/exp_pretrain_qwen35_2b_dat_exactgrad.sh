@@ -19,8 +19,8 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #     own k_proj / v_proj / input_layernorm (was K=kaiming, V=0).
 #   - conv_off_proj init N(0, 0.005) instead of zeros (a zero readout passed
 #     zero gradient upstream to conv_lr_dw / conv_lr_proj / proj_intention).
-# Offset bounding (OFF_PENALTY / OFF_RANGE) and FiLM injection are exposed as
-# knobs but default OFF here to keep the attribution clean.
+# Offset bounding (OFF_PENALTY / OFF_RANGE) is exposed as a knob but defaults
+# OFF here to keep the attribution clean.
 #
 # Recipe, kept as close as possible to the proven qwen2.5 0701/0731 line:
 #   - NO hd_gate, intention branch + intention_as_gate ON, spatial guide OFF
@@ -134,10 +134,9 @@ DAT_LAYERS="${DAT_LAYERS:-auto}"
 # Mutually exclusive: OFF_PENALTY (suggested 1.0) or OFF_RANGE (suggested 0.2-0.4).
 OFF_PENALTY="${OFF_PENALTY:-0}"
 OFF_RANGE="${OFF_RANGE:-0}"
-INTENTION_INJECT="${INTENTION_INJECT:-gate}"   # 'film' adds post-ln_2 FiLM (zero-init)
 
 echo "[0908-pretrain] qwen3_5 2B  dat_layers=$DAT_LAYERS  grid=20  nogate  exact_grad=1" \
-     "off_penalty=$OFF_PENALTY off_range=$OFF_RANGE inject=$INTENTION_INJECT"
+     "off_penalty=$OFF_PENALTY off_range=$OFF_RANGE"
 
 torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40989}" llava/train/train_qwen_dat.py \
     --deepspeed ./scripts/zero_configs/zero2.json \
@@ -163,7 +162,6 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40989}" llava/train/tr
     --dat_inject_lr_image False \
     --dat_off_penalty "$OFF_PENALTY" \
     --dat_off_range "$OFF_RANGE" \
-    --dat_intention_inject "$INTENTION_INJECT" \
     --dat_lr 1e-4 \
     --lora_enable False \
     --tune_mm_vision False \

@@ -89,8 +89,8 @@ def matches_dat(name: str) -> bool:
 
 
 def main() -> None:
-    # The train-side list is a superset across families (e.g. Qwen3.5 FiLM
-    # keys); the Qwen2.5 modeling list must be covered by it.
+    # The train-side list is a superset across families; the Qwen2.5 modeling
+    # list must be covered by it.
     assert set(DAT_KEYS_MATCH) <= set(TRAIN_DAT_KEYS_MATCH), (
         f"DAT_KEYS_MATCH desync: modeling={DAT_KEYS_MATCH} "
         f"train={TRAIN_DAT_KEYS_MATCH}"

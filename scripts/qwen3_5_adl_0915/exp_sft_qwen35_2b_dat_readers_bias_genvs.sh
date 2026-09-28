@@ -350,7 +350,6 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_inject_lr_image False \
     --dat_off_penalty "${OFF_PENALTY:-1.0}" \
     --dat_off_range "${OFF_RANGE:-0}" \
-    --dat_intention_inject "${INTENTION_INJECT:-gate}" \
     --dat_image_hd_for_question "${QUESTION_HD:-True}" \
     --dat_hd_lse_bias "${HD_LSE_BIAS:-0}" \
     --dat_hd_lse_bias_decay_steps "${HD_LSE_BIAS_DECAY:-0}" \

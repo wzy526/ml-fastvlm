@@ -145,7 +145,6 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40991}" llava/train/tr
     --dat_inject_lr_image False \
     --dat_off_penalty "${OFF_PENALTY:-0}" \
     --dat_off_range "${OFF_RANGE:-0}" \
-    --dat_intention_inject "${INTENTION_INJECT:-gate}" \
     --dat_lr 1e-4 \
     --lora_enable True \
     --lora_r 8 \

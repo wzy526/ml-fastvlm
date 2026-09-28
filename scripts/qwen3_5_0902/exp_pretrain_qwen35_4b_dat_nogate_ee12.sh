@@ -179,7 +179,6 @@ torchrun --nproc_per_node="$NPROC" --master_port "${MASTER_PORT:-40985}" llava/t
     --dat_use_intention_branch True \
     --dat_intention_as_gate True \
     --dat_use_spatial_attn_guide "${SPATIAL_GUIDE:-False}" \
-    --dat_intention_inject "${INTENTION_INJECT:-gate}" \
     --dat_off_range "${OFF_RANGE:-0}" \
     --dat_off_penalty "${OFF_PENALTY:-0}" \
     --dat_shared_vit False \

@@ -707,7 +707,6 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             'layers': '',
             'use_intention_branch': True,
             'intention_as_gate': True,
-            'intention_inject': 'gate',   # 'gate' (legacy) | 'film' (post-norm)
             # (removed 0923: 'question_inject'='xattn' -- a from-scratch
             # cell->question cross-attention readout; never localised, see
             # glob_relevance='attn' for what replaced it)
@@ -1037,20 +1036,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         else:
             self.proj_intention = nn.Identity()
 
-        # Question conditioning of the offsets: where it is applied decides
-        # whether it survives. ln_2 is a channel-wise LayerNorm evaluated per
-        # spatial position, so a factor multiplied in BEFORE it is either
-        # partially removed (a per-channel gate keeps only its relative
-        # profile) or removed outright (a per-position scalar s > 0 cancels
-        # exactly, since mu -> s*mu and sigma -> s*sigma). Measured on the
-        # 0901 4B ckpt: sampling points move only ~4% of the grid pitch across
-        # different questions on the same image.
-        #
-        # 'film' adds a second, post-norm route that nothing downstream can
-        # divide out: per-channel FiLM plus an additive spatial map. All new
-        # parameters are zero-init, so a checkpoint trained under 'gate' keeps
-        # bit-identical outputs and can be warm-started.
-        self.intention_inject = dat.get('intention_inject', 'gate')
         assert dat.get('question_inject', 'none') == 'none', \
             "question_inject='xattn' was removed (0923); use glob_relevance='attn'"
 
@@ -1112,14 +1097,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             self.conv_off_proj = _FP32WeightConv2d(
                 self.inter_size * 2, 2, kernel_size=1, stride=1, padding=0, bias=False,
             )
-
-        if self.intention_inject == 'film' and self.use_intention_branch:
-            ln2_ch = self.ln_2.weight.numel()
-            self.proj_film = _FP32WeightLinear(self.off_dim, 2 * ln2_ch)
-            self.spatial_gain = nn.Parameter(torch.zeros(ln2_ch))
-        else:
-            self.proj_film = None
-            self.spatial_gain = None
 
         # Global localisation head (see 'use_global_offset' in the defaults):
         # one relevance logit per cell from the same post-ln_2 features that
@@ -1208,12 +1185,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 self.hd_input_layernorm.weight.data = (
                     self.hd_input_layernorm.weight.data.to(torch.float32)
                 )
-        if self.spatial_gain is not None and self.spatial_gain.dtype != torch.float32:
-            with torch.no_grad():
-                self.spatial_gain.data = self.spatial_gain.data.to(torch.float32)
         for sub in (self.conv_lr_dw, self.ln_1, self.conv_lr_proj,
                     self.proj_intention, self.ln_2, self.conv_off_proj,
-                    self.proj_film, self.conv_glob, self.glob_q, self.glob_k):
+                    self.conv_glob, self.glob_q, self.glob_k):
             if not isinstance(sub, nn.Module):
                 continue
             for p in sub.parameters(recurse=False):
@@ -1233,12 +1207,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             nn.init.xavier_uniform_(self.proj_intention.weight)
             if self.proj_intention.bias is not None:
                 nn.init.zeros_(self.proj_intention.bias)
-        if self.proj_film is not None:
-            # zero => gamma = beta = 0 => post-norm modulation is the identity,
-            # so a 'gate'-trained ckpt is reproduced exactly on load
-            nn.init.zeros_(self.proj_film.weight)
-            nn.init.zeros_(self.proj_film.bias)
-            nn.init.zeros_(self.spatial_gain)
         if self.conv_glob is not None:
             # zero => uniform relevance => centroid 0, scale 1 => legacy grid
             nn.init.zeros_(self.conv_glob.weight)
@@ -1344,19 +1312,13 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         return torch.stack([t_grid, h_grid, w_grid])  # [3, Ns]
 
     def _sample_hd_from_off_guide(self, off_guide, image_hd_features, hd_feat_idx, Lp, device,
-                                  film=None, spatial=None, n_unsup_lead=0, glob_logits=None):
+                                  n_unsup_lead=0, glob_logits=None):
         """Core deformable sampling: off_guide -> offsets -> grid_sample -> KV.
 
         Args:
             glob_logits: optional [Lp*off_grps, 1, gh, gw] question-cell relevance
                      logits (glob_relevance 'qk'/'both'), added to the conv map
                      (if any) before the soft-argmax of the global term.
-            film:    optional (gamma, beta), each [Lp*off_grps, C, 1, 1]. Applied
-                     after ln_2 so the channel modulation cannot be normalized
-                     away (see the note in __init__).
-            spatial: optional [Lp*off_grps, 1, gh, gw] map added after ln_2;
-                     additive, because any multiplicative per-position scalar is
-                     cancelled exactly by a channel-wise LayerNorm.
             n_unsup_lead: leading slots (each off_grps rows) EXCLUDED from offset
                      supervision -- the question-agnostic image-conditioned slot
                      of the fused path cannot know where the answer is, so
@@ -1369,11 +1331,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             sampling_locs: [Lp, off_grps, grid_size, grid_size, 2]
         """
         h = self.ln_2(off_guide)
-        if film is not None:
-            gamma, beta = film
-            h = h * (1.0 + gamma.to(h.dtype)) + beta.to(h.dtype)
-        if spatial is not None:
-            h = h + self.spatial_gain.view(1, -1, 1, 1).to(h.dtype) * spatial.to(h.dtype)
         offsets = self.conv_off_proj(F.silu(h)).float()
         if self.off_range > 0:
             offsets = self.off_range * torch.tanh(offsets)
@@ -1693,7 +1650,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
 
         intention_indices = None
         embed_intention = None
-        film = None            # post-norm channel modulation (intention_inject='film')
         if self.use_intention_branch:
             intention_indices = [ar[2] for ar in answer_ranges]
             intention_tokens = _grad_scale(query_states[b_idx, intention_indices], _tg)
@@ -1705,11 +1661,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             embed_intention = einops.rearrange(
                 embed_intention, 'l g c -> (l g) c 1 1',
             )
-            if self.proj_film is not None:
-                _film = einops.rearrange(
-                    self.proj_film(intention_per_group), 'l g c -> (l g) c 1 1',
-                )
-                film = tuple(_film.chunk(2, dim=1))
 
         if want_image:
             assert not (self.use_intention_branch and not self.intention_as_gate), (
@@ -1746,7 +1697,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 embed_lr, 'g c h w -> (l g) c h w', l=Lp,
             )
 
-            spatial_add = None
             if self.use_intention_branch and self.use_spatial_attn_guide:
                 q_lr_flat = _grad_scale(query_states[b_idx, image_range_index], _tg)
                 q_int_flat = _grad_scale(query_states[b_idx, intention_indices], _tg)
@@ -1760,14 +1710,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 spatial_guide_rep = einops.repeat(
                     spatial_attn_guide, 'l 1 h w -> (l g) 1 h w', g=self.off_grps,
                 )
-                if self.intention_inject == 'film':
-                    # Log-scale so uniform attention maps to exactly 0, then add
-                    # it after ln_2. Multiplying it in here would be a no-op: a
-                    # positive per-position scalar cancels in a channel-wise
-                    # LayerNorm (verified numerically at 2e-5 relative change).
-                    spatial_add = torch.log(spatial_guide_rep.clamp_min(1e-6))
-                else:
-                    embed_lr_rep = embed_lr_rep * spatial_guide_rep.to(embed_lr_rep.dtype)
+                embed_lr_rep = embed_lr_rep * spatial_guide_rep.to(embed_lr_rep.dtype)
 
             glob_logits = None
             glob_q_idx = None
@@ -1815,16 +1758,6 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             if want_image:
                 off_guide_img = einops.repeat(embed_lr, 'g c h w -> (l g) c h w', l=1)
                 off_guide_all = torch.cat([off_guide_img, off_guide], dim=0)
-                # The image-conditioned slot is question-agnostic by definition,
-                # so it is padded with the identity (gamma=beta=0, no spatial add).
-                film_all, spatial_all = film, spatial_add
-                if film is not None:
-                    pad = film[0].new_zeros((self.off_grps,) + film[0].shape[1:])
-                    film_all = (torch.cat([pad, film[0]], dim=0),
-                                torch.cat([pad, film[1]], dim=0))
-                if spatial_add is not None:
-                    pad = spatial_add.new_zeros((self.off_grps,) + spatial_add.shape[1:])
-                    spatial_all = torch.cat([pad, spatial_add], dim=0)
                 glob_all = glob_logits
                 if glob_logits is not None:
                     # zeros = uniform relevance = identity grid for the image slot
@@ -1832,8 +1765,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     glob_all = torch.cat([pad, glob_logits], dim=0)
                 key_all, value_all, slocs_all = self._sample_hd_from_off_guide(
                     off_guide_all, image_hd_features, hd_feat_idx, Lp + 1, device,
-                    film=film_all, spatial=spatial_all, n_unsup_lead=1,
-                    glob_logits=glob_all,
+                    n_unsup_lead=1, glob_logits=glob_all,
                 )
                 kimg_parts.append(key_all[0:1])
                 vimg_parts.append(value_all[0:1])
@@ -1844,7 +1776,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             else:
                 key_hd, value_hd, slocs = self._sample_hd_from_off_guide(
                     off_guide, image_hd_features, hd_feat_idx, Lp, device,
-                    film=film, spatial=spatial_add, glob_logits=glob_logits,
+                    glob_logits=glob_logits,
                 )
                 key_parts.append(key_hd)
                 value_parts.append(value_hd)
@@ -2420,7 +2352,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     # these, so a fresh base conversion collects nothing here.
     _DAT_REINIT_MARKERS = (
         '.conv_lr_dw.', '.conv_lr_proj.', '.conv_off_proj.',
-        '.proj_intention.', '.proj_film.', '.spatial_gain',
+        '.proj_intention.',
         '.k_proj_hd.', '.v_proj_hd.', '.hd_input_layernorm.',
         '.hd_gate', '.ln_1.', '.ln_2.',
         '.conv_glob.', '.glob_q.', '.glob_k.',
@@ -3019,8 +2951,6 @@ DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
-    # intention_inject='film' extras (None unless enabled)
-    'proj_film', 'spatial_gain',
     # use_global_offset extras (None unless enabled; conv_glob for 'conv'/'both',
     # glob_q/glob_k for 'qk'/'both'/'attn+qk'; 'attn' itself is parameter-free)
     'conv_glob', 'glob_q', 'glob_k',

@@ -148,7 +148,6 @@ DAT_LAYERS="${DAT_LAYERS:-auto}"
 # Mutually exclusive with OFF_RANGE.
 OFF_PENALTY="${OFF_PENALTY:-1.0}"
 OFF_RANGE="${OFF_RANGE:-0}"
-INTENTION_INJECT="${INTENTION_INJECT:-gate}"   # 'film' adds post-ln_2 FiLM (zero-init)
 
 # The two knobs this arm tests (leverage-test settings E+F = G).
 #   QUESTION_HD: question tokens also read image-conditioned HD (offsets from
@@ -162,7 +161,7 @@ HD_LSE_BIAS="${HD_LSE_BIAS:-3.0}"
 HD_LSE_BIAS_DECAY="${HD_LSE_BIAS_DECAY:-4000}"
 
 echo "[0915-pretrain] qwen3_5 2B  dat_layers=$DAT_LAYERS  grid=20  nogate  exact_grad=1" \
-     "off_penalty=$OFF_PENALTY off_range=$OFF_RANGE inject=$INTENTION_INJECT" \
+     "off_penalty=$OFF_PENALTY off_range=$OFF_RANGE" \
      "question_hd=$QUESTION_HD hd_lse_bias=$HD_LSE_BIAS->0 over $HD_LSE_BIAS_DECAY steps"
 
 torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40989}" llava/train/train_qwen_dat.py \
@@ -189,7 +188,6 @@ torchrun --nproc_per_node=8 --master_port "${MASTER_PORT:-40989}" llava/train/tr
     --dat_inject_lr_image False \
     --dat_off_penalty "$OFF_PENALTY" \
     --dat_off_range "$OFF_RANGE" \
-    --dat_intention_inject "$INTENTION_INJECT" \
     --dat_image_hd_for_question "$QUESTION_HD" \
     --dat_hd_lse_bias "$HD_LSE_BIAS" \
     --dat_hd_lse_bias_decay_steps "$HD_LSE_BIAS_DECAY" \

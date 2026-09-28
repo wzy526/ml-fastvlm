@@ -141,13 +141,11 @@ IGNORE_INDEX = -100
 local_rank = None
 
 # DAT parameter patterns (superset across families; must cover every
-# modeling_*_dat.py DAT_KEYS_MATCH). 'proj_film' / 'spatial_gain' exist only
-# in Qwen3.5 DAT with dat_intention_inject='film'.
+# modeling_*_dat.py DAT_KEYS_MATCH).
 DAT_KEYS_MATCH = [
     'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
-    'proj_film', 'spatial_gain',
     'conv_glob', 'glob_q', 'glob_k',   # Qwen3.5 DAT with dat_use_global_offset
 ]
 
@@ -497,15 +495,6 @@ class ModelArguments:
                           "0901 4B ckpt the former straight-through path pinned 53.6%% of sampling points to "
                           "the [-1,1] border and 69.8%% of HD attention mass lands there. "
                           "Suggested 0.2-0.4 (2-4x the grid pitch of 0.0997 at grid=20)."}
-    )
-    dat_intention_inject: str = field(
-        default="gate",
-        metadata={"help": "How the question conditions the offsets. 'gate' (legacy) "
-                          "multiplies before ln_2, where a channel gate is partly and a "
-                          "spatial scalar is entirely normalized away. 'film' adds a "
-                          "post-norm route (per-channel FiLM + additive spatial map) with "
-                          "zero-init params, so a 'gate' ckpt warm-starts unchanged. "
-                          "Use with --dat_use_spatial_attn_guide True."}
     )
     dat_insert_kvhd_offset: int = field(
         default=6,
@@ -3544,7 +3533,6 @@ def train():
             'use_intention_branch': model_args.dat_use_intention_branch,
             'intention_as_gate': model_args.dat_intention_as_gate,
             'use_spatial_attn_guide': model_args.dat_use_spatial_attn_guide,
-            'intention_inject': model_args.dat_intention_inject,
             'off_range': model_args.dat_off_range,
             'off_penalty': model_args.dat_off_penalty,
             'off_sup_weight': model_args.dat_off_sup_weight,

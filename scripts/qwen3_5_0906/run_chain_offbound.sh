@@ -30,10 +30,8 @@ set -euo pipefail
 # So this chain retrains with the bound in place, where the offsets can adapt
 # to it instead of being squashed after the fact.
 #
-# SCOPE: single variable. intention_inject stays 'gate' and the spatial guide
-# stays off, so any delta is attributable to the offset bound alone. The
-# post-norm FiLM route (intention_inject=film) is implemented and warm-start
-# safe, but belongs in a separate arm.
+# SCOPE: single variable. The intention gate stays on and the spatial guide
+# stays off, so any delta is attributable to the offset bound alone.
 #
 # off_range=0.3 is ~3x the reference grid pitch (0.0997 at grid=20), so each
 # point can still travel three cells from its reference while 8 sampling groups
