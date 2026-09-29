@@ -1,6 +1,6 @@
 # Offset 学习实验计划
 
-日期：2026-09-29。代码基线：`262a26c`（`main`）。本文是实验执行与后续实现清单，不表示实验已经完成；本次提交只新增文档。
+初版日期：2026-09-29；修复记录更新：2026-09-30。初版代码基线：`262a26c`（`main`）。本文区分代码实现、回归测试与真实模型实验；修复状态见下文，GPU 实验结果仍需运行记录。
 
 目标：固定每张图、每个 DAT 层的 `20×20=400` 个采样 token，让采样位置随问题和图像证据改变，并稳定降低答案损失。暂不做自适应点数，也不增加定位辅助 loss。8 个 offset group 是一个 token 内的分组采样，不应把预算记成 3200 个 reader token；不同 HD reader 分支的实际开销另记。
 
@@ -8,14 +8,28 @@
 
 | 阶段 | 要回答的问题 | 当前状态 | 进入下一阶段的条件 |
 | --- | --- | --- | --- |
-| E0 环境与基线 | 当前 checkpoint 能否读取 HD 内容？ | 第 3 节命令可直接运行 | 环境检查通过；记录 real/off/shuffle/oracle 基线及限制 |
-| E1 query 路由 | 首个答案 token 是否使用问题条件 HD？ | 已确认存在错位，需先修实现 | 单标签、短答案、多轮、训练与 prefill 对齐测试通过 |
+| E0 环境与基线 | 当前 checkpoint 能否读取 HD 内容？ | 已修报告崩溃与不同图配对；第 3 节命令可运行 | 环境检查通过；记录 real/off/shuffle/oracle 基线及限制 |
+| E1 query 路由 | 首个答案 token 是否使用问题条件 HD？ | 已独立修复训练路由；真实张量/GPU 检查待运行 | 单标签、短答案、多轮、首答案 query 与 prefill 对齐测试通过 |
 | E2 条件与几何 | local query、采样位置、位置编码是否一致？ | 需增加独立实验路径 | 因素分开控制，oracle 与 learned 使用相同编码约定 |
 | E3 CE 梯度 | 答案损失能否给局部移动提供有效方向？ | 需新增诊断 | 坐标梯度数值检查通过；直接优化坐标能获得收益 |
 | E4 局部头 | HD 邻域是否比当前 LR 输入更适合预测修正？ | HD 邻域 refiner 尚未实现 | sampler-only 短训在验证集优于零残差与 LR-local |
 | E5 因果验收 | 提升是否来自问题相关的位置选择？ | 需新增干预与结果汇总 | 固定预算反事实对照、独立测试集、重复种子结果支持结论 |
 
 先跑 E0 留档；正式训练以 E1–E3 通过为前提。后续新功能没有现成 CLI，本文不会用虚构的启动参数代替实现。
+
+### 2026-09-30 修复与回归命令
+
+- E0 报告：原 `_corr` 只在有 `GLOBC` 时定义，但无 global offset 也可能有 HD diag12 统计；现已无条件定义，避免报告阶段 `UnboundLocalError` 导致 JSON 未生成。
+- shuffle：probe 原来只比较前 4096 字节、搜索 8 个候选；leverage 原来直接使用半个数据集之外的行。现两者共用完整解码 RGB 像素与尺寸的 SHA256、全候选确定性搜索，并在模型加载前排除无不同图 donor 的输入。结果保存配对以便审计。
+- E1：训练答案 query 修为 `[s−1,e)`，question-HD 边界同步；`labels[0]` 不参与 shifted CE，解析时排除。只改路由，不改 local query、位置编码和 offset head。
+
+```bash
+python scripts/test_probe_report.py
+python scripts/test_hd_shuffle.py
+python scripts/test_qwen35_dat_routing.py
+```
+
+前两项需要 NumPy/Pillow，无需模型或 GPU。路由测试的区间与缓存早退检查只需标准库；4 项真实张量解析检查在有 PyTorch 时执行，否则明确跳过。本地已通过 4 项报告、8 项 shuffle、6 项路由检查；4 项 PyTorch 检查因本地未安装而跳过。公司机器需补跑它们及真实模型的 exact merge/前向反向检查。
 
 ## 2. 内网机器同步与固定实验条件
 
@@ -100,7 +114,7 @@ manifest = {
 print(f"Saved {len(subset)} samples; checkpoint grid_size=20")
 ```
 
-将此 Python 块保存为运行目录中的脚本后执行，或直接用 `python - <<'PY'` 在终端执行。多个问题可以来自同一图像；shuffle 的具体配对仍需确认不是同一张图。
+将此 Python 块保存为运行目录中的脚本后执行，或直接用 `python - <<'PY'` 在终端执行。多个问题可以来自同一图像；shuffle 现已按全图指纹排除相同内容，并输出实际 donor 配对。
 
 ## 3. E0：现有脚本可直接运行的检查
 
@@ -145,7 +159,8 @@ done
 - 当前 learned 与 oracle 的位置编码不同，real-vs-oracle 不能单独归因于 offset，见 E2。
 - `oracle_min_cells=20` 是窗口最小边长所对应的 HD 特征单元数，不是采样点数；oracle 窗可能大于原 bbox。
 - `oracle_rand` 尝试避开 GT，失败时使用最远候选，仍可能重叠；正式错窗对照要统计实际重叠率。
-- probe 按文件顺序取前 N 个样本；输出未完整保存输入标识，因此应和 `input_manifest.json` 一起保存。
+- probe 按文件顺序取前 N 个样本；输出 `sample_index`，shuffle 还输出目标/来源图像指纹与 `shuffle_source_index`，应和 `input_manifest.json` 一起保存。
+- probe shuffle 保留目标 LR 输入、问题和 HD 尺寸，但仍重新计算 offset 与隐藏状态。这是 HD 替换对照，尚不是固定坐标重放对照。全图指纹只保证原始解码像素不同，不保证语义、缩放后特征或答案不同。donor 可以重复使用；它不是保证一一对应的行排列。
 - diag12 的 `ib_s/2`、`ib_shd` 是候选网格落框率的离线几何计算，并未重采样生成答案；`covered` 子集只要求已有采样点命中框。它还平均了 group 坐标，不等于逐组真实覆盖。
 
 ### 3.3 HD 内容是否影响答案 CE
@@ -168,17 +183,21 @@ python scripts/_test_lr_drop_leverage.py \
 
 该脚本不训练，不调用 optimizer.step；`g_off` 只统计部分 offset 卷积参数，不是逐点坐标梯度。它将 A/B/C/D/O/S/P 的 question reader 关掉、HD bias 置零；`--question_hd` 仅另加 E 条件，不能把全部结果当成原 checkpoint 的部署行为。脚本使用 train mode，且未全面关闭 checkpoint 的辅助梯度 hook；其梯度数值不能证明“纯 CE 在训练 offset”。E3 必须使用专门的纯 CE 诊断。
 
-## 4. E1：先修答案 query 路由
+O/S 共享目标 oracle 窗口、对应位置编码、HD 尺寸和 dropout seed，只替换 HD 图像。输出的 `shuffle_pairs` 是完整预选配对表；`per_sample` 中第 j 条结果对应 `sample_indices[j]`，再用该索引查配对，以兼容被跳过的样本。leverage 会按 seed 重排/过滤输入，所以它与 probe 的候选池、次序和 donor 不一定相同。
+
+## 4. E1：答案 query 路由修复及验收
 
 实现位置：[modeling_qwen3_5_dat.py](../llava/model/language_model/modeling_qwen3_5_dat.py) 的 `compute_image_range_list` 和 `Qwen3_5AttentionDAT.forward`。
 
-当前答案标签的端点 `[s,e]` 都包含在监督内，但问题条件 HD 的训练 query 为 `[s,e)`。next-token CE 对应的 query 应为 `[s−1,e)`。需要同时调整 question-HD 的终点，保持各 segment 不重叠，满足 exact merge 的前提。不要只把一个起点减一。
+答案标签的端点 `[s,e]` 都包含在监督内；修复前问题条件 HD 的训练 query 为 `[s,e)`，遗漏预测首答案 token 的 `s−1` 行。现已通过 `_dat_answer_query_range` 统一为 `[max(s−1,0),e)`，并用 `_dat_question_ranges` 同步切分 question-HD，保证正常多轮各 segment 不重叠。
+
+prefill 继续使用现有 `[intention_idx+1,Nq)`，cached decode 继续走原早退路径。此次修复使训练与 prefill 的首答案预测行都使用问题条件 HD，但没有声称整个 assistant 前缀逐行路由或 logits 完全相同；更早的模板行仍有原来的路由差异。文本 span 元数据也保持原含义。
 
 必须验证：
 
 1. 单个有效标签 `s=e` 时仍有一个答案 query；普通短答案、结束符与换行的监督位置逐 token 打印。
 2. 多轮对话的每个答案段均正确；question-HD 开/关都检查；padding 和截断不产生负索引或越界。
-3. 同一完整 prompt 下，训练预测首答案 token 的位置与推理 prefill 使用同一套问题条件 HD。
+3. 同一完整 prompt 下，训练预测首答案 token 的位置与推理 prefill 均归入问题条件 HD；模型级验证不预设所有前缀 logits 完全相同。
 4. 只对首个答案内容 token 的 CE backward，确认其对应坐标有计算图；零梯度需区分 reader 没有利用 HD 与路由断开。
 
 此处先做实现正确性修复，不与新 head、LoRA 或新 loss 混在一个性能实验里。修复前基线只用于定位问题，正式消融共用修复后实现。

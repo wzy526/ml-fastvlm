@@ -54,6 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.probe_whd_qwen35 import (  # noqa: E402
     FACTOR, TOK_PX, SYSTEM_PROMPT, hd_target_size, oracle_locs, set_force_locs,
 )
+from scripts.hd_probe_utils import different_image_indices, image_fingerprint  # noqa: E402
 
 KVHD_KEYS = ("k_proj_hd", "v_proj_hd")
 KVLR_KEYS = ("self_attn.k_proj.", "self_attn.v_proj.")
@@ -89,6 +90,24 @@ def load_items(path, image_folder, n, seed):
         print(f"[lrdrop] {len(items) - n_box} samples without bbox dropped (oracle settings need it)")
         items = [it for it in items if it[3]]
     return items
+
+
+def prepare_shuffle_pairs(items):
+    """Exclude repeated files and duplicate decoded images from wrong-HD pairs."""
+    cache, fingerprints = {}, []
+    for path, *_ in items:
+        path = os.path.realpath(path)
+        if path not in cache:
+            with Image.open(path) as image:
+                cache[path] = image_fingerprint(image)
+        fingerprints.append(cache[path])
+    donors = different_image_indices(fingerprints)
+    return [
+        {"sample_index": i, "image": item[0], "image_sha256": fingerprints[i],
+         "shuffle_source_index": donor, "shuffle_source_image": items[donor][0],
+         "shuffle_source_sha256": fingerprints[donor]}
+        for i, (item, donor) in enumerate(zip(items, donors))
+    ]
 
 
 def hd_inputs(img, hd_w, hd_h, hr_processor, device, dtype):
@@ -177,6 +196,8 @@ def main():
 
     items = load_items(args.data_json, args.image_folder, args.n, args.seed)
     print(f"[lrdrop] {len(items)} samples from {args.data_json}")
+    has_bbox = bool(items) and all(it[3] for it in items) and not args.no_oracle
+    shuffle_pairs = prepare_shuffle_pairs(items) if has_bbox else []
 
     model = Qwen3_5DATForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
@@ -210,7 +231,6 @@ def main():
                 ("B LR drop, HD on", True, "real", False, 0.0),
                 ("C LR drop, HD off", True, "off", False, 0.0),
                 ("D full LR, HD off", False, "off", False, 0.0)]
-    has_bbox = bool(items) and all(it[3] for it in items) and not args.no_oracle
     if has_bbox:
         settings += [("O LR drop, HD oracle", True, "oracle", False, 0.0),
                      ("S LR drop, HD shuffle", True, "shuffle", False, 0.0),
@@ -228,6 +248,7 @@ def main():
     print(f"[lrdrop] settings: {[s[0] for s in settings]}  grid_size={grid_size}")
 
     dat_mods = [model.get_submodule(n) for n in sorted(dat_layer_prefixes)]
+    processed_indices = []
 
     def set_knobs(q_hd, bias):
         for m in dat_mods:
@@ -247,9 +268,10 @@ def main():
             hd_feats_shuf = None
             if any(s[2] == "shuffle" for s in settings):
                 # another sample's image at the SAME HD geometry (probe's shuffle)
-                other = items[(i + len(items) // 2) % len(items)][0]
-                hd_o = hd_inputs(Image.open(other).convert("RGB"), hd_w, hd_h,
-                                 hr_processor, device, dtype)
+                other = shuffle_pairs[i]["shuffle_source_image"]
+                with Image.open(other) as other_image:
+                    hd_o = hd_inputs(other_image.convert("RGB"), hd_w, hd_h,
+                                     hr_processor, device, dtype)
                 hd_feats_shuf = model._generate_hd_features(hd_o["pixel_values_hd"],
                                                             hd_o["image_grid_thw_hd"])
         for name, drop, hd_mode, q_hd, bias in settings:
@@ -269,6 +291,7 @@ def main():
             r["g_kvlr"].append(grad_norm(model, KVLR_KEYS))
             r["g_off"].append(grad_norm(model, OFF_KEYS))
             r["lr_drop_frac"].append(float(getattr(model, "_lr_drop_frac", 0.0)))
+        processed_indices.append(i)
         model.zero_grad(set_to_none=True)
     os.environ.pop("DAT_LR_DROP_FORCE", None)
     set_knobs(False, 0.0)
@@ -323,9 +346,11 @@ def main():
         if has_bbox:
             extra = {"content_read_starved": mean(so), "oracle_help_starved": mean(co),
                      "oracle_help_today": mean(dp)}
-        json.dump({"args": vars(args), "summary": summ, "per_sample": rec,
-                   "lever": lever, "hd_help_starved": mean(pa), "hd_help_today": mean(pd), **extra},
-                  open(args.out, "w"), indent=2)
+        with open(args.out, "w") as output:
+            json.dump({"args": vars(args), "summary": summ, "per_sample": rec,
+                       "sample_indices": processed_indices, "shuffle_pairs": shuffle_pairs,
+                       "lever": lever, "hd_help_starved": mean(pa), "hd_help_today": mean(pd), **extra},
+                      output, indent=2)
         print(f"[lrdrop] saved -> {args.out}")
 
 

@@ -877,6 +877,35 @@ def build_dat_layers_string(text_config, mode: str = "auto") -> str:
     return ''.join(chars)
 
 
+def _dat_answer_query_range(answer_range, num_query_tokens):
+    """Map inclusive label endpoints to the half-open HD query interval.
+
+    Training labels [s, e] are predicted at [s - 1, e); label 0 has no
+    preceding query and is excluded. A negative end marks prefill, whose
+    existing assistant-prefix interval is kept unchanged.
+    """
+    ans_start, ans_end, intention_idx = answer_range[:3]
+    if ans_end >= 0:
+        q_start, q_end = ans_start - 1, ans_end
+    else:
+        q_start, q_end = intention_idx + 1, num_query_tokens
+    q_start = min(max(q_start, 0), num_query_tokens)
+    q_end = min(max(q_end, q_start), num_query_tokens)
+    return q_start, q_end
+
+
+def _dat_question_ranges(image_end, answer_ranges, num_query_tokens):
+    """Question HD fills gaps before answer queries, without sharing rows."""
+    question_ranges = []
+    prev_end = min(max(image_end, 0), num_query_tokens)
+    for answer_range in answer_ranges:
+        q_start, q_end = _dat_answer_query_range(answer_range, num_query_tokens)
+        if q_start > prev_end:
+            question_ranges.append((prev_end, q_start))
+        prev_end = max(prev_end, q_end)
+    return question_ranges
+
+
 def compute_image_range_list(input_ids, labels, image_token_id,
                               im_start_token_id=IM_START_TOKEN_ID,
                               image_grid_thw=None, spatial_merge_size=2):
@@ -939,6 +968,9 @@ def compute_image_range_list(input_ids, labels, image_token_id,
         if labels is not None:
             lab = labels[b]
             ans_mask = (lab != -100)
+            # Shifted next-token CE never supervises labels[0]. Exclude it
+            # before looking for a preceding assistant marker (none can exist).
+            ans_mask[0] = False
             if ans_mask.any():
                 ans_indices = torch.where(ans_mask)[0]
                 # Question span bookkeeping: starts after the (last) image, and
@@ -1976,18 +2008,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             # Direction A: image-conditioned HD for question tokens
             question_segs: List[Tuple[int, int]] = []
             if self.dat_image_hd_for_question and M == 1:
-                _q_prev_end = lr_list[0][1]
-                for _ar in image_range_list[b_idx][1:]:
-                    _a_s, _a_e, _a_int = _ar[0], _ar[1], _ar[2]
-                    if _a_e > 0:
-                        _q_ans_start = _a_s
-                        _next_prev = _a_e
-                    else:
-                        _q_ans_start = _a_int + 1
-                        _next_prev = Nq
-                    if _q_ans_start > _q_prev_end:
-                        question_segs.append((_q_prev_end, _q_ans_start))
-                    _q_prev_end = _next_prev
+                question_segs = _dat_question_ranges(
+                    lr_list[0][1], image_range_list[b_idx][1:], Nq,
+                )
 
             # Fused sampling: answer K/V + optional image-conditioned K/V
             key_hd_all, value_hd_all, _slocs, k_img_all, v_img_all = \
@@ -2038,16 +2061,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             v_hd_l_first: Optional[torch.Tensor] = None
 
             for l_idx, answer_range in enumerate(image_range_list[b_idx][1:]):
-                ans_start = answer_range[0]
-                ans_end = answer_range[1]
-                intention_idx = answer_range[2]
-
-                if ans_end > 0:
-                    q_ans_start = ans_start
-                    Nans = ans_end - ans_start
-                else:
-                    q_ans_start = intention_idx + 1
-                    Nans = Nq - q_ans_start
+                q_ans_start, q_ans_end = _dat_answer_query_range(answer_range, Nq)
+                Nans = q_ans_end - q_ans_start
 
                 if Nans <= 0:
                     continue

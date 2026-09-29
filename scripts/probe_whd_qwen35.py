@@ -49,6 +49,11 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
+if __package__:
+    from .hd_probe_utils import different_image_indices, image_fingerprint
+else:
+    from hd_probe_utils import different_image_indices, image_fingerprint
+
 PATCH = 16
 MERGE = 2
 FACTOR = PATCH * MERGE          # 32
@@ -217,6 +222,16 @@ def hd_target_size(image, lr_grid_thw, hr_scale, hd_cap):
     return hd_w, hd_h
 
 
+def prepare_shuffle_sources(samples):
+    """Record content-checked donors once, before loading the model."""
+    fingerprints = [image_fingerprint(sample["image"]) for sample in samples]
+    donors = different_image_indices(fingerprints)
+    for i, (sample, donor) in enumerate(zip(samples, donors)):
+        sample["image_sha256"] = fingerprints[i]
+        sample["shuffle_source_index"] = donor
+        sample["shuffle_source_sha256"] = fingerprints[donor]
+
+
 def make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, source):
     """Build the HD-side image under the requested ablation source."""
     img = sample["image"]
@@ -229,15 +244,11 @@ def make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, source):
         return (img.resize((lr_w_px, lr_h_px), Image.BICUBIC)
                    .resize((hd_w, hd_h), Image.BICUBIC))
     if source == "shuffle":
-        # HR-Bench stores the 4 cyclic option permutations of one question as
-        # CONSECUTIVE rows sharing the same image, so idx+1 returns the SAME
-        # image 3 times out of 4. Jump half-way round and skip identical images.
-        n = len(samples)
-        for step in range(n // 2, n // 2 + 8):
-            other = samples[(idx + step) % n]["image"]
-            if other.size != img.size or other.tobytes()[:4096] != img.tobytes()[:4096]:
-                return other.resize((hd_w, hd_h), Image.BICUBIC)
-        raise RuntimeError(f"shuffle: could not find a different image for sample {idx}")
+        if "shuffle_source_index" not in sample:
+            prepare_shuffle_sources(samples)
+        other = samples[sample["shuffle_source_index"]]["image"]
+        # LR/prompt and the HD geometry still belong to the target sample.
+        return other.resize((hd_w, hd_h), Image.BICUBIC)
     if source == "noise":
         rng = np.random.RandomState(idx)
         arr = rng.randint(0, 256, size=(hd_h, hd_w, 3), dtype=np.uint8)
@@ -779,6 +790,9 @@ def main():
 
     install_merge_hook()
     samples = load_samples(args)
+    if args.hd_source == "shuffle":
+        prepare_shuffle_sources(samples)
+        print(f"[probe] shuffle: {len(samples)} content-checked donor pairs")
     has_gt = samples and samples[0]["gt"] is not None
     print(f"[probe] {len(samples)} samples  tok_budget={args.tok_budget}  "
           f"hd_source={args.hd_source}  biases={args.hd_bias}")
@@ -942,6 +956,13 @@ def main():
             layer_glob[lid] = {"shift": sh, "scale": sc, "n": len(GLOB[lid])}
             print(f"{lid:>6} | {sh:>7.3f} | {sc:>7.3f} | {len(GLOB[lid]):>5}")
 
+    # HD-key diagnostics also use correlation when the global offset is off.
+    def _corr(a, b):
+        a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+        if len(a) < 3 or a.std() < 1e-9 or b.std() < 1e-9:
+            return float("nan")
+        return float(np.corrcoef(a, b)[0, 1])
+
     if GLOBC:
         # Sample-dependence of the global term. r = Pearson correlation across
         # samples between the predicted centroid (scale) and the GT window's
@@ -950,12 +971,6 @@ def main():
         # question-blind prior). std(c) = spread of the prediction across samples.
         # r ~ 0 and |c-t| ~ const -> the head learned a fixed prior, it does not
         # read the question/image; r >> 0 and |c-t| < const -> it localises.
-        def _corr(a, b):
-            a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-            if len(a) < 3 or a.std() < 1e-9 or b.std() < 1e-9:
-                return float("nan")
-            return float(np.corrcoef(a, b)[0, 1])
-
         print(f"\n==== global term: sample-dependence  (r = corr(pred, GT) across samples) ====")
         print(f"{'layer':>6} | {'r_cx':>6} {'r_cy':>6} | {'r_sx':>6} {'r_sy':>6} | "
               f"{'|c-t|':>6} {'const':>6} | {'std(c)':>6} | {'mean s':>6} {'GT s':>6}")
@@ -1544,7 +1559,7 @@ def main():
                 print(f"[probe] dump_maps: wrote {fn}  ({len(panels)} samples)")
 
     if args.out:
-        json.dump({
+        report = {
             "model_path": args.model_path,
             "dataset": args.image_folder or args.dataset,
             "tok_budget": args.tok_budget,
@@ -1556,11 +1571,16 @@ def main():
             "layer_loc": layer_loc,
             "layer_glob": layer_glob,
             "per_sample": [
-                {"gt": gts[k], "category": samples[k]["category"],
+                {"sample_index": k, "gt": gts[k], "category": samples[k]["category"],
+                 **{key: samples[k][key] for key in
+                    ("image_sha256", "shuffle_source_index", "shuffle_source_sha256")
+                    if key in samples[k]},
                  **{c: raw[c][k] for c in configs}}
                 for k in range(n)
             ],
-        }, open(args.out, "w"), indent=2, ensure_ascii=False)
+        }
+        with open(args.out, "w") as output:
+            json.dump(report, output, indent=2, ensure_ascii=False)
         print(f"[probe] saved -> {args.out}")
 
 
