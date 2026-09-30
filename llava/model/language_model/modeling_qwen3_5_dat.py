@@ -806,6 +806,8 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             #               prompt token). Causal, has read the whole question
             #               and is about to answer: mass 0.43-0.60, 8/8 heads.
             'glob_query_pos': 'im_start',
+            'local_query_pos': 'im_start',
+            'hd_position_mode': 'legacy',
             # Dense supervision of the relevance map (training-only, bbox
             # samples, needs use_global_offset): cross-entropy between the
             # softmax p over the gh*gw cells and the uniform distribution over
@@ -1043,6 +1045,15 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         self.intention_as_gate = dat['intention_as_gate']
         self.use_intention_branch = dat['use_intention_branch']
         self.use_spatial_attn_guide = dat.get('use_spatial_attn_guide', True)
+        self.local_query_pos = str(dat.get('local_query_pos', 'im_start'))
+        if self.local_query_pos not in ('im_start', 'ans_prev'):
+            raise ValueError(f'unknown local_query_pos: {self.local_query_pos}')
+        self.hd_position_mode = str(dat.get('hd_position_mode', 'legacy'))
+        if self.hd_position_mode not in ('legacy', 'slot'):
+            raise ValueError(f'unknown hd_position_mode: {self.hd_position_mode}')
+        self._dat_sampling_control = None
+        self._dat_sample_key = (0, 0)
+        self._dat_exact_merge_available = _EXACT_MERGE_AVAILABLE
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -1320,7 +1331,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         w_min = lr_pos[2].min()
         w_max = lr_pos[2].max()
 
-        if self._dat_force_locs is not None:
+        if (self._dat_force_locs is not None and self.hd_position_mode == 'legacy'
+                and self._dat_sampling_control is None):
             # Positions follow the forced sampling locations (row-major, same
             # order as the sampled tokens), mapped from [-1, 1] onto the LR range.
             fl = self._dat_force_locs.to(device=device).float()
@@ -1363,9 +1375,13 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             sampling_locs: [Lp, off_grps, grid_size, grid_size, 2]
         """
         h = self.ln_2(off_guide)
-        offsets = self.conv_off_proj(F.silu(h)).float()
+        raw_offsets = self.conv_off_proj(F.silu(h)).float()
+        offsets = raw_offsets
         if self.off_range > 0:
             offsets = self.off_range * torch.tanh(offsets)
+        control = self._dat_sampling_control
+        if control is not None and control.zero_residual:
+            offsets = offsets * 0.0
         self._fn_chk("sample.offsets", offsets)
         if self.training:
             self._dat_offset_stats = (
@@ -1460,6 +1476,12 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     del gb[:-512]
         else:
             x = references + offsets
+        if control is not None:
+            # A frozen reference supplies the COMPLETE per-slot/per-group coarse
+            # grid. Detaching the current locator alone would still let later
+            # layers drift when earlier local samplers change hidden states.
+            coarse = control.resolve_coarse(self, x - offsets)
+            x = coarse + offsets
         # Offset supervision acts on the LEARNED grid x, computed before any
         # teacher forcing replaces it, so the two can coexist on one sample
         # (tf_force_prob routing): the pull trains the offset head, the forced
@@ -1535,6 +1557,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                     del gbuf[:-512]
                 return g + p
             x.register_hook(_hook)
+        if control is not None:
+            x = control.override(self, x, Lp)
         if self.training:
             self._dat_offset_oob = (x.abs() > 1.0).float().mean().item()
 
@@ -1572,6 +1596,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             sample_locs = x.clamp(-1, 1).permute(0, 2, 3, 1)
 
         hd_feat = image_hd_features[hd_feat_idx]  # [H_hr, W_hr, C]
+        if control is not None:
+            control.record(self, x, sample_locs, raw_offsets, x - coarse, hd_feat.shape[:2], Lp, n_unsup_lead)
         img_hr = einops.rearrange(
             hd_feat, 'h w (g c) -> g c h w',
             g=self.off_grps, c=self.off_dim,
@@ -1629,9 +1655,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
               f"finabsmax={fmax:.4g} nan_frac={float(torch.isnan(tf).float().mean()):.3g}",
               flush=True)
 
-    def _glob_query_indices(self, answer_ranges):
-        """Token that asks for the global relevance map (glob_query_pos)."""
-        if self.glob_query_pos == 'ans_prev':
+    def _query_indices(self, answer_ranges, mode):
+        """Independent local/global query selection, including prefill."""
+        if mode == 'ans_prev':
             out = []
             for ar in answer_ranges:
                 # ar[0] = answer start (training) or seq_len (inference); the
@@ -1641,6 +1667,12 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 out.append(p if p > int(ar[2]) else int(ar[2]))
             return out
         return [ar[2] for ar in answer_ranges]
+
+    def _glob_query_indices(self, answer_ranges):
+        return self._query_indices(answer_ranges, self.glob_query_pos)
+
+    def _local_query_indices(self, answer_ranges):
+        return self._query_indices(answer_ranges, self.local_query_pos)
 
     def _glob_attn_logits(self, attn_qk, b_idx, q_idx, lr_start, lr_end, lr_h, lr_w, Lp):
         """'attn' relevance: the trunk's own attention from the query tokens over
@@ -1683,7 +1715,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         intention_indices = None
         embed_intention = None
         if self.use_intention_branch:
-            intention_indices = [ar[2] for ar in answer_ranges]
+            intention_indices = self._local_query_indices(answer_ranges)
             intention_tokens = _grad_scale(query_states[b_idx, intention_indices], _tg)
             intention_per_group = einops.rearrange(
                 intention_tokens, 'l (g c) -> l g c',
@@ -1705,6 +1737,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         slocs_first = None
 
         for m, (lr_start, lr_end, lr_h, lr_w) in enumerate(lr_list):
+            self._dat_sample_key = (b_idx, m)
             hd_feat_idx = hd_feat_idxs[m]
             lr_len = lr_end - lr_start
             assert lr_h * lr_w == lr_len, (
@@ -2131,6 +2164,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             and torch.is_grad_enabled()
             and bool(seg_q_list)
         )
+        self._dat_last_merge_branch = 'exact' if use_exact_merge else 'legacy'
         if (
             not use_exact_merge
             and _EXACT_MERGE_GRAD

@@ -10,12 +10,12 @@
 | --- | --- | --- | --- |
 | E0 环境与基线 | 当前 checkpoint 能否读取 HD 内容？ | 已修报告崩溃与不同图配对；第 3 节命令可运行 | 环境检查通过；记录 real/off/shuffle/oracle 基线及限制 |
 | E1 query 路由 | 首个答案 token 是否使用问题条件 HD？ | 已独立修复训练路由；真实张量/GPU 检查待运行 | 单标签、短答案、多轮、首答案 query 与 prefill 对齐测试通过 |
-| E2 条件与几何 | local query、采样位置、位置编码是否一致？ | 需增加独立实验路径 | 因素分开控制，oracle 与 learned 使用相同编码约定 |
-| E3 CE 梯度 | 答案损失能否给局部移动提供有效方向？ | 需新增诊断 | 坐标梯度数值检查通过；直接优化坐标能获得收益 |
+| E2 条件与几何 | local query、采样位置、位置编码是否一致？ | 已增加 query/slot/冻结参考粗网格控制；真实模型验收待运行 | 因素分开控制，oracle 与 learned 使用相同编码约定 |
+| E3 CE 梯度 | 答案损失能否给局部移动提供有效方向？ | 已增加逐组坐标梯度与有限差分；CPU 回归通过，GPU 待运行 | 坐标梯度数值检查通过；直接优化坐标能获得收益 |
 | E4 局部头 | HD 邻域是否比当前 LR 输入更适合预测修正？ | HD 邻域 refiner 尚未实现 | sampler-only 短训在验证集优于零残差与 LR-local |
 | E5 因果验收 | 提升是否来自问题相关的位置选择？ | 需新增干预与结果汇总 | 固定预算反事实对照、独立测试集、重复种子结果支持结论 |
 
-先跑 E0 留档；正式训练以 E1–E3 通过为前提。后续新功能没有现成 CLI，本文不会用虚构的启动参数代替实现。
+先跑 E0 留档；正式训练以 E1–E3 通过为前提。已实现的实验控制与 CLI 见第 9 节；其他待实现功能仍需开发后才能启动实验。
 
 ### 2026-09-30 修复与回归命令
 
@@ -216,9 +216,9 @@ prefill 继续使用现有 `[intention_idx+1,Nq)`，cached decode 继续走原�
 
 ### 5.1 local query 与 global query 独立控制
 
-当前 `glob_query_pos=ans_prev` 只影响全局定位。局部 gate 的 `intention_indices` 仍取 `ar[2]`，即 assistant 的 `<|im_start|>`；不能由全局 query 设置推断局部头也已改用 prompt-end。
+`glob_query_pos=ans_prev` 只影响全局定位。局部头现在由独立的 `local_query_pos` 控制：`im_start` 取 `ar[2]`，`ans_prev` 取训练答案前一行或 prefill 最后一行；对应 CLI 为 `--dat_local_query_pos`，默认保持 `im_start`。局部 gate 和 spatial guide 共用这一选择，global query 保持独立。选择写入 checkpoint 配置，训练与推理均读取它。
 
-增加只控制局部头 query 来源的实验路径，对比 `im_start` 与 `ans_prev=s−1`。保持同一 coarse grid、reader、局部头容量、初始化、样本和步数。该对照要在训练与推理一致的条件下跑；对旧 checkpoint 直接换 query 的结果只作即时干预诊断，不代表重训后的能力上限。
+用该实验路径对比 `im_start` 与 `ans_prev=s−1`。保持同一 coarse grid、reader、局部头容量、初始化、样本和步数。对旧 checkpoint 直接换 query 的结果只作即时干预诊断，不代表重训后的能力上限。
 
 同图问题交换时，仅交换送给采样器的问题表示，reader 继续接收原问题。观察采样是否朝各自证据移动，以及原问题对应的坐标是否更有利于原答案。
 
@@ -238,7 +238,7 @@ prefill 继续使用现有 `[intention_idx+1,Nq)`，cached decode 继续走原�
 - 若希望位置编码也对坐标可微，不能无说明地 `round().long()`；整数化会截断这条位置梯度，但不等于 grid_sample 的内容梯度也消失。
 - E3 先用固定 slot 编码，单独判断内容采样带来的梯度，避免一次改变两条路径。
 
-以上编码对照当前没有 CLI；需实现后才可声称完成。可在此阶段另做 center-only、scale-only 干预，区分质心误差与窗口密度误差，避免只看一个 `in_box` 数字。
+编码对照已通过 `--dat_hd_position_mode slot` 实现；默认 `legacy` 保持旧 checkpoint 行为。`DATSamplingControl` 的作用域也强制采用 slot 编码，learned、零残差、共享 oracle 网格和逐组 override 均共用这一位置约定。center-only、scale-only 的真实模型干预仍需另行运行。
 
 ## 6. E3：证明纯 next-token CE 能指导局部移动
 
@@ -266,13 +266,15 @@ sampler-only 时冻结 ViT、merger、LLM、k/v_hd、HD layernorm、HD gate/bias
 
 但仅冻结主干权重不保证后层 `c/s` 数值恒定：较早层 DAT 的变化仍可能改变后层输入。需要严格固定粗定位时，使用同一冻结参考模型或缓存的 `c/s`，并记录其跨 step 是否漂移。冻结检查同时比较 optimizer.step 前后的参数变化，确认 reader 没有被其他解冻逻辑重新放开。
 
-### 6.2 逐点梯度与局部数值验证（需新增诊断）
+### 6.2 逐点梯度与局部数值验证
 
 先用 16–32 个有明确答案证据的验证样本，保留最终采样坐标的梯度。记录每层/每组：坐标梯度范数、非零比例、clamp 前越界比例、边界点比例、残差范围、tanh 饱和比例，以及首答案 token 的独立 CE 梯度。
 
 在少量远离边界与插值单元折点的坐标上，用中心有限差分检查 `dL/dx` 的符号与量级。扰动用 HD 单元定义，例如 `0.01/0.05/0.1` 个单元；检查多个步长，避免 bf16 舍入让微小 loss 差淹没。固定随机性和样本；在可行范围采用 fp32 的小规模参考计算。
 
 再沿归一化负梯度移动少量坐标，与相同步长的正方向、随机方向比较 CE。只在光滑局部和数值精度允许的范围解读，不要求每个样本每一步都下降；观察配对均值、符号一致性与误差。
+
+`scripts/check_dat_coordinate_grad.py` 已实现纯 CE、content/template/first 三类分项梯度和中心有限差分，具体命令见第 9 节。负梯度移动与直接坐标优化仍是后续真实模型实验，不能由 CPU 回归代替。
 
 ### 6.3 直接优化坐标，区分信号不足与 head 学不会
 
@@ -362,3 +364,72 @@ reader 共训放在 sampler-only 之后，使用独立的 2×2 对照：固定/�
 - [ ] 固定预算对照显示泛化收益，而不只是训练 loss 或框内点数改善。
 
 主要代码入口：[模型与采样](../llava/model/language_model/modeling_qwen3_5_dat.py)、[训练与冻结](../llava/train/train_qwen_dat.py)、[推理 probe/diag12](../scripts/probe_whd_qwen35.py)、[读出 leverage](../scripts/_test_lr_drop_leverage.py)。
+
+## 9. 已实现的 sampler-only 控制与坐标检查
+
+CPU 回归读取生产采样方法，使用冻结 reader 和真实 CE 检查每组 override、梯度、三种有限差分步长、optimizer.step 的冻结边界、共同零残差起点、多图/多答案预算，以及 checkpoint 重算期间的粗网格回放：
+
+```bash
+python scripts/test_dat_loading_geometry.py
+python scripts/test_dat_experiments.py
+```
+
+### 9.1 局部 query 两组短训
+
+`--dat_sampler_only True` 从**完整初始 DAT checkpoint**继承 reader、全局定位、head 容量、DAT 层、HR scale 等配置，避免通用 CLI 的默认 grid/groups 改变已有模型。只切换 local query 和固定 slot 编码、关闭训练 curriculum；局部 readout `conv_off_proj` 清零，其他局部头参数保留初始 checkpoint 数值。原 local 残差被替换为零起点，不叠加旧残差。零 readout 的第一步只更新 readout，上游 head 从随后步骤获得梯度。
+
+下面共用同一初始 checkpoint、seed、数据和顺序，分别训练两组。沿用第 2 节环境变量；若训练集与验证集另行划分，改用真实训练 JSON，不能把 heldout 验证集直接拿来训练。
+
+```bash
+export TRAIN_JSON='/absolute/path/to/train.json'
+for qpos in im_start ans_prev; do
+  torchrun --nproc_per_node=1 llava/train/train_qwen_dat.py \
+    --model_name_or_path "$MODEL_PATH" --model_family qwen3_5 \
+    --use_dat True --dat_sampler_only True --dat_local_query_pos "$qpos" \
+    --data_path "$TRAIN_JSON" --image_folder "$IMAGE_FOLDER" \
+    --dat_tf_prob 0 --dat_tf_force_prob 0 \
+    --dat_off_penalty 0 --dat_off_sup_weight 0 --dat_rel_sup_weight 0 \
+    --dat_lr_drop_prob 0 --dat_hd_lse_bias 0 --dat_hd_lse_bias_decay_steps 0 \
+    --hd_content_gap_every 0 --lora_enable False --kd_on False \
+    --tune_mm_mlp False --dat_warmup_steps 0 \
+    --use_hr_first_resize False --use_decoupled_hr_lr False \
+    --lr_min_pixels 28224 --lr_max_pixels 262144 --hd_max_pixels 5017600 \
+    --bf16 True --seed 42 --dat_lr 1e-4 --learning_rate 1e-4 \
+    --max_steps 100 --per_device_train_batch_size 1 --gradient_accumulation_steps 1 \
+    --gradient_checkpointing True \
+    --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
+    --model_max_length 4096 --logging_steps 1 --save_steps 100 \
+    --report_to none --output_dir "$RUN_ROOT/local_${qpos}"
+done
+```
+
+最终可训练参数只有 `conv_lr_dw/ln_1/conv_lr_proj/proj_intention/ln_2/conv_off_proj`；ViT、merger、LLM、k/v_hd、HD norm/gate 和 coarse locator 冻结。冻结 reference 是初始化模型的完整副本，其 local query 固定 `im_start`、local 残差固定零。每个 batch 先在 reference 中取得所有层、样本、图像、reader slot、group 的粗网格，再回放给 student；reference 与 student 共用固定 reader/预处理，后层粗网格不会随训练中的前层局部残差变化。
+
+这条 opt-in 路径每个进程额外保留一份冻结模型并增加一次前向；支持 DDP/ZeRO-2，当前显式拒绝 ZeRO-3。最终冻结在通用 DAT 解冻之后、optimizer 创建之前执行，启动日志打印最终 trainable/optimizer 参数，输出 `dat_sampler_manifest.json` 防止向同一输出目录恢复不同设置。非 sampler-only 路径保持原有配置流程。
+
+### 9.2 真实 checkpoint 的纯 CE 坐标检查
+
+```bash
+python scripts/check_dat_coordinate_grad.py \
+  --model_path "$MODEL_PATH" \
+  --data_json "$RUN_ROOT/eval_subset.json" --image_folder "$IMAGE_FOLDER" \
+  --n 16 --seed 0 --local_query_pos ans_prev --residual zero \
+  --tok_budget 256 --min_pixels 28224 --hd_cap 5017600 --hr_scale 3 \
+  --fd_points 2 --fd_steps 0.01 0.05 0.1 \
+  --coordinates_out "$RUN_ROOT/coordinates.json" \
+  --out "$RUN_ROOT/coordinate_grad.json"
+```
+
+脚本冻结所有模型权重，并关闭 checkpoint 的 TF、offset/relevance 辅助梯度 hook、LR drop、HD bias 和 dropout；只对显式坐标叶张量求导。保留真实 grid_sample 输入的梯度，分别报告 total/content/template/first CE；逐层、reader slot、group 输出范数、非零比例、clamp 前越界、边界比例、raw/effective 残差范围与 tanh 饱和比例。实际 merge 分支必须为 exact，否则报错；`hd_gate` 存在或 exact backward 不可用的 checkpoint/环境需要单独处理，不能把 legacy 梯度当作数值验收。
+
+有限差分按 HD 单元换算扰动，选择远离 clamp 边界和插值折点的坐标；输出每个步长的 analytic/FD、符号、误差和原始 CE 差。bf16 reader 量化可能吞掉小 CE 差，`unresolved_loss_delta` 会标记它，报告不把这种情况自动判为梯度错误或通过。CPU fp32 回归提供采样内容梯度的平滑参考；端到端 GPU 数值与收益仍需在公司机器运行。
+
+检查已训练模型时用 `--model_path "$RUN_ROOT/local_ans_prev" --reference_model_path "$MODEL_PATH" --residual learned`；reference 必须是训练时的初始 checkpoint。脚本逐参数验证 reader/coarse 权重与 reference 相同，允许 local sampler 权重变化。固定 reference 的粗网格、slot 编码和预算后，才比较训练效果。常规 `generate` 不自动加载这个 reference；受控推理须沿用 `sampling_control` 回放，不能混为固定粗网格实验。
+
+### 9.3 完整逐组坐标观察与 override
+
+`--coordinates_out` 保存 `[reader_slots, groups, 20, 20, 2]` 的完整坐标，JSON 用 `sample_index` 和 `[layer,batch_row,image_index]` 定位。修改某一 group 后传入 `--coordinates_in`，保持同一数据、seed 和样本顺序；不平均 group，也不隐式广播。`--residual zero/learned` 控制未覆盖坐标的起点，显式 override 优先。坐标使用 `(x,y)`、`[-1,1]`，之后由真实 clamp/grid_sample 处理。
+
+Python 接口在 `llava/model/dat_experiments.py`：先用 `DATSamplingControl(zero_residual=True)` 对冻结 reference 做 capture，再用 `capture.replay(observe=True, overrides={key: coordinates})` 对 student 执行 `sampling_control`。`records[key]['sampled']` 是实际 grid_sample 输入，保留计算图和 `.grad`；旧可视化返回的 detached 坐标继续保持原语义。使用 gradient checkpointing 时，replay 作用域必须覆盖 backward；训练入口已处理这一生命周期。
+
+每个 reader slot/每张图仍输出 400 个 KV token。8 个 group 是同一 token 的通道分组；image reader 与多个 answer reader 的额外开销分别记账。新的控制与诊断不包含 HD 邻域 refiner、直接坐标优化或验证集收益结论。

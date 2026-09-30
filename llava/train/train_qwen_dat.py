@@ -433,6 +433,15 @@ class ModelArguments:
                           "required with dat_off_sup_weight > 0 -- at 1 the 0916 offsup run's "
                           "pull rewrote the LR features and HD-off V* fell 55.5 -> 50.3."}
     )
+    dat_local_query_pos: str = field(
+        default='im_start', metadata={'help': 'Local sampler query: im_start or ans_prev; independent of global query.'}
+    )
+    dat_hd_position_mode: str = field(
+        default='legacy', metadata={'help': 'HD RoPE: legacy forced-coordinate positions, or common fixed slot positions.'}
+    )
+    dat_sampler_only: bool = field(
+        default=False, metadata={'help': 'Qwen3.5 controlled experiment: only local sampler trains; frozen reference coarse grid, fixed slots, zero residual, 400 tokens per reader.'}
+    )
     dat_use_global_offset: bool = field(
         default=False,
         metadata={"help": "Add a global localisation term to the DAT offset head: a per-cell "
@@ -2890,8 +2899,12 @@ class Qwen2VLTrainer(transformers.Trainer):
         'image_paths', 'dat_force_window',
     )
 
-    def __init__(self, *args, kd_teacher: Optional[torch.nn.Module] = None, **kwargs):
+    def __init__(self, *args, kd_teacher: Optional[torch.nn.Module] = None,
+                 dat_reference=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.dat_reference = dat_reference
+        if self.dat_reference is not None:
+            self.dat_reference.to(next(self.model.parameters()).device).eval()
         self.kd_teacher = kd_teacher
         if self.kd_teacher is not None:
             try:
@@ -2911,7 +2924,15 @@ class Qwen2VLTrainer(transformers.Trainer):
             # PeftModel/LoraModel in front, hiding the attribute.
             inner = _unwrap_to_base_dat_model(model)
             inner._batch_image_paths = image_paths
-        result = super().training_step(model, inputs, num_items_in_batch, **kwargs)
+        try:
+            # The replay control remains installed through checkpoint recompute
+            # and backward, then ends with this batch.
+            result = super().training_step(model, inputs, num_items_in_batch, **kwargs)
+        finally:
+            if self.dat_reference is not None:
+                from llava.model.dat_experiments import dat_attention_modules
+                for module in dat_attention_modules(model):
+                    module._dat_sampling_control = None
 
         # After backward (before zero_grad): capture DAT grad norms and
         # forward diagnostics.  Under DDP+PEFT, register_hook may silently
@@ -3106,6 +3127,10 @@ class Qwen2VLTrainer(transformers.Trainer):
 
         optimizer_cls, optimizer_kwargs = transformers.Trainer.get_optimizer_cls_and_kwargs(self.args)
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+        if self.dat_reference is not None:
+            from llava.model.dat_experiments import assert_sampler_optimizer
+            rank0_print('[sampler-only] optimizer parameters:',
+                        assert_sampler_optimizer(opt_model, self.optimizer))
         return self.optimizer
 
     # ------------------------------------------------------------------
@@ -3349,6 +3374,19 @@ class Qwen2VLTrainer(transformers.Trainer):
         # of kd_on -- otherwise unknown kwargs would crash model.forward().
         student_inputs, teacher_extras = self._split_student_teacher_inputs(inputs)
 
+        if self.dat_reference is not None:
+            from llava.model.dat_experiments import (
+                DATSamplingControl, sampling_control, dat_attention_modules,
+            )
+            reference_control = DATSamplingControl(zero_residual=True)
+            student_inputs = dict(student_inputs, use_cache=False)
+            reference_inputs = student_inputs
+            with sampling_control(self.dat_reference, reference_control), torch.no_grad():
+                self.dat_reference(**reference_inputs)
+            replay = reference_control.replay()
+            for module in dat_attention_modules(model):
+                module._dat_sampling_control = replay
+
         kd_on = getattr(self.args, 'kd_on', False)
         if (not kd_on) or (self.kd_teacher is None):
             self._maybe_log_hd_content_gap(model, student_inputs, num_items_in_batch)
@@ -3462,6 +3500,30 @@ def train():
     # Trainer seeds too late: DAT adapters and missing model weights have
     # already been initialized by then. Seed all RNGs before construction.
     transformers.set_seed(training_args.seed)
+    if model_args.dat_sampler_only:
+        if model_args.model_family != 'qwen3_5' or not model_args.use_dat:
+            raise ValueError('dat_sampler_only requires use_dat=True and model_family=qwen3_5')
+        conflicts = {
+            'lora_enable': training_args.lora_enable,
+            'kd_on': training_args.kd_on,
+            'dat_warmup_steps': model_args.dat_warmup_steps,
+            'tune_mm_mlp': model_args.tune_mm_mlp,
+            'dat_tf_prob': data_args.dat_tf_prob,
+            'dat_off_penalty': model_args.dat_off_penalty,
+            'dat_off_sup_weight': model_args.dat_off_sup_weight,
+            'dat_rel_sup_weight': model_args.dat_rel_sup_weight,
+            'dat_lr_drop_prob': model_args.dat_lr_drop_prob,
+            'dat_hd_lse_bias': model_args.dat_hd_lse_bias,
+            'dat_hd_lse_bias_decay_steps': model_args.dat_hd_lse_bias_decay_steps,
+            'hd_content_gap_every': training_args.hd_content_gap_every,
+        }
+        active = [name for name, value in conflicts.items() if value]
+        if active:
+            raise ValueError('sampler-only pure CE requires these options disabled: ' + ', '.join(active))
+        from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+        if is_deepspeed_zero3_enabled():
+            raise ValueError('frozen-reference sampler-only currently supports DDP/ZeRO-2, not ZeRO-3')
+        model_args.dat_hd_position_mode = 'slot'
 
     local_rank = training_args.local_rank
     if local_rank is None or local_rank == -1:
@@ -3544,6 +3606,8 @@ def train():
             'tf_force_prob': model_args.dat_tf_force_prob,
             'route_by_lr_drop': model_args.dat_route_by_lr_drop,
             'off_head_trunk_grad': model_args.dat_off_head_trunk_grad,
+            'local_query_pos': model_args.dat_local_query_pos,
+            'hd_position_mode': model_args.dat_hd_position_mode,
             'use_global_offset': model_args.dat_use_global_offset,
             'glob_min_scale': model_args.dat_glob_min_scale,
             'glob_relevance': model_args.dat_glob_relevance,
@@ -3561,6 +3625,18 @@ def train():
             'use_fused_vit': model_args.dat_fused_vit,
             'use_shared_vit': model_args.dat_shared_vit,
         }
+        if model_args.dat_sampler_only:
+            from llava.model.dat_experiments import sampler_dat_config
+            source_path = pathlib.Path(model_args.model_name_or_path) / 'config.json'
+            source_config = json.loads(source_path.read_text())
+            dat_extra_args = sampler_dat_config(source_config.get('dat_extra_args'),
+                                               model_args.dat_local_query_pos)
+            # The ordinary CLI defaults must not change trained readers or
+            # head capacity (e.g. default grid=6/groups=1 vs checkpoint 20/8).
+            model_args.dat_layers = dat_extra_args.get('layers', '')
+            model_args.dat_hr_scale = dat_extra_args.get('hr_scale', 3)
+            model_args.dat_hd_proj = dat_extra_args.get('hd_proj', True)
+            rank0_print('[sampler-only] inherited DAT architecture/readers from checkpoint config')
 
         rank0_print(f"Loading DAT model ({model_args.model_family}) from {model_args.model_name_or_path}...")
         rank0_print(f"DAT config: {dat_extra_args}")
@@ -3751,6 +3827,36 @@ def train():
 
         print_trainable_parameters(model)
 
+    # Final freeze pass after every ordinary DAT/PEFT unfreeze operation.
+    dat_reference = None
+    if model_args.dat_sampler_only:
+        from llava.model.dat_experiments import (
+            freeze_local_sampler_only, dat_attention_modules, disable_dropout, require_pure_ce,
+        )
+        require_pure_ce(model)
+        dat_reference = copy.deepcopy(model).requires_grad_(False).eval()
+        dat_reference.config.dat_extra_args['local_query_pos'] = 'im_start'
+        disable_dropout(dat_reference)
+        for module in dat_attention_modules(dat_reference):
+            # A common reference query across im_start/ans_prev experiment arms.
+            module.local_query_pos = 'im_start'
+            module.hd_position_mode = 'slot'
+        if hasattr(dat_reference, 'gradient_checkpointing_disable'):
+            dat_reference.gradient_checkpointing_disable()
+        trainable = freeze_local_sampler_only(model)
+        model.config.use_cache = False
+        rank0_print('[sampler-only] final trainable parameters:', trainable)
+        manifest = dict(checkpoint=os.path.abspath(model_args.model_name_or_path),
+            seed=training_args.seed, local_query=model_args.dat_local_query_pos,
+            reference_local_query='im_start', position_mode='slot',
+            reference_dat_args=dat_reference.config.dat_extra_args,
+            tokens_per_reader=400, zero_residual_start=True, trainable=trainable)
+        manifest_path = pathlib.Path(training_args.output_dir) / 'dat_sampler_manifest.json'
+        if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
+            raise ValueError('sampler experiment settings differ from the existing output manifest')
+        if local_rank == 0:
+            manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+
     # ----- KD teacher (pure base VLM, no DAT, no LoRA) -----
     kd_teacher = None
     if getattr(training_args, 'kd_on', False):
@@ -3857,6 +3963,7 @@ def train():
         data_collator=data_collator,
         callbacks=callbacks if callbacks else None,
         kd_teacher=kd_teacher,
+        dat_reference=dat_reference,
     )
     trainer._dat_monitor_callback = dat_monitor
 
