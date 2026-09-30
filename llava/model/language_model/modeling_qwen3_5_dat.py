@@ -2256,6 +2256,17 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
       sequence untouched; HD info reaches them via the residual stream.
     """
     config_class = Qwen3_5DATConfig
+    # HF must keep these in fp32 while materializing checkpoint tensors, also
+    # with dtype='auto'. Upcasting a bf16 copy afterwards cannot recover bits.
+    _DAT_FP32_MODULES = (
+        'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
+        'ln_2', 'conv_off_proj', 'conv_glob', 'glob_q', 'glob_k',
+        'hd_gate', 'hd_input_layernorm',
+    )
+    _keep_in_fp32_modules = list(dict.fromkeys(
+        (getattr(Qwen3_5ForConditionalGeneration, '_keep_in_fp32_modules', None) or [])
+        + list(_DAT_FP32_MODULES)
+    ))
 
     def __init__(self, config: Qwen3_5DATConfig):
         super().__init__(config)
@@ -2385,7 +2396,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         Running last, this makes the checkpoint authoritative regardless of HF's
         init ordering. No-op for a fresh base conversion (no DAT keys on disk).
         """
-        if not isinstance(path, str) or not os.path.isdir(path):
+        if not isinstance(path, (str, os.PathLike)) or not os.path.isdir(path):
             return
 
         def _is_dat_key(k):
@@ -2422,6 +2433,12 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             if tgt is None or tuple(tgt.shape) != tuple(v.shape):
                 continue
             with torch.no_grad():
+                if any(part in cls._DAT_FP32_MODULES for part in k.split('.')):
+                    # Restore from the source tensor, never via a rounded target.
+                    # Covers HF versions whose 'auto' loader ignores the hint.
+                    tgt.data = v.to(device=tgt.device, dtype=torch.float32)
+                    n_loaded += 1
+                    continue
                 tgt.data.copy_(v.to(tgt.dtype).to(tgt.device))
             n_loaded += 1
 

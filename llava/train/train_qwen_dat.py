@@ -1425,8 +1425,9 @@ class Qwen2VLCoupledDATDataset(Dataset):
                 # Step 2: HD — 尽可能高，但有上限
                 orig_pixels = img.width * img.height
                 thw = inputs["image_grid_thw"][0]
-                lr_h = thw[1].item() * self.FACTOR
-                lr_w = thw[2].item() * self.FACTOR
+                # image_grid_thw counts patches before spatial merging.
+                lr_h = thw[1].item() * self.PATCH_SIZE
+                lr_w = thw[2].item() * self.PATCH_SIZE
                 lr_pixels = lr_h * lr_w
 
                 # HD 目标：LR 的 hr_scale² 倍，但不超过原图，也不超过显存上限
@@ -3458,6 +3459,9 @@ def train():
         (ModelArguments, DataArguments, Qwen2VLTrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # Trainer seeds too late: DAT adapters and missing model weights have
+    # already been initialized by then. Seed all RNGs before construction.
+    transformers.set_seed(training_args.seed)
 
     local_rank = training_args.local_rank
     if local_rank is None or local_rank == -1:

@@ -212,7 +212,7 @@ def extract_letter(text):
 # ──────────────────────────────────────────────────────────────
 
 def hd_target_size(image, lr_grid_thw, hr_scale, hd_cap):
-    lr_px = int(lr_grid_thw[1]) * FACTOR * int(lr_grid_thw[2]) * FACTOR
+    lr_px = int(lr_grid_thw[1]) * PATCH * int(lr_grid_thw[2]) * PATCH
     hd_total = min(lr_px * hr_scale * hr_scale, image.width * image.height, hd_cap)
     aspect = image.width / image.height
     hd_h = int(math.sqrt(hd_total / aspect))

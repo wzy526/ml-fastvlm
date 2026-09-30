@@ -110,7 +110,7 @@ def make_processor(path, min_px, max_px):
 
 def hd_target_size(image, lr_grid_thw, hr_scale, hd_cap):
     """Return (hd_w, hd_h): HR resize target, factor-32 snapped."""
-    lr_px = int(lr_grid_thw[1]) * FACTOR * int(lr_grid_thw[2]) * FACTOR
+    lr_px = int(lr_grid_thw[1]) * PATCH * int(lr_grid_thw[2]) * PATCH
     hd_total = lr_px * hr_scale * hr_scale
     hd_total = min(hd_total, image.width * image.height, hd_cap)
     aspect = image.width / image.height

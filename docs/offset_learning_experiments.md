@@ -19,6 +19,16 @@
 
 ### 2026-09-30 修复与回归命令
 
+- FP32 加载：Qwen3.5 DAT 声明 HF 的 FP32 保留模块，并从原始 checkpoint 直接恢复这些参数为 FP32；`torch_dtype='auto'` 和显式 bf16 均不再经过 bf16 中转。reader 的 k/v_hd 仍沿用模型精度。
+- LR-first：训练、probe 和 TTFT benchmark 用 `patch_size` 将未合并 `image_grid_thw` 换算为像素，尺寸对齐仍用 `patch_size * merge_size`；消除重复乘 merge size 导致的面积四倍误差。
+- 初始化：训练入口解析参数后立即调用 `transformers.set_seed(training_args.seed)`，先于模型和 DAT 参数构造。
+
+```bash
+python scripts/test_dat_loading_geometry.py
+```
+
+此回归用临时 safetensors 检查 66 个非 bf16 可表示的 FP32 参数逐位保留，兼顾矩形图和构造前 seed 顺序；需要 PyTorch/safetensors。真实 checkpoint 的张量数由层配置决定。
+
 - E0 报告：原 `_corr` 只在有 `GLOBC` 时定义，但无 global offset 也可能有 HD diag12 统计；现已无条件定义，避免报告阶段 `UnboundLocalError` 导致 JSON 未生成。
 - shuffle：probe 原来只比较前 4096 字节、搜索 8 个候选；leverage 原来直接使用半个数据集之外的行。现两者共用完整解码 RGB 像素与尺寸的 SHA256、全候选确定性搜索，并在模型加载前排除无不同图 donor 的输入。结果保存配对以便审计。
 - E1：训练答案 query 修为 `[s−1,e)`，question-HD 边界同步；`labels[0]` 不参与 shifted CE，解析时排除。只改路由，不改 local query、位置编码和 offset head。
