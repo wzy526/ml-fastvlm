@@ -489,6 +489,12 @@ class ModelArguments:
         metadata={"help": "Comma list of DAT layer indices that get the global offset term "
                           "(others keep the legacy grid, no glob params). '' = all DAT layers."}
     )
+    dat_glob_grid: str = field(
+        default="moments",
+        metadata={"help": "dat_use_global_offset: how the relevance map becomes a grid. 'moments' "
+                          "(x = c + s * ref with c = mean, s = std of the map) or 'warp' (the map's "
+                          "quantile grid: per-axis inverse-CDF of the marginals; no c / s, no floor)."}
+    )
     dat_rel_sup_weight: float = field(
         default=0.0,
         metadata={"help": "Dense supervision of the dat_use_global_offset relevance map on bbox "
@@ -3615,6 +3621,7 @@ def train():
             'glob_query_pos': model_args.dat_glob_query_pos,
             'glob_floor': model_args.dat_glob_floor,
             'glob_layers': model_args.dat_glob_layers,
+            'glob_grid': model_args.dat_glob_grid,
             'rel_sup_weight': model_args.dat_rel_sup_weight,
             'hd_gate_init': model_args.dat_hd_gate_init,
             'hd_gate_freeze': model_args.dat_hd_gate_freeze,

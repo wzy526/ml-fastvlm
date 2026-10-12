@@ -214,6 +214,28 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #       alone; separates 'off_sup pulled the map' from 'q/k LoRA per se')
 #   Pass: sample-dependence |c-t| <= 0.28 and r_cx/r_cy >= 0.75 at layers
 #   15/19, hits real >= +3.0, train loss not above E1's.
+# Mini F result (0924): F1 moved |c-t| 0.35 -> 0.31 only, peak in box still
+#   0.17, and the LM baseline dropped 1.6 (why off_head_trunk_grad=0 exists);
+#   F0 == E1. The trunk-attention map is not where c improves.
+# Mini E1 @ 2000 steps (0924_miniE1_2k): overall +2.0 at 1000 (hits +3.3),
+#   plateau after; 600 steps was under-trained. New reference: checkpoint-1000.
+# Diag 12 (probe): ans_prev's attention over the 400 sampled HD keys (layers
+#   15/19) is an HD-resolution c: untrained, a grid centred on it with half the
+#   coarse scale puts 0.13 of its points in the box (model 0.05, oracle 0.10).
+# Diag 13 (probe, 1012): the map's QUANTILE grid instead of its moments
+#   ('warp', see _quantile_grid): in_box 0.056 vs 0.045, |c-t| 0.318 vs 0.349,
+#   hits unchanged, misses -1.7 vs -2.5. No floor needed (median-background
+#   removal added 0.002 and hurt misses).
+# Mini H (1012): E1 with GLOB_GRID=warp GLOB_FLOOR=0, 1000 steps:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 GRAD_ACCUM=1 \
+#   DATA_JSON=$OSS_DATA/extra_0916/viscot_bbox.train.json MODEL_PATH=<v2-merged> \
+#   TF_PROB=1 TF_FORCE_PROB=0.5 OFF_SUP_WEIGHT=10 REL_SUP_WEIGHT=0 LR_DROP_PROB=0.5 ROUTE_BY_DROP=1 \
+#   OFF_HEAD_TRUNK_GRAD=0 GLOBAL_OFFSET=1 GLOB_REL=attn GLOB_QPOS=ans_prev GLOB_GRID=warp \
+#   GLOB_FLOOR=0 GLOB_LAYERS=11,15,19,23 FREEZE_BASE=True LORA_ENABLE=False TUNE_MM_MLP=False \
+#   MAX_STEPS=1000 WARMUP_STEPS=20 SAVE_STEPS=1000 EXP_NAME=1012_miniH_warp bash <this script>
+#   Pass vs miniE1_2k@1000 re-probed under the same geometry (overall ~+2.0,
+#   hits +3.4, misses -2.5, in_box 0.045): hits >= +3.8, overall >= +2.5,
+#   misses >= -1.5, in_box at layers 15/19 >= 0.06.
 #
 # Full 0920 combined run (data = 0817 mix + viscot doc boxes + synth_hd text on
 # SA-1B natural images (+ optional Visual-CoT natural-image boxes), built by
@@ -371,6 +393,7 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_glob_query_pos "${GLOB_QPOS:-ans_prev}" \
     --dat_glob_floor "${GLOB_FLOOR:-0}" \
     --dat_glob_layers "${GLOB_LAYERS:-}" \
+    --dat_glob_grid "${GLOB_GRID:-moments}" \
     --dat_rel_sup_weight "${REL_SUP_WEIGHT:-0}" \
     --dat_lr 1e-4 \
     --lora_enable "${LORA_ENABLE:-True}" \

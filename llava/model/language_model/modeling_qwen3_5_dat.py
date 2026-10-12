@@ -546,6 +546,48 @@ class _InjectGradFn(torch.autograd.Function):
         return pull, None
 
 
+def _quantile_grid(p, gs):
+    """Quantile (saliency-warped) sampling grid of a relevance map.
+
+    p   [R, N] map over the gs x gs cells (rows sum to 1), N = gs * gs
+    ->  [R, 2, gs, gs] grid positions (x, y) in [-1, 1]
+
+    glob_grid='warp': p is used as a sampling DENSITY instead of being fitted
+    by its mean / std (glob_grid='moments'). Per axis take the marginal, its
+    CDF, and put the i-th grid line at CDF^-1 of the i-th quantile of the
+    uniform reference grid (piecewise-linear inverse, p is constant inside a
+    cell). A cell holding 30% of the mass gets 30% of the lines; a flat map
+    gives exactly the uniform reference grid; a one-hot map puts every line
+    inside that cell. Monotone per axis, so the grid topology (and the dw-conv
+    local offsets added on top) is unchanged. Differentiable in p through the
+    in-cell fraction. 0923-1012 probe on miniE1_2k (inference-only swap):
+    in_box 0.056 vs 0.045 for moments + floor, |c-t| 0.318 vs 0.349, the
+    readout did not lose on hits (every earlier grid swap did) and lost less
+    on misses (-1.7 vs -2.5): a flat map means 'unsure', the quantile grid
+    keeps that as near-uniform coverage where the floor erased it.
+    """
+    R, N = p.shape
+    pm = p.view(R, gs, gs)                                           # [R, y, x]
+    m = 1.0 / max(gs - 1, 1)
+    ref = torch.linspace(-1.0 + m, 1.0 - m, gs, device=p.device, dtype=p.dtype)
+    u = ((ref + 1.0) * 0.5).clamp(1e-6, 1 - 1e-6).expand(R, gs).contiguous()   # [R, gs] quantiles
+    edges = torch.linspace(-1.0, 1.0, gs + 1, device=p.device, dtype=p.dtype)
+
+    def inv_cdf(marg):                                               # [R, gs] -> [R, gs]
+        marg = marg / marg.sum(-1, keepdim=True).clamp_min(1e-9)
+        F_ = torch.cat([marg.new_zeros(R, 1), marg.cumsum(-1)], -1)  # [R, gs+1]
+        F_ = torch.cat([F_[:, :-1], torch.ones_like(F_[:, -1:])], -1)   # F[-1] = 1 exactly
+        k = (torch.searchsorted(F_.detach(), u, right=True) - 1).clamp(0, gs - 1)
+        F0, F1 = F_.gather(1, k), F_.gather(1, k + 1)
+        frac = ((u - F0) / (F1 - F0).clamp_min(1e-9)).clamp(0.0, 1.0)
+        return edges[k] + frac * (2.0 / gs)
+
+    X = inv_cdf(pm.sum(1))                                           # x marginal: sum over y
+    Y = inv_cdf(pm.sum(2))
+    return torch.stack([X[:, None, :].expand(R, gs, gs),
+                        Y[:, :, None].expand(R, gs, gs)], 1)
+
+
 def _route_windows(win_locs, supervise, tf_force_prob, lr_dropped=None):
     """Decide, per sample, what a bbox window does this forward.
 
@@ -767,6 +809,11 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             # mass 0.16 < 0.236 uniform, grid dist ratio 1.04 = worse than not
             # moving), layer 7 weak (0.28); 11/15/19/23 carry the signal.
             'glob_layers': '',
+            # How the map becomes a grid: 'moments' (legacy: x = c + s * ref,
+            # c = mean, s = std of p -- a Gaussian fit, hence glob_floor) or
+            # 'warp' (x = quantile grid of p, see _quantile_grid; no c / s, no
+            # floor needed; glob_floor still applies to p first if set).
+            'glob_grid': 'moments',
             # Where the relevance logits come from:
             #   'conv': 1x1 conv on the post-ln_2 (intention-gated) cell features.
             #           The question enters only as a per-channel scalar gate, so
@@ -1154,6 +1201,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             self.use_global_offset = layer_idx in _keep
         self.glob_min_scale = float(dat.get('glob_min_scale', 0.1))
         self.glob_floor = float(dat.get('glob_floor', 0.0))
+        self.glob_grid = str(dat.get('glob_grid', 'moments') or 'moments')
+        assert self.glob_grid in ('moments', 'warp'), f"glob_grid={self.glob_grid!r}"
         self.glob_relevance = str(dat.get('glob_relevance', 'conv'))
         assert self.glob_relevance in ('conv', 'qk', 'both', 'attn', 'attn+qk'), self.glob_relevance
         self.glob_dim = int(dat.get('glob_dim', 128))
@@ -1419,12 +1468,21 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 z = q.sum(-1, keepdim=True)
                 p = torch.where(z > 1e-9, q / z.clamp_min(1e-9), p)
             g = references[:1].flatten(2)                                  # [1, 2, N]
-            c = (p * g).sum(-1)                                            # [R, 2]
-            var = (p * (g - c.unsqueeze(-1)) ** 2).sum(-1)                 # [R, 2]
-            var_u = g.var(dim=-1, unbiased=False)                          # [1, 2]
-            s = (var / var_u).clamp_min(1e-12).sqrt().clamp(self.glob_min_scale, 1.0)
-            x = (c.unsqueeze(-1).unsqueeze(-1)
-                 + s.unsqueeze(-1).unsqueeze(-1) * references + offsets)
+            if self.glob_grid == 'warp':
+                # quantile grid of the map; c / s below are only the grid's
+                # effective centre / spread for the monitors and the probe
+                wg = _quantile_grid(p[:, 0], self.grid_size).to(references.dtype)   # [R, 2, gs, gs]
+                x = wg + offsets
+                wf = wg.detach().flatten(2)                                # [R, 2, N]
+                c = wf.mean(-1)
+                s = (wf.std(-1, unbiased=False) / g.std(-1, unbiased=False)).clamp(0.0, 1.0)
+            else:
+                c = (p * g).sum(-1)                                            # [R, 2]
+                var = (p * (g - c.unsqueeze(-1)) ** 2).sum(-1)                 # [R, 2]
+                var_u = g.var(dim=-1, unbiased=False)                          # [1, 2]
+                s = (var / var_u).clamp_min(1e-12).sqrt().clamp(self.glob_min_scale, 1.0)
+                x = (c.unsqueeze(-1).unsqueeze(-1)
+                     + s.unsqueeze(-1).unsqueeze(-1) * references + offsets)
             self._fn_chk("sample.glob", x)
             # Dense relevance supervision: CE(p, uniform over the cells inside
             # the target window), gradient p - t injected on the supervised
