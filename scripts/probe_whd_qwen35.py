@@ -375,6 +375,7 @@ def install_merge_hook():
     orig = Qwen3_5AttentionDAT._merge_two_pass_lse
 
     def patched(self, out1, lse1, out2, lse2, ans_start, ans_end):
+        STATE["pending_locs"] = []                    # diag 14: HD rotary calls of this layer are over
         if STATE["bias"] != 0.0:
             lse2 = lse2 + STATE["bias"]
         if STATE["record"]:
@@ -572,6 +573,7 @@ def install_merge_hook():
         return torch.stack([gx, gy], 1)
 
     def patched_sample(self, *a, **kw):
+        STATE["pending_locs"] = []                    # diag 14: never let stale locations leak
         mode = STATE.get("glob_readout") or ""
         if mode or STATE.get("glob_layers") is not None:
             STATE["orig_p"] = None
@@ -614,6 +616,10 @@ def install_merge_hook():
                 self._dat_glob_last = torch.stack([c_eff.norm(dim=1).mean(), s_eff.mean()])
         else:
             key_hd, value_hd, locs = orig_sample(self, *a, **kw)
+        if STATE.get("hd_pos", "legacy") != "legacy" and getattr(self, "_dat_force_locs", None) is None:
+            # Diagnostic 14: hand the ACTUAL sampling locations (one grid per
+            # slot, groups averaged) to the rotary hook below, in slot order
+            STATE["pending_locs"] = [locs[l].float().mean(0).reshape(-1, 2) for l in range(locs.size(0))]
         if STATE["record"]:
             with torch.no_grad():
                 k = key_hd.float()                       # [Lp, Ns, D]
@@ -707,6 +713,41 @@ def install_merge_hook():
         return key_hd, value_hd, locs
 
     Qwen3_5AttentionDAT._sample_hd_from_off_guide = patched_sample
+
+    # Diagnostic 14 (--hd_pos sampled | sampled_frac): truthful HD positions.
+    # _construct_hd_position_ids gives the model's OWN grid a fixed linspace
+    # over the whole LR position range, whatever c / s / warp actually did
+    # (only a teacher-FORCED grid gets positions from its real locations).
+    # So at inference the mRoPE positions of the 400 HD keys claim 'uniform,
+    # full image' while the keys come from a zoomed (and, under warp, non-
+    # uniformly spaced) window; in training half the samples (forced) carry
+    # truthful positions and half do not. Here the positions are rebuilt from
+    # the actual sampling locations exactly as the forced path does
+    # (sampled = rounded to integer LR units like the forced path;
+    # sampled_frac = fractional). Inference-only, so read it as 'does the
+    # readout already prefer truthful positions': hits up -> make the model
+    # do this (hd_position_mode='sampled') and retrain.
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
+    orig_rot_fwd = Qwen3_5TextRotaryEmbedding.forward
+
+    def patched_rot_fwd(self, x, position_ids):
+        pend = STATE.get("pending_locs")
+        if pend and position_ids.dim() == 3 and position_ids.size(1) == 1 \
+                and position_ids.size(-1) == pend[0].size(0):
+            loc = pend.pop(0).to(position_ids.device)
+            pid = position_ids.float()
+            h_min, h_max = pid[1].min(), pid[1].max()
+            w_min, w_max = pid[2].min(), pid[2].max()
+            fx = (loc[:, 0].clamp(-1, 1) + 1.0) * 0.5
+            fy = (loc[:, 1].clamp(-1, 1) + 1.0) * 0.5
+            h = fy * (h_max - h_min) + h_min
+            w = fx * (w_max - w_min) + w_min
+            new = torch.stack([pid[0, 0], h, w])[:, None, :]           # [3, 1, Ns]
+            position_ids = new if STATE["hd_pos"] == "sampled_frac" else new.round().long()
+            STATE["hd_pos_n"] = STATE.get("hd_pos_n", 0) + 1
+        return orig_rot_fwd(self, x, position_ids)
+
+    Qwen3_5TextRotaryEmbedding.forward = patched_rot_fwd
 
     # Diagnostic 12: could a SECOND localisation stage read c off the sampled
     # HD keys? At each DAT layer the answer segment's query (prompt end =
@@ -854,8 +895,16 @@ def main():
     ap.add_argument("--glob_layers", default=None,
                     help="comma list of DAT layers that keep the global term at inference; the "
                          "others get a flat map (c=0, s=1). Default: all")
+    ap.add_argument("--hd_pos", choices=["legacy", "sampled", "sampled_frac"], default="legacy",
+                    help="mRoPE positions of the HD keys for the model's OWN grid: 'legacy' = fixed "
+                         "linspace over the LR range (as trained), 'sampled' = from the actual sampling "
+                         "locations rounded to LR units (what a teacher-forced grid gets), "
+                         "'sampled_frac' = fractional. Inference-only (diag 14)")
     args = ap.parse_args()
     STATE["glob_readout"] = args.glob_readout
+    STATE["hd_pos"] = args.hd_pos
+    if args.hd_pos != "legacy":
+        print(f"[probe] HD positions override: {args.hd_pos} (positions follow the sampled locations)")
     STATE["glob_layers"] = (None if args.glob_layers is None
                             else {int(x) for x in args.glob_layers.split(",") if x.strip()})
     if args.glob_readout or args.glob_layers:
@@ -940,6 +989,9 @@ def main():
     if STATE.get("gate_log"):
         print(f"[probe] gate readout: global term ON for {100 * float(np.mean(STATE['gate_log'])):.1f}% "
               f"of (sample, layer) calls")
+    if STATE.get("hd_pos_n"):
+        print(f"[probe] HD positions rebuilt from sampled locations in {STATE['hd_pos_n']} rotary calls "
+              f"(expect ~ samples x DAT layers x slots)")
     if args.hd_source.startswith("oracle"):
         print(f"[probe] forced sampling window on {n_forced}/{len(samples)} samples "
               f"(min {args.oracle_min_cells} HD cells per side)")
