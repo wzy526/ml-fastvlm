@@ -519,23 +519,99 @@ def install_merge_hook():
                 on = conc >= float(thr)
                 STATE.setdefault("gate_log", []).append(float(on.float().mean()))
                 return torch.where(on, m / m.sum(-1, keepdim=True), torch.full_like(p, 1.0 / N))
+            if kind == "warp":
+                # the grid itself was replaced (see warp_grid); a flat map
+                # makes the model's moments the identity (c = 0, s = 1)
+                return torch.full_like(p, 1.0 / N)
             raise ValueError(f"unknown --glob_readout {mode}")
         return f
 
+    # Diagnostic 13 (--glob_readout warp[:<lam>]): the QUANTILE grid of the
+    # map instead of its moments. The model fits a Gaussian to p (c = mean,
+    # s = std) and needed a floor because 'peak + flat background' is not
+    # one; here p is a sampling density: per axis take the marginal, its
+    # CDF, and put the i-th grid line at CDF^-1 of the i-th uniform-grid
+    # quantile (piecewise-linear inverse, p constant inside a cell). Dense
+    # cells get many lines, the flat background keeps its proportional share
+    # (coverage for the misses), nothing is fitted, no constants. Monotone,
+    # so the grid topology (and the dw-conv local offsets added on top) is
+    # unchanged. Saliency-sampler style (Recasens 2018 / FOVEA 2021) with the
+    # model's own attention as the saliency. lam < 1 mixes the map with the
+    # uniform density (minimum coverage); lam = 1 = pure.
+    def warp_grid(p, gs, lam):
+        # p [R, N] -> warped reference grid [R, 2, gs, gs] in (x, y)
+        R, N = p.shape
+        if lam < 0:
+            # 'warp:-1' = data-driven background: subtract each row's median
+            # cell value (the flat level, estimated per sample instead of the
+            # constant 1/N of glob_floor), relu, renormalise
+            q = (p - p.median(-1, keepdim=True).values).clamp_min(0)
+            z = q.sum(-1, keepdim=True)
+            p = torch.where(z > 1e-9, q / z.clamp_min(1e-9), p)
+        elif lam < 1.0:
+            p = lam * p + (1.0 - lam) / N
+        pm = p.view(R, gs, gs)                                       # [R, y, x]
+        m = 1.0 / max(gs - 1, 1)
+        ref = torch.linspace(-1.0 + m, 1.0 - m, gs, device=p.device, dtype=p.dtype)
+        u = ((ref + 1.0) * 0.5).clamp(1e-6, 1 - 1e-6)                # [gs] uniform-grid quantiles
+        edges = torch.linspace(-1.0, 1.0, gs + 1, device=p.device, dtype=p.dtype)
+
+        def inv_cdf(marg):                                           # marg [R, gs] -> [R, gs] positions
+            marg = marg / marg.sum(-1, keepdim=True).clamp_min(1e-9)
+            F = torch.cat([marg.new_zeros(R, 1), marg.cumsum(-1)], -1)   # [R, gs+1], F[-1] = 1
+            F[:, -1] = 1.0
+            k = (torch.searchsorted(F, u.expand(R, gs).contiguous(), right=True) - 1).clamp(0, gs - 1)
+            F0, F1 = F.gather(1, k), F.gather(1, k + 1)
+            frac = (u - F0) / (F1 - F0).clamp_min(1e-9)
+            return edges[k] + frac.clamp(0, 1) * (2.0 / gs)
+
+        X = inv_cdf(pm.sum(1))                                       # marginal over x: sum over y
+        Y = inv_cdf(pm.sum(2))
+        gx = X[:, None, :].expand(R, gs, gs)
+        gy = Y[:, :, None].expand(R, gs, gs)
+        return torch.stack([gx, gy], 1)
+
     def patched_sample(self, *a, **kw):
-        if STATE.get("glob_readout") or STATE.get("glob_layers") is not None:
+        mode = STATE.get("glob_readout") or ""
+        if mode or STATE.get("glob_layers") is not None:
             STATE["orig_p"] = None
             torch.softmax = glob_softmax_for(self.layer_idx, self.grid_size)
+            warped = None
+            layers = STATE.get("glob_layers")
+            if mode.startswith("warp") and (layers is None or self.layer_idx in layers) \
+                    and kw.get("glob_logits") is not None:
+                assert getattr(self, "conv_glob", None) is None, "warp probe needs a pure attn/qk map"
+                lam = float(mode.partition(":")[2] or 1.0)
+                with torch.no_grad():
+                    gl = kw["glob_logits"].float().flatten(1)                     # [R, N]
+                    warped = warp_grid(orig_softmax(gl, -1), self.grid_size, lam)  # [R, 2, gs, gs]
+                    # the model reads the cell coordinates g from row 0 of the
+                    # reference grid and adds c = E_uniform[g] = mean(row 0):
+                    # pre-shift every row by -mean(row 0)/2 so x = warped + offsets exactly
+                    c0 = warped[:1].flatten(2).mean(-1)                           # [1, 2]
+                    ref_out = warped - 0.5 * c0[:, :, None, None]
+                self._grid_generate = lambda h, w, n, device, _r=ref_out: _r
             try:
                 key_hd, value_hd, locs = orig_sample(self, *a, **kw)
             finally:
                 torch.softmax = orig_softmax
+                if warped is not None:
+                    del self._grid_generate                   # back to the class method
             # map-level tables and the hit/miss split always describe the
             # model's OWN map; only c / s / the grid follow the override
             op = STATE.get("orig_p")
             lp = getattr(self, "_dat_glob_last_p", None)
             if op is not None and lp is not None:
                 self._dat_glob_last_p = (op, lp[1])
+            if warped is not None:
+                # effective centre / scale of the quantile grid for the
+                # sample-dependence table: mean position, std / std(uniform)
+                wf = warped.flatten(2)                                            # [R, 2, N]
+                ref_u = self.__class__._grid_generate(self, self.grid_size, self.grid_size, 1, warped.device)[:1].flatten(2)
+                c_eff = wf.mean(-1)
+                s_eff = (wf.std(-1, unbiased=False) / ref_u.std(-1, unbiased=False)).clamp(0.0, 1.0)
+                self._dat_glob_last_cs = (c_eff, s_eff)
+                self._dat_glob_last = torch.stack([c_eff.norm(dim=1).mean(), s_eff.mean()])
         else:
             key_hd, value_hd, locs = orig_sample(self, *a, **kw)
         if STATE["record"]:
@@ -771,7 +847,10 @@ def main():
                          "k x k cells around the argmax (c = argmax, s ~ k/gs); 'local:<k>:<lam>' = "
                          "floor then moments inside the k x k window around the argmax; "
                          "'gate:<k>:<thr>' = win:k when the floored mass in that window >= thr "
-                         "(unimodal map), identity grid otherwise. Default: model as trained")
+                         "(unimodal map), identity grid otherwise; 'warp[:<lam>]' = the map's "
+                         "QUANTILE grid (per-axis inverse-CDF of the marginals, no moments, no floor; "
+                         "lam < 1 mixes in a uniform density for minimum coverage). "
+                         "Default: model as trained")
     ap.add_argument("--glob_layers", default=None,
                     help="comma list of DAT layers that keep the global term at inference; the "
                          "others get a flat map (c=0, s=1). Default: all")
