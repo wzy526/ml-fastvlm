@@ -854,6 +854,10 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             #               and is about to answer: mass 0.43-0.60, 8/8 heads.
             'glob_query_pos': 'im_start',
             'local_query_pos': 'im_start',
+            # mRoPE positions of the HD keys: 'legacy' (own grid: fixed linspace
+            # over the LR range; forced grid: its real locations), 'slot' (always
+            # the fixed linspace), 'sampled' (always the real sampling locations,
+            # see _hd_position_ids_from_locs).
             'hd_position_mode': 'legacy',
             # Dense supervision of the relevance map (training-only, bbox
             # samples, needs use_global_offset): cross-entropy between the
@@ -1096,8 +1100,9 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         if self.local_query_pos not in ('im_start', 'ans_prev'):
             raise ValueError(f'unknown local_query_pos: {self.local_query_pos}')
         self.hd_position_mode = str(dat.get('hd_position_mode', 'legacy'))
-        if self.hd_position_mode not in ('legacy', 'slot'):
+        if self.hd_position_mode not in ('legacy', 'slot', 'sampled'):
             raise ValueError(f'unknown hd_position_mode: {self.hd_position_mode}')
+        self._dat_last_slocs = None
         self._dat_sampling_control = None
         self._dat_sample_key = (0, 0)
         self._dat_exact_merge_available = _EXACT_MERGE_AVAILABLE
@@ -1395,6 +1400,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         grid_y = torch.linspace(0, 1, self.grid_size, device=device, dtype=torch.float32)
         grid_x = torch.linspace(0, 1, self.grid_size, device=device, dtype=torch.float32)
 
+        # ('slot' / 'legacy' without a forced grid): positions by grid slot, a
+        # fixed linspace over the LR range whatever the grid actually sampled
         h_hd = (grid_y * (h_max - h_min) + h_min).long()
         w_hd = (grid_x * (w_max - w_min) + w_min).long()
 
@@ -1403,6 +1410,35 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         t_grid = t_val.expand(Ns).long()
 
         return torch.stack([t_grid, h_grid, w_grid])  # [3, Ns]
+
+    def _hd_position_ids_from_locs(self, pos_3d_b, lr_list, locs_per_image, device):
+        """hd_position_mode='sampled': mRoPE positions of the HD keys from the
+        ACTUAL sampling locations (groups averaged), one slot's grid per image,
+        mapped from [-1, 1] onto that image's LR position range -- the formula
+        the forced path has always used, now for every grid. Why: with the
+        global term the model's own grid is a zoomed window (and, under
+        glob_grid='warp', non-uniformly spaced), yet 'legacy'/'slot' tell the
+        readout 'uniform over the full image'; in training half the samples
+        (forced) carried truthful positions and half did not.
+
+        pos_3d_b        [3, Nq]
+        lr_list         [(lr_start, lr_end, lr_h, lr_w)] per image
+        locs_per_image  [M][G, gs, gs, 2] (x, y) in [-1, 1]
+        -> [3, M * Ns]
+        """
+        out = []
+        for (lr_start, lr_end, _h, _w), loc in zip(lr_list, locs_per_image):
+            lr_pos = pos_3d_b[:, lr_start:lr_end]
+            h_min, h_max = lr_pos[1].min().float(), lr_pos[1].max().float()
+            w_min, w_max = lr_pos[2].min().float(), lr_pos[2].max().float()
+            fl = loc.to(device=device).float().mean(0).reshape(-1, 2).clamp(-1.0, 1.0)   # [Ns, 2]
+            fx = (fl[:, 0] + 1.0) * 0.5
+            fy = (fl[:, 1] + 1.0) * 0.5
+            h_grid = (fy * (h_max - h_min) + h_min).round().long()
+            w_grid = (fx * (w_max - w_min) + w_min).round().long()
+            t_grid = lr_pos[0, 0].expand(fl.size(0)).long()
+            out.append(torch.stack([t_grid, h_grid, w_grid]))
+        return torch.cat(out, dim=1)
 
     def _sample_hd_from_off_guide(self, off_guide, image_hd_features, hd_feat_idx, Lp, device,
                                   n_unsup_lead=0, glob_logits=None):
@@ -1793,6 +1829,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
         key_parts, value_parts = [], []
         kimg_parts, vimg_parts = [], []
         slocs_first = None
+        # per-image sampling locations of every slot, for hd_position_mode='sampled'
+        simg_parts, sans_parts = [], []
 
         for m, (lr_start, lr_end, lr_h, lr_w) in enumerate(lr_list):
             self._dat_sample_key = (b_idx, m)
@@ -1894,6 +1932,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 vimg_parts.append(value_all[0:1])
                 key_parts.append(key_all[1:])
                 value_parts.append(value_all[1:])
+                simg_parts.append(slocs_all[0])
+                sans_parts.append(slocs_all[1:])
                 if slocs_first is None:
                     slocs_first = slocs_all[1:]
             else:
@@ -1903,11 +1943,14 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 )
                 key_parts.append(key_hd)
                 value_parts.append(value_hd)
+                sans_parts.append(slocs)
                 if slocs_first is None:
                     slocs_first = slocs
 
         key_hd = torch.cat(key_parts, dim=1)
         value_hd = torch.cat(value_parts, dim=1)
+        # [M][G, gs, gs, 2] image slot, [M][Lp, G, gs, gs, 2] answer slots
+        self._dat_last_slocs = (simg_parts if want_image else None, sans_parts)
 
         if want_image:
             key_img = torch.cat(kimg_parts, dim=1)
@@ -2115,6 +2158,19 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
             if _want_vis and _dat_vis_entry is None and _slocs is not None:
                 _dat_vis_entry = (b_idx, _slocs)
 
+            # hd_position_mode='sampled': per-slot positions from the actual grids
+            _pos_img = hd_pos_ids_batched
+            _pos_ans = None
+            if self.hd_position_mode == 'sampled' and self._dat_last_slocs is not None:
+                _simg, _sans = self._dat_last_slocs
+                if _simg is not None:
+                    _pos_img = self._hd_position_ids_from_locs(orig_pos_b, lr_list, _simg, device).unsqueeze(1)
+                _n_ans = _sans[0].size(0)
+                _pos_ans = [self._hd_position_ids_from_locs(
+                    orig_pos_b, lr_list, [sa[l] for sa in _sans], device).unsqueeze(1)
+                    for l in range(_n_ans)]
+                self._dat_last_slocs = None
+
             if question_segs:
                 k_img = (k_img_all[0]
                          .view(Ns_total, self.num_key_value_heads, self.head_dim)
@@ -2129,7 +2185,7 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 ).transpose(1, 2)
 
                 # HD position embeddings (partial + interleaved mRoPE)
-                cos_img, sin_img = self._dat_rotary_emb(k_img, hd_pos_ids_batched)
+                cos_img, sin_img = self._dat_rotary_emb(k_img, _pos_img)
                 k_img = apply_rotary_pos_emb_single(k_img, cos_img, sin_img)
 
                 k_img = repeat_kv(k_img, self.num_key_value_groups)
@@ -2174,7 +2230,8 @@ class Qwen3_5AttentionDAT(Qwen3_5Attention):
                 ).transpose(1, 2)
 
                 # Partial + interleaved mRoPE for HD positions
-                cos_hd, sin_hd = self._dat_rotary_emb(k_hd_l, hd_pos_ids_batched)
+                cos_hd, sin_hd = self._dat_rotary_emb(
+                    k_hd_l, _pos_ans[l_idx] if _pos_ans is not None and l_idx < len(_pos_ans) else hd_pos_ids_batched)
                 k_hd_l = apply_rotary_pos_emb_single(k_hd_l, cos_hd, sin_hd)
 
                 k_hd_l = repeat_kv(k_hd_l, self.num_key_value_groups)

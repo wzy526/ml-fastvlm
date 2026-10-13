@@ -237,6 +237,20 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   hits +3.4, misses -2.5, in_box 0.045): hits >= +3.8, overall >= +2.5,
 #   misses >= -1.5, in_box at layers 15/19 >= 0.06.
 #
+# Mini H result (1012): grid as predicted (in_box 0.054, misses -0.9) but
+#   hits +2.3 and ORACLE hits +2.3 (E1_2k: +3.4 / +3.4) -> the readout trained
+#   on warp grids came out weaker, cause open (noise band on hits ~ +-0.7, or
+#   the HD positions: the own grid's mRoPE positions are a fixed full-range
+#   linspace while forced grids get their real locations). Inference-only
+#   truthful positions (probe --hd_pos sampled) did not help (readout co-adapted).
+#   Note under this geometry E1_2k's hits ALREADY match oracle (+3.41 vs
+#   +3.38); the whole remaining gap (+2.0 vs +2.6) is the miss group (-2.5 vs 0).
+# Mini H2 / I (1013): H2 = mini-H with SEED=43 (noise calibration);
+#   I = mini-H + HD_POS=sampled (hd_position_mode='sampled': every grid's
+#   positions from its real sampling locations, forced or not).
+#   H2 ~ +3.3 -> H was noise, use warp; H2 ~ +2.3 and I back to +3.3 -> the
+#   position lie was the cause; both ~ +2.3 -> something else in warp training.
+#
 # Full 0920 combined run (data = 0817 mix + viscot doc boxes + synth_hd text on
 # SA-1B natural images (+ optional Visual-CoT natural-image boxes), built by
 # scripts/compose_sft_mix.py):
@@ -394,6 +408,7 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dat_glob_floor "${GLOB_FLOOR:-0}" \
     --dat_glob_layers "${GLOB_LAYERS:-}" \
     --dat_glob_grid "${GLOB_GRID:-moments}" \
+    --dat_hd_position_mode "${HD_POS:-legacy}" \
     --dat_rel_sup_weight "${REL_SUP_WEIGHT:-0}" \
     --dat_lr 1e-4 \
     --lora_enable "${LORA_ENABLE:-True}" \
@@ -434,7 +449,7 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40993}" ll
     --dataloader_prefetch_factor 2 \
     --dataloader_persistent_workers True \
     --dataloader_drop_last True \
-    --seed 42 \
+    --seed "${SEED:-42}" \
     --report_to "wandb" \
     --run_name "$EXP_NAME"
 
