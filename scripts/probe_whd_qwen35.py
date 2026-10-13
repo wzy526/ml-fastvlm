@@ -13,6 +13,9 @@ Configs (all share the same LR input; only the HD side changes):
                             (same key count, ZERO extra information)
                    shuffle  a different sample's image (wrong content)
                    noise    uniform random noise
+                   crop_tokens  READOUT CEILING, no HD pass: the oracle window
+                            cropped from the original image goes in as a 2nd
+                            image of <= --crop_tok ordinary LLM tokens
       --hd_bias    constant(s) added to lse_hd before the merge; >0 pushes
                    attention toward HD, <0 away. Pass several values to
                    sweep, e.g. --hd_bias -6 -3 0 1.5 3
@@ -305,6 +308,81 @@ def oracle_locs(sample, idx, hd_w, hd_h, grid_size, min_cells, source):
     return locs.clamp(-1.0, 1.0)
 
 
+def crop_window(sample, hd_w, hd_h, min_cells):
+    """The 'oracle' window as (x0, y0, x1, y1) image fractions — same box
+    expansion / min-cells / clamping as oracle_locs(source='oracle')."""
+    boxes = sample.get("bboxes") or []
+    if not boxes:
+        return None
+    W, H = sample["image"].size
+    x0 = min(b[0] for b in boxes) / W
+    y0 = min(b[1] for b in boxes) / H
+    x1 = max(b[0] + b[2] for b in boxes) / W
+    y1 = max(b[1] + b[3] for b in boxes) / H
+    ww = min(max(x1 - x0, min_cells * FACTOR / hd_w), 1.0)
+    wh = min(max(y1 - y0, min_cells * FACTOR / hd_h), 1.0)
+    cx = min(max((x0 + x1) / 2, ww / 2), 1 - ww / 2)
+    cy = min(max((y0 + y1) / 2, wh / 2), 1 - wh / 2)
+    return cx - ww / 2, cy - wh / 2, cx + ww / 2, cy + wh / 2
+
+
+def make_crop_image(sample, win, crop_tok):
+    """Crop the window from the ORIGINAL image and size it to <= crop_tok LLM
+    tokens (multiples of FACTOR, never upsampled beyond the original pixels)."""
+    W, H = sample["image"].size
+    x0, y0, x1, y1 = win
+    px0, py0 = int(x0 * W), int(y0 * H)
+    px1, py1 = max(int(math.ceil(x1 * W)), px0 + 1), max(int(math.ceil(y1 * H)), py0 + 1)
+    crop = sample["image"].crop((px0, py0, min(px1, W), min(py1, H)))
+    cw, ch = crop.size
+    sc = math.sqrt(min(crop_tok * TOK_PX, cw * ch) / (cw * ch))
+    nw = max(FACTOR, int(cw * sc) // FACTOR * FACTOR)
+    nh = max(FACTOR, int(ch * sc) // FACTOR * FACTOR)
+    return crop.resize((nw, nh), Image.BICUBIC)
+
+
+def build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor, hr_processor, args,
+                            device, dtype):
+    """--hd_source crop_tokens: [LR image (exactly the LR branch's pixels),
+    window crop] as a native two-image prompt, no HD side. Returns the model
+    kwargs that REPLACE the LR-only ones, or None when the sample has no bbox."""
+    win = crop_window(sample, hd_w, hd_h, args.oracle_min_cells)
+    if win is None:
+        return None
+    lr_img = sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH),
+                                    Image.BICUBIC)
+    crop_img = make_crop_image(sample, win, args.crop_tok)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "image", "image": lr_img},
+            {"type": "text", "text": "Zoomed-in view of the relevant region:"},
+            {"type": "image", "image": crop_img},
+            {"type": "text", "text": sample["prompt"]},
+        ]},
+    ]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    )
+    # hr_processor keeps any FACTOR-aligned size in [TOK_PX, 100 Mpx] as is, so the
+    # first image reproduces the LR grid exactly and the crop keeps its budget.
+    inp = hr_processor(text=[text], images=[lr_img, crop_img], return_tensors="pt")
+    thw = inp["image_grid_thw"]
+    st = STATE.setdefault("crop_stats", {"n": 0, "lr_same": 0, "tok": []})
+    st["n"] += 1
+    st["lr_same"] += bool(torch.equal(thw[0].cpu(), lr_thw.cpu()))
+    st["tok"].append(int(thw[1][1] * thw[1][2]) // (MERGE * MERGE))
+    out = {}
+    for k, v in inp.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+        if k == "pixel_values":
+            out[k] = v.to(device=device, dtype=dtype)
+        elif k in ("input_ids", "attention_mask", "image_grid_thw"):
+            out[k] = v.to(device)
+    return out
+
+
 def set_force_locs(model, locs):
     from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5AttentionDAT
     for m in model.modules():
@@ -327,8 +405,6 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
     lr_thw = inputs["image_grid_thw"][0]
 
     hd_w, hd_h = hd_target_size(sample["image"], lr_thw, args.hr_scale, args.hd_cap)
-    hd_img = make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, args.hd_source)
-    hr_inputs = hr_processor.image_processor(images=[hd_img], return_tensors="pt")
 
     moved = {}
     for k, v in inputs.items():
@@ -338,10 +414,17 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
             moved[k] = v.to(device=device, dtype=dtype)
         elif k in ("input_ids", "attention_mask", "image_grid_thw"):
             moved[k] = v.to(device)
-    hd_extra = {
-        "pixel_values_hd": hr_inputs["pixel_values"].to(device=device, dtype=dtype),
-        "image_grid_thw_hd": hr_inputs["image_grid_thw"].to(device),
-    }
+    if args.hd_source == "crop_tokens":
+        # no HD side at all; the "HD-on" config is the two-image prompt
+        hd_extra = build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor,
+                                           hr_processor, args, device, dtype) or {}
+    else:
+        hd_img = make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, args.hd_source)
+        hr_inputs = hr_processor.image_processor(images=[hd_img], return_tensors="pt")
+        hd_extra = {
+            "pixel_values_hd": hr_inputs["pixel_values"].to(device=device, dtype=dtype),
+            "image_grid_thw_hd": hr_inputs["image_grid_thw"].to(device),
+        }
     locs = None
     if args.hd_source.startswith("oracle"):
         locs = oracle_locs(sample, idx, hd_w, hd_h, args.grid_size,
@@ -861,11 +944,20 @@ def main():
     ap.add_argument("--hd_cap", type=int, default=5017600)
     ap.add_argument("--hr_scale", type=int, default=3)
     ap.add_argument("--hd_source",
-                    choices=["real", "lr_up", "shuffle", "noise", "oracle", "oracle_rand"],
+                    choices=["real", "lr_up", "shuffle", "noise", "oracle", "oracle_rand",
+                             "crop_tokens"],
                     default="real",
                     help="oracle/oracle_rand need --dataset vstar (GT bboxes): HD is the real "
                          "image but the 400 sampling points are forced onto a window around the "
-                         "target (oracle) or a same-size window elsewhere (oracle_rand)")
+                         "target (oracle) or a same-size window elsewhere (oracle_rand). "
+                         "crop_tokens = readout CEILING: no HD pass at all; the oracle window is "
+                         "cropped from the original image and fed as a SECOND image of <= "
+                         "--crop_tok LLM tokens (frozen trunk, native multi-image path). Same "
+                         "region as 'oracle', but as ordinary tokens in the sequence instead of "
+                         "400 cross-attended keys")
+    ap.add_argument("--crop_tok", type=int, default=400,
+                    help="--hd_source crop_tokens: LLM-token budget of the window crop "
+                         "(400 = the 20x20 sampling grid's key count)")
     ap.add_argument("--hd_bias", type=float, nargs="+", default=[0.0],
                     help="constant(s) added to lse_hd; several values = sweep")
     ap.add_argument("--attn", default="flash_attention_2")
@@ -932,8 +1024,9 @@ def main():
     install_lr_key_hook(model)
     image_token_id = getattr(model.config, "image_token_id", None)
     args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
-    if args.hd_source.startswith("oracle") and args.dataset not in ("vstar", "synth"):
-        raise SystemExit("--hd_source oracle/oracle_rand needs --dataset vstar or synth (GT bboxes)")
+    if (args.hd_source.startswith("oracle") or args.hd_source == "crop_tokens") \
+            and args.dataset not in ("vstar", "synth"):
+        raise SystemExit("--hd_source oracle/oracle_rand/crop_tokens needs --dataset vstar or synth (GT bboxes)")
     # Free-text datasets: normalized containment instead of MCQ letter matching,
     # and room for a short sentence answer.
     free_text = args.dataset == "synth"
@@ -995,6 +1088,12 @@ def main():
     if args.hd_source.startswith("oracle"):
         print(f"[probe] forced sampling window on {n_forced}/{len(samples)} samples "
               f"(min {args.oracle_min_cells} HD cells per side)")
+    if STATE.get("crop_stats"):
+        st = STATE["crop_stats"]
+        print(f"[probe] crop_tokens: window crop fed as 2nd image on {st['n']}/{len(samples)} samples; "
+              f"crop tokens mean {np.mean(st['tok']):.0f} (min {min(st['tok'])}, max {max(st['tok'])}, "
+              f"budget {args.crop_tok}); LR grid identical to the off config in "
+              f"{st['lr_same']}/{st['n']}")
 
     # ── report ────────────────────────────────────────────────
     cats = sorted({s["category"] for s in samples})
