@@ -354,7 +354,12 @@ def build_two_image_inputs(sample, lr_thw, second_img, processor, hr_processor, 
     second = {"type": "image", "image": second_img}
     question = {"type": "text", "text": sample["prompt"]}
     content = [{"type": "image", "image": lr_img}]
-    content += [hint, second, question] if args.crop_pos == "before" else [question, hint, second]
+    if args.crop_pos == "before":
+        content += [hint, second, question]
+    elif args.crop_pos == "after":
+        content += [question, hint, second]
+    else:                                   # after_restate: question repeated after the 2nd image
+        content += [question, hint, second, dict(question)]
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": content}]
     text = processor.apply_chat_template(
@@ -383,7 +388,13 @@ def build_two_image_inputs(sample, lr_thw, second_img, processor, hr_processor, 
 def build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor, hr_processor, args,
                             device, dtype):
     """--hd_source crop_tokens: the ORACLE window crop as the 2nd image, or
-    None when the sample has no bbox."""
+    None when the sample has no bbox. plain_tokens: the WHOLE image resized to
+    the same token budget (control: 'any 2nd image' vs 'the right window')."""
+    if args.hd_source == "plain_tokens":
+        STATE["crop_stats_area"] = 1.0
+        return build_two_image_inputs(sample, lr_thw,
+                                      make_crop_image(sample, (0.0, 0.0, 1.0, 1.0), args.crop_tok),
+                                      processor, hr_processor, args, device, dtype)
     win = crop_window(sample, hd_w, hd_h, args.oracle_min_cells)
     if win is None:
         return None
@@ -412,10 +423,10 @@ def model_map(sample_idx, layers):
     Returns (p [N], gs)."""
     ms = []
     for l in layers:
-        rows = GLOBP.get(l)
+        rows = PMAP.get(l)
         if not rows or len(rows) != sample_idx + 1:
             return None
-        ms.append(np.asarray(rows[-1][0], dtype=np.float64))
+        ms.append(np.asarray(rows[-1], dtype=np.float64))
     p = np.mean(ms, 0)
     p = p / max(p.sum(), 1e-12)
     gs = int(round(math.sqrt(p.size)))
@@ -558,7 +569,7 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
         elif k in ("input_ids", "attention_mask", "image_grid_thw"):
             moved[k] = v.to(device)
     STATE["geom"] = (lr_thw, hd_w, hd_h)
-    if args.hd_source == "crop_tokens":
+    if args.hd_source in ("crop_tokens", "plain_tokens"):
         # no HD side at all; the "HD-on" config is the two-image prompt
         hd_extra = build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor,
                                            hr_processor, args, device, dtype) or {}
@@ -872,6 +883,14 @@ def install_merge_hook():
                 gl = getattr(self, "_dat_glob_last", None)
                 if gl is not None:
                     GLOB[self.layer_idx].append(tuple(gl.float().tolist()))
+                # the model's own map, recorded for every dataset (pred_* needs it
+                # on bbox-free sets such as HR-Bench too)
+                pg0 = getattr(self, "_dat_glob_last_p", None)
+                if pg0 is not None:
+                    pm0 = pg0[0]
+                    if pm0.size(0) > self.off_grps:
+                        pm0 = pm0[self.off_grps:]
+                    PMAP[self.layer_idx].append(pm0.mean(0).float().cpu().numpy())
                 # Localisation: did the learned grid move toward the GT region?
                 #   dist   = mean point->target-grid distance (training's off_sup_dist)
                 #   in_box = fraction of sampling points inside the raw GT box
@@ -1039,6 +1058,7 @@ LOC = defaultdict(list)          # layer_idx -> [(dist, dist_uniform, in_box, in
 GLOB = defaultdict(list)         # layer_idx -> [(mean |centroid|, mean scale), ...]  (global offset term)
 GLOBC = defaultdict(list)        # layer_idx -> [(cx, cy, sx, sy, tcx, tcy, tsx, tsy), ...] per sample
 GLOBP = defaultdict(list)        # layer_idx -> [(relevance map [N], in-window mask [N], in-box mask [N]), ...]
+PMAP = defaultdict(list)         # layer_idx -> [relevance map [N], ...] per sample, bbox or not
 HDC = defaultdict(list)          # layer_idx -> [(c_hd x, y, c_hdF x, y, peak_in_box, mass_in_box, pts_in_box, tcx, tcy), ...]
 
 
@@ -1092,7 +1112,8 @@ def main():
     ap.add_argument("--hr_scale", type=int, default=3)
     ap.add_argument("--hd_source",
                     choices=["real", "lr_up", "shuffle", "noise", "oracle", "oracle_rand",
-                             "crop_tokens", "pred_window", "pred_warp", "warp_oracle"],
+                             "crop_tokens", "plain_tokens", "pred_window", "pred_warp",
+                             "warp_oracle"],
                     default="real",
                     help="oracle/oracle_rand need --dataset vstar (GT bboxes): HD is the real "
                          "image but the 400 sampling points are forced onto a window around the "
@@ -1105,9 +1126,10 @@ def main():
     ap.add_argument("--crop_tok", type=int, default=400,
                     help="crop_tokens / pred_* / warp_oracle: LLM-token budget of the 2nd image "
                          "(400 = the 20x20 sampling grid's key count)")
-    ap.add_argument("--crop_pos", choices=["before", "after"], default="before",
-                    help="2nd image before the question (native multi-image) or AFTER it "
-                         "(single-pass KV-cache continuation: only the answer sees it)")
+    ap.add_argument("--crop_pos", choices=["before", "after", "after_restate"], default="before",
+                    help="2nd image before the question (native multi-image), AFTER it "
+                         "(single-pass KV-cache continuation: only the answer sees it), or after "
+                         "it with the question repeated behind the image (after_restate)")
     ap.add_argument("--map_layers", default="11,15,19,23",
                     help="pred_*: DAT layers whose (question-slot) relevance maps are averaged")
     ap.add_argument("--map_floor", type=float, default=1.0,
@@ -1182,10 +1204,11 @@ def main():
     install_lr_key_hook(model)
     image_token_id = getattr(model.config, "image_token_id", None)
     args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
-    if (args.hd_source.startswith("oracle") or args.hd_source == "crop_tokens"
-            or args.hd_source in PRED_SOURCES) and args.dataset not in ("vstar", "synth"):
-        raise SystemExit("--hd_source oracle/oracle_rand/crop_tokens/pred_*/warp_oracle needs "
-                         "--dataset vstar or synth (GT bboxes)")
+    if (args.hd_source.startswith("oracle") or args.hd_source in ("crop_tokens", "warp_oracle")) \
+            and args.dataset not in ("vstar", "synth"):
+        raise SystemExit("--hd_source oracle/oracle_rand/crop_tokens/warp_oracle needs "
+                         "--dataset vstar or synth (GT bboxes); pred_window/pred_warp/plain_tokens "
+                         "work on any dataset")
     args.map_layers = [int(x) for x in args.map_layers.split(",") if x.strip()]
     pred_mode = args.hd_source in PRED_SOURCES
     if pred_mode:
