@@ -691,6 +691,142 @@ def build_pred_inputs(sample, sample_idx, lr_thw, hd_w, hd_h, processor, hr_proc
                                   device, dtype)
 
 
+# ──────────────────────────────────────────────────────────────
+# --hd_source sampled_tokens: DAT's OWN sampled HD features (bilinear
+# grid_sample on the merger output, exactly what k_proj_hd / v_proj_hd see)
+# placed IN THE SEQUENCE as ordinary image tokens instead of the K/V bypass.
+# Separates "deformable sampling of features" from "the bypass readout":
+#   samp_oracle  : the oracle window grid (= --hd_source oracle's forced grid)
+#                  vs crop_tokens of the same window (re-encoded pixel crop)
+#   samp_pred    : the model's own deformable grid (answer slot, --samp_layer)
+#   samp_uniform : the identity grid over the whole HD map vs plain_tokens
+# Positions (--samp_pos): square = the tokens pose as a gs x gs image (what a
+# native crop gets); lr = the LR image's mRoPE frame at the sampled location
+# (hd_position_mode='sampled'). Zero new parameters.
+# ──────────────────────────────────────────────────────────────
+PLOCS = defaultdict(list)        # layer_idx -> [answer-slot grid [G, gh, gw, 2] (x, y) in [-1, 1], ...]
+SAMP_GRIDS = ("oracle", "pred", "uniform")
+
+
+def samp_locs(kind, sample, idx, hd_w, hd_h, args):
+    """Sampling grid for one sample as [G, Ns, 2] (x, y) in [-1, 1]; None when
+    unavailable (no bbox for oracle, no recorded grid for pred)."""
+    gs = args.grid_size
+    if kind == "oracle":
+        loc = oracle_locs(sample, idx, hd_w, hd_h, gs, args.oracle_min_cells, "oracle")
+        return None if loc is None else loc[None]
+    if kind == "uniform":
+        m = 1.0 / max(gs - 1, 1)
+        xs = torch.linspace(-1 + m, 1 - m, gs)
+        gy, gx = torch.meshgrid(xs, xs, indexing="ij")
+        return torch.stack([gx, gy], -1).reshape(1, -1, 2)
+    rows = PLOCS.get(args.samp_layer)
+    if not rows or len(rows) != idx + 1:
+        return None
+    return rows[-1].reshape(rows[-1].size(0), -1, 2)
+
+
+def sample_hd_tokens(feat, locs_g):
+    """feat [H, W, C] merger output, locs_g [G, Ns, 2] -> [Ns, C]: group g's
+    channel block sampled at group g's points, bilinear, align_corners=True —
+    the model's _sample_hd_from_off_guide without the K/V projections."""
+    H, W, C = feat.shape
+    G = locs_g.size(0)
+    chunks = feat.float().permute(2, 0, 1).reshape(G, C // G, H, W)       # 'h w (g c) -> g c h w'
+    grid = locs_g.to(chunks.device).float().clamp(-1, 1)[:, None]          # [G, 1, Ns, 2]
+    out = Fnn.grid_sample(chunks, grid, mode="bilinear", align_corners=True)  # [G, C/G, 1, Ns]
+    return out[:, :, 0].permute(2, 0, 1).reshape(locs_g.size(1), C).to(feat.dtype)
+
+
+def install_samp_hooks(model, image_token_id):
+    """(1) visual forward hook: replace the LAST Ns merged tokens (the dummy
+    2nd image) with STATE['samp_inject']; (2) get_rope_index wrapper: under
+    STATE['samp_rope'] give those tokens the LR image's mRoPE frame."""
+    def vis_hook(module, args_, output):
+        inj = STATE.get("samp_inject")
+        if inj is None:
+            return None
+        ns, tot = inj.size(0), STATE["samp_total"]
+
+        def fix(t):
+            # one ViT call for both images (rows = all merged tokens) or one
+            # call per image (the dummy's own rows); never the LR image alone
+            if torch.is_tensor(t) and t.dim() == 2 and (t.size(0) == tot or
+                                                        (t.size(0) == ns and tot - ns != ns)):
+                t = t.clone()
+                t[-ns:] = inj.to(t.dtype)
+                STATE["samp_inject_n"] = STATE.get("samp_inject_n", 0) + 1
+            return t
+        if torch.is_tensor(output):
+            return fix(output)
+        if isinstance(output, tuple):
+            return tuple(fix(t) for t in output)
+        for k_ in list(output.keys()):                      # ModelOutput
+            v = output[k_]
+            if torch.is_tensor(v):
+                output[k_] = fix(v)
+            elif isinstance(v, (list, tuple)) and v and torch.is_tensor(v[0]) \
+                    and sum(x.size(0) for x in v) == tot:
+                cat = fix(torch.cat(list(v), 0))
+                output[k_] = list(torch.split(cat, [x.size(0) for x in v]))
+        return output
+    model.model.visual.register_forward_hook(vis_hook)
+
+    inner = model.model
+    orig_rope_index = inner.get_rope_index
+
+    def rope_index(*a, **kw):
+        pos, deltas = orig_rope_index(*a, **kw)
+        sr = STATE.get("samp_rope")
+        ids = kw.get("input_ids", a[0] if a else None)
+        if sr is None or ids is None or pos.dim() != 3:
+            return pos, deltas
+        img = (ids[0] == image_token_id).nonzero().flatten()
+        n_lr, ns = sr["n_lr"], sr["fx"].numel()
+        if img.numel() != n_lr + ns:
+            return pos, deltas
+        lr_i, hd_i = img[:n_lr], img[n_lr:]
+        pos = pos.clone()
+        lr_pos = pos[:, 0, lr_i].float()
+        h_min, h_max = lr_pos[1].min(), lr_pos[1].max()
+        w_min, w_max = lr_pos[2].min(), lr_pos[2].max()
+        fx, fy = sr["fx"].to(pos.device), sr["fy"].to(pos.device)
+        pos[1, 0, hd_i] = (fy * (h_max - h_min) + h_min).round().long()
+        pos[2, 0, hd_i] = (fx * (w_max - w_min) + w_min).round().long()
+        pos[0, 0, hd_i] = lr_pos[0, 0].long()
+        STATE["samp_rope_n"] = STATE.get("samp_rope_n", 0) + 1
+        return pos, deltas
+    inner.get_rope_index = rope_index
+
+
+def build_samp_inputs(sample, lr_thw, kind, locs_g, hd_feat, pos_mode, processor, hr_processor,
+                      args, device, dtype):
+    """Two-image prompt whose 2nd image is a gs x gs DUMMY (its ViT output is
+    overwritten by the sampled HD tokens via the hooks)."""
+    gs = args.grid_size
+    dummy = Image.new("RGB", (gs * FACTOR, gs * FACTOR), (127, 127, 127))
+    if kind == "oracle":
+        lo, hi = locs_g[0].min(0).values, locs_g[0].max(0).values
+        STATE["crop_stats_area"] = float(((hi[0] - lo[0]) / 2) * ((hi[1] - lo[1]) / 2))
+    else:
+        STATE["crop_stats_area"] = float("nan")
+    inp = build_two_image_inputs(sample, lr_thw, dummy, processor, hr_processor, args, device, dtype)
+    thw = inp["image_grid_thw"]
+    assert int(thw[1][1] * thw[1][2]) // (MERGE * MERGE) == gs * gs, thw
+    STATE["samp_inject"] = sample_hd_tokens(hd_feat, locs_g)
+    STATE["samp_total"] = int((thw.prod(-1) // (MERGE * MERGE)).sum())
+    fl = locs_g.float().mean(0).clamp(-1, 1)
+    STATE["samp_rope"] = None if pos_mode == "square" else {
+        "n_lr": int(thw[0][1] * thw[0][2]) // (MERGE * MERGE),
+        "fx": (fl[:, 0] + 1) * 0.5, "fy": (fl[:, 1] + 1) * 0.5}
+    return inp
+
+
+def clear_samp():
+    STATE["samp_inject"] = None
+    STATE["samp_rope"] = None
+
+
 def set_force_locs(model, locs):
     from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5AttentionDAT
     for m in model.modules():
@@ -732,7 +868,7 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
     else:
         # pred_* / warp_oracle: the HD pass runs on the real image (to record
         # the model's own map); the second-image prompt is built afterwards
-        src = "real" if args.hd_source in PRED_SOURCES else args.hd_source
+        src = "real" if args.hd_source in PRED_SOURCES + ("sampled_tokens",) else args.hd_source
         hd_img = make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, src)
         hr_inputs = hr_processor.image_processor(images=[hd_img], return_tensors="pt")
         hd_extra = {
@@ -1047,6 +1183,8 @@ def install_merge_hook():
                     if pm0.size(0) > self.off_grps:
                         pm0 = pm0[self.off_grps:]
                     PMAP[self.layer_idx].append(pm0.mean(0).float().cpu().numpy())
+                # the model's own sampling grid (answer slot), for sampled_tokens
+                PLOCS[self.layer_idx].append(locs[-1].float().cpu())
                 # Localisation: did the learned grid move toward the GT region?
                 #   dist   = mean point->target-grid distance (training's off_sup_dist)
                 #   in_box = fraction of sampling points inside the raw GT box
@@ -1269,7 +1407,7 @@ def main():
     ap.add_argument("--hd_source",
                     choices=["real", "lr_up", "shuffle", "noise", "oracle", "oracle_rand",
                              "crop_tokens", "plain_tokens", "pred_window", "pred_warp",
-                             "warp_oracle", "ground_window"],
+                             "warp_oracle", "ground_window", "sampled_tokens"],
                     default="real",
                     help="oracle/oracle_rand need --dataset vstar (GT bboxes): HD is the real "
                          "image but the 400 sampling points are forced onto a window around the "
@@ -1303,6 +1441,16 @@ def main():
     ap.add_argument("--crop_shift", type=float, default=0.0,
                     help="crop_tokens: move the window centre by this x window size in a random "
                          "direction (how precise must the localiser be?)")
+    ap.add_argument("--samp_grids", default="oracle,pred,uniform",
+                    help="sampled_tokens: which sampling grids to place in the sequence "
+                         "(oracle = GT window grid, pred = the model's own deformable grid, "
+                         "uniform = identity grid over the whole HD map)")
+    ap.add_argument("--samp_pos", default="square,lr",
+                    help="sampled_tokens: mRoPE positions of the sampled tokens: square = a gs x gs "
+                         "image block (what a native crop gets), lr = the LR image's frame at the "
+                         "sampled location (hd_position_mode='sampled')")
+    ap.add_argument("--samp_layer", type=int, default=15,
+                    help="sampled_tokens pred: DAT layer whose answer-slot grid is used")
     ap.add_argument("--ground_coords", choices=["norm1000", "pixels"], default="norm1000",
                     help="ground_window: coordinate frame of the model's bbox output (Qwen3-VL "
                          "lineage = 0..1000 normalised; Qwen2.5-VL = pixels of the input image)")
@@ -1374,15 +1522,29 @@ def main():
     install_lr_key_hook(model)
     image_token_id = getattr(model.config, "image_token_id", None)
     args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
-    if (args.hd_source.startswith("oracle") or args.hd_source in ("crop_tokens", "warp_oracle")) \
+    samp_mode = args.hd_source == "sampled_tokens"
+    args.samp_grids = [g for g in args.samp_grids.split(",") if g]
+    args.samp_pos = [p for p in args.samp_pos.split(",") if p]
+    if samp_mode:
+        bad = [g for g in args.samp_grids if g not in SAMP_GRIDS] + \
+              [p for p in args.samp_pos if p not in ("square", "lr")]
+        if bad:
+            raise SystemExit(f"sampled_tokens: unknown --samp_grids/--samp_pos {bad}")
+        install_samp_hooks(model, image_token_id)
+        k_exit = int((getattr(model.config, "dat_extra_args", None) or {}).get("hd_early_exit_k", 0) or 0)
+        print(f"[probe] sampled_tokens: grids {args.samp_grids} x positions {args.samp_pos}; "
+              f"pred grid from layer {args.samp_layer}; Ns = {args.grid_size ** 2}; "
+              f"HD ViT early exit k = {k_exit or 'off (full ViT + merger)'}")
+    if (args.hd_source.startswith("oracle") or args.hd_source in ("crop_tokens", "warp_oracle")
+            or (samp_mode and "oracle" in args.samp_grids)) \
             and args.dataset not in ("vstar", "synth"):
         raise SystemExit("--hd_source oracle/oracle_rand/crop_tokens/warp_oracle needs "
                          "--dataset vstar or synth (GT bboxes); pred_window/pred_warp/plain_tokens "
                          "work on any dataset")
     args.map_layers = [int(x) for x in args.map_layers.split(",") if x.strip()]
     pred_mode = args.hd_source in PRED_SOURCES
-    if pred_mode:
-        args.hd_bias = [0.0]            # the real HD pass only serves to record the map
+    if pred_mode or samp_mode:
+        args.hd_bias = [0.0]            # the real HD pass only serves to record the map / grid
     # Free-text datasets: normalized containment instead of MCQ letter matching,
     # and room for a short sentence answer.
     free_text = args.dataset == "synth"
@@ -1402,8 +1564,11 @@ def main():
 
     # config name -> list of predicted letters (parallel to samples)
     ground_mode = args.hd_source == "ground_window"
+    samp_cfgs = [f"samp_{g}@{p}" for g in args.samp_grids for p in args.samp_pos] if samp_mode else []
     if pred_mode:
         configs = ["off", "real b=+0", args.hd_source]
+    elif samp_mode:
+        configs = ["off", "real b=+0"] + samp_cfgs
     elif ground_mode:
         configs = ["off", "ground_window"]
     else:
@@ -1457,7 +1622,41 @@ def main():
             else:
                 t = gen(inp2)
             raw[args.hd_source].append(t); preds[args.hd_source].append(extract(t))
+        if samp_mode:
+            # the real pass recorded the model's own grid; the HD features are
+            # recomputed once here (same ViT call / early exit as the model's)
+            lr_thw_, hd_w_, hd_h_ = STATE["geom"]
+            with torch.inference_mode():
+                hd_feat = model._generate_hd_features(hd_extra["pixel_values_hd"],
+                                                      hd_extra["image_grid_thw_hd"])[0]
+            for g in args.samp_grids:
+                locs_g = samp_locs(g, s, i, hd_w_, hd_h_, args)
+                for p in args.samp_pos:
+                    cname = f"samp_{g}@{p}"
+                    if locs_g is None:
+                        sf = STATE.setdefault("samp_fallback", defaultdict(int))
+                        sf[cname] += 1
+                        t = raw["off"][-1]
+                    else:
+                        inp2 = build_samp_inputs(s, lr_thw_, g, locs_g, hd_feat, p, processor,
+                                                 hr_processor, args, device, dtype)
+                        t = gen(inp2)
+                        clear_samp()
+                    raw[cname].append(t); preds[cname].append(extract(t))
+            if "oracle" in args.samp_grids:
+                win = crop_window(s, hd_w_, hd_h_, args.oracle_min_cells)
+                if win is not None:
+                    STATE.setdefault("samp_win_cells", []).append(
+                        ((win[2] - win[0]) * hd_w_ / FACTOR, (win[3] - win[1]) * hd_h_ / FACTOR))
     STATE["bias"] = 0.0
+    if samp_mode:
+        wc = np.array(STATE.get("samp_win_cells") or [[float("nan")] * 2])
+        print(f"[probe] sampled_tokens: tokens injected in {STATE.get('samp_inject_n', 0)} ViT calls, "
+              f"LR-frame positions applied in {STATE.get('samp_rope_n', 0)} rope calls "
+              f"(expect samples x #@lr configs); fallback to the LR answer: "
+              f"{dict(STATE.get('samp_fallback', {})) or 'none'}; oracle window = "
+              f"{np.nanmean(wc[:, 0]):.1f} x {np.nanmean(wc[:, 1]):.1f} HD cells on average "
+              f"(grid {args.grid_size} x {args.grid_size}: > grid = the points sub-sample the window)")
     if STATE.get("gate_log"):
         print(f"[probe] gate readout: global term ON for {100 * float(np.mean(STATE['gate_log'])):.1f}% "
               f"of (sample, layer) calls")
