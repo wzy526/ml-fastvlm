@@ -143,15 +143,18 @@ def load_vstar(args):
             doc = json.loads(line)
             img_path = os.path.join(root, doc["image"])
             side = os.path.splitext(img_path)[0] + ".json"
-            bboxes = []
+            bboxes, targets = [], []
             if os.path.isfile(side):
-                bboxes = json.load(open(side)).get("bbox", []) or []
+                sd = json.load(open(side))
+                bboxes = sd.get("bbox", []) or []
+                targets = sd.get("target_object", []) or []
             samples.append({
                 "image": Image.open(img_path).convert("RGB"),
                 "prompt": doc["text"].strip(),
                 "gt": str(doc["label"]).strip().upper(),
                 "category": str(doc.get("category", "n/a")),
                 "bboxes": [list(map(float, b)) for b in bboxes],
+                "targets": [str(t) for t in targets],      # names of the queried objects
             })
     n_box = sum(1 for s in samples if s["bboxes"])
     print(f"[probe] V* Bench: {len(samples)} questions, {n_box} with target bboxes")
@@ -406,6 +409,17 @@ def build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor, hr_processor,
 GROUND_PROMPT = ("To answer the question below, which part of the image has to be examined "
                  "closely? Output only the bounding box of that region as [x1, y1, x2, y2].\n"
                  "Question: {q}")
+GROUND_PROMPT_TGT = ("Locate the following in the image and output only its bounding box as "
+                     "[x1, y1, x2, y2]: {t}")
+
+
+def ground_prompt(sample):
+    """V*: ground the named target object(s); otherwise the question itself
+    (first line only: no answer-format instructions, which the model would
+    obey instead of producing a box)."""
+    if sample.get("targets"):
+        return GROUND_PROMPT_TGT.format(t=", ".join(sample["targets"]))
+    return GROUND_PROMPT.format(q=sample["prompt"].strip().split("\n")[0])
 
 
 def pad_window(box, pad, min_cells, hd_w, hd_h):
@@ -431,8 +445,7 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
                                     Image.BICUBIC)
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": [{"type": "image", "image": lr_img},
-                                             {"type": "text",
-                                              "text": GROUND_PROMPT.format(q=sample["prompt"])}]}]
+                                             {"type": "text", "text": ground_prompt(sample)}]}]
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
     )
@@ -447,24 +460,28 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
     g = processor.tokenizer.decode(out[0][moved["input_ids"].shape[1]:],
                                    skip_special_tokens=True).strip()
     st = STATE.setdefault("ground_stats", {"n": 0, "parsed": 0, "in_win": 0, "in_box": 0,
-                                           "iou": [], "raw": []})
+                                           "iou": [], "raw": [], "alt_in_win": 0})
     st["n"] += 1
     if len(st["raw"]) < 4:
         st["raw"].append(g[:120])
+    Wl, Hl = lr_img.size
     # prefer an explicit 4-number list "[x1, y1, x2, y2]" / "(x1,y1),(x2,y2)";
     # otherwise the first four numbers after dropping key names like bbox_2d
     num = r"(-?\d+(?:\.\d+)?)"
     m4 = re.search(rf"\[\s*{num}\s*,\s*{num}\s*,\s*{num}\s*,\s*{num}\s*\]", g) \
         or re.search(rf"\(\s*{num}\s*,\s*{num}\s*\)\s*,\s*\(\s*{num}\s*,\s*{num}\s*\)", g)
     nums = list(m4.groups()) if m4 else re.findall(r"-?\d+(?:\.\d+)?", re.sub(r"[A-Za-z_]+\d[A-Za-z_]*", " ", g))
-    box = None
+    box = alt = None
     if len(nums) >= 4:
         x1, y1, x2, y2 = (float(v) for v in nums[:4])
-        if args.ground_coords == "norm1000":
+        if max(x1, y1, x2, y2) <= 1.0:                   # fractions
+            fr, alt = (x1, y1, x2, y2), None
+        elif args.ground_coords == "norm1000":
             fr = (x1 / 1000, y1 / 1000, x2 / 1000, y2 / 1000)
+            alt = (x1 / Wl, y1 / Hl, x2 / Wl, y2 / Hl)   # the other reading, for the report
         else:                                            # pixels of the LR image
-            Wl, Hl = lr_img.size
             fr = (x1 / Wl, y1 / Hl, x2 / Wl, y2 / Hl)
+            alt = (x1 / 1000, y1 / 1000, x2 / 1000, y2 / 1000)
         fr = tuple(min(max(v, 0.0), 1.0) for v in fr)
         if fr[2] > fr[0] and fr[3] > fr[1]:
             box = fr
@@ -479,6 +496,9 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
             cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
             st["in_box"] += (gt[0] <= cx <= gt[2]) and (gt[1] <= cy <= gt[3])
             st["in_win"] += (gw[0] <= cx <= gw[2]) and (gw[1] <= cy <= gw[3])
+            if alt is not None:
+                ax, ay = (alt[0] + alt[2]) / 2, (alt[1] + alt[3]) / 2
+                st["alt_in_win"] += (gw[0] <= ax <= gw[2]) and (gw[1] <= ay <= gw[3])
             ix = max(0.0, min(box[2], gt[2]) - max(box[0], gt[0]))
             iy = max(0.0, min(box[3], gt[3]) - max(box[1], gt[1]))
             inter = ix * iy
@@ -1406,7 +1426,9 @@ def main():
         iou = np.mean(g["iou"]) if g["iou"] else float("nan")
         print(f"[probe] ground_window: bbox parsed on {g['parsed']}/{g['n']} (coords={args.ground_coords}, "
               f"pad x{args.ground_pad}); predicted-box centre in GT window {g['in_win']}/{g['n']}, "
-              f"in GT box {g['in_box']}/{g['n']}; mean IoU with GT box {iou:.3f}; unparsed -> whole image")
+              f"in GT box {g['in_box']}/{g['n']}; mean IoU with GT box {iou:.3f}; under the OTHER "
+              f"coordinate reading centre-in-window would be {g['alt_in_win']}/{g['n']}; "
+              f"unparsed -> whole image")
         for r in g["raw"]:
             print(f"[probe]   raw: {r!r}")
 
