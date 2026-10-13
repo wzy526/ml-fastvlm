@@ -451,7 +451,12 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
     st["n"] += 1
     if len(st["raw"]) < 4:
         st["raw"].append(g[:120])
-    nums = re.findall(r"-?\d+(?:\.\d+)?", g)
+    # prefer an explicit 4-number list "[x1, y1, x2, y2]" / "(x1,y1),(x2,y2)";
+    # otherwise the first four numbers after dropping key names like bbox_2d
+    num = r"(-?\d+(?:\.\d+)?)"
+    m4 = re.search(rf"\[\s*{num}\s*,\s*{num}\s*,\s*{num}\s*,\s*{num}\s*\]", g) \
+        or re.search(rf"\(\s*{num}\s*,\s*{num}\s*\)\s*,\s*\(\s*{num}\s*,\s*{num}\s*\)", g)
+    nums = list(m4.groups()) if m4 else re.findall(r"-?\d+(?:\.\d+)?", re.sub(r"[A-Za-z_]+\d[A-Za-z_]*", " ", g))
     box = None
     if len(nums) >= 4:
         x1, y1, x2, y2 = (float(v) for v in nums[:4])
