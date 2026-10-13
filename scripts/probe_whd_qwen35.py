@@ -341,37 +341,34 @@ def make_crop_image(sample, win, crop_tok):
     return crop.resize((nw, nh), Image.BICUBIC)
 
 
-def build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor, hr_processor, args,
-                            device, dtype):
-    """--hd_source crop_tokens: [LR image (exactly the LR branch's pixels),
-    window crop] as a native two-image prompt, no HD side. Returns the model
-    kwargs that REPLACE the LR-only ones, or None when the sample has no bbox."""
-    win = crop_window(sample, hd_w, hd_h, args.oracle_min_cells)
-    if win is None:
-        return None
+def build_two_image_inputs(sample, lr_thw, second_img, processor, hr_processor, args,
+                           device, dtype):
+    """[LR image (exactly the LR branch's pixels), second_img] as a native
+    two-image prompt, no HD side. --crop_pos before: the 2nd image precedes
+    the question (question tokens can attend to it); after: it FOLLOWS the
+    question (= single-pass KV-cache continuation; only the answer sees it).
+    Returns the model kwargs that REPLACE the LR-only ones."""
     lr_img = sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH),
                                     Image.BICUBIC)
-    crop_img = make_crop_image(sample, win, args.crop_tok)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": [
-            {"type": "image", "image": lr_img},
-            {"type": "text", "text": "Zoomed-in view of the relevant region:"},
-            {"type": "image", "image": crop_img},
-            {"type": "text", "text": sample["prompt"]},
-        ]},
-    ]
+    hint = {"type": "text", "text": "Zoomed-in view of the relevant region:"}
+    second = {"type": "image", "image": second_img}
+    question = {"type": "text", "text": sample["prompt"]}
+    content = [{"type": "image", "image": lr_img}]
+    content += [hint, second, question] if args.crop_pos == "before" else [question, hint, second]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": content}]
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
     )
     # hr_processor keeps any FACTOR-aligned size in [TOK_PX, 100 Mpx] as is, so the
-    # first image reproduces the LR grid exactly and the crop keeps its budget.
-    inp = hr_processor(text=[text], images=[lr_img, crop_img], return_tensors="pt")
+    # first image reproduces the LR grid exactly and the second keeps its budget.
+    inp = hr_processor(text=[text], images=[lr_img, second_img], return_tensors="pt")
     thw = inp["image_grid_thw"]
-    st = STATE.setdefault("crop_stats", {"n": 0, "lr_same": 0, "tok": []})
+    st = STATE.setdefault("crop_stats", {"n": 0, "lr_same": 0, "tok": [], "area": []})
     st["n"] += 1
     st["lr_same"] += bool(torch.equal(thw[0].cpu(), lr_thw.cpu()))
     st["tok"].append(int(thw[1][1] * thw[1][2]) // (MERGE * MERGE))
+    st["area"].append(STATE.pop("crop_stats_area", float("nan")))   # window area fraction
     out = {}
     for k, v in inp.items():
         if not isinstance(v, torch.Tensor):
@@ -381,6 +378,152 @@ def build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor, hr_processor,
         elif k in ("input_ids", "attention_mask", "image_grid_thw"):
             out[k] = v.to(device)
     return out
+
+
+def build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor, hr_processor, args,
+                            device, dtype):
+    """--hd_source crop_tokens: the ORACLE window crop as the 2nd image, or
+    None when the sample has no bbox."""
+    win = crop_window(sample, hd_w, hd_h, args.oracle_min_cells)
+    if win is None:
+        return None
+    STATE["crop_stats_area"] = (win[2] - win[0]) * (win[3] - win[1])
+    return build_two_image_inputs(sample, lr_thw, make_crop_image(sample, win, args.crop_tok),
+                                  processor, hr_processor, args, device, dtype)
+
+
+# ── model-map -> second image (pred_window / pred_warp / warp_oracle) ──
+PRED_SOURCES = ("pred_window", "pred_warp", "warp_oracle")
+
+
+def _cell_grid(gs):
+    """Cell-centre coordinates of the gs x gs relevance map in [-1, 1], row-major
+    (y, x) like the model's p.view(R, gs, gs); same half-cell margin as
+    _grid_generate / _quantile_grid."""
+    m = 1.0 / max(gs - 1, 1)
+    xs = np.linspace(-1 + m, 1 - m, gs)
+    gx, gy = np.meshgrid(xs, xs)
+    return xs, gx.ravel(), gy.ravel()
+
+
+def model_map(sample_idx, layers):
+    """Mean of the model's OWN relevance maps (question slot, pre-floor) at
+    `layers` for the sample just processed; None if a layer did not record.
+    Returns (p [N], gs)."""
+    ms = []
+    for l in layers:
+        rows = GLOBP.get(l)
+        if not rows or len(rows) != sample_idx + 1:
+            return None
+        ms.append(np.asarray(rows[-1][0], dtype=np.float64))
+    p = np.mean(ms, 0)
+    p = p / max(p.sum(), 1e-12)
+    gs = int(round(math.sqrt(p.size)))
+    if gs * gs != p.size:
+        return None
+    return p, gs
+
+
+def map_window(p, gs, floor_lam, min_cells, hd_w, hd_h):
+    """The moments grid's extent (c +- s * ref half-extent, floor lam like the
+    model's glob_floor) as (x0, y0, x1, y1) image fractions, min-cells / clamp
+    like the oracle window."""
+    N = gs * gs
+    q = np.clip(p - floor_lam / N, 0.0, None)
+    q = q / q.sum() if q.sum() > 1e-9 else p
+    xs, gx, gy = _cell_grid(gs)
+    cx, cy = float((q * gx).sum()), float((q * gy).sum())
+    su = float(xs.std())
+    sx = min(math.sqrt(float((q * (gx - cx) ** 2).sum())) / su, 1.0)
+    sy = min(math.sqrt(float((q * (gy - cy) ** 2).sum())) / su, 1.0)
+    half = 1.0 - 1.0 / max(gs - 1, 1)                       # ref grid half-extent
+    fx0, fx1 = (cx - sx * half + 1) / 2, (cx + sx * half + 1) / 2
+    fy0, fy1 = (cy - sy * half + 1) / 2, (cy + sy * half + 1) / 2
+    ww = min(max(fx1 - fx0, min_cells * FACTOR / hd_w), 1.0)
+    wh = min(max(fy1 - fy0, min_cells * FACTOR / hd_h), 1.0)
+    mx_ = min(max((fx0 + fx1) / 2, ww / 2), 1 - ww / 2)
+    my_ = min(max((fy0 + fy1) / 2, wh / 2), 1 - wh / 2)
+    return mx_ - ww / 2, my_ - wh / 2, mx_ + ww / 2, my_ + wh / 2
+
+
+def box_map(sample, gs, mass):
+    """Synthetic relevance map: (1 - mass) uniform + mass on the cells whose
+    centres fall in the GT box (nearest cell when the box is tiny)."""
+    W, H = sample["image"].size
+    bs = sample["bboxes"]
+    bx = np.array([min(b[0] for b in bs) / W, min(b[1] for b in bs) / H,
+                   max(b[0] + b[2] for b in bs) / W, max(b[1] + b[3] for b in bs) / H]) * 2 - 1
+    _, gx, gy = _cell_grid(gs)
+    inb = (gx >= bx[0]) & (gx <= bx[2]) & (gy >= bx[1]) & (gy <= bx[3])
+    if not inb.any():
+        c = np.array([(bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2])
+        inb[np.argmin((gx - c[0]) ** 2 + (gy - c[1]) ** 2)] = True
+    N = gs * gs
+    return (1 - mass) / N + mass * inb / inb.sum()
+
+
+def warp_image(img, p, gs, lam, out_tok):
+    """Pixel-level rectilinear warp of the WHOLE image: per-axis marginals of
+    (lam * p + (1 - lam) * uniform) -> CDF -> piecewise-linear inverse at the
+    output pixel centres -> bilinear resample. Output area <= out_tok LLM
+    tokens (image aspect, FACTOR-aligned). lam = 0 is a plain resize."""
+    import torch.nn.functional as Fnn
+    N = gs * gs
+    pm = (lam * p + (1 - lam) / N).reshape(gs, gs)          # [y, x]
+    mx, my = pm.sum(0), pm.sum(1)
+    W, H = img.size
+    sc = math.sqrt(min(out_tok * TOK_PX, W * H) / (W * H))
+    ow = max(FACTOR, int(W * sc) // FACTOR * FACTOR)
+    oh = max(FACTOR, int(H * sc) // FACTOR * FACTOR)
+    # anti-alias: pre-shrink so that even the most compressed region is not
+    # sampled far below the source density (4x the output area)
+    pre = math.sqrt(min(1.0, 4.0 * ow * oh / (W * H)))
+    if pre < 1.0:
+        img = img.resize((max(1, int(W * pre)), max(1, int(H * pre))), Image.BICUBIC)
+    edges = np.linspace(-1.0, 1.0, gs + 1)
+
+    def inv_cdf(marg, n_out):
+        cdf = np.concatenate([[0.0], np.cumsum(marg / marg.sum())])
+        cdf[-1] = 1.0
+        u = (np.arange(n_out) + 0.5) / n_out
+        return np.interp(u, cdf, edges)
+
+    xs = torch.tensor(inv_cdf(mx, ow), dtype=torch.float32)
+    ys = torch.tensor(inv_cdf(my, oh), dtype=torch.float32)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    grid = torch.stack([gx, gy], -1)[None]                   # [1, oh, ow, 2] (x, y)
+    t = torch.from_numpy(np.asarray(img, dtype=np.float32)).permute(2, 0, 1)[None] / 255.0
+    out = Fnn.grid_sample(t, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    arr = (out[0].permute(1, 2, 0).clamp(0, 1).numpy() * 255.0).round().astype(np.uint8)
+    return Image.fromarray(arr, "RGB")
+
+
+def build_pred_inputs(sample, sample_idx, lr_thw, hd_w, hd_h, processor, hr_processor, args,
+                      device, dtype):
+    """Second image from the model's OWN map (pred_window: moments window crop;
+    pred_warp: whole-image rectilinear warp) or from a synthetic GT-box map
+    (warp_oracle). None when no map / bbox is available."""
+    if args.hd_source == "warp_oracle":
+        if not sample.get("bboxes"):
+            return None
+        gs = args.grid_size
+        img2 = warp_image(sample["image"], box_map(sample, gs, args.warp_box_mass), gs, 1.0,
+                          args.crop_tok)
+        STATE["crop_stats_area"] = float("nan")
+    else:
+        mp = model_map(sample_idx, args.map_layers)
+        if mp is None:
+            return None
+        p, gs = mp
+        if args.hd_source == "pred_window":
+            win = map_window(p, gs, args.map_floor, args.oracle_min_cells, hd_w, hd_h)
+            STATE["crop_stats_area"] = (win[2] - win[0]) * (win[3] - win[1])
+            img2 = make_crop_image(sample, win, args.crop_tok)
+        else:
+            img2 = warp_image(sample["image"], p, gs, args.warp_lam, args.crop_tok)
+            STATE["crop_stats_area"] = float("nan")
+    return build_two_image_inputs(sample, lr_thw, img2, processor, hr_processor, args,
+                                  device, dtype)
 
 
 def set_force_locs(model, locs):
@@ -414,12 +557,16 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
             moved[k] = v.to(device=device, dtype=dtype)
         elif k in ("input_ids", "attention_mask", "image_grid_thw"):
             moved[k] = v.to(device)
+    STATE["geom"] = (lr_thw, hd_w, hd_h)
     if args.hd_source == "crop_tokens":
         # no HD side at all; the "HD-on" config is the two-image prompt
         hd_extra = build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor,
                                            hr_processor, args, device, dtype) or {}
     else:
-        hd_img = make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, args.hd_source)
+        # pred_* / warp_oracle: the HD pass runs on the real image (to record
+        # the model's own map); the second-image prompt is built afterwards
+        src = "real" if args.hd_source in PRED_SOURCES else args.hd_source
+        hd_img = make_hd_image(sample, idx, samples, lr_thw, hd_w, hd_h, src)
         hr_inputs = hr_processor.image_processor(images=[hd_img], return_tensors="pt")
         hd_extra = {
             "pixel_values_hd": hr_inputs["pixel_values"].to(device=device, dtype=dtype),
@@ -945,7 +1092,7 @@ def main():
     ap.add_argument("--hr_scale", type=int, default=3)
     ap.add_argument("--hd_source",
                     choices=["real", "lr_up", "shuffle", "noise", "oracle", "oracle_rand",
-                             "crop_tokens"],
+                             "crop_tokens", "pred_window", "pred_warp", "warp_oracle"],
                     default="real",
                     help="oracle/oracle_rand need --dataset vstar (GT bboxes): HD is the real "
                          "image but the 400 sampling points are forced onto a window around the "
@@ -956,8 +1103,19 @@ def main():
                          "region as 'oracle', but as ordinary tokens in the sequence instead of "
                          "400 cross-attended keys")
     ap.add_argument("--crop_tok", type=int, default=400,
-                    help="--hd_source crop_tokens: LLM-token budget of the window crop "
+                    help="crop_tokens / pred_* / warp_oracle: LLM-token budget of the 2nd image "
                          "(400 = the 20x20 sampling grid's key count)")
+    ap.add_argument("--crop_pos", choices=["before", "after"], default="before",
+                    help="2nd image before the question (native multi-image) or AFTER it "
+                         "(single-pass KV-cache continuation: only the answer sees it)")
+    ap.add_argument("--map_layers", default="11,15,19,23",
+                    help="pred_*: DAT layers whose (question-slot) relevance maps are averaged")
+    ap.add_argument("--map_floor", type=float, default=1.0,
+                    help="pred_window: glob_floor lambda applied to the averaged map before c/s")
+    ap.add_argument("--warp_lam", type=float, default=0.5,
+                    help="pred_warp: map mixed with uniform, lam * p + (1 - lam) / N (0 = plain resize)")
+    ap.add_argument("--warp_box_mass", type=float, default=0.5,
+                    help="warp_oracle: relevance mass placed on the GT-box cells (rest uniform)")
     ap.add_argument("--hd_bias", type=float, nargs="+", default=[0.0],
                     help="constant(s) added to lse_hd; several values = sweep")
     ap.add_argument("--attn", default="flash_attention_2")
@@ -1024,9 +1182,14 @@ def main():
     install_lr_key_hook(model)
     image_token_id = getattr(model.config, "image_token_id", None)
     args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
-    if (args.hd_source.startswith("oracle") or args.hd_source == "crop_tokens") \
-            and args.dataset not in ("vstar", "synth"):
-        raise SystemExit("--hd_source oracle/oracle_rand/crop_tokens needs --dataset vstar or synth (GT bboxes)")
+    if (args.hd_source.startswith("oracle") or args.hd_source == "crop_tokens"
+            or args.hd_source in PRED_SOURCES) and args.dataset not in ("vstar", "synth"):
+        raise SystemExit("--hd_source oracle/oracle_rand/crop_tokens/pred_*/warp_oracle needs "
+                         "--dataset vstar or synth (GT bboxes)")
+    args.map_layers = [int(x) for x in args.map_layers.split(",") if x.strip()]
+    pred_mode = args.hd_source in PRED_SOURCES
+    if pred_mode:
+        args.hd_bias = [0.0]            # the real HD pass only serves to record the map
     # Free-text datasets: normalized containment instead of MCQ letter matching,
     # and room for a short sentence answer.
     free_text = args.dataset == "synth"
@@ -1045,7 +1208,10 @@ def main():
                       temperature=None, top_p=None, top_k=None)
 
     # config name -> list of predicted letters (parallel to samples)
-    configs = ["off"] + [f"{args.hd_source} b={b:+g}" for b in args.hd_bias]
+    if pred_mode:
+        configs = ["off", "real b=+0", args.hd_source]
+    else:
+        configs = ["off"] + [f"{args.hd_source} b={b:+g}" for b in args.hd_bias]
     preds = {c: [] for c in configs}
     raw = {c: [] for c in configs}
     record_bias = 0.0 if 0.0 in args.hd_bias else args.hd_bias[0]
@@ -1078,6 +1244,17 @@ def main():
             STATE["record"] = False
             raw[cname].append(t); preds[cname].append(extract(t))
         set_force_locs(model, None)
+        if pred_mode:
+            # the real pass above recorded the model's own maps -> 2nd image
+            lr_thw_, hd_w_, hd_h_ = STATE["geom"]
+            inp2 = build_pred_inputs(s, i, lr_thw_, hd_w_, hd_h_, processor, hr_processor,
+                                     args, device, dtype)
+            if inp2 is None:
+                STATE["pred_fallback"] = STATE.get("pred_fallback", 0) + 1
+                t = raw["off"][-1]                               # no map -> LR answer
+            else:
+                t = gen(inp2)
+            raw[args.hd_source].append(t); preds[args.hd_source].append(extract(t))
     STATE["bias"] = 0.0
     if STATE.get("gate_log"):
         print(f"[probe] gate readout: global term ON for {100 * float(np.mean(STATE['gate_log'])):.1f}% "
@@ -1090,10 +1267,12 @@ def main():
               f"(min {args.oracle_min_cells} HD cells per side)")
     if STATE.get("crop_stats"):
         st = STATE["crop_stats"]
-        print(f"[probe] crop_tokens: window crop fed as 2nd image on {st['n']}/{len(samples)} samples; "
-              f"crop tokens mean {np.mean(st['tok']):.0f} (min {min(st['tok'])}, max {max(st['tok'])}, "
-              f"budget {args.crop_tok}); LR grid identical to the off config in "
-              f"{st['lr_same']}/{st['n']}")
+        area = np.nanmean(st["area"]) if st["area"] else float("nan")
+        print(f"[probe] {args.hd_source}: 2nd image ({args.crop_pos} the question) on {st['n']}/{len(samples)} "
+              f"samples; tokens mean {np.mean(st['tok']):.0f} (min {min(st['tok'])}, max {max(st['tok'])}, "
+              f"budget {args.crop_tok}); window area {100 * area:.1f}% of image; LR grid identical to "
+              f"the off config in {st['lr_same']}/{st['n']}"
+              + (f"; map missing -> LR answer on {STATE['pred_fallback']}" if STATE.get("pred_fallback") else ""))
 
     # ── report ────────────────────────────────────────────────
     cats = sorted({s["category"] for s in samples})
@@ -1659,12 +1838,16 @@ def main():
                 subsets = [("peak in win", hitm), ("peak out", ~hitm),
                            ("box<10px@LR", small), ("box>=10px", ~small),
                            ("in&>=10px", hitm & ~small), ("out&>=10px", ~hitm & ~small)]
-                on_c = configs[1] if len(configs) > 1 else None
+                on_cs = configs[1:]
+                on_c = on_cs[0] if on_cs else None
                 print(f"\n==== by localisation outcome at layer {ref_l}  (peak in GT window = hit)  "
                       f"and by GT box height at LR ====")
-                print(f"{'subset':>12} | {'n':>4} | {'off':>6} {'on':>6} {'delta':>6} | "
+                if len(on_cs) > 1:
+                    print("on/delta columns, in order: " + " | ".join(on_cs))
+                on_hdr = " ".join(f"{'on':>6} {'delta':>6}" for _ in on_cs)
+                print(f"{'subset':>12} | {'n':>4} | {'off':>6} {on_hdr} | "
                       f"{'s':>6} {'in_box':>6} {'ratio':>6}")
-                print("-" * 70)
+                print("-" * (56 + 14 * len(on_cs)))
                 subset_out = {}
                 for name, m in subsets:
                     idx = [k for k in range(n) if m[k]]
@@ -1672,6 +1855,8 @@ def main():
                         continue
                     a_off = acc(preds["off"], m)
                     a_on = acc(preds[on_c], m) if on_c else float("nan")
+                    on_cells = " ".join(f"{acc(preds[c], m):>6.2f} {acc(preds[c], m) - a_off:>+6.2f}"
+                                        for c in on_cs)
                     s_mean = float(np.mean([(GLOBC[ref_l][k][2] + GLOBC[ref_l][k][3]) / 2 for k in idx])) \
                         if ref_l in GLOBC and len(GLOBC[ref_l]) == n else float("nan")
                     if ref_l in LOC and len(LOC[ref_l]) == n:
@@ -1681,7 +1866,7 @@ def main():
                         ib = ratio = float("nan")
                     subset_out[name] = {"n": len(idx), "off": a_off, "on": a_on, "s": s_mean,
                                         "in_box": ib, "ratio": ratio}
-                    print(f"{name:>12} | {len(idx):>4} | {a_off:>6.2f} {a_on:>6.2f} {a_on - a_off:>+6.2f} | "
+                    print(f"{name:>12} | {len(idx):>4} | {a_off:>6.2f} {on_cells} | "
                           f"{s_mean:>6.3f} {ib:>6.3f} {ratio:>6.3f}")
                 layer_glob.setdefault(-1, {})["by_outcome"] = {"ref_layer": ref_l, **subset_out}
 
