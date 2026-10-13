@@ -311,21 +311,57 @@ def oracle_locs(sample, idx, hd_w, hd_h, grid_size, min_cells, source):
     return locs.clamp(-1.0, 1.0)
 
 
-def crop_window(sample, hd_w, hd_h, min_cells):
-    """The 'oracle' window as (x0, y0, x1, y1) image fractions — same box
-    expansion / min-cells / clamping as oracle_locs(source='oracle')."""
+def gt_box_frac(sample):
+    """Union of the GT boxes as (x0, y0, x1, y1) image fractions, or None."""
     boxes = sample.get("bboxes") or []
     if not boxes:
         return None
     W, H = sample["image"].size
-    x0 = min(b[0] for b in boxes) / W
-    y0 = min(b[1] for b in boxes) / H
-    x1 = max(b[0] + b[2] for b in boxes) / W
-    y1 = max(b[1] + b[3] for b in boxes) / H
-    ww = min(max(x1 - x0, min_cells * FACTOR / hd_w), 1.0)
-    wh = min(max(y1 - y0, min_cells * FACTOR / hd_h), 1.0)
+    return (min(b[0] for b in boxes) / W, min(b[1] for b in boxes) / H,
+            max(b[0] + b[2] for b in boxes) / W, max(b[1] + b[3] for b in boxes) / H)
+
+
+def crop_window(sample, hd_w, hd_h, min_cells, pad=1.0):
+    """The 'oracle' window as (x0, y0, x1, y1) image fractions — same box
+    expansion / min-cells / clamping as oracle_locs(source='oracle'); pad > 1
+    scales the box about its centre first (looser window, less zoom)."""
+    gt = gt_box_frac(sample)
+    if gt is None:
+        return None
+    x0, y0, x1, y1 = gt
+    ww = min(max((x1 - x0) * pad, min_cells * FACTOR / hd_w), 1.0)
+    wh = min(max((y1 - y0) * pad, min_cells * FACTOR / hd_h), 1.0)
     cx = min(max((x0 + x1) / 2, ww / 2), 1 - ww / 2)
     cy = min(max((y0 + y1) / 2, wh / 2), 1 - wh / 2)
+    return cx - ww / 2, cy - wh / 2, cx + ww / 2, cy + wh / 2
+
+
+def corrupt_window(win, gt, rng, hit, shift):
+    """Controlled localisation error for the hit-rate / precision curves.
+    hit=False: a window of the SAME size at a random place not overlapping the
+    GT box (a confidently wrong localiser). shift>0 (hit=True): the window
+    centre moved by shift x window size in a random direction (an imprecise
+    localiser), clamped into the image."""
+    x0, y0, x1, y1 = win
+    ww, wh = x1 - x0, y1 - y0
+    if not hit:
+        best, best_d = None, -1.0
+        gcx, gcy = (gt[0] + gt[2]) / 2, (gt[1] + gt[3]) / 2
+        for _ in range(64):
+            rx, ry = rng.uniform(ww / 2, max(ww / 2, 1 - ww / 2)), rng.uniform(wh / 2, max(wh / 2, 1 - wh / 2))
+            if abs(rx - gcx) >= (ww + gt[2] - gt[0]) / 2 or abs(ry - gcy) >= (wh + gt[3] - gt[1]) / 2:
+                best = (rx, ry)
+                break
+            d = (rx - gcx) ** 2 + (ry - gcy) ** 2
+            if d > best_d:
+                best, best_d = (rx, ry), d
+        cx, cy = best
+    else:
+        ang = rng.uniform(0, 2 * math.pi)
+        cx = (x0 + x1) / 2 + shift * ww * math.cos(ang)
+        cy = (y0 + y1) / 2 + shift * wh * math.sin(ang)
+    cx = min(max(cx, ww / 2), 1 - ww / 2)
+    cy = min(max(cy, wh / 2), 1 - wh / 2)
     return cx - ww / 2, cy - wh / 2, cx + ww / 2, cy + wh / 2
 
 
@@ -388,19 +424,28 @@ def build_two_image_inputs(sample, lr_thw, second_img, processor, hr_processor, 
     return out
 
 
-def build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor, hr_processor, args,
+def build_crop_token_inputs(sample, idx, lr_thw, hd_w, hd_h, processor, hr_processor, args,
                             device, dtype):
     """--hd_source crop_tokens: the ORACLE window crop as the 2nd image, or
     None when the sample has no bbox. plain_tokens: the WHOLE image resized to
-    the same token budget (control: 'any 2nd image' vs 'the right window')."""
+    the same token budget (control: 'any 2nd image' vs 'the right window').
+    --crop_pad / --crop_hit_rate / --crop_shift degrade the oracle window in a
+    controlled way (how good must a localiser be?)."""
     if args.hd_source == "plain_tokens":
         STATE["crop_stats_area"] = 1.0
         return build_two_image_inputs(sample, lr_thw,
                                       make_crop_image(sample, (0.0, 0.0, 1.0, 1.0), args.crop_tok),
                                       processor, hr_processor, args, device, dtype)
-    win = crop_window(sample, hd_w, hd_h, args.oracle_min_cells)
+    win = crop_window(sample, hd_w, hd_h, args.oracle_min_cells, pad=args.crop_pad)
     if win is None:
         return None
+    if args.crop_hit_rate < 1.0 or args.crop_shift > 0:
+        rng = np.random.RandomState(2000 + idx)
+        hit = bool(rng.uniform() < args.crop_hit_rate)
+        win = corrupt_window(win, gt_box_frac(sample), rng, hit, args.crop_shift)
+        cs = STATE.setdefault("crop_corrupt", {"hit": 0, "n": 0})
+        cs["n"] += 1
+        cs["hit"] += hit
     STATE["crop_stats_area"] = (win[2] - win[0]) * (win[3] - win[1])
     return build_two_image_inputs(sample, lr_thw, make_crop_image(sample, win, args.crop_tok),
                                   processor, hr_processor, args, device, dtype)
@@ -682,7 +727,7 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
         hd_extra = {}                        # built in the main loop (needs a generate call)
     elif args.hd_source in ("crop_tokens", "plain_tokens"):
         # no HD side at all; the "HD-on" config is the two-image prompt
-        hd_extra = build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor,
+        hd_extra = build_crop_token_inputs(sample, idx, lr_thw, hd_w, hd_h, processor,
                                            hr_processor, args, device, dtype) or {}
     else:
         # pred_* / warp_oracle: the HD pass runs on the real image (to record
@@ -1249,6 +1294,15 @@ def main():
                     help="pred_warp: map mixed with uniform, lam * p + (1 - lam) / N (0 = plain resize)")
     ap.add_argument("--warp_box_mass", type=float, default=0.5,
                     help="warp_oracle: relevance mass placed on the GT-box cells (rest uniform)")
+    ap.add_argument("--crop_pad", type=float, default=1.0,
+                    help="crop_tokens: GT box scaled by this factor before the min-cells rule "
+                         "(looser window = less zoom; how tight must the localiser be?)")
+    ap.add_argument("--crop_hit_rate", type=float, default=1.0,
+                    help="crop_tokens: fraction of samples that get the GT window; the rest get a "
+                         "same-size window elsewhere (how often must the localiser be right?)")
+    ap.add_argument("--crop_shift", type=float, default=0.0,
+                    help="crop_tokens: move the window centre by this x window size in a random "
+                         "direction (how precise must the localiser be?)")
     ap.add_argument("--ground_coords", choices=["norm1000", "pixels"], default="norm1000",
                     help="ground_window: coordinate frame of the model's bbox output (Qwen3-VL "
                          "lineage = 0..1000 normalised; Qwen2.5-VL = pixels of the input image)")
@@ -1421,6 +1475,11 @@ def main():
               f"budget {args.crop_tok}); window area {100 * area:.1f}% of image; LR grid identical to "
               f"the off config in {st['lr_same']}/{st['n']}"
               + (f"; map missing -> LR answer on {STATE['pred_fallback']}" if STATE.get("pred_fallback") else ""))
+        if args.hd_source == "crop_tokens":
+            cc = STATE.get("crop_corrupt", {"hit": st["n"], "n": st["n"]})
+            print(f"[probe] crop_tokens window: pad x{args.crop_pad}, shift {args.crop_shift} x window, "
+                  f"target hit-rate {args.crop_hit_rate} -> realised {cc['hit']}/{cc['n']} GT windows, "
+                  f"the rest same-size windows away from the target")
     if STATE.get("ground_stats"):
         g = STATE["ground_stats"]
         iou = np.mean(g["iou"]) if g["iou"] else float("nan")
