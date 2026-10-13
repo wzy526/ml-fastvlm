@@ -403,6 +403,90 @@ def build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor, hr_processor,
                                   processor, hr_processor, args, device, dtype)
 
 
+GROUND_PROMPT = ("To answer the question below, which part of the image has to be examined "
+                 "closely? Output only the bounding box of that region as [x1, y1, x2, y2].\n"
+                 "Question: {q}")
+
+
+def pad_window(box, pad, min_cells, hd_w, hd_h):
+    """(x0, y0, x1, y1) fractions -> window scaled by `pad` about its centre,
+    at least min_cells HD cells per side, clamped into the image."""
+    x0, y0, x1, y1 = box
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    ww = min(max((x1 - x0) * pad, min_cells * FACTOR / hd_w), 1.0)
+    wh = min(max((y1 - y0) * pad, min_cells * FACTOR / hd_h), 1.0)
+    cx = min(max(cx, ww / 2), 1 - ww / 2)
+    cy = min(max(cy, wh / 2), 1 - wh / 2)
+    return cx - ww / 2, cy - wh / 2, cx + ww / 2, cy + wh / 2
+
+
+def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_processor, args,
+                         device, dtype):
+    """--hd_source ground_window: ask the (frozen) model, on the LR image, for
+    the bbox of the region it needs to look at; crop that (padded) window as
+    the 2nd image. Zero-training localisation from the model's own grounding
+    ability instead of its attention. Falls back to the whole image when no
+    box can be parsed."""
+    lr_img = sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH),
+                                    Image.BICUBIC)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [{"type": "image", "image": lr_img},
+                                             {"type": "text",
+                                              "text": GROUND_PROMPT.format(q=sample["prompt"])}]}]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    )
+    inp = hr_processor(text=[text], images=[lr_img], return_tensors="pt")
+    moved = {k: (v.to(device=device, dtype=dtype) if k == "pixel_values" else v.to(device))
+             for k, v in inp.items()
+             if isinstance(v, torch.Tensor) and k in ("input_ids", "attention_mask",
+                                                      "pixel_values", "image_grid_thw")}
+    with torch.inference_mode():
+        out = model.generate(**moved, max_new_tokens=48, do_sample=False,
+                             temperature=None, top_p=None, top_k=None)
+    g = processor.tokenizer.decode(out[0][moved["input_ids"].shape[1]:],
+                                   skip_special_tokens=True).strip()
+    st = STATE.setdefault("ground_stats", {"n": 0, "parsed": 0, "in_win": 0, "in_box": 0,
+                                           "iou": [], "raw": []})
+    st["n"] += 1
+    if len(st["raw"]) < 4:
+        st["raw"].append(g[:120])
+    nums = re.findall(r"-?\d+(?:\.\d+)?", g)
+    box = None
+    if len(nums) >= 4:
+        x1, y1, x2, y2 = (float(v) for v in nums[:4])
+        if args.ground_coords == "norm1000":
+            fr = (x1 / 1000, y1 / 1000, x2 / 1000, y2 / 1000)
+        else:                                            # pixels of the LR image
+            Wl, Hl = lr_img.size
+            fr = (x1 / Wl, y1 / Hl, x2 / Wl, y2 / Hl)
+        fr = tuple(min(max(v, 0.0), 1.0) for v in fr)
+        if fr[2] > fr[0] and fr[3] > fr[1]:
+            box = fr
+    if box is not None:
+        st["parsed"] += 1
+        if sample.get("bboxes"):
+            W, H = sample["image"].size
+            bs = sample["bboxes"]
+            gt = (min(b[0] for b in bs) / W, min(b[1] for b in bs) / H,
+                  max(b[0] + b[2] for b in bs) / W, max(b[1] + b[3] for b in bs) / H)
+            gw = crop_window(sample, hd_w, hd_h, args.oracle_min_cells)
+            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+            st["in_box"] += (gt[0] <= cx <= gt[2]) and (gt[1] <= cy <= gt[3])
+            st["in_win"] += (gw[0] <= cx <= gw[2]) and (gw[1] <= cy <= gw[3])
+            ix = max(0.0, min(box[2], gt[2]) - max(box[0], gt[0]))
+            iy = max(0.0, min(box[3], gt[3]) - max(box[1], gt[1]))
+            inter = ix * iy
+            union = ((box[2] - box[0]) * (box[3] - box[1]) + (gt[2] - gt[0]) * (gt[3] - gt[1]) - inter)
+            st["iou"].append(inter / max(union, 1e-9))
+        win = pad_window(box, args.ground_pad, args.oracle_min_cells, hd_w, hd_h)
+    else:
+        win = (0.0, 0.0, 1.0, 1.0)
+    STATE["crop_stats_area"] = (win[2] - win[0]) * (win[3] - win[1])
+    return build_two_image_inputs(sample, lr_thw, make_crop_image(sample, win, args.crop_tok),
+                                  processor, hr_processor, args, device, dtype)
+
+
 # ── model-map -> second image (pred_window / pred_warp / warp_oracle) ──
 PRED_SOURCES = ("pred_window", "pred_warp", "warp_oracle")
 
@@ -569,7 +653,9 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
         elif k in ("input_ids", "attention_mask", "image_grid_thw"):
             moved[k] = v.to(device)
     STATE["geom"] = (lr_thw, hd_w, hd_h)
-    if args.hd_source in ("crop_tokens", "plain_tokens"):
+    if args.hd_source == "ground_window":
+        hd_extra = {}                        # built in the main loop (needs a generate call)
+    elif args.hd_source in ("crop_tokens", "plain_tokens"):
         # no HD side at all; the "HD-on" config is the two-image prompt
         hd_extra = build_crop_token_inputs(sample, lr_thw, hd_w, hd_h, processor,
                                            hr_processor, args, device, dtype) or {}
@@ -1113,7 +1199,7 @@ def main():
     ap.add_argument("--hd_source",
                     choices=["real", "lr_up", "shuffle", "noise", "oracle", "oracle_rand",
                              "crop_tokens", "plain_tokens", "pred_window", "pred_warp",
-                             "warp_oracle"],
+                             "warp_oracle", "ground_window"],
                     default="real",
                     help="oracle/oracle_rand need --dataset vstar (GT bboxes): HD is the real "
                          "image but the 400 sampling points are forced onto a window around the "
@@ -1138,6 +1224,11 @@ def main():
                     help="pred_warp: map mixed with uniform, lam * p + (1 - lam) / N (0 = plain resize)")
     ap.add_argument("--warp_box_mass", type=float, default=0.5,
                     help="warp_oracle: relevance mass placed on the GT-box cells (rest uniform)")
+    ap.add_argument("--ground_coords", choices=["norm1000", "pixels"], default="norm1000",
+                    help="ground_window: coordinate frame of the model's bbox output (Qwen3-VL "
+                         "lineage = 0..1000 normalised; Qwen2.5-VL = pixels of the input image)")
+    ap.add_argument("--ground_pad", type=float, default=2.0,
+                    help="ground_window: window side = pad x the predicted box side (context)")
     ap.add_argument("--hd_bias", type=float, nargs="+", default=[0.0],
                     help="constant(s) added to lse_hd; several values = sweep")
     ap.add_argument("--attn", default="flash_attention_2")
@@ -1231,8 +1322,11 @@ def main():
                       temperature=None, top_p=None, top_k=None)
 
     # config name -> list of predicted letters (parallel to samples)
+    ground_mode = args.hd_source == "ground_window"
     if pred_mode:
         configs = ["off", "real b=+0", args.hd_source]
+    elif ground_mode:
+        configs = ["off", "ground_window"]
     else:
         configs = ["off"] + [f"{args.hd_source} b={b:+g}" for b in args.hd_bias]
     preds = {c: [] for c in configs}
@@ -1260,12 +1354,18 @@ def main():
 
         set_force_locs(model, locs)          # None -> learned offsets (non-oracle sources)
         n_forced += locs is not None
-        for b, cname in zip(args.hd_bias, configs[1:]):
-            STATE["bias"] = float(b)
-            STATE["record"] = (b == record_bias)
-            t = gen({**base_inputs, **hd_extra})
-            STATE["record"] = False
-            raw[cname].append(t); preds[cname].append(extract(t))
+        if ground_mode:
+            lr_thw_, hd_w_, hd_h_ = STATE["geom"]
+            t = gen(ground_window_inputs(s, lr_thw_, hd_w_, hd_h_, model, processor, hr_processor,
+                                         args, device, dtype))
+            raw["ground_window"].append(t); preds["ground_window"].append(extract(t))
+        else:
+            for b, cname in zip(args.hd_bias, configs[1:]):
+                STATE["bias"] = float(b)
+                STATE["record"] = (b == record_bias)
+                t = gen({**base_inputs, **hd_extra})
+                STATE["record"] = False
+                raw[cname].append(t); preds[cname].append(extract(t))
         set_force_locs(model, None)
         if pred_mode:
             # the real pass above recorded the model's own maps -> 2nd image
@@ -1296,6 +1396,14 @@ def main():
               f"budget {args.crop_tok}); window area {100 * area:.1f}% of image; LR grid identical to "
               f"the off config in {st['lr_same']}/{st['n']}"
               + (f"; map missing -> LR answer on {STATE['pred_fallback']}" if STATE.get("pred_fallback") else ""))
+    if STATE.get("ground_stats"):
+        g = STATE["ground_stats"]
+        iou = np.mean(g["iou"]) if g["iou"] else float("nan")
+        print(f"[probe] ground_window: bbox parsed on {g['parsed']}/{g['n']} (coords={args.ground_coords}, "
+              f"pad x{args.ground_pad}); predicted-box centre in GT window {g['in_win']}/{g['n']}, "
+              f"in GT box {g['in_box']}/{g['n']}; mean IoU with GT box {iou:.3f}; unparsed -> whole image")
+        for r in g["raw"]:
+            print(f"[probe]   raw: {r!r}")
 
     # ── report ────────────────────────────────────────────────
     cats = sorted({s["category"] for s in samples})
