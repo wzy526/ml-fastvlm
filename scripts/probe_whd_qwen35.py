@@ -49,6 +49,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import torch.nn.functional as Fnn
 from PIL import Image
 from tqdm import tqdm
 
