@@ -599,6 +599,7 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
     # stage 2 (--ground_stages 2): crop --ground_refine_pad x the first box
     # from the ORIGINAL image at <= --ground_refine_tok tokens (the target is
     # now several cells big) and ground again; the box maps back to the image
+    s1_boxes, rw, g2 = list(boxes), None, ""
     if args.ground_stages >= 2 and boxes:
         rw = pad_window(boxes[0], args.ground_refine_pad, args.oracle_min_cells, hd_w, hd_h)
         rimg = make_crop_image(sample, rw, args.ground_refine_tok)
@@ -609,6 +610,9 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
             bx = b2[0]
             boxes = [(x0 + bx[0] * (x1 - x0), y0 + bx[1] * (y1 - y0),
                       x0 + bx[2] * (x1 - x0), y0 + bx[3] * (y1 - y0))] + boxes[1:]
+    log = {"s1": s1_boxes, "final": list(boxes), "refine_win": rw, "raw": g[:80], "raw2": g2[:80],
+           "phrase": sample.get("_extracted"), "hit": None, "iou": None, "wins": [], "crops": []}
+    STATE.setdefault("ground_log", []).append(log)
     if boxes:
         st["parsed"] += 1
         st["n_boxes"].append(len(boxes))
@@ -618,13 +622,18 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
             st["in_box"] += hits[0][1]
             st["iou"].append(hits[0][2])
             st["any_in_win"] += any(h[0] for h in hits)
+            log["hit"], log["iou"] = bool(hits[0][0]), float(hits[0][2])
         # one crop per box, the token budget split between them
         wins = [pad_window(b, args.ground_pad, args.oracle_min_cells, hd_w, hd_h) for b in boxes]
         imgs = [make_crop_image(sample, w, max(64, args.crop_tok // len(wins))) for w in wins]
         STATE["crop_stats_area"] = sum((w[2] - w[0]) * (w[3] - w[1]) for w in wins)
     else:
-        imgs = [make_crop_image(sample, (0.0, 0.0, 1.0, 1.0), args.crop_tok)]
+        wins = [(0.0, 0.0, 1.0, 1.0)]
+        imgs = [make_crop_image(sample, wins[0], args.crop_tok)]
         STATE["crop_stats_area"] = 1.0
+    log["wins"] = wins
+    if args.dump_ground:
+        log["crops"] = [im.copy() for im in imgs]
     return build_two_image_inputs(sample, lr_thw, imgs, processor, hr_processor, args, device, dtype)
 
 
@@ -1583,6 +1592,11 @@ def main():
                     help="ground_window stage 2: crop side = this x the stage-1 box side")
     ap.add_argument("--ground_refine_tok", type=int, default=640,
                     help="ground_window stage 2: token budget of the refinement crop")
+    ap.add_argument("--dump_ground", default=None,
+                    help="ground_window: directory for a ground.png contact sheet (--dump_n samples, "
+                         "--dump_select first|miss|hit by the final box): full image with GT box "
+                         "(green), stage-1 box (red), stage-2 box (orange), crop window (yellow); a "
+                         "zoom around the GT; the crop the model answered from")
     ap.add_argument("--ground_topk", type=int, default=1,
                     help="ground_window: ask for up to k candidate boxes; one crop each, the "
                          "--crop_tok budget split between them")
@@ -2532,6 +2546,93 @@ def main():
                 fn = os.path.join(args.dump_maps, f"layer{lid}.png")
                 sheet.save(fn)
                 print(f"[probe] dump_maps: wrote {fn}  ({len(panels)} samples)")
+
+    if args.dump_ground and STATE.get("ground_log"):
+        # Failure modes of the model's own grounding: per sample, [full image
+        # with boxes] [zoom around the GT, same boxes] [the crop answered from].
+        # Green = GT box, red = stage-1 (LR) box, orange = stage-2 box,
+        # yellow = crop window, white = stage-2 search crop.
+        from PIL import ImageDraw
+        os.makedirs(args.dump_ground, exist_ok=True)
+        glog = STATE["ground_log"]
+        PW = 320
+
+        def _draw_boxes(img, region, lg, gt):
+            """img cropped to `region` (fractions) and scaled to PW wide, with
+            every box (image fractions) drawn in region coordinates."""
+            W, H = img.size
+            rx0, ry0, rx1, ry1 = region
+            px = (int(rx0 * W), int(ry0 * H), max(int(math.ceil(rx1 * W)), int(rx0 * W) + 1),
+                  max(int(math.ceil(ry1 * H)), int(ry0 * H) + 1))
+            crop = img.crop(px).convert("RGB")
+            sc = PW / crop.width
+            out = crop.resize((PW, max(1, int(crop.height * sc))))
+            d = ImageDraw.Draw(out)
+
+            def rect(b, color, w=2):
+                if b is None:
+                    return
+                x0 = (b[0] * W - px[0]) * sc; y0 = (b[1] * H - px[1]) * sc
+                x1 = (b[2] * W - px[0]) * sc; y1 = (b[3] * H - px[1]) * sc
+                if x1 - x0 < 3:            # a tiny box: make it visible as a small square
+                    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                    x0, x1, y0, y1 = cx - 3, cx + 3, cy - 3, cy + 3
+                d.rectangle([x0, y0, x1, y1], outline=color, width=w)
+            rect(lg.get("refine_win"), (255, 255, 255), 1)
+            for wn in lg.get("wins", []):
+                rect(wn, (255, 230, 0))
+            for b in lg.get("s1", []):
+                rect(b, (255, 40, 40))
+            if lg.get("refine_win") is not None and lg.get("final"):
+                rect(lg["final"][0], (255, 140, 0))
+            rect(gt, (0, 255, 0))
+            return out
+
+        if args.dump_select == "first":
+            sel = list(range(min(args.dump_n, len(glog))))
+        else:
+            want_hit = args.dump_select == "hit"
+            sel = [i for i, lg in enumerate(glog) if lg["hit"] is not None and lg["hit"] == want_hit][:args.dump_n]
+            print(f"[probe] dump_ground: {args.dump_select}: "
+                  f"{sum(1 for lg in glog if lg['hit'] is not None and lg['hit'] == want_hit)}/{len(glog)} samples")
+        panels = []
+        on_c = "ground_window"
+        for i in sel:
+            s, lg = samples[i], glog[i]
+            gt = gt_box_frac(s)
+            zoom = pad_window(gt, 8.0, 8, *STATE["geom"][1:]) if gt else (0.0, 0.0, 1.0, 1.0)
+            row = [_draw_boxes(s["image"], (0.0, 0.0, 1.0, 1.0), lg, gt),
+                   _draw_boxes(s["image"], zoom, lg, gt)]
+            if lg["crops"]:
+                c = lg["crops"][0].convert("RGB")
+                row.append(c.resize((PW, max(1, int(c.height * PW / c.width)))))
+            rh = max(p.height for p in row) + 28
+            strip = Image.new("RGB", (PW * 3 + 8, rh), (20, 20, 20))
+            for j, p in enumerate(row):
+                strip.paste(p, (j * (PW + 4), 28))
+            ok_off = hit(preds["off"][i], gts[i]) if has_gt else None
+            ok_on = hit(preds[on_c][i], gts[i]) if has_gt else None
+            W_, H_ = s["image"].size
+            lr_sc = math.sqrt(args.tok_budget * TOK_PX / max(W_ * H_, 1))
+            bx = s["bboxes"][0] if s.get("bboxes") else (0, 0, 0, 0)
+            l1 = (f"[{i}] {'HIT' if lg['hit'] else 'MISS'}  IoU={lg['iou'] if lg['iou'] is not None else float('nan'):.3f}  "
+                  f"off={'ok' if ok_off else 'x'} crop={'ok' if ok_on else 'x'}  box@LR {bx[2] * lr_sc:.0f}x{bx[3] * lr_sc:.0f}px  "
+                  f"img {W_}x{H_}  {s['prompt'][:70]}")
+            l2 = (f"targets={s.get('targets')}  raw1={lg['raw']!r}" + (f"  raw2={lg['raw2']!r}" if lg["raw2"] else "")
+                  + (f"  phrase={lg['phrase']!r}" if lg.get("phrase") else ""))
+            d = ImageDraw.Draw(strip)
+            d.text((4, 1), l1[:150], fill=(220, 220, 220))
+            d.text((4, 14), l2[:150], fill=(170, 170, 170))
+            panels.append(strip)
+        if panels:
+            sheet = Image.new("RGB", (panels[0].width, sum(p.height for p in panels)), (20, 20, 20))
+            yy = 0
+            for p in panels:
+                sheet.paste(p, (0, yy)); yy += p.height
+            fn = os.path.join(args.dump_ground, f"ground_{args.dump_select}.png")
+            sheet.save(fn)
+            print(f"[probe] dump_ground: wrote {fn}  ({len(panels)} samples; green GT, red stage-1, "
+                  f"orange stage-2, yellow crop window, white stage-2 search crop)")
 
     if args.out:
         report = {
