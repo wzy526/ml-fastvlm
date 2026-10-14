@@ -549,6 +549,17 @@ def box_hits(box, sample, hd_w, hd_h, min_cells):
             inter / max(union, 1e-9))
 
 
+def stage1_image(sample, lr_thw, args):
+    """The image the stage-1 localiser sees: the student's exact LR pixels, or
+    (--ground_tok > 0) the whole image at that token budget (offline teacher)."""
+    if getattr(args, "ground_tok", 0) and args.ground_tok > 0:
+        img = make_crop_image(sample, (0.0, 0.0, 1.0, 1.0), args.ground_tok)
+        st = STATE.setdefault("stage1_tok", [])
+        st.append((img.width // FACTOR) * (img.height // FACTOR))
+        return img
+    return sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH), Image.BICUBIC)
+
+
 def pad_window(box, pad, min_cells, hd_w, hd_h):
     """(x0, y0, x1, y1) fractions -> window scaled by `pad` about its centre,
     at least min_cells HD cells per side, clamped into the image."""
@@ -567,9 +578,10 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
     the bbox of the region it needs to look at; crop that (padded) window as
     the 2nd image. Zero-training localisation from the model's own grounding
     ability instead of its attention. Falls back to the whole image when no
-    box can be parsed."""
-    lr_img = sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH),
-                                    Image.BICUBIC)
+    box can be parsed. --ground_tok > 0: the stage-1 image is shown at that
+    token budget instead of the student's LR (an OFFLINE teacher: how well
+    does the same grounding localise when it can see the target?)."""
+    lr_img = stage1_image(sample, lr_thw, args)
     st = STATE.setdefault("ground_stats", {"n": 0, "parsed": 0, "in_win": 0, "in_box": 0,
                                            "iou": [], "raw": [], "alt_in_win": 0,
                                            "s1_in_win": 0, "any_in_win": 0, "n_boxes": [],
@@ -1152,7 +1164,7 @@ def tile_pick_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_processor,
     def inside(b):
         return gt is not None and b[0] <= gcx <= b[2] and b[1] <= gcy <= b[3]
 
-    lr_img = sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH), Image.BICUBIC)
+    lr_img = stage1_image(sample, lr_thw, args)
     c1, g1 = ask(lr_img)
     if len(st["raw"]) < 4:
         st["raw"].append(g1[:40])
@@ -1834,6 +1846,9 @@ def main():
     ap.add_argument("--ground_topk", type=int, default=1,
                     help="ground_window: ask for up to k candidate boxes; one crop each, the "
                          "--crop_tok budget split between them")
+    ap.add_argument("--ground_tok", type=int, default=0,
+                    help="ground_window / tile_pick: show the stage-1 image at this token budget "
+                         "instead of the student's LR (offline teacher; 0 = the LR pixels)")
     ap.add_argument("--teacher_tok", type=int, default=2304,
                     help="attn_window: token budget of the model's own high-res (teacher) run")
     ap.add_argument("--teacher_win", choices=["peak", "moments"], default="peak",
@@ -2131,6 +2146,9 @@ def main():
               f"{100 * np.mean(g['mass_in_win']) if g['mass_in_win'] else float('nan'):.1f}% vs chance "
               f"{100 * np.mean(g['area']) if g['area'] else float('nan'):.1f}%"
               + (f"; no map -> LR answer on {STATE['teacher_fallback']}" if STATE.get("teacher_fallback") else ""))
+    if STATE.get("stage1_tok"):
+        print(f"[probe] stage-1 localiser image: {np.mean(STATE['stage1_tok']):.0f} tokens on average "
+              f"(--ground_tok {args.ground_tok}; the student still answers from LR {args.tok_budget} + crop)")
     if STATE.get("tile_stats"):
         g = STATE["tile_stats"]
         ng = max(g["n_gt"], 1)
