@@ -772,36 +772,64 @@ def install_samp_hooks(model, image_token_id):
                 output[k_] = list(torch.split(cat, [x.size(0) for x in v]))
         return output
     model.model.visual.register_forward_hook(vis_hook)
+    # the LR-frame positions are applied in the rotary hook of
+    # install_merge_hook (samp_rope_positions): the position ids reach the
+    # rotary embedding whatever path computed them (get_rope_index is bypassed
+    # by generate() on some transformers versions: 0 calls seen on the cluster)
 
-    inner = model.model
-    orig_rope_index = inner.get_rope_index
 
-    def rope_index(*a, **kw):
-        pos, deltas = orig_rope_index(*a, **kw)
-        sr = STATE.get("samp_rope")
-        ids = kw.get("input_ids", a[0] if a else None)
-        if sr is None or ids is None or pos.dim() != 3:
-            return pos, deltas
-        img = (ids[0] == image_token_id).nonzero().flatten()
-        n_lr, ns = sr["n_lr"], sr["fx"].numel()
-        if img.numel() != n_lr + ns:
-            return pos, deltas
-        lr_i, hd_i = img[:n_lr], img[n_lr:]
-        pos = pos.clone()
-        lr_pos = pos[:, 0, lr_i].float()
-        h_min, h_max = lr_pos[1].min(), lr_pos[1].max()
-        w_min, w_max = lr_pos[2].min(), lr_pos[2].max()
-        fx, fy = sr["fx"].to(pos.device), sr["fy"].to(pos.device)
-        pos[1, 0, hd_i] = (fy * (h_max - h_min) + h_min).round().long()
-        pos[2, 0, hd_i] = (fx * (w_max - w_min) + w_min).round().long()
-        pos[0, 0, hd_i] = lr_pos[0, 0].long()
-        STATE["samp_rope_n"] = STATE.get("samp_rope_n", 0) + 1
-        return pos, deltas
-    inner.get_rope_index = rope_index
+def samp_rope_positions(position_ids):
+    """Under STATE['samp_rope'] (prefill of a sampled_tokens @lr prompt): the
+    dummy image's tokens get the LR image's mRoPE frame at their sampling
+    location (t = LR t, h/w = fraction of the LR h/w range, rounded) — the
+    formula of _hd_position_ids_from_locs. Handles [3, B, L] and [4, B, L]
+    (text counter + mRoPE) position ids; decode steps (L = 1) untouched."""
+    sr = STATE.get("samp_rope")
+    if sr is None or position_ids.dim() != 3 or position_ids.size(-1) != sr["L"]:
+        return position_ids
+    o = position_ids.size(0) - 3
+    if o not in (0, 1):
+        return position_ids
+    pid = position_ids.clone()
+    dev = pid.device
+    lr_i, hd_i = sr["lr_i"].to(dev), sr["hd_i"].to(dev)
+    lr_pos = pid[o:, 0, lr_i].float()
+    h_min, h_max = lr_pos[1].min(), lr_pos[1].max()
+    w_min, w_max = lr_pos[2].min(), lr_pos[2].max()
+    fx, fy = sr["fx"].to(dev), sr["fy"].to(dev)
+    pid[o + 1, 0, hd_i] = (fy * (h_max - h_min) + h_min).round().to(pid.dtype)
+    pid[o + 2, 0, hd_i] = (fx * (w_max - w_min) + w_min).round().to(pid.dtype)
+    pid[o, 0, hd_i] = lr_pos[0, 0].to(pid.dtype)
+    STATE["samp_rope_n"] = STATE.get("samp_rope_n", 0) + 1
+    return pid
+
+
+def tiled_hd_features(model, hd_img, hr_processor, device, dtype, tile_cells):
+    """--samp_vit tiles: the HD feature map assembled from INDEPENDENT ViT
+    runs on tiles of <= tile_cells x tile_cells merged cells (AnyRes-style:
+    each tile is a small image to the ViT, no whole-image context / position
+    interpolation). Same [H, W, C] layout as the model's single HD call."""
+    W, H = hd_img.size
+    cw, ch = W // FACTOR, H // FACTOR
+    xs = np.array_split(np.arange(cw), max(1, math.ceil(cw / tile_cells)))
+    ys = np.array_split(np.arange(ch), max(1, math.ceil(ch / tile_cells)))
+    feat = None
+    for ys_ in ys:
+        for xs_ in xs:
+            tile = hd_img.crop((int(xs_[0]) * FACTOR, int(ys_[0]) * FACTOR,
+                                int(xs_[-1] + 1) * FACTOR, int(ys_[-1] + 1) * FACTOR))
+            hr = hr_processor.image_processor(images=[tile], return_tensors="pt")
+            f = model._generate_hd_features(hr["pixel_values"].to(device=device, dtype=dtype),
+                                            hr["image_grid_thw"].to(device))[0]
+            assert tuple(f.shape[:2]) == (len(ys_), len(xs_)), (f.shape, len(ys_), len(xs_), tile.size)
+            if feat is None:
+                feat = f.new_empty(ch, cw, f.size(-1))
+            feat[int(ys_[0]):int(ys_[-1]) + 1, int(xs_[0]):int(xs_[-1]) + 1] = f
+    return feat, len(xs) * len(ys)
 
 
 def build_samp_inputs(sample, lr_thw, kind, locs_g, hd_feat, pos_mode, processor, hr_processor,
-                      args, device, dtype):
+                      args, device, dtype, image_token_id):
     """Two-image prompt whose 2nd image is a gs x gs DUMMY (its ViT output is
     overwritten by the sampled HD tokens via the hooks)."""
     gs = args.grid_size
@@ -817,9 +845,15 @@ def build_samp_inputs(sample, lr_thw, kind, locs_g, hd_feat, pos_mode, processor
     STATE["samp_inject"] = sample_hd_tokens(hd_feat, locs_g)
     STATE["samp_total"] = int((thw.prod(-1) // (MERGE * MERGE)).sum())
     fl = locs_g.float().mean(0).clamp(-1, 1)
-    STATE["samp_rope"] = None if pos_mode == "square" else {
-        "n_lr": int(thw[0][1] * thw[0][2]) // (MERGE * MERGE),
-        "fx": (fl[:, 0] + 1) * 0.5, "fy": (fl[:, 1] + 1) * 0.5}
+    if pos_mode == "square":
+        STATE["samp_rope"] = None
+    else:
+        ids = inp["input_ids"][0]
+        img = (ids == image_token_id).nonzero().flatten()
+        n_lr = int(thw[0][1] * thw[0][2]) // (MERGE * MERGE)
+        assert img.numel() == n_lr + gs * gs, (img.numel(), n_lr, gs * gs)
+        STATE["samp_rope"] = {"L": int(ids.numel()), "lr_i": img[:n_lr].cpu(), "hd_i": img[n_lr:].cpu(),
+                              "fx": (fl[:, 0] + 1) * 0.5, "fy": (fl[:, 1] + 1) * 0.5}
     return inp
 
 
@@ -1275,6 +1309,7 @@ def install_merge_hook():
     orig_rot_fwd = Qwen3_5TextRotaryEmbedding.forward
 
     def patched_rot_fwd(self, x, position_ids):
+        position_ids = samp_rope_positions(position_ids)       # sampled_tokens @lr
         pend = STATE.get("pending_locs")
         if pend and position_ids.dim() == 3 and position_ids.size(1) == 1 \
                 and position_ids.size(-1) == pend[0].size(0):
@@ -1450,6 +1485,12 @@ def main():
                     help="sampled_tokens: mRoPE positions of the sampled tokens: square = a gs x gs "
                          "image block (what a native crop gets), lr = the LR image's frame at the "
                          "sampled location (hd_position_mode='sampled')")
+    ap.add_argument("--samp_vit", choices=["whole", "tiles"], default="whole",
+                    help="sampled_tokens: HD feature map from the model's single whole-image ViT "
+                         "call (as DAT does) or stitched from independent ViT runs on tiles "
+                         "(is the whole-image ViT context what makes sampled features weak?)")
+    ap.add_argument("--samp_tile_cells", type=int, default=20,
+                    help="sampled_tokens --samp_vit tiles: max merged cells per tile side")
     ap.add_argument("--samp_layer", type=int, default=15,
                     help="sampled_tokens pred: DAT layer whose answer-slot grid is used")
     ap.add_argument("--ground_coords", choices=["norm1000", "pixels"], default="norm1000",
@@ -1628,8 +1669,14 @@ def main():
             # recomputed once here (same ViT call / early exit as the model's)
             lr_thw_, hd_w_, hd_h_ = STATE["geom"]
             with torch.inference_mode():
-                hd_feat = model._generate_hd_features(hd_extra["pixel_values_hd"],
-                                                      hd_extra["image_grid_thw_hd"])[0]
+                if args.samp_vit == "whole":
+                    hd_feat = model._generate_hd_features(hd_extra["pixel_values_hd"],
+                                                          hd_extra["image_grid_thw_hd"])[0]
+                else:
+                    hd_img = make_hd_image(s, i, samples, lr_thw_, hd_w_, hd_h_, "real")
+                    hd_feat, n_tiles = tiled_hd_features(model, hd_img, hr_processor, device, dtype,
+                                                         args.samp_tile_cells)
+                    STATE.setdefault("samp_tiles", []).append(n_tiles)
             for g in args.samp_grids:
                 locs_g = samp_locs(g, s, i, hd_w_, hd_h_, args)
                 for p in args.samp_pos:
@@ -1640,7 +1687,7 @@ def main():
                         t = raw["off"][-1]
                     else:
                         inp2 = build_samp_inputs(s, lr_thw_, g, locs_g, hd_feat, p, processor,
-                                                 hr_processor, args, device, dtype)
+                                                 hr_processor, args, device, dtype, image_token_id)
                         t = gen(inp2)
                         clear_samp()
                     raw[cname].append(t); preds[cname].append(extract(t))
@@ -1652,9 +1699,13 @@ def main():
     STATE["bias"] = 0.0
     if samp_mode:
         wc = np.array(STATE.get("samp_win_cells") or [[float("nan")] * 2])
-        print(f"[probe] sampled_tokens: tokens injected in {STATE.get('samp_inject_n', 0)} ViT calls, "
-              f"LR-frame positions applied in {STATE.get('samp_rope_n', 0)} rope calls "
-              f"(expect samples x #@lr configs); fallback to the LR answer: "
+        tiles = STATE.get("samp_tiles")
+        print(f"[probe] sampled_tokens: HD features from "
+              + (f"{np.mean(tiles):.1f} independent ViT tiles per image (<= {args.samp_tile_cells} cells per side)"
+                 if tiles else "the model's single whole-image ViT call")
+              + f"; tokens injected in {STATE.get('samp_inject_n', 0)} ViT calls, "
+              f"LR-frame positions applied in {STATE.get('samp_rope_n', 0)} rotary calls "
+              f"(expect >= samples x #@lr configs); fallback to the LR answer: "
               f"{dict(STATE.get('samp_fallback', {})) or 'none'}; oracle window = "
               f"{np.nanmean(wc[:, 0]):.1f} x {np.nanmean(wc[:, 1]):.1f} HD cells on average "
               f"(grid {args.grid_size} x {args.grid_size}: > grid = the points sub-sample the window)")
