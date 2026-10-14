@@ -390,16 +390,18 @@ def build_two_image_inputs(sample, lr_thw, second_img, processor, hr_processor, 
     Returns the model kwargs that REPLACE the LR-only ones."""
     lr_img = sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH),
                                     Image.BICUBIC)
-    hint = {"type": "text", "text": "Zoomed-in view of the relevant region:"}
-    second = {"type": "image", "image": second_img}
+    seconds = list(second_img) if isinstance(second_img, (list, tuple)) else [second_img]
+    hint = {"type": "text", "text": "Zoomed-in view of the relevant region:" if len(seconds) == 1
+            else "Zoomed-in views of candidate regions:"}
+    second = [{"type": "image", "image": im} for im in seconds]
     question = {"type": "text", "text": sample["prompt"]}
     content = [{"type": "image", "image": lr_img}]
     if args.crop_pos == "before":
-        content += [hint, second, question]
+        content += [hint] + second + [question]
     elif args.crop_pos == "after":
-        content += [question, hint, second]
+        content += [question, hint] + second
     else:                                   # after_restate: question repeated after the 2nd image
-        content += [question, hint, second, dict(question)]
+        content += [question, hint] + second + [dict(question)]
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": content}]
     text = processor.apply_chat_template(
@@ -407,12 +409,12 @@ def build_two_image_inputs(sample, lr_thw, second_img, processor, hr_processor, 
     )
     # hr_processor keeps any FACTOR-aligned size in [TOK_PX, 100 Mpx] as is, so the
     # first image reproduces the LR grid exactly and the second keeps its budget.
-    inp = hr_processor(text=[text], images=[lr_img, second_img], return_tensors="pt")
+    inp = hr_processor(text=[text], images=[lr_img] + seconds, return_tensors="pt")
     thw = inp["image_grid_thw"]
     st = STATE.setdefault("crop_stats", {"n": 0, "lr_same": 0, "tok": [], "area": []})
     st["n"] += 1
     st["lr_same"] += bool(torch.equal(thw[0].cpu(), lr_thw.cpu()))
-    st["tok"].append(int(thw[1][1] * thw[1][2]) // (MERGE * MERGE))
+    st["tok"].append(int(sum(int(t[1] * t[2]) for t in thw[1:])) // (MERGE * MERGE))
     st["area"].append(STATE.pop("crop_stats_area", float("nan")))   # window area fraction
     out = {}
     for k, v in inp.items():
@@ -459,13 +461,92 @@ GROUND_PROMPT_TGT = ("Locate the following in the image and output only its boun
                      "[x1, y1, x2, y2]: {t}")
 
 
-def ground_prompt(sample):
-    """V*: ground the named target object(s); otherwise the question itself
-    (first line only: no answer-format instructions, which the model would
-    obey instead of producing a box)."""
-    if sample.get("targets"):
-        return GROUND_PROMPT_TGT.format(t=", ".join(sample["targets"]))
-    return GROUND_PROMPT.format(q=sample["prompt"].strip().split("\n")[0])
+GROUND_PROMPT_TOPK = ("Locate the following in the image. Output up to {k} candidate bounding boxes, "
+                      "most likely first, each as [x1, y1, x2, y2], one per line: {t}")
+EXTRACT_PROMPT = ("Which object or region in the image must be looked at closely to answer the "
+                  "question? Reply with only a short noun phrase, no explanation.\nQuestion: {q}")
+
+
+def ground_prompt(sample, query, k=1):
+    """target: the sidecar target_object names (V* only; an upper bound, the
+    names are not available in the wild); question: the question's first line
+    (no answer-format instructions, which the model would obey instead of
+    producing a box); extract: a phrase the model itself produced from the
+    question (sample['_extracted']) — the realistic single-model pipeline."""
+    q = sample["prompt"].strip().split("\n")[0]
+    if query == "target" and sample.get("targets"):
+        t = ", ".join(sample["targets"])
+    elif query == "extract" and sample.get("_extracted"):
+        t = sample["_extracted"]
+    else:
+        return GROUND_PROMPT.format(q=q)
+    return GROUND_PROMPT_TGT.format(t=t) if k <= 1 else GROUND_PROMPT_TOPK.format(t=t, k=k)
+
+
+def lm_text(img, prompt_text, model, processor, hr_processor, device, dtype, max_new_tokens):
+    """Greedy answer of the frozen model to (img, prompt_text); img is used at
+    its own size (FACTOR-aligned by the caller)."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [{"type": "image", "image": img},
+                                             {"type": "text", "text": prompt_text}]}]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    )
+    inp = hr_processor(text=[text], images=[img], return_tensors="pt")
+    moved = {k: (v.to(device=device, dtype=dtype) if k == "pixel_values" else v.to(device))
+             for k, v in inp.items()
+             if isinstance(v, torch.Tensor) and k in ("input_ids", "attention_mask",
+                                                      "pixel_values", "image_grid_thw")}
+    with torch.inference_mode():
+        out = model.generate(**moved, max_new_tokens=max_new_tokens, do_sample=False,
+                             temperature=None, top_p=None, top_k=None)
+    return processor.tokenizer.decode(out[0][moved["input_ids"].shape[1]:],
+                                      skip_special_tokens=True).strip()
+
+
+def parse_boxes(g, img_size, coords, max_boxes):
+    """All bounding boxes in the model's text as (x0, y0, x1, y1) fractions of
+    the image the model saw (plus the alternative coordinate reading of the
+    first box, for the report). Explicit 4-number lists / point pairs first;
+    otherwise the first four numbers after dropping key names like bbox_2d."""
+    Wl, Hl = img_size
+    num = r"(-?\d+(?:\.\d+)?)"
+    quads = re.findall(rf"\[\s*{num}\s*,\s*{num}\s*,\s*{num}\s*,\s*{num}\s*\]", g) \
+        or re.findall(rf"\(\s*{num}\s*,\s*{num}\s*\)\s*,\s*\(\s*{num}\s*,\s*{num}\s*\)", g)
+    if not quads:
+        nums = re.findall(r"-?\d+(?:\.\d+)?", re.sub(r"[A-Za-z_]+\d[A-Za-z_]*", " ", g))
+        quads = [tuple(nums[:4])] if len(nums) >= 4 else []
+    boxes, alt = [], None
+    for q in quads[:max_boxes]:
+        x1, y1, x2, y2 = (float(v) for v in q)
+        if max(x1, y1, x2, y2) <= 1.0:
+            fr, a = (x1, y1, x2, y2), None
+        elif coords == "norm1000":
+            fr, a = (x1 / 1000, y1 / 1000, x2 / 1000, y2 / 1000), (x1 / Wl, y1 / Hl, x2 / Wl, y2 / Hl)
+        else:
+            fr, a = (x1 / Wl, y1 / Hl, x2 / Wl, y2 / Hl), (x1 / 1000, y1 / 1000, x2 / 1000, y2 / 1000)
+        fr = tuple(min(max(v, 0.0), 1.0) for v in fr)
+        if fr[2] > fr[0] and fr[3] > fr[1]:
+            boxes.append(fr)
+            if alt is None:
+                alt = a
+    return boxes, alt
+
+
+def box_hits(box, sample, hd_w, hd_h, min_cells):
+    """(centre in GT window, centre in GT box, IoU with GT box) or None without GT."""
+    gt = gt_box_frac(sample)
+    if gt is None:
+        return None
+    gw = crop_window(sample, hd_w, hd_h, min_cells)
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    ix = max(0.0, min(box[2], gt[2]) - max(box[0], gt[0]))
+    iy = max(0.0, min(box[3], gt[3]) - max(box[1], gt[1]))
+    inter = ix * iy
+    union = (box[2] - box[0]) * (box[3] - box[1]) + (gt[2] - gt[0]) * (gt[3] - gt[1]) - inter
+    return ((gw[0] <= cx <= gw[2]) and (gw[1] <= cy <= gw[3]),
+            (gt[0] <= cx <= gt[2]) and (gt[1] <= cy <= gt[3]),
+            inter / max(union, 1e-9))
 
 
 def pad_window(box, pad, min_cells, hd_w, hd_h):
@@ -489,73 +570,62 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
     box can be parsed."""
     lr_img = sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH),
                                     Image.BICUBIC)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": [{"type": "image", "image": lr_img},
-                                             {"type": "text", "text": ground_prompt(sample)}]}]
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
-    )
-    inp = hr_processor(text=[text], images=[lr_img], return_tensors="pt")
-    moved = {k: (v.to(device=device, dtype=dtype) if k == "pixel_values" else v.to(device))
-             for k, v in inp.items()
-             if isinstance(v, torch.Tensor) and k in ("input_ids", "attention_mask",
-                                                      "pixel_values", "image_grid_thw")}
-    with torch.inference_mode():
-        out = model.generate(**moved, max_new_tokens=48, do_sample=False,
-                             temperature=None, top_p=None, top_k=None)
-    g = processor.tokenizer.decode(out[0][moved["input_ids"].shape[1]:],
-                                   skip_special_tokens=True).strip()
     st = STATE.setdefault("ground_stats", {"n": 0, "parsed": 0, "in_win": 0, "in_box": 0,
-                                           "iou": [], "raw": [], "alt_in_win": 0})
+                                           "iou": [], "raw": [], "alt_in_win": 0,
+                                           "s1_in_win": 0, "any_in_win": 0, "n_boxes": [],
+                                           "extracted": []})
     st["n"] += 1
+    gen_ = lambda img, p, n: lm_text(img, p, model, processor, hr_processor, device, dtype, n)
+    # --ground_query extract: the model names what to look for (from the
+    # question alone), then grounds that phrase — no sidecar names involved
+    if args.ground_query == "extract":
+        q = sample["prompt"].strip().split("\n")[0]
+        phrase = gen_(lr_img, EXTRACT_PROMPT.format(q=q), 16).split("\n")[0].strip().strip(".\"'")
+        sample["_extracted"] = phrase or None
+        if len(st["extracted"]) < 6:
+            st["extracted"].append((q[:60], phrase[:40]))
+    prompt_text = ground_prompt(sample, args.ground_query, args.ground_topk)
+    # stage 1: boxes on the LR image
+    g = gen_(lr_img, prompt_text, 48 if args.ground_topk <= 1 else 32 * args.ground_topk)
     if len(st["raw"]) < 4:
         st["raw"].append(g[:120])
-    Wl, Hl = lr_img.size
-    # prefer an explicit 4-number list "[x1, y1, x2, y2]" / "(x1,y1),(x2,y2)";
-    # otherwise the first four numbers after dropping key names like bbox_2d
-    num = r"(-?\d+(?:\.\d+)?)"
-    m4 = re.search(rf"\[\s*{num}\s*,\s*{num}\s*,\s*{num}\s*,\s*{num}\s*\]", g) \
-        or re.search(rf"\(\s*{num}\s*,\s*{num}\s*\)\s*,\s*\(\s*{num}\s*,\s*{num}\s*\)", g)
-    nums = list(m4.groups()) if m4 else re.findall(r"-?\d+(?:\.\d+)?", re.sub(r"[A-Za-z_]+\d[A-Za-z_]*", " ", g))
-    box = alt = None
-    if len(nums) >= 4:
-        x1, y1, x2, y2 = (float(v) for v in nums[:4])
-        if max(x1, y1, x2, y2) <= 1.0:                   # fractions
-            fr, alt = (x1, y1, x2, y2), None
-        elif args.ground_coords == "norm1000":
-            fr = (x1 / 1000, y1 / 1000, x2 / 1000, y2 / 1000)
-            alt = (x1 / Wl, y1 / Hl, x2 / Wl, y2 / Hl)   # the other reading, for the report
-        else:                                            # pixels of the LR image
-            fr = (x1 / Wl, y1 / Hl, x2 / Wl, y2 / Hl)
-            alt = (x1 / 1000, y1 / 1000, x2 / 1000, y2 / 1000)
-        fr = tuple(min(max(v, 0.0), 1.0) for v in fr)
-        if fr[2] > fr[0] and fr[3] > fr[1]:
-            box = fr
-    if box is not None:
+    boxes, alt = parse_boxes(g, lr_img.size, args.ground_coords, args.ground_topk)
+    if boxes and alt is not None:
+        h = box_hits(alt, sample, hd_w, hd_h, args.oracle_min_cells)
+        st["alt_in_win"] += bool(h and h[0])
+    if boxes:
+        h = box_hits(boxes[0], sample, hd_w, hd_h, args.oracle_min_cells)
+        st["s1_in_win"] += bool(h and h[0])
+    # stage 2 (--ground_stages 2): crop --ground_refine_pad x the first box
+    # from the ORIGINAL image at <= --ground_refine_tok tokens (the target is
+    # now several cells big) and ground again; the box maps back to the image
+    if args.ground_stages >= 2 and boxes:
+        rw = pad_window(boxes[0], args.ground_refine_pad, args.oracle_min_cells, hd_w, hd_h)
+        rimg = make_crop_image(sample, rw, args.ground_refine_tok)
+        g2 = gen_(rimg, ground_prompt(sample, args.ground_query, 1), 48)
+        b2, _ = parse_boxes(g2, rimg.size, args.ground_coords, 1)
+        if b2:
+            x0, y0, x1, y1 = rw
+            bx = b2[0]
+            boxes = [(x0 + bx[0] * (x1 - x0), y0 + bx[1] * (y1 - y0),
+                      x0 + bx[2] * (x1 - x0), y0 + bx[3] * (y1 - y0))] + boxes[1:]
+    if boxes:
         st["parsed"] += 1
-        if sample.get("bboxes"):
-            W, H = sample["image"].size
-            bs = sample["bboxes"]
-            gt = (min(b[0] for b in bs) / W, min(b[1] for b in bs) / H,
-                  max(b[0] + b[2] for b in bs) / W, max(b[1] + b[3] for b in bs) / H)
-            gw = crop_window(sample, hd_w, hd_h, args.oracle_min_cells)
-            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-            st["in_box"] += (gt[0] <= cx <= gt[2]) and (gt[1] <= cy <= gt[3])
-            st["in_win"] += (gw[0] <= cx <= gw[2]) and (gw[1] <= cy <= gw[3])
-            if alt is not None:
-                ax, ay = (alt[0] + alt[2]) / 2, (alt[1] + alt[3]) / 2
-                st["alt_in_win"] += (gw[0] <= ax <= gw[2]) and (gw[1] <= ay <= gw[3])
-            ix = max(0.0, min(box[2], gt[2]) - max(box[0], gt[0]))
-            iy = max(0.0, min(box[3], gt[3]) - max(box[1], gt[1]))
-            inter = ix * iy
-            union = ((box[2] - box[0]) * (box[3] - box[1]) + (gt[2] - gt[0]) * (gt[3] - gt[1]) - inter)
-            st["iou"].append(inter / max(union, 1e-9))
-        win = pad_window(box, args.ground_pad, args.oracle_min_cells, hd_w, hd_h)
+        st["n_boxes"].append(len(boxes))
+        hits = [box_hits(b, sample, hd_w, hd_h, args.oracle_min_cells) for b in boxes]
+        if hits[0] is not None:
+            st["in_win"] += hits[0][0]
+            st["in_box"] += hits[0][1]
+            st["iou"].append(hits[0][2])
+            st["any_in_win"] += any(h[0] for h in hits)
+        # one crop per box, the token budget split between them
+        wins = [pad_window(b, args.ground_pad, args.oracle_min_cells, hd_w, hd_h) for b in boxes]
+        imgs = [make_crop_image(sample, w, max(64, args.crop_tok // len(wins))) for w in wins]
+        STATE["crop_stats_area"] = sum((w[2] - w[0]) * (w[3] - w[1]) for w in wins)
     else:
-        win = (0.0, 0.0, 1.0, 1.0)
-    STATE["crop_stats_area"] = (win[2] - win[0]) * (win[3] - win[1])
-    return build_two_image_inputs(sample, lr_thw, make_crop_image(sample, win, args.crop_tok),
-                                  processor, hr_processor, args, device, dtype)
+        imgs = [make_crop_image(sample, (0.0, 0.0, 1.0, 1.0), args.crop_tok)]
+        STATE["crop_stats_area"] = 1.0
+    return build_two_image_inputs(sample, lr_thw, imgs, processor, hr_processor, args, device, dtype)
 
 
 # ── model-map -> second image (pred_window / pred_warp / warp_oracle) ──
@@ -1502,6 +1572,20 @@ def main():
                          "lineage = 0..1000 normalised; Qwen2.5-VL = pixels of the input image)")
     ap.add_argument("--ground_pad", type=float, default=2.0,
                     help="ground_window: window side = pad x the predicted box side (context)")
+    ap.add_argument("--ground_query", choices=["target", "question", "extract"], default="target",
+                    help="ground_window: what the model is asked to locate: the sidecar target names "
+                         "(V* upper bound), the question's first line, or a phrase the model itself "
+                         "extracts from the question first (realistic pipeline)")
+    ap.add_argument("--ground_stages", type=int, default=1,
+                    help="ground_window: 2 = ground again on a crop around the first box "
+                         "(coarse-to-fine)")
+    ap.add_argument("--ground_refine_pad", type=float, default=4.0,
+                    help="ground_window stage 2: crop side = this x the stage-1 box side")
+    ap.add_argument("--ground_refine_tok", type=int, default=640,
+                    help="ground_window stage 2: token budget of the refinement crop")
+    ap.add_argument("--ground_topk", type=int, default=1,
+                    help="ground_window: ask for up to k candidate boxes; one crop each, the "
+                         "--crop_tok budget split between them")
     ap.add_argument("--hd_bias", type=float, nargs="+", default=[0.0],
                     help="constant(s) added to lse_hd; several values = sweep")
     ap.add_argument("--attn", default="flash_attention_2")
@@ -1738,13 +1822,17 @@ def main():
     if STATE.get("ground_stats"):
         g = STATE["ground_stats"]
         iou = np.mean(g["iou"]) if g["iou"] else float("nan")
-        print(f"[probe] ground_window: bbox parsed on {g['parsed']}/{g['n']} (coords={args.ground_coords}, "
-              f"pad x{args.ground_pad}); predicted-box centre in GT window {g['in_win']}/{g['n']}, "
-              f"in GT box {g['in_box']}/{g['n']}; mean IoU with GT box {iou:.3f}; under the OTHER "
-              f"coordinate reading centre-in-window would be {g['alt_in_win']}/{g['n']}; "
-              f"unparsed -> whole image")
+        print(f"[probe] ground_window: query={args.ground_query} stages={args.ground_stages} "
+              f"topk={args.ground_topk}; bbox parsed on {g['parsed']}/{g['n']} (coords={args.ground_coords}, "
+              f"pad x{args.ground_pad}); FINAL first-box centre in GT window {g['in_win']}/{g['n']}, "
+              f"in GT box {g['in_box']}/{g['n']}; mean IoU with GT box {iou:.3f}; stage-1 (LR) box "
+              f"in window {g['s1_in_win']}/{g['n']}; ANY of the {np.mean(g['n_boxes']) if g['n_boxes'] else 0:.2f} "
+              f"boxes in window {g['any_in_win']}/{g['n']}; under the OTHER coordinate reading stage-1 "
+              f"would be {g['alt_in_win']}/{g['n']}; unparsed -> whole image")
         for r in g["raw"]:
             print(f"[probe]   raw: {r!r}")
+        for q_, p_ in g["extracted"]:
+            print(f"[probe]   extracted: {q_!r} -> {p_!r}")
 
     # ── report ────────────────────────────────────────────────
     cats = sorted({s["category"] for s in samples})
