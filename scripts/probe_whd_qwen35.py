@@ -727,15 +727,16 @@ def samp_locs(kind, sample, idx, hd_w, hd_h, args):
     return rows[-1].reshape(rows[-1].size(0), -1, 2)
 
 
-def sample_hd_tokens(feat, locs_g):
+def sample_hd_tokens(feat, locs_g, mode="bilinear"):
     """feat [H, W, C] merger output, locs_g [G, Ns, 2] -> [Ns, C]: group g's
     channel block sampled at group g's points, bilinear, align_corners=True —
-    the model's _sample_hd_from_off_guide without the K/V projections."""
+    the model's _sample_hd_from_off_guide without the K/V projections.
+    mode='nearest' snaps every point to its cell (no feature blending)."""
     H, W, C = feat.shape
     G = locs_g.size(0)
     chunks = feat.float().permute(2, 0, 1).reshape(G, C // G, H, W)       # 'h w (g c) -> g c h w'
     grid = locs_g.to(chunks.device).float().clamp(-1, 1)[:, None]          # [G, 1, Ns, 2]
-    out = Fnn.grid_sample(chunks, grid, mode="bilinear", align_corners=True)  # [G, C/G, 1, Ns]
+    out = Fnn.grid_sample(chunks, grid, mode=mode, align_corners=True)     # [G, C/G, 1, Ns]
     return out[:, :, 0].permute(2, 0, 1).reshape(locs_g.size(1), C).to(feat.dtype)
 
 
@@ -842,7 +843,7 @@ def build_samp_inputs(sample, lr_thw, kind, locs_g, hd_feat, pos_mode, processor
     inp = build_two_image_inputs(sample, lr_thw, dummy, processor, hr_processor, args, device, dtype)
     thw = inp["image_grid_thw"]
     assert int(thw[1][1] * thw[1][2]) // (MERGE * MERGE) == gs * gs, thw
-    STATE["samp_inject"] = sample_hd_tokens(hd_feat, locs_g)
+    STATE["samp_inject"] = sample_hd_tokens(hd_feat, locs_g, args.samp_mode)
     STATE["samp_total"] = int((thw.prod(-1) // (MERGE * MERGE)).sum())
     fl = locs_g.float().mean(0).clamp(-1, 1)
     if pos_mode == "square":
@@ -1489,6 +1490,9 @@ def main():
                     help="sampled_tokens: HD feature map from the model's single whole-image ViT "
                          "call (as DAT does) or stitched from independent ViT runs on tiles "
                          "(is the whole-image ViT context what makes sampled features weak?)")
+    ap.add_argument("--samp_mode", choices=["bilinear", "nearest"], default="bilinear",
+                    help="sampled_tokens: bilinear = the model's sampling (points between cells blend "
+                         "neighbouring features); nearest = snap to the cell")
     ap.add_argument("--samp_tile_cells", type=int, default=20,
                     help="sampled_tokens --samp_vit tiles: max merged cells per tile side")
     ap.add_argument("--samp_layer", type=int, default=15,
