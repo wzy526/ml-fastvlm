@@ -1846,6 +1846,9 @@ def main():
     ap.add_argument("--ground_topk", type=int, default=1,
                     help="ground_window: ask for up to k candidate boxes; one crop each, the "
                          "--crop_tok budget split between them")
+    ap.add_argument("--plain_model", action="store_true",
+                    help="load --model_path as a stock Qwen3.5 (no DAT): e.g. a larger size as an "
+                         "offline localisation teacher for ground_window / tile_pick")
     ap.add_argument("--ground_tok", type=int, default=0,
                     help="ground_window / tile_pick: show the stage-1 image at this token budget "
                          "instead of the student's LR (offline teacher; 0 = the LR pixels)")
@@ -1921,10 +1924,24 @@ def main():
     print(f"[probe] {len(samples)} samples  tok_budget={args.tok_budget}  "
           f"hd_source={args.hd_source}  biases={args.hd_bias}")
 
-    model = Qwen3_5DATForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
-        attn_implementation=args.attn,
-    ).eval()
+    if args.plain_model:
+        # a stock Qwen3.5 checkpoint (e.g. a larger size as an offline localisation
+        # teacher): only the no-HD sources make sense (ground_window, tile_pick,
+        # crop_tokens, plain_tokens, attn_window)
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+        if args.hd_source not in ("ground_window", "tile_pick", "crop_tokens", "plain_tokens", "attn_window"):
+            raise SystemExit("--plain_model: use a source without an HD branch")
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+            args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
+            attn_implementation=args.attn,
+        ).eval()
+        print(f"[probe] plain Qwen3.5 model from {args.model_path} "
+              f"({sum(p.numel() for p in model.parameters()) / 1e9:.1f} B params)")
+    else:
+        model = Qwen3_5DATForConditionalGeneration.from_pretrained(
+            args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
+            attn_implementation=args.attn,
+        ).eval()
     install_lr_key_hook(model)
     image_token_id = getattr(model.config, "image_token_id", None)
     args.grid_size = int((getattr(model.config, "dat_extra_args", None) or {}).get("grid_size", 20))
