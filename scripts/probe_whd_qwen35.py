@@ -942,6 +942,239 @@ def clear_samp():
     STATE["samp_rope"] = None
 
 
+# ──────────────────────────────────────────────────────────────
+# B. --hd_source attn_window: the model's OWN high-resolution run as the
+# localisation teacher. The image is shown natively at --teacher_tok tokens;
+# while the model answers, the attention of the answer-producing queries
+# (prompt end + every decode step) over the image tokens is recorded at the
+# full-attention layers (post-RoPE q/k, softmax restricted to the image
+# tokens, heads averaged). The map, averaged over --map_layers, gives a window
+# (--teacher_win peak | moments) that is cropped from the original image and
+# shown to the LR student (tok_budget) as the 2nd image. Zero training; the
+# teacher's own answer is reported too (= native accuracy at teacher_tok).
+# ──────────────────────────────────────────────────────────────
+def install_teacher_hook():
+    import transformers.models.qwen3_5.modeling_qwen3_5 as hf
+    orig = hf.apply_rotary_pos_emb
+
+    def wrapped(q, k, cos, sin, *a, **kw):
+        q, k = orig(q, k, cos, sin, *a, **kw)
+        T = STATE.get("teacher")
+        if T is not None:
+            teacher_record(T, q, k)
+        return q, k
+    hf.apply_rotary_pos_emb = wrapped
+
+
+def _img_attn(q, kimg):
+    """q [H, D] (one query, all heads), kimg [Hk, N, D] -> [N] head-mean softmax
+    over the image tokens only."""
+    H, Hk = q.size(0), kimg.size(0)
+    kk = kimg.repeat_interleave(H // Hk, dim=0) if Hk != H else kimg
+    att = torch.einsum('hd,hnd->hn', q, kk) / math.sqrt(q.size(-1))
+    return att.softmax(-1).mean(0)
+
+
+def teacher_record(T, q, k):
+    """One apply_rotary_pos_emb call = one full-attention layer. Prefill: keep
+    the image keys of this layer and the prompt-end query's map; decode steps:
+    the new token's query against the kept keys."""
+    if q.dim() != 4:
+        return
+    with torch.no_grad():
+        L = T["L"]
+        if q.size(2) == L or (q.size(2) == 1 and q.size(1) != 1):       # [B, H, S, D]
+            qs, ks = q[0], k[0]
+        elif q.size(1) == L or q.size(1) == 1:                            # [B, S, H, D]
+            qs, ks = q[0].transpose(0, 1), k[0].transpose(0, 1)
+        else:
+            return
+        li = T["call"] % T["n_full"]
+        T["call"] += 1
+        if qs.size(1) == L:                                               # prefill
+            kimg = ks[:, T["img_idx"].to(ks.device)].float()              # [Hk, N, D]
+            T["kimg"][li] = kimg
+            T["maps"][li].append(_img_attn(qs[:, -1].float(), kimg).cpu())
+        elif qs.size(1) == 1 and li in T["kimg"]:                         # decode
+            T["maps"][li].append(_img_attn(qs[:, 0].float(), T["kimg"][li]).cpu())
+
+
+def rect_map_window(p, gh, gw, floor_lam, min_cells, hd_w, hd_h, mode):
+    """Window (x0, y0, x1, y1) image fractions from a [gh*gw] map: 'peak' = a
+    min_cells window centred on the argmax cell; 'moments' = floor, then
+    centre +- std-scaled half extent (like map_window) on a rectangular grid."""
+    p = np.asarray(p, dtype=np.float64).reshape(gh, gw)
+    if mode == "peak":
+        iy, ix = np.unravel_index(int(p.argmax()), p.shape)
+        cx, cy = (ix + 0.5) / gw, (iy + 0.5) / gh
+        return pad_window((cx - 1e-3, cy - 1e-3, cx + 1e-3, cy + 1e-3), 1.0, min_cells, hd_w, hd_h)
+    N = gh * gw
+    q = np.clip(p - floor_lam / N, 0.0, None)
+    q = q / q.sum() if q.sum() > 1e-9 else p / p.sum()
+    xs = (np.arange(gw) + 0.5) / gw
+    ys = (np.arange(gh) + 0.5) / gh
+    px, py = q.sum(0), q.sum(1)
+    cx, cy = float((px * xs).sum()), float((py * ys).sum())
+    sx = math.sqrt(float((px * (xs - cx) ** 2).sum())) / max(float(np.std(xs)), 1e-9)
+    sy = math.sqrt(float((py * (ys - cy) ** 2).sum())) / max(float(np.std(ys)), 1e-9)
+    hx, hy = min(sx, 1.0) * 0.5, min(sy, 1.0) * 0.5
+    return pad_window((cx - hx, cy - hy, cx + hx, cy + hy), 1.0, min_cells, hd_w, hd_h)
+
+
+def teacher_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_processor, t_processor,
+                          args, device, dtype, image_token_id, full_layers, gen_kwargs):
+    """Returns (teacher answer text, student inputs or None)."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [{"type": "image", "image": sample["image"]},
+                                             {"type": "text", "text": sample["prompt"]}]}]
+    text = t_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                           enable_thinking=False)
+    inp = t_processor(text=[text], images=[sample["image"]], return_tensors="pt")
+    moved = {k: (v.to(device=device, dtype=dtype) if k == "pixel_values" else v.to(device))
+             for k, v in inp.items()
+             if isinstance(v, torch.Tensor) and k in ("input_ids", "attention_mask", "pixel_values",
+                                                      "image_grid_thw")}
+    ids = moved["input_ids"][0]
+    img_idx = (ids == image_token_id).nonzero().flatten()
+    thw = inp["image_grid_thw"][0]
+    gh, gw = int(thw[1]) // MERGE, int(thw[2]) // MERGE
+    assert img_idx.numel() == gh * gw, (img_idx.numel(), gh, gw)
+    T = {"L": int(ids.numel()), "img_idx": img_idx.cpu(), "n_full": len(full_layers), "call": 0,
+         "kimg": {}, "maps": defaultdict(list)}
+    STATE["teacher"] = T
+    with torch.inference_mode():
+        out = model.generate(**moved, **gen_kwargs)
+    STATE["teacher"] = None
+    t_ans = processor.tokenizer.decode(out[0][ids.numel():], skip_special_tokens=True).strip()
+    st = STATE.setdefault("teacher_stats", {"n": 0, "tok": [], "calls_ok": 0, "steps": [],
+                                            "peak_in_win": 0, "mom_in_win": 0, "mass_in_win": [],
+                                            "area": [], "n_gt": 0})
+    st["n"] += 1
+    st["tok"].append(gh * gw)
+    st["calls_ok"] += T["call"] % T["n_full"] == 0
+    sel = [full_layers.index(l) for l in args.map_layers if l in full_layers]
+    maps = [np.mean([m.numpy() for m in T["maps"][li]], 0) for li in sel if T["maps"].get(li)]
+    if not maps:
+        return t_ans, None
+    st["steps"].append(len(T["maps"][sel[0]]))
+    p = np.mean(maps, 0)
+    p = p / max(p.sum(), 1e-12)
+    win = rect_map_window(p, gh, gw, args.map_floor, args.oracle_min_cells, hd_w, hd_h, args.teacher_win)
+    gt = gt_box_frac(sample)
+    if gt is not None:
+        st["n_gt"] += 1
+        gw_ = crop_window(sample, hd_w, hd_h, args.oracle_min_cells)
+        pk = rect_map_window(p, gh, gw, 1.0, args.oracle_min_cells, hd_w, hd_h, "peak")
+        mo = rect_map_window(p, gh, gw, args.map_floor, args.oracle_min_cells, hd_w, hd_h, "moments")
+        for key, w in (("peak_in_win", pk), ("mom_in_win", mo)):
+            cx, cy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+            st[key] += (gw_[0] <= cx <= gw_[2]) and (gw_[1] <= cy <= gw_[3])
+        # floored attention mass inside the GT window (chance = window area)
+        q = np.clip(p - 1.0 / p.size, 0, None).reshape(gh, gw)
+        q = q / q.sum() if q.sum() > 1e-9 else p.reshape(gh, gw)
+        ys, xs = np.meshgrid((np.arange(gh) + 0.5) / gh, (np.arange(gw) + 0.5) / gw, indexing="ij")
+        inside = (xs >= gw_[0]) & (xs <= gw_[2]) & (ys >= gw_[1]) & (ys <= gw_[3])
+        st["mass_in_win"].append(float(q[inside].sum()))
+        st["area"].append((gw_[2] - gw_[0]) * (gw_[3] - gw_[1]))
+    STATE["crop_stats_area"] = (win[2] - win[0]) * (win[3] - win[1])
+    return t_ans, build_two_image_inputs(sample, lr_thw, make_crop_image(sample, win, args.crop_tok),
+                                         processor, hr_processor, args, device, dtype)
+
+
+# ──────────────────────────────────────────────────────────────
+# D. --hd_source tile_pick: localisation as CELL SELECTION instead of
+# coordinates. The LR image is divided into an n x n grid (--tile_draw draws
+# the lines and cell numbers on the probe's copy of the image); the model is
+# asked which cell holds the target (a number, not a box). Optional stage 2:
+# the chosen cell (x --tile_margin) is cropped from the original image at
+# <= --tile_tok tokens and divided again. The final cell (x margin, min cells)
+# is the student's 2nd image. Zero training.
+# ──────────────────────────────────────────────────────────────
+TILE_PROMPT = ("The image is divided into a {n} x {n} grid of equal cells, numbered 1 to {m} row by "
+               "row starting at the top-left{drawn}. Which cell contains {t}? Answer with the cell "
+               "number only.")
+
+
+def draw_grid(img, n):
+    from PIL import ImageDraw, ImageFont
+    out = img.convert("RGB").copy()
+    d = ImageDraw.Draw(out)
+    W, H = out.size
+    for i in range(1, n):
+        d.line([(i * W / n, 0), (i * W / n, H)], fill=(255, 255, 0), width=max(2, W // 400))
+        d.line([(0, i * H / n), (W, i * H / n)], fill=(255, 255, 0), width=max(2, W // 400))
+    size = max(14, min(W, H) // (4 * n))
+    try:
+        font = ImageFont.load_default(size=size)
+    except TypeError:
+        font = ImageFont.load_default()
+    for r in range(n):
+        for c in range(n):
+            x, y = c * W / n + 4, r * H / n + 2
+            label = str(r * n + c + 1)
+            d.rectangle([x - 2, y - 1, x + size * 0.65 * len(label) + 4, y + size + 2], fill=(0, 0, 0))
+            d.text((x, y), label, fill=(255, 255, 0), font=font)
+    return out
+
+
+def tile_target(sample, query):
+    q = sample["prompt"].strip().split("\n")[0]
+    if query == "target" and sample.get("targets"):
+        return ", ".join(sample["targets"])
+    return f"the object or region needed to answer this question: \"{q}\""
+
+
+def tile_pick_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_processor, args, device, dtype):
+    n, m = args.tile_n, args.tile_n * args.tile_n
+    st = STATE.setdefault("tile_stats", {"n": 0, "parsed1": 0, "parsed2": 0, "s1_hit": 0, "final_hit": 0,
+                                         "n_gt": 0, "raw": []})
+    st["n"] += 1
+    gt = gt_box_frac(sample)
+    gcx, gcy = ((gt[0] + gt[2]) / 2, (gt[1] + gt[3]) / 2) if gt else (None, None)
+    if gt:
+        st["n_gt"] += 1
+    drawn = ", with yellow grid lines and cell numbers drawn on it" if args.tile_draw else ""
+    prompt = TILE_PROMPT.format(n=n, m=m, drawn=drawn, t=tile_target(sample, args.ground_query))
+
+    def ask(img):
+        shown = draw_grid(img, n) if args.tile_draw else img
+        g = lm_text(shown, prompt, model, processor, hr_processor, device, dtype, 8)
+        mm = re.search(r"\d+", g)
+        c = int(mm.group()) if mm else None
+        return (c if c is not None and 1 <= c <= m else None), g
+
+    def cell_box(region, c):
+        x0, y0, x1, y1 = region
+        r, k = divmod(c - 1, n)
+        return (x0 + k * (x1 - x0) / n, y0 + r * (y1 - y0) / n,
+                x0 + (k + 1) * (x1 - x0) / n, y0 + (r + 1) * (y1 - y0) / n)
+
+    def inside(b):
+        return gt is not None and b[0] <= gcx <= b[2] and b[1] <= gcy <= b[3]
+
+    lr_img = sample["image"].resize((int(lr_thw[2]) * PATCH, int(lr_thw[1]) * PATCH), Image.BICUBIC)
+    c1, g1 = ask(lr_img)
+    if len(st["raw"]) < 4:
+        st["raw"].append(g1[:40])
+    if c1 is None:
+        win = (0.0, 0.0, 1.0, 1.0)
+    else:
+        st["parsed1"] += 1
+        cell = cell_box((0.0, 0.0, 1.0, 1.0), c1)
+        st["s1_hit"] += inside(cell)
+        win = pad_window(cell, args.tile_margin, args.oracle_min_cells, hd_w, hd_h)
+        if args.tile_stages >= 2:
+            region = pad_window(cell, args.tile_margin, args.oracle_min_cells, hd_w, hd_h)
+            c2, _ = ask(make_crop_image(sample, region, args.tile_tok))
+            if c2 is not None:
+                st["parsed2"] += 1
+                win = pad_window(cell_box(region, c2), args.tile_margin, args.oracle_min_cells, hd_w, hd_h)
+    st["final_hit"] += inside(win)
+    STATE["crop_stats_area"] = (win[2] - win[0]) * (win[3] - win[1])
+    return build_two_image_inputs(sample, lr_thw, make_crop_image(sample, win, args.crop_tok),
+                                  processor, hr_processor, args, device, dtype)
+
+
 def set_force_locs(model, locs):
     from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5AttentionDAT
     for m in model.modules():
@@ -974,8 +1207,8 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
         elif k in ("input_ids", "attention_mask", "image_grid_thw"):
             moved[k] = v.to(device)
     STATE["geom"] = (lr_thw, hd_w, hd_h)
-    if args.hd_source == "ground_window":
-        hd_extra = {}                        # built in the main loop (needs a generate call)
+    if args.hd_source in ("ground_window", "attn_window", "tile_pick"):
+        hd_extra = {}                        # built in the main loop (needs generate calls)
     elif args.hd_source in ("crop_tokens", "plain_tokens"):
         # no HD side at all; the "HD-on" config is the two-image prompt
         hd_extra = build_crop_token_inputs(sample, idx, lr_thw, hd_w, hd_h, processor,
@@ -1523,7 +1756,8 @@ def main():
     ap.add_argument("--hd_source",
                     choices=["real", "lr_up", "shuffle", "noise", "oracle", "oracle_rand",
                              "crop_tokens", "plain_tokens", "pred_window", "pred_warp",
-                             "warp_oracle", "ground_window", "sampled_tokens"],
+                             "warp_oracle", "ground_window", "sampled_tokens", "attn_window",
+                             "tile_pick"],
                     default="real",
                     help="oracle/oracle_rand need --dataset vstar (GT bboxes): HD is the real "
                          "image but the 400 sampling points are forced onto a window around the "
@@ -1600,6 +1834,19 @@ def main():
     ap.add_argument("--ground_topk", type=int, default=1,
                     help="ground_window: ask for up to k candidate boxes; one crop each, the "
                          "--crop_tok budget split between them")
+    ap.add_argument("--teacher_tok", type=int, default=2304,
+                    help="attn_window: token budget of the model's own high-res (teacher) run")
+    ap.add_argument("--teacher_win", choices=["peak", "moments"], default="peak",
+                    help="attn_window: window from the teacher map: min-cells window on the argmax "
+                         "cell, or floor + moments (c +- s)")
+    ap.add_argument("--tile_n", type=int, default=3, help="tile_pick: n x n cells per stage")
+    ap.add_argument("--tile_draw", action="store_true",
+                    help="tile_pick: draw the grid lines and cell numbers on the image shown to the "
+                         "model (probe copy only)")
+    ap.add_argument("--tile_stages", type=int, default=2, help="tile_pick: 1 or 2 selection stages")
+    ap.add_argument("--tile_margin", type=float, default=1.5,
+                    help="tile_pick: window / stage-2 region = chosen cell scaled by this")
+    ap.add_argument("--tile_tok", type=int, default=640, help="tile_pick: stage-2 crop token budget")
     ap.add_argument("--hd_bias", type=float, nargs="+", default=[0.0],
                     help="constant(s) added to lse_hd; several values = sweep")
     ap.add_argument("--attn", default="flash_attention_2")
@@ -1708,13 +1955,36 @@ def main():
 
     # config name -> list of predicted letters (parallel to samples)
     ground_mode = args.hd_source == "ground_window"
+    teacher_mode = args.hd_source == "attn_window"
+    tile_mode = args.hd_source == "tile_pick"
+    t_processor, full_layers, teacher_cfg = None, [], None
+    if teacher_mode:
+        install_teacher_hook()
+        lt = list(getattr(model.config.text_config, "layer_types", []))
+        full_layers = [i for i, x in enumerate(lt) if x == "full_attention"]
+        bad = [l for l in args.map_layers if l not in full_layers]
+        if bad or not full_layers:
+            raise SystemExit(f"attn_window: --map_layers must be full-attention layers {full_layers}; got {bad}")
+        t_processor = AutoProcessor.from_pretrained(ppath, min_pixels=args.min_pixels,
+                                                    max_pixels=args.teacher_tok * TOK_PX)
+        teacher_cfg = f"native@{args.teacher_tok}"
+        print(f"[probe] attn_window: teacher = the model itself at <= {args.teacher_tok} tokens; "
+              f"maps from layers {args.map_layers} of full-attention layers {full_layers}; "
+              f"window = {args.teacher_win} (min {args.oracle_min_cells} cells); student LR {args.tok_budget} "
+              f"+ crop {args.crop_tok} ({args.crop_pos})")
+    if tile_mode:
+        print(f"[probe] tile_pick: {args.tile_n}x{args.tile_n} cells, {args.tile_stages} stage(s), "
+              f"grid {'DRAWN on the image' if args.tile_draw else 'described in text only'}, "
+              f"margin x{args.tile_margin}, query={args.ground_query}")
     samp_cfgs = [f"samp_{g}@{p}" for g in args.samp_grids for p in args.samp_pos] if samp_mode else []
     if pred_mode:
         configs = ["off", "real b=+0", args.hd_source]
     elif samp_mode:
         configs = ["off", "real b=+0"] + samp_cfgs
-    elif ground_mode:
-        configs = ["off", "ground_window"]
+    elif ground_mode or tile_mode:
+        configs = ["off", args.hd_source]
+    elif teacher_mode:
+        configs = ["off", teacher_cfg, "attn_window"]
     else:
         configs = ["off"] + [f"{args.hd_source} b={b:+g}" for b in args.hd_bias]
     preds = {c: [] for c in configs}
@@ -1747,6 +2017,23 @@ def main():
             t = gen(ground_window_inputs(s, lr_thw_, hd_w_, hd_h_, model, processor, hr_processor,
                                          args, device, dtype))
             raw["ground_window"].append(t); preds["ground_window"].append(extract(t))
+        elif tile_mode:
+            lr_thw_, hd_w_, hd_h_ = STATE["geom"]
+            t = gen(tile_pick_inputs(s, lr_thw_, hd_w_, hd_h_, model, processor, hr_processor,
+                                     args, device, dtype))
+            raw["tile_pick"].append(t); preds["tile_pick"].append(extract(t))
+        elif teacher_mode:
+            lr_thw_, hd_w_, hd_h_ = STATE["geom"]
+            t_ans, inp2 = teacher_window_inputs(s, lr_thw_, hd_w_, hd_h_, model, processor, hr_processor,
+                                                t_processor, args, device, dtype, image_token_id,
+                                                full_layers, gen_kwargs)
+            raw[teacher_cfg].append(t_ans); preds[teacher_cfg].append(extract(t_ans))
+            if inp2 is None:
+                STATE["teacher_fallback"] = STATE.get("teacher_fallback", 0) + 1
+                t = raw["off"][-1]
+            else:
+                t = gen(inp2)
+            raw["attn_window"].append(t); preds["attn_window"].append(extract(t))
         else:
             for b, cname in zip(args.hd_bias, configs[1:]):
                 STATE["bias"] = float(b)
@@ -1833,6 +2120,23 @@ def main():
             print(f"[probe] crop_tokens window: pad x{args.crop_pad}, shift {args.crop_shift} x window, "
                   f"target hit-rate {args.crop_hit_rate} -> realised {cc['hit']}/{cc['n']} GT windows, "
                   f"the rest same-size windows away from the target")
+    if STATE.get("teacher_stats"):
+        g = STATE["teacher_stats"]
+        ng = max(g["n_gt"], 1)
+        print(f"[probe] attn_window teacher: {g['n']} runs at {np.mean(g['tok']):.0f} image tokens (budget "
+              f"{args.teacher_tok}); rope-call count consistent on {g['calls_ok']}/{g['n']} "
+              f"(must be all); answer queries per map {np.mean(g['steps']) if g['steps'] else 0:.1f} "
+              f"(prompt end + decode steps); PEAK cell in GT window {g['peak_in_win']}/{ng}, MOMENTS centre "
+              f"in window {g['mom_in_win']}/{ng}; floored attention mass in the GT window "
+              f"{100 * np.mean(g['mass_in_win']) if g['mass_in_win'] else float('nan'):.1f}% vs chance "
+              f"{100 * np.mean(g['area']) if g['area'] else float('nan'):.1f}%"
+              + (f"; no map -> LR answer on {STATE['teacher_fallback']}" if STATE.get("teacher_fallback") else ""))
+    if STATE.get("tile_stats"):
+        g = STATE["tile_stats"]
+        ng = max(g["n_gt"], 1)
+        print(f"[probe] tile_pick: stage-1 cell parsed {g['parsed1']}/{g['n']}, stage-2 {g['parsed2']}/{g['n']}; "
+              f"GT centre in the chosen stage-1 cell {g['s1_hit']}/{ng} (chance 1/{args.tile_n ** 2}); "
+              f"GT centre in the FINAL window {g['final_hit']}/{ng}; raw: {g['raw']}")
     if STATE.get("ground_stats"):
         g = STATE["ground_stats"]
         iou = np.mean(g["iou"]) if g["iou"] else float("nan")
