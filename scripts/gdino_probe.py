@@ -166,6 +166,7 @@ def main():
         n_win3 += any(h[0] for h in hits3)
         n_box3 += any(h[1] for h in hits3)
         rows.append({"i": i, "box": dets[0][1], "score": dets[0][0], "n_det": len(dets),
+                     "boxes": [b for _, b in dets[:3]], "scores": [sc for sc, _ in dets[:3]],
                      "in_win": in_win, "in_box": in_box, "iou": iou})
         if (n % 25) == 0:
             print(f"  {n}: window {n_win}/{n}, in box {n_box}/{n}, IoU {sum(ious)/max(len(ious),1):.3f}")

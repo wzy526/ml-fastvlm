@@ -598,8 +598,8 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
     if args.box_json:
         # external localiser (scripts/gdino_probe.py --out): its top-1 box IS the
         # window — "what does the student score if it learned that localiser?"
-        bx = STATE["box_json"].get(STATE.get("sample_idx"))
-        boxes = [tuple(float(v) for v in bx)] if bx else []
+        bx = STATE["box_json"].get(STATE.get("sample_idx")) or []
+        boxes = [tuple(float(v) for v in b) for b in bx[: args.box_topk]]
         if boxes:
             h = box_hits(boxes[0], sample, hd_w, hd_h, args.oracle_min_cells)
             st["s1_in_win"] += bool(h and h[0])
@@ -1875,6 +1875,8 @@ def main():
                     help="ground_window: skip the model's grounding and take the top-1 box per "
                          "sample from scripts/gdino_probe.py --out (an external localiser as the "
                          "window; --ground_pad / --oracle_min_cells still shape the crop)")
+    ap.add_argument("--box_topk", type=int, default=1,
+                    help="--box_json: use the first k boxes (one crop each, --crop_tok split)")
     ap.add_argument("--plain_model", action="store_true",
                     help="load --model_path as a stock Qwen3.5 (no DAT): e.g. a larger size as an "
                          "offline localisation teacher for ground_window / tile_pick")
@@ -2021,10 +2023,10 @@ def main():
         if not ground_mode:
             raise SystemExit("--box_json needs --hd_source ground_window")
         rows = json.load(open(os.path.expanduser(args.box_json)))
-        STATE["box_json"] = {int(r["i"]): r["box"] for r in rows if r.get("box")}
+        STATE["box_json"] = {int(r["i"]): (r.get("boxes") or [r["box"]]) for r in rows if r.get("box")}
         print(f"[probe] ground_window: boxes from {args.box_json} "
-              f"({len(STATE['box_json'])}/{len(rows)} samples with a box; window = pad x{args.ground_pad}, "
-              f"min {args.oracle_min_cells} cells)")
+              f"({len(STATE['box_json'])}/{len(rows)} samples with a box; top-{args.box_topk}, one crop "
+              f"each; window = pad x{args.ground_pad}, min {args.oracle_min_cells} cells)")
     teacher_mode = args.hd_source == "attn_window"
     tile_mode = args.hd_source == "tile_pick"
     t_processor, full_layers, teacher_cfg = None, [], None
