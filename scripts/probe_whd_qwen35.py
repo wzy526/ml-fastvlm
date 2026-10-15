@@ -1935,14 +1935,15 @@ def main():
         # a stock Qwen3.5 checkpoint (e.g. a larger size as an offline localisation
         # teacher): only the no-HD sources make sense (ground_window, tile_pick,
         # crop_tokens, plain_tokens, attn_window)
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+        # (Auto class: also loads Qwen3-VL-*-Instruct, whose grounding is trained)
+        from transformers import AutoModelForImageTextToText
         if args.hd_source not in ("ground_window", "tile_pick", "crop_tokens", "plain_tokens", "attn_window"):
             raise SystemExit("--plain_model: use a source without an HD branch")
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+        model = AutoModelForImageTextToText.from_pretrained(
             args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
             attn_implementation=args.attn,
         ).eval()
-        print(f"[probe] plain Qwen3.5 model from {args.model_path} "
+        print(f"[probe] plain {type(model).__name__} from {args.model_path} "
               f"({sum(p.numel() for p in model.parameters()) / 1e9:.1f} B params)")
     else:
         model = Qwen3_5DATForConditionalGeneration.from_pretrained(
