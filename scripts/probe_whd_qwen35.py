@@ -394,7 +394,14 @@ def build_two_image_inputs(sample, lr_thw, second_img, processor, hr_processor, 
     hint = {"type": "text", "text": "Zoomed-in view of the relevant region:" if len(seconds) == 1
             else "Zoomed-in views of candidate regions:"}
     second = [{"type": "image", "image": im} for im in seconds]
-    question = {"type": "text", "text": sample["prompt"]}
+    q_text = sample["prompt"]
+    if getattr(args, "plain_model", False) and sample.get("gt") is not None \
+            and not args.dataset == "synth":
+        # a stock checkpoint starts narrating ("Based on the zoomed-in view, ...")
+        # once a 2nd image is present and never reaches the letter within the
+        # token budget; the fine-tuned 2B does not need this
+        q_text += " Reply with the option letter only, no explanation."
+    question = {"type": "text", "text": q_text}
     content = [{"type": "image", "image": lr_img}]
     if args.crop_pos == "before":
         content += [hint] + second + [question]
