@@ -11,7 +11,7 @@ Everything is frozen except the head; nothing in the model or trainer changes.
   eval (V*) -> top-1 cell centre in the GT window / in the GT box, top-3 any;
                writes a --box_json file for probe_whd_qwen35.py (ground_window)
 
-  python scripts/where_head.py --model_path $E/checkpoint-1000 \
+  torchrun --nproc_per_node 8 scripts/where_head.py --model_path $E/checkpoint-1000 \
       --train_json $OSS_DATA/extra_0916/viscot_bbox.train.json \
                    $OSS_DATA/extra_0920/viscot_nat_bbox.json \
       --image_root ~/sft_data/train_split --steps 3000 \
@@ -47,7 +47,7 @@ def question_of(s):
     return q.split("\n")[0].strip() or q
 
 
-def load_train(jsons, image_root, max_per_json):
+def load_train(jsons, image_root, max_per_json, say=print):
     rows = []
     for j in jsons:
         data = json.load(open(os.path.expanduser(j)))
@@ -72,7 +72,7 @@ def load_train(jsons, image_root, max_per_json):
             k += 1
             if k >= max_per_json:
                 break
-        print(f"[where] {os.path.basename(j)}: {k} samples with a box")
+        say(f"[where] {os.path.basename(j)}: {k} samples with a box")
     random.shuffle(rows)
     return rows
 
@@ -80,11 +80,12 @@ def load_train(jsons, image_root, max_per_json):
 # ───────────────────────── frozen model features ─────────────────────────
 
 class Frozen:
-    def __init__(self, model_path, txt_layer, hd_cap, attn, device):
+    def __init__(self, model_path, txt_layer, hd_cap, attn, device, local_rank=0):
         from transformers import AutoProcessor
         from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5DATForConditionalGeneration
         self.model = Qwen3_5DATForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map={"": 0}, attn_implementation=attn).eval()
+            model_path, torch_dtype=torch.bfloat16, device_map={"": local_rank},
+            attn_implementation=attn).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.proc = AutoProcessor.from_pretrained(model_path, min_pixels=FACTOR * FACTOR, max_pixels=100_000_000)
@@ -265,24 +266,45 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    device = "cuda"
-    frozen = Frozen(args.model_path, args.txt_layer, args.hd_cap, args.attn, device)
+    # data parallel over the GPUs torchrun gives us: every rank runs the frozen
+    # model on its own shard of the rows, DDP averages the (tiny) head gradients
+    rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = f"cuda:{local_rank}"
+    if world > 1:
+        import torch.distributed as dist
+        dist.init_process_group("nccl")
+    main_rank = rank == 0
+    say = print if main_rank else (lambda *a, **k: None)
+    barrier = (lambda: dist.barrier()) if world > 1 else (lambda: None)
+
+    frozen = Frozen(args.model_path, args.txt_layer, args.hd_cap, args.attn, device, local_rank)
     vstar = load_vstar(args.vstar_root, args.vstar_n)
     c_img = frozen.hd_features(vstar[0]["image"]).shape[-1]
     c_txt = frozen.text_states("what colour is the cup?").shape[-1]
     head = WhereHead(c_img, c_txt, args.d).to(device)
-    print(f"[where] head: {sum(p.numel() for p in head.parameters()) / 1e6:.2f} M params; "
-          f"C_img={c_img} C_txt={c_txt} (LM layer {args.txt_layer}); HD cap {args.hd_cap} px")
+    say(f"[where] head: {sum(p.numel() for p in head.parameters()) / 1e6:.2f} M params; "
+        f"C_img={c_img} C_txt={c_txt} (LM layer {args.txt_layer}); HD cap {args.hd_cap} px; "
+        f"{world} GPU(s) -> {args.steps} steps x {args.accum} x {world} = {args.steps * args.accum * world} samples")
 
     if args.load:
         head.load_state_dict(torch.load(os.path.expanduser(args.load), map_location=device))
-        eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells, args.out_boxes, " [loaded]")
+        if main_rank:
+            eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells, args.out_boxes, " [loaded]")
         return
 
-    rows = load_train(args.train_json, os.path.expanduser(args.image_root), args.max_per_json)
+    rows = load_train(args.train_json, os.path.expanduser(args.image_root), args.max_per_json, say)
     held, rows = rows[: args.heldout], rows[args.heldout:]
-    print(f"[where] {len(rows)} train rows, {len(held)} held-out; {args.steps} steps x {args.accum}")
-    eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells, None, " [untrained]")
+    rows = rows[rank::world]                                   # same shuffle on every rank (seeded)
+    say(f"[where] {len(rows)} train rows per rank, {len(held)} held-out")
+    if main_rank:
+        eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells, None, " [untrained]")
+    barrier()
+    train_head = head
+    if world > 1:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        train_head = DDP(head, device_ids=[local_rank])
 
     opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -291,36 +313,40 @@ def main():
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
         for _ in range(args.accum):
-            r = rows[seen % len(rows)]
-            seen += 1
-            try:
-                img = Image.open(r["path"]).convert("RGB")
-            except Exception:
-                skipped += 1
-                continue
+            while True:                                        # every rank does exactly accum backwards
+                r = rows[seen % len(rows)]
+                seen += 1
+                try:
+                    img = Image.open(r["path"]).convert("RGB")
+                    break
+                except Exception:
+                    skipped += 1
             feat = frozen.hd_features(img)
             txt = frozen.text_states(r["q"])
-            logits = head(feat, txt)
+            logits = train_head(feat, txt)
             mask = cell_targets(r["box"], *logits.shape, args.dilate)
             if mask.sum() == 0:
                 skipped += 1
-                continue
-            loss = head_loss(logits, mask) / args.accum
+                loss = logits.sum() * 0.0                      # keep DDP's collective in step
+            else:
+                loss = head_loss(logits, mask) / args.accum
             loss.backward()
             run_loss += loss.item()
         torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
         opt.step()
         sched.step()
         if step % 50 == 0:
-            print(f"[where] step {step}/{args.steps} loss {run_loss / 50:.3f} lr {sched.get_last_lr()[0]:.2e} "
-                  f"{(time.time() - t0) / step:.2f}s/step skipped {skipped}", flush=True)
+            say(f"[where] step {step}/{args.steps} loss {run_loss / 50:.3f} lr {sched.get_last_lr()[0]:.2e} "
+                f"{(time.time() - t0) / step:.2f}s/step skipped {skipped}", flush=True)
             run_loss = 0.0
         if step % args.eval_every == 0 or step == args.steps:
-            eval_heldout(frozen, head, held, args.min_cells, args.out_cells, f" [step {step}]")
-            eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells,
-                       args.out_boxes if step == args.steps else None, f" [step {step}]")
-            if args.save:
-                torch.save(head.state_dict(), os.path.expanduser(args.save))
+            if main_rank:
+                eval_heldout(frozen, head, held, args.min_cells, args.out_cells, f" [step {step}]")
+                eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells,
+                           args.out_boxes if step == args.steps else None, f" [step {step}]")
+                if args.save:
+                    torch.save(head.state_dict(), os.path.expanduser(args.save))
+            barrier()
 
 
 if __name__ == "__main__":
