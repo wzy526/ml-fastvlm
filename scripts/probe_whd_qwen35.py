@@ -595,6 +595,16 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
                                            "extracted": []})
     st["n"] += 1
     gen_ = lambda img, p, n: lm_text(img, p, model, processor, hr_processor, device, dtype, n)
+    if args.box_json:
+        # external localiser (scripts/gdino_probe.py --out): its top-1 box IS the
+        # window — "what does the student score if it learned that localiser?"
+        bx = STATE["box_json"].get(STATE.get("sample_idx"))
+        boxes = [tuple(float(v) for v in bx)] if bx else []
+        if boxes:
+            h = box_hits(boxes[0], sample, hd_w, hd_h, args.oracle_min_cells)
+            st["s1_in_win"] += bool(h and h[0])
+        return ground_window_finish(sample, lr_thw, hd_w, hd_h, boxes, list(boxes), None, "", "",
+                                    st, processor, hr_processor, args, device, dtype)
     # --ground_query extract: the model names what to look for (from the
     # question alone), then grounds that phrase — no sidecar names involved
     if args.ground_query == "extract":
@@ -629,6 +639,14 @@ def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_proces
             bx = b2[0]
             boxes = [(x0 + bx[0] * (x1 - x0), y0 + bx[1] * (y1 - y0),
                       x0 + bx[2] * (x1 - x0), y0 + bx[3] * (y1 - y0))] + boxes[1:]
+    return ground_window_finish(sample, lr_thw, hd_w, hd_h, boxes, s1_boxes, rw, g, g2,
+                                st, processor, hr_processor, args, device, dtype)
+
+
+def ground_window_finish(sample, lr_thw, hd_w, hd_h, boxes, s1_boxes, rw, g, g2,
+                         st, processor, hr_processor, args, device, dtype):
+    """Stats + log + the padded window crop(s) as the 2nd image (whole image
+    when there is no box)."""
     log = {"s1": s1_boxes, "final": list(boxes), "refine_win": rw, "raw": g[:80], "raw2": g2[:80],
            "phrase": sample.get("_extracted"), "hit": None, "iou": None, "wins": [], "crops": []}
     STATE.setdefault("ground_log", []).append(log)
@@ -1853,6 +1871,10 @@ def main():
     ap.add_argument("--ground_topk", type=int, default=1,
                     help="ground_window: ask for up to k candidate boxes; one crop each, the "
                          "--crop_tok budget split between them")
+    ap.add_argument("--box_json", default=None,
+                    help="ground_window: skip the model's grounding and take the top-1 box per "
+                         "sample from scripts/gdino_probe.py --out (an external localiser as the "
+                         "window; --ground_pad / --oracle_min_cells still shape the crop)")
     ap.add_argument("--plain_model", action="store_true",
                     help="load --model_path as a stock Qwen3.5 (no DAT): e.g. a larger size as an "
                          "offline localisation teacher for ground_window / tile_pick")
@@ -1995,6 +2017,14 @@ def main():
 
     # config name -> list of predicted letters (parallel to samples)
     ground_mode = args.hd_source == "ground_window"
+    if args.box_json:
+        if not ground_mode:
+            raise SystemExit("--box_json needs --hd_source ground_window")
+        rows = json.load(open(os.path.expanduser(args.box_json)))
+        STATE["box_json"] = {int(r["i"]): r["box"] for r in rows if r.get("box")}
+        print(f"[probe] ground_window: boxes from {args.box_json} "
+              f"({len(STATE['box_json'])}/{len(rows)} samples with a box; window = pad x{args.ground_pad}, "
+              f"min {args.oracle_min_cells} cells)")
     teacher_mode = args.hd_source == "attn_window"
     tile_mode = args.hd_source == "tile_pick"
     t_processor, full_layers, teacher_cfg = None, [], None
@@ -2039,6 +2069,7 @@ def main():
 
     n_forced = 0
     for i, s in enumerate(tqdm(samples, desc="probe")):
+        STATE["sample_idx"] = i
         base_inputs, hd_extra, locs = build_inputs(
             s, i, samples, processor, hr_processor, args, device, dtype)
 
