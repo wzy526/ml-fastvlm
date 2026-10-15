@@ -34,6 +34,7 @@ def load_vstar(root, max_samples):
             sd = json.load(open(side)) if os.path.isfile(side) else {}
             samples.append({
                 "image": Image.open(img_path).convert("RGB"),
+                "prompt": doc["text"].strip(),
                 "category": str(doc.get("category", "n/a")),
                 "bboxes": [list(map(float, b)) for b in (sd.get("bbox") or [])],
                 "targets": [str(t) for t in (sd.get("target_object") or [])],
