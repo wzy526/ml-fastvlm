@@ -449,6 +449,15 @@ def build_crop_token_inputs(sample, idx, lr_thw, hd_w, hd_h, processor, hr_proce
     win = crop_window(sample, hd_w, hd_h, args.oracle_min_cells, pad=args.crop_pad)
     if win is None:
         return None
+    k = len(sample.get("bboxes") or [])
+    if args.multi_box == "per_box" and k >= 2:
+        # one crop per GT box, the token budget split between them
+        cells = multi_box_cells(args, k, args.crop_tok)
+        wins = per_box_windows(sample, hd_w, hd_h, cells, pad=args.crop_pad)
+        multi_stat(wins, win, cells)
+        STATE["crop_stats_area"] = sum((w[2] - w[0]) * (w[3] - w[1]) for w in wins)
+        imgs = [make_crop_image(sample, w, max(64, args.crop_tok // k)) for w in wins]
+        return build_two_image_inputs(sample, lr_thw, imgs, processor, hr_processor, args, device, dtype)
     if args.crop_hit_rate < 1.0 or args.crop_shift > 0:
         rng = np.random.RandomState(2000 + idx)
         hit = bool(rng.uniform() < args.crop_hit_rate)
@@ -577,6 +586,53 @@ def pad_window(box, pad, min_cells, hd_w, hd_h):
     cx = min(max(cx, ww / 2), 1 - ww / 2)
     cy = min(max(cy, wh / 2), 1 - wh / 2)
     return cx - ww / 2, cy - wh / 2, cx + ww / 2, cy + wh / 2
+
+
+# ── multi-target oracles (--multi_box per_box): one window PER GT box instead
+# of one window around their union. V* relative_position asks about two
+# objects that can be far apart; the union window is then large and blurry
+# while a crop can only be one rectangle. Deformable sampling can put its
+# points on both boxes at once — this is the comparison.
+def per_box_windows(sample, hd_w, hd_h, min_cells, pad=1.0):
+    """One (x0, y0, x1, y1) fraction window per GT box, >= min_cells cells per side."""
+    W, H = sample["image"].size
+    return [pad_window((b[0] / W, b[1] / H, (b[0] + b[2]) / W, (b[1] + b[3]) / H),
+                       pad, min_cells, hd_w, hd_h) for b in (sample.get("bboxes") or [])]
+
+
+def multi_oracle_locs(wins, grid_size):
+    """Ns = grid_size^2 points split evenly over the windows (a g x g grid each,
+    g = floor(sqrt(Ns / k))); the few left-over points are a coarse uniform
+    grid over the whole image (context). [Ns, 2] in [-1, 1]."""
+    ns, k = grid_size * grid_size, len(wins)
+    g = int(math.sqrt(ns // k))
+    pts = []
+    for (x0, y0, x1, y1) in wins:
+        gy, gx = torch.meshgrid(torch.linspace(y0, y1, g), torch.linspace(x0, x1, g), indexing="ij")
+        pts.append(torch.stack([gx, gy], dim=-1).reshape(-1, 2))
+    rem = ns - g * g * k
+    if rem > 0:
+        gr = int(math.ceil(math.sqrt(rem)))
+        gy, gx = torch.meshgrid(torch.linspace(0, 1, gr), torch.linspace(0, 1, gr), indexing="ij")
+        pts.append(torch.stack([gx, gy], dim=-1).reshape(-1, 2)[:rem])
+    return (torch.cat(pts, 0) * 2.0 - 1.0).clamp(-1.0, 1.0)
+
+
+def multi_box_cells(args, k, per_box_budget):
+    """min cells per side of a per-box window: --multi_min_cells, or the side of
+    the g x g grid / token budget each box gets (one sample or token per cell)."""
+    if args.multi_min_cells > 0:
+        return args.multi_min_cells
+    return max(4, int(math.sqrt(per_box_budget // k)))
+
+
+def multi_stat(wins, union_win, cells):
+    st = STATE.setdefault("multi_stats", {"n": 0, "k": [], "area": [], "union": [], "cells": []})
+    st["n"] += 1
+    st["k"].append(len(wins))
+    st["area"].append(sum((w[2] - w[0]) * (w[3] - w[1]) for w in wins))
+    st["union"].append((union_win[2] - union_win[0]) * (union_win[3] - union_win[1]))
+    st["cells"].append(cells)
 
 
 def ground_window_inputs(sample, lr_thw, hd_w, hd_h, model, processor, hr_processor, args,
@@ -1264,6 +1320,14 @@ def build_inputs(sample, idx, samples, processor, hr_processor, args, device, dt
     if args.hd_source.startswith("oracle"):
         locs = oracle_locs(sample, idx, hd_w, hd_h, args.grid_size,
                            args.oracle_min_cells, args.hd_source)
+        k = len(sample.get("bboxes") or [])
+        if args.hd_source == "oracle" and args.multi_box == "per_box" and k >= 2:
+            # the Ns points split over one window per GT box (deformable
+            # sampling covering several far-apart targets at once)
+            cells = multi_box_cells(args, k, args.grid_size * args.grid_size)
+            wins = per_box_windows(sample, hd_w, hd_h, cells)
+            multi_stat(wins, crop_window(sample, hd_w, hd_h, args.oracle_min_cells), cells)
+            locs = multi_oracle_locs(wins, args.grid_size)
     # Localisation target for the learned grid (any source): the oracle window
     # grid (= the training target of --dat_off_sup_weight) and the raw GT box
     # in [-1, 1] coords. None when the sample has no bbox.
@@ -1875,6 +1939,14 @@ def main():
                     help="ground_window: skip the model's grounding and take the top-1 box per "
                          "sample from scripts/gdino_probe.py --out (an external localiser as the "
                          "window; --ground_pad / --oracle_min_cells still shape the crop)")
+    ap.add_argument("--multi_box", choices=["union", "per_box"], default="union",
+                    help="samples with >= 2 GT boxes (V* relative_position): oracle / crop_tokens "
+                         "use one window around the union (default) or one window PER box "
+                         "(oracle: the 400 points split over the boxes; crop_tokens: one crop each, "
+                         "--crop_tok split). Single-box samples are unaffected.")
+    ap.add_argument("--multi_min_cells", type=int, default=0,
+                    help="per_box: min cells per side of each box window (0 = the side of the "
+                         "per-box point grid / token budget, i.e. one sample per cell)")
     ap.add_argument("--box_topk", type=int, default=1,
                     help="--box_json: use the first k boxes (one crop each, --crop_tok split)")
     ap.add_argument("--plain_model", action="store_true",
@@ -2193,6 +2265,11 @@ def main():
             print(f"[probe] crop_tokens window: pad x{args.crop_pad}, shift {args.crop_shift} x window, "
                   f"target hit-rate {args.crop_hit_rate} -> realised {cc['hit']}/{cc['n']} GT windows, "
                   f"the rest same-size windows away from the target")
+    if STATE.get("multi_stats"):
+        m = STATE["multi_stats"]
+        print(f"[probe] multi_box per_box: {m['n']} samples with >= 2 boxes (mean k {np.mean(m['k']):.2f}); "
+              f"per-box windows {np.mean(m['cells']):.0f} cells/side, total area {100 * np.mean(m['area']):.1f}% "
+              f"of the image vs the union window {100 * np.mean(m['union']):.1f}%")
     if STATE.get("teacher_stats"):
         g = STATE["teacher_stats"]
         ng = max(g["n_gt"], 1)
