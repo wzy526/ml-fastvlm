@@ -95,9 +95,55 @@ class Frozen:
         self.device = device
         self.dtype = torch.bfloat16
         self.feat_cap = None        # --feat lr: tok x 1024 px (the LM's LR view), else the HD cap
+        self.lm_layer = None        # --feat lm:L: cells = LM layer-L states of the LR image tokens
+        self.lr_proc = None
+        self.image_token_id = getattr(self.model.config, "image_token_id", None)
+        self.lm_calls = 0
+
+    def set_lm_view(self, model_path, lm_layer, lr_tok):
+        from transformers import AutoProcessor
+        self.lm_layer = lm_layer
+        self.lr_proc = AutoProcessor.from_pretrained(model_path, min_pixels=FACTOR * FACTOR,
+                                                     max_pixels=lr_tok * FACTOR * FACTOR)
 
     def feats(self, img):
         return self.hd_features(img, self.feat_cap)
+
+    def pair(self, img, q):
+        """(cells (H, W, C), text (T, C)) for the head."""
+        if self.lm_layer is not None:
+            return self.lm_features(img, q)
+        return self.feats(img), self.text_states(q)
+
+    @torch.no_grad()
+    def lm_features(self, img, q):
+        """One LM forward on [LR image, question] (the student's own prefill):
+        cells = layer-L hidden states at the image-token positions, reshaped to
+        the merged grid; text = layer-L states of everything after the image
+        (question + template tail). These cells have attended to the question
+        for L layers -- the representation the LM's own text grounding (77 %)
+        and SD-RPN's RPN read from; the frozen ViT cells (48 %) have not."""
+        messages = [{"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": [{"type": "image", "image": img},
+                                                 {"type": "text", "text": q}]}]
+        text = self.lr_proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                                enable_thinking=False)
+        inp = self.lr_proc(text=[text], images=[img], return_tensors="pt")
+        ids = inp["input_ids"].to(self.device)
+        out = self.model(input_ids=ids, attention_mask=inp["attention_mask"].to(self.device),
+                         pixel_values=inp["pixel_values"].to(device=self.device, dtype=self.dtype),
+                         image_grid_thw=inp["image_grid_thw"].to(self.device),
+                         output_hidden_states=True, return_dict=True)
+        hs = out.hidden_states[self.lm_layer][0]              # (S, C)
+        is_img = ids[0] == self.image_token_id
+        thw = inp["image_grid_thw"][0]
+        gh, gw = int(thw[1]) // 2, int(thw[2]) // 2
+        cells = hs[is_img]
+        assert cells.shape[0] == gh * gw, (cells.shape, gh, gw)
+        last_img = int(torch.nonzero(is_img)[-1])
+        txt = hs[last_img + 1:]
+        self.lm_calls += 1
+        return cells.reshape(gh, gw, -1), txt
 
     @torch.no_grad()
     def hd_features(self, img, cap=None):
@@ -258,8 +304,7 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
         if gt is None:
             continue
         n += 1
-        feat = frozen.feats(s["image"])
-        txt = frozen.text_states(vstar_query(s, query))
+        feat, txt = frozen.pair(s["image"], vstar_query(s, query))
         logits = head(feat, txt)
         H, W = logits.shape
         hd_w, hd_h = hd_size(s["image"])
@@ -300,7 +345,7 @@ def eval_heldout(frozen, head, rows, min_cells, out_cells, tag=""):
         except Exception:
             continue
         n += 1
-        logits = head(frozen.feats(img), frozen.text_states(r["q"]))
+        logits = head(*frozen.pair(img, r["q"]))
         hd_w, hd_h = hd_size(img)
         win = gt_window(r["box"], hd_w, hd_h, min_cells)
         h = box_hits(top_boxes(logits, 1, out_cells)[0][1], r["box"], win)
@@ -341,9 +386,11 @@ def main():
                          "question<->cell cross-attention + depthwise conv + FFN, per-cell logit")
     ap.add_argument("--xlayers", type=int, default=2)
     ap.add_argument("--xheads", type=int, default=6)
-    ap.add_argument("--feat", choices=["hd", "lr"], default="hd",
-                    help="cells from the HD grid (native res, hd_cap) or from the LR view "
-                         "(--lr_tok x 1024 px, what the LM's own localiser sees)")
+    ap.add_argument("--feat", default="hd",
+                    help="hd: cells from the frozen ViT on the HD grid (native res, hd_cap); "
+                         "lr: same ViT on the LR view (--lr_tok x 1024 px); "
+                         "lm:L: LM layer-L hidden states of the LR image tokens after one "
+                         "prefill of [image, question] (text = the same layer's question states)")
     ap.add_argument("--lr_tok", type=int, default=640)
     ap.add_argument("--eval_query", default="question",
                     help="V* eval text, comma list of question|target (target = sidecar object names)")
@@ -377,10 +424,13 @@ def main():
     time.sleep(args.stagger * local_rank)
     if args.feat == "lr":
         frozen.feat_cap = args.lr_tok * FACTOR * FACTOR
+    elif args.feat.startswith("lm:"):
+        frozen.set_lm_view(args.model_path, int(args.feat.split(":")[1]), args.lr_tok)
+    elif args.feat != "hd":
+        raise SystemExit(f"--feat {args.feat}: expected hd | lr | lm:L")
     vstar = load_vstar(args.vstar_root, args.vstar_n)
-    f0 = frozen.feats(vstar[0]["image"])
-    c_img = f0.shape[-1]
-    c_txt = frozen.text_states("what colour is the cup?").shape[-1]
+    f0, t0_ = frozen.pair(vstar[0]["image"], "what colour is the cup?")
+    c_img, c_txt = f0.shape[-1], t0_.shape[-1]
     if args.head == "xattn":
         head = XAttnHead(c_img, c_txt, args.d, args.xlayers, args.xheads).to(device)
     else:
@@ -424,8 +474,7 @@ def main():
                     break
                 except Exception:
                     skipped += 1
-            feat = frozen.feats(img)
-            txt = frozen.text_states(r["q"])
+            feat, txt = frozen.pair(img, r["q"])
             logits = train_head(feat, txt)
             mask = cell_targets(r["box"], *logits.shape, args.dilate)
             if mask.sum() == 0:
