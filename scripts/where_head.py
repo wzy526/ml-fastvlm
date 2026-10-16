@@ -94,11 +94,17 @@ class Frozen:
         self.hd_cap = hd_cap
         self.device = device
         self.dtype = torch.bfloat16
+        self.feat_cap = None        # --feat lr: tok x 1024 px (the LM's LR view), else the HD cap
+
+    def feats(self, img):
+        return self.hd_features(img, self.feat_cap)
 
     @torch.no_grad()
-    def hd_features(self, img):
-        """(H, W, C) at the probe's HD geometry: native resolution capped at hd_cap, 32 px cells."""
-        total = min(img.width * img.height, self.hd_cap)
+    def hd_features(self, img, cap=None):
+        """(H, W, C) at the probe's HD geometry: native resolution capped at hd_cap
+        (or `cap`: e.g. the LR token budget x 1024 px = what the LM's LR view is
+        built from), 32 px cells."""
+        total = min(img.width * img.height, cap or self.hd_cap)
         aspect = img.width / img.height
         h = int(math.sqrt(total / aspect))
         w = int(h * aspect)
@@ -136,6 +142,61 @@ class WhereHead(nn.Module):
         t = self.txt_in(txt.float())                           # T d
         s = torch.einsum("hwd,td->hwt", x, t) * self.scale     # H W T
         return s.max(-1).values + self.bias
+
+
+class XBlock(nn.Module):
+    """One round of question <-> cells interaction: the question tokens read
+    the cells, the cells read the (updated) question, then a 3x3 conv (local
+    context) and an FFN on the cells."""
+
+    def __init__(self, d, heads):
+        super().__init__()
+        self.t_norm = nn.LayerNorm(d)
+        self.t_attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.c_norm = nn.LayerNorm(d)
+        self.c_attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.conv = nn.Conv2d(d, d, 3, padding=1, groups=d)            # depthwise, cheap
+        self.f_norm = nn.LayerNorm(d)
+        self.ffn = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(), nn.Linear(2 * d, d))
+
+    def forward(self, cells, txt, H, W):
+        """cells (1, N, d), txt (1, T, d)"""
+        tq = self.t_norm(txt)
+        txt = txt + self.t_attn(tq, cells, cells, need_weights=False)[0]
+        cq = self.c_norm(cells)
+        cells = cells + self.c_attn(cq, txt, txt, need_weights=False)[0]
+        g = cells.transpose(1, 2).reshape(1, -1, H, W)
+        cells = cells + self.conv(g).flatten(2).transpose(1, 2)
+        cells = cells + self.ffn(self.f_norm(cells))
+        return cells, txt
+
+
+class XAttnHead(nn.Module):
+    """--head xattn: a small question<->cell transformer (what the dot-product
+    head lacks: the cells can see which words were already matched elsewhere,
+    the words can see the whole map) + a learned 2-D position embedding so
+    'left of' / 'second row' style phrases can be used. Per-cell logit at the end."""
+
+    def __init__(self, c_img, c_txt, d=384, layers=2, heads=6, max_hw=128):
+        super().__init__()
+        self.img_in = nn.Sequential(nn.LayerNorm(c_img), nn.Linear(c_img, d))
+        self.txt_in = nn.Sequential(nn.LayerNorm(c_txt), nn.Linear(c_txt, d))
+        self.row = nn.Embedding(max_hw, d)
+        self.col = nn.Embedding(max_hw, d)
+        nn.init.normal_(self.row.weight, std=0.02)
+        nn.init.normal_(self.col.weight, std=0.02)
+        self.blocks = nn.ModuleList(XBlock(d, heads) for _ in range(layers))
+        self.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+
+    def forward(self, feat, txt):
+        H, W, _ = feat.shape
+        x = self.img_in(feat.float())
+        pos = self.row(torch.arange(H, device=x.device))[:, None] + self.col(torch.arange(W, device=x.device))[None]
+        cells = (x + pos).reshape(1, H * W, -1)
+        t = self.txt_in(txt.float())[None]
+        for blk in self.blocks:
+            cells, t = blk(cells, t, H, W)
+        return self.out(cells)[0, :, 0].reshape(H, W)
 
 
 def cell_targets(box, H, W, dilate):
@@ -184,7 +245,7 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
         if gt is None:
             continue
         n += 1
-        feat = frozen.hd_features(s["image"])
+        feat = frozen.feats(s["image"])
         txt = frozen.text_states(s["prompt"].split("\n")[0])
         logits = head(feat, txt)
         H, W = logits.shape
@@ -226,7 +287,7 @@ def eval_heldout(frozen, head, rows, min_cells, out_cells, tag=""):
         except Exception:
             continue
         n += 1
-        logits = head(frozen.hd_features(img), frozen.text_states(r["q"]))
+        logits = head(frozen.feats(img), frozen.text_states(r["q"]))
         hd_w, hd_h = hd_size(img)
         win = gt_window(r["box"], hd_w, hd_h, min_cells)
         h = box_hits(top_boxes(logits, 1, out_cells)[0][1], r["box"], win)
@@ -262,6 +323,15 @@ def main():
     ap.add_argument("--load", default=None, help="skip training, evaluate this head")
     ap.add_argument("--out_boxes", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--head", choices=["dot", "xattn"], default="dot",
+                    help="dot: word-cell dot product, max over words (v1). xattn: --xlayers rounds of "
+                         "question<->cell cross-attention + depthwise conv + FFN, per-cell logit")
+    ap.add_argument("--xlayers", type=int, default=2)
+    ap.add_argument("--xheads", type=int, default=6)
+    ap.add_argument("--feat", choices=["hd", "lr"], default="hd",
+                    help="cells from the HD grid (native res, hd_cap) or from the LR view "
+                         "(--lr_tok x 1024 px, what the LM's own localiser sees)")
+    ap.add_argument("--lr_tok", type=int, default=640)
     args = ap.parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -280,12 +350,18 @@ def main():
     barrier = (lambda: dist.barrier()) if world > 1 else (lambda: None)
 
     frozen = Frozen(args.model_path, args.txt_layer, args.hd_cap, args.attn, device, local_rank)
+    if args.feat == "lr":
+        frozen.feat_cap = args.lr_tok * FACTOR * FACTOR
     vstar = load_vstar(args.vstar_root, args.vstar_n)
-    c_img = frozen.hd_features(vstar[0]["image"]).shape[-1]
+    f0 = frozen.feats(vstar[0]["image"])
+    c_img = f0.shape[-1]
     c_txt = frozen.text_states("what colour is the cup?").shape[-1]
-    head = WhereHead(c_img, c_txt, args.d).to(device)
-    say(f"[where] head: {sum(p.numel() for p in head.parameters()) / 1e6:.2f} M params; "
-        f"C_img={c_img} C_txt={c_txt} (LM layer {args.txt_layer}); HD cap {args.hd_cap} px; "
+    if args.head == "xattn":
+        head = XAttnHead(c_img, c_txt, args.d, args.xlayers, args.xheads).to(device)
+    else:
+        head = WhereHead(c_img, c_txt, args.d).to(device)
+    say(f"[where] head={args.head} d={args.d}: {sum(p.numel() for p in head.parameters()) / 1e6:.2f} M params; "
+        f"feat={args.feat} (sample 0 grid {tuple(f0.shape[:2])}) C_img={c_img} C_txt={c_txt} (LM layer {args.txt_layer}); "
         f"{world} GPU(s) -> {args.steps} steps x {args.accum} x {world} = {args.steps * args.accum * world} samples")
 
     if args.load:
@@ -321,7 +397,7 @@ def main():
                     break
                 except Exception:
                     skipped += 1
-            feat = frozen.hd_features(img)
+            feat = frozen.feats(img)
             txt = frozen.text_states(r["q"])
             logits = train_head(feat, txt)
             mask = cell_targets(r["box"], *logits.shape, args.dilate)
