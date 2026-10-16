@@ -238,8 +238,18 @@ def top_boxes(logits, k, cells):
 
 # ───────────────────────── eval ─────────────────────────
 
+def vstar_query(s, mode):
+    """question: first line of the prompt (what the head was trained on).
+    target: the sidecar object names ('cup, glove') — an upper bound that
+    separates 'the features cannot find it' from 'the head cannot work out
+    WHAT to find from the question'."""
+    if mode == "target" and s.get("targets"):
+        return ", ".join(s["targets"])
+    return s["prompt"].split("\n")[0]
+
+
 @torch.no_grad()
-def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag=""):
+def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="", query="question"):
     head.eval()
     n = n_win = n_box = n_win3 = n_box3 = 0
     ious, rows, per_cat = [], [], {}
@@ -249,7 +259,7 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
             continue
         n += 1
         feat = frozen.feats(s["image"])
-        txt = frozen.text_states(s["prompt"].split("\n")[0])
+        txt = frozen.text_states(vstar_query(s, query))
         logits = head(feat, txt)
         H, W = logits.shape
         hd_w, hd_h = hd_size(s["image"])
@@ -268,7 +278,7 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
         rows.append({"i": i, "box": list(tops[0][1]), "score": tops[0][0],
                      "boxes": [list(b) for _, b in tops], "scores": [v for v, _ in tops],
                      "grid": [H, W], "in_win": bool(hits[0][0]), "in_box": bool(hits[0][1])})
-    print(f"[where]{tag} V* {n}: top-1 cell centre in GT window {n_win}/{n} ({100 * n_win / max(n, 1):.1f}%), "
+    print(f"[where]{tag} V* {n} (query={query}): top-1 cell centre in GT window {n_win}/{n} ({100 * n_win / max(n, 1):.1f}%), "
           f"in GT box {n_box}/{n}; top-3 any: window {n_win3}/{n}, box {n_box3}/{n}; "
           f"IoU of a {out_cells}-cell square {sum(ious) / max(len(ious), 1):.3f}")
     for c, (m, w, b) in sorted(per_cat.items()):
@@ -335,6 +345,8 @@ def main():
                     help="cells from the HD grid (native res, hd_cap) or from the LR view "
                          "(--lr_tok x 1024 px, what the LM's own localiser sees)")
     ap.add_argument("--lr_tok", type=int, default=640)
+    ap.add_argument("--eval_query", default="question",
+                    help="V* eval text, comma list of question|target (target = sidecar object names)")
     ap.add_argument("--stagger", type=float, default=8.0,
                     help="seconds x local_rank to wait before the first forward (Triton compile)")
     args = ap.parse_args()
@@ -380,7 +392,9 @@ def main():
     if args.load:
         head.load_state_dict(torch.load(os.path.expanduser(args.load), map_location=device))
         if main_rank:
-            eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells, args.out_boxes, " [loaded]")
+            for q in args.eval_query.split(","):
+                eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells,
+                           args.out_boxes if q == "question" else None, " [loaded]", query=q)
         return
 
     rows = load_train(args.train_json, os.path.expanduser(args.image_root), args.max_per_json, say)
