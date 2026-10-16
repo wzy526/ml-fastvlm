@@ -335,6 +335,8 @@ def main():
                     help="cells from the HD grid (native res, hd_cap) or from the LR view "
                          "(--lr_tok x 1024 px, what the LM's own localiser sees)")
     ap.add_argument("--lr_tok", type=int, default=640)
+    ap.add_argument("--stagger", type=float, default=8.0,
+                    help="seconds x local_rank to wait before the first forward (Triton compile)")
     args = ap.parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -351,8 +353,16 @@ def main():
     main_rank = rank == 0
     say = print if main_rank else (lambda *a, **k: None)
     barrier = (lambda: dist.barrier()) if world > 1 else (lambda: None)
+    if world > 1:
+        # 8 ranks compiling the same Triton kernels (fla linear attention in the
+        # Qwen3.5 trunk) against one cache dir deadlocked on the first HD
+        # forward (py-spy: all ranks inside _generate_hd_features): give every
+        # rank its own cache and stagger the first forward
+        os.environ["TRITON_CACHE_DIR"] = os.path.expanduser(f"~/.triton_cache/rank{local_rank}")
+        os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
 
     frozen = Frozen(args.model_path, args.txt_layer, args.hd_cap, args.attn, device, local_rank)
+    time.sleep(args.stagger * local_rank)
     if args.feat == "lr":
         frozen.feat_cap = args.lr_tok * FACTOR * FACTOR
     vstar = load_vstar(args.vstar_root, args.vstar_n)
