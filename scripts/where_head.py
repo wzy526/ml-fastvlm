@@ -130,10 +130,11 @@ class Frozen:
                                                 enable_thinking=False)
         inp = self.lr_proc(text=[text], images=[img], return_tensors="pt")
         ids = inp["input_ids"].to(self.device)
-        out = self.model(input_ids=ids, attention_mask=inp["attention_mask"].to(self.device),
-                         pixel_values=inp["pixel_values"].to(device=self.device, dtype=self.dtype),
-                         image_grid_thw=inp["image_grid_thw"].to(self.device),
-                         output_hidden_states=True, return_dict=True)
+        kw = {}                                   # everything the processor made (mm_token_type_ids too)
+        for k, v in inp.items():
+            if isinstance(v, torch.Tensor):
+                kw[k] = v.to(device=self.device, dtype=self.dtype) if k == "pixel_values" else v.to(self.device)
+        out = self.model(**kw, output_hidden_states=True, return_dict=True)
         hs = out.hidden_states[self.lm_layer][0]              # (S, C)
         is_img = ids[0] == self.image_token_id
         thw = inp["image_grid_thw"][0]
