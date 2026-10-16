@@ -177,7 +177,7 @@ class XAttnHead(nn.Module):
     the words can see the whole map) + a learned 2-D position embedding so
     'left of' / 'second row' style phrases can be used. Per-cell logit at the end."""
 
-    def __init__(self, c_img, c_txt, d=384, layers=2, heads=6, max_hw=128):
+    def __init__(self, c_img, c_txt, d=384, layers=2, heads=6, max_hw=512):
         super().__init__()
         self.img_in = nn.Sequential(nn.LayerNorm(c_img), nn.Linear(c_img, d))
         self.txt_in = nn.Sequential(nn.LayerNorm(c_txt), nn.Linear(c_txt, d))
@@ -191,7 +191,10 @@ class XAttnHead(nn.Module):
     def forward(self, feat, txt):
         H, W, _ = feat.shape
         x = self.img_in(feat.float())
-        pos = self.row(torch.arange(H, device=x.device))[:, None] + self.col(torch.arange(W, device=x.device))[None]
+        n_pos = self.row.num_embeddings                        # 5 Mpx panoramas reach ~140 cells a side
+        ri = torch.arange(H, device=x.device).clamp_max(n_pos - 1)
+        ci = torch.arange(W, device=x.device).clamp_max(n_pos - 1)
+        pos = self.row(ri)[:, None] + self.col(ci)[None]
         cells = (x + pos).reshape(1, H * W, -1)
         t = self.txt_in(txt.float())[None]
         for blk in self.blocks:
