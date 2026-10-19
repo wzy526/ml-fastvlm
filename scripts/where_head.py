@@ -379,7 +379,7 @@ def main():
     ap.add_argument("--vstar_n", type=int, default=300)
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--save", default=None)
-    ap.add_argument("--load", default=None, help="skip training, evaluate this head")
+    ap.add_argument("--load", default=None, help="init head from this file; with --train_json continue training, else eval only")
     ap.add_argument("--out_boxes", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--head", choices=["dot", "xattn"], default="dot",
@@ -442,11 +442,13 @@ def main():
 
     if args.load:
         head.load_state_dict(torch.load(os.path.expanduser(args.load), map_location=device))
-        if main_rank:
-            for q in args.eval_query.split(","):
-                eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells,
-                           args.out_boxes if q == "question" else None, " [loaded]", query=q)
-        return
+        say(f"[where] loaded head weights from {args.load}")
+        if not args.train_json:                                # eval-only
+            if main_rank:
+                for q in args.eval_query.split(","):
+                    eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells,
+                               args.out_boxes if q == "question" else None, " [loaded]", query=q)
+            return
 
     rows = load_train(args.train_json, os.path.expanduser(args.image_root), args.max_per_json, say)
     held, rows = rows[: args.heldout], rows[args.heldout:]
