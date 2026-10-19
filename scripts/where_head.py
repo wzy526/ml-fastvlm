@@ -48,8 +48,11 @@ def question_of(s):
 
 
 def load_train(jsons, image_root, max_per_json, say=print):
+    """max_per_json: one int for all jsons, or one per json (last value repeats)."""
+    caps = list(max_per_json) if isinstance(max_per_json, (list, tuple)) else [max_per_json]
     rows = []
-    for j in jsons:
+    for ji, j in enumerate(jsons):
+        cap = caps[min(ji, len(caps) - 1)]
         data = json.load(open(os.path.expanduser(j)))
         random.shuffle(data)
         k = 0
@@ -70,7 +73,7 @@ def load_train(jsons, image_root, max_per_json, say=print):
             path = im if os.path.isabs(im) else os.path.join(image_root, im)
             rows.append({"path": path, "box": tuple(b), "q": q, "src": os.path.basename(j)})
             k += 1
-            if k >= max_per_json:
+            if k >= cap:
                 break
         say(f"[where] {os.path.basename(j)}: {k} samples with a box")
     random.shuffle(rows)
@@ -363,7 +366,8 @@ def main():
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--train_json", nargs="*", default=[])
     ap.add_argument("--image_root", default="~/sft_data/train_split")
-    ap.add_argument("--max_per_json", type=int, default=20000)
+    ap.add_argument("--max_per_json", type=int, nargs="+", default=[20000],
+                    help="cap per --train_json (one value for all, or one per json)")
     ap.add_argument("--heldout", type=int, default=200, help="training rows kept aside for an in-domain check")
     ap.add_argument("--steps", type=int, default=3000, help="optimizer steps (x --accum samples each)")
     ap.add_argument("--accum", type=int, default=8)
