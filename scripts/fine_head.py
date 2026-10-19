@@ -26,11 +26,13 @@ window is under --min_hd_cells HD cells are dropped: a 640 px COCO image has
       --save $E/loc/fine_mix.pt --out_boxes $E/loc/fine_mix.json
 """
 import argparse
+import json
 import math
 import os
 import random
 import sys
 import time
+from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -250,7 +252,7 @@ def main():
     device = f"cuda:{local_rank}"
     if world > 1:
         import torch.distributed as dist
-        dist.init_process_group("nccl")
+        dist.init_process_group("nccl", timeout=timedelta(hours=3))
         os.environ["TRITON_CACHE_DIR"] = os.path.expanduser(f"~/.triton_cache/rank{local_rank}")
         os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
     main_rank = rank == 0
@@ -292,7 +294,18 @@ def main():
             return
 
     rows = wh.load_train(args.train_json, os.path.expanduser(args.image_root), args.max_per_json, say)
+    # The scan opens every image header and can take longer than the NCCL
+    # store timeout. Rank 0 writes the kept list to a file; the others poll
+    # the file instead of waiting inside a collective.
+    keep_path = f"/tmp/fine_head_kept_{os.environ.get('MASTER_PORT', '0')}.json"
+    t_start = time.time()
+    barrier()
     if main_rank:
+        if world > 1:
+            try:
+                os.remove(keep_path)
+            except FileNotFoundError:
+                pass
         kept = []
         for n, r in enumerate(rows):
             if n % 10000 == 0:
@@ -301,12 +314,16 @@ def main():
                 kept.append(r)
         say(f"[fine] resolution: kept {len(kept)}/{len(rows)} "
             f"(window >= {args.min_hd_cells} HD cells; 640 px images are dropped)")
+        if world > 1:
+            tmp = keep_path + ".tmp"
+            json.dump(kept, open(tmp, "w"))
+            os.replace(tmp, keep_path)
     else:
-        kept = None
-    if world > 1:
-        box = [kept]
-        dist.broadcast_object_list(box, src=0)
-        kept = box[0]
+        while not (os.path.isfile(keep_path) and os.path.getmtime(keep_path) >= t_start):
+            if time.time() - t_start > 7200:
+                raise SystemExit("[fine] rank 0 did not publish the kept list within 2 h")
+            time.sleep(5)
+        kept = json.load(open(keep_path))
     random.shuffle(kept)
     held, rows = kept[: args.heldout], kept[args.heldout:]
     rows = rows[rank::world]
