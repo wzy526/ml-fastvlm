@@ -2394,6 +2394,53 @@ class Qwen3_5DecoderLayerDAT(Qwen3_5DecoderLayer):
 # DAT ForConditionalGeneration (top-level model)
 # ============================================================================
 
+def _where_top_box(logits, cells):
+    """Top cell -> square of `cells` cells, as fractions of the LM grid.
+    Same square scripts/where_head.py top_boxes writes into the box json."""
+    H, W = logits.shape
+    cy, cx = divmod(int(logits.reshape(-1).argmax()), W)
+    half = cells / 2.0
+    return ((cx + 0.5 - half) / W, (cy + 0.5 - half) / H,
+            (cx + 0.5 + half) / W, (cy + 0.5 + half) / H)
+
+
+def _where_hd_size(image, lr_thw, hr_scale, hd_cap):
+    """probe_whd_qwen35.hd_target_size, so the min-cells floor matches the probe."""
+    lr_px = int(lr_thw[1]) * 16 * int(lr_thw[2]) * 16
+    total = min(lr_px * hr_scale * hr_scale, image.width * image.height, hd_cap)
+    aspect = image.width / image.height
+    hd_h = int(math.sqrt(total / aspect))
+    hd_w = int(hd_h * aspect)
+    return max(32, (hd_w // 32) * 32), max(32, (hd_h // 32) * 32)
+
+
+def _where_pad_window(box, pad, min_cells, hd_w, hd_h):
+    """probe_whd_qwen35.pad_window."""
+    x0, y0, x1, y1 = box
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    ww = min(max((x1 - x0) * pad, min_cells * 32 / hd_w), 1.0)
+    wh = min(max((y1 - y0) * pad, min_cells * 32 / hd_h), 1.0)
+    cx = min(max(cx, ww / 2), 1 - ww / 2)
+    cy = min(max(cy, wh / 2), 1 - wh / 2)
+    return cx - ww / 2, cy - wh / 2, cx + ww / 2, cy + wh / 2
+
+
+def _where_crop_image(image, win, crop_tok):
+    """probe_whd_qwen35.make_crop_image."""
+    from PIL import Image
+    W, H = image.size
+    x0, y0, x1, y1 = win
+    px0, py0 = int(x0 * W), int(y0 * H)
+    px1 = max(int(math.ceil(x1 * W)), px0 + 1)
+    py1 = max(int(math.ceil(y1 * H)), py0 + 1)
+    crop = image.crop((px0, py0, min(px1, W), min(py1, H)))
+    cw, ch = crop.size
+    sc = math.sqrt(min(crop_tok * 1024, cw * ch) / float(cw * ch))
+    nw = max(32, int(cw * sc) // 32 * 32)
+    nh = max(32, int(ch * sc) // 32 * 32)
+    return crop.resize((nw, nh), Image.BICUBIC)
+
+
 class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     """Qwen3.5 with DAT: uses the native vision encoder for both LR and HD features.
 
@@ -2668,6 +2715,93 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     layer.input_layernorm.weight.to(m.hd_input_layernorm.weight.dtype))
             n += 1
         logger.info(f"HD adapters warm-started from base k_proj / v_proj for {n} DAT layers")
+
+    @torch.inference_mode()
+    def where_crop_generate(
+        self,
+        image,
+        question,
+        where_head,
+        processor,
+        hr_processor,
+        where_question=None,
+        layer=8,
+        out_cells=4,
+        crop_tok=400,
+        ground_pad=2.0,
+        min_cells=20,
+        hr_scale=3,
+        hd_cap=5017600,
+        max_new_tokens=8,
+    ):
+        """Answer from a cropped window instead of the HD K/V bypass.
+
+        1. One LR prefill (no HD) and the frozen where-head on layer-`layer`
+           image-token states — the same features scripts/where_head.py trains on.
+        2. The head's top cell, expanded like probe_whd_qwen35.py's ground_window
+           (pad x ground_pad, at least min_cells HD cells), cropped from the
+           original image and re-encoded as a normal second image.
+        3. generate() on [LR image, question, crop, question]. pixel_values_hd
+           is not passed, so the K/V bypass stays off.
+
+        Returns {text, box, window}. `where_question` is what the head sees
+        (the question's first line); `question` is the full answering prompt.
+        """
+        from PIL import Image  # noqa: F401  (crop returns a PIL image)
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        where_question = where_question if where_question is not None else question
+
+        def _tensors(inp, keep):
+            out = {}
+            for k, v in inp.items():
+                if not torch.is_tensor(v):
+                    continue
+                if keep is not None and k not in keep:
+                    continue
+                out[k] = v.to(device=device, dtype=dtype) if k == "pixel_values" else v.to(device)
+            return out
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": [{"type": "image", "image": image},
+                                                 {"type": "text", "text": where_question}]}]
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        loc_inp = processor(text=[text], images=[image], return_tensors="pt")
+        loc_kw = _tensors(loc_inp, None)
+        out = self(**loc_kw, output_hidden_states=True, return_dict=True)
+        ids = loc_kw["input_ids"][0]
+        image_id = self.config.image_token_id
+        is_img = ids == image_id
+        thw = loc_inp["image_grid_thw"][0]
+        gh, gw = int(thw[1]) // 2, int(thw[2]) // 2
+        hs = out.hidden_states[layer][0]
+        cells = hs[is_img]
+        if cells.shape[0] != gh * gw:
+            raise RuntimeError(f"where_crop: image tokens {cells.shape[0]} != grid {gh}x{gw}")
+        txt = hs[int(torch.nonzero(is_img)[-1]) + 1:]
+        logits = where_head(cells.reshape(gh, gw, -1), txt)
+        box = _where_top_box(logits, out_cells)
+        hd_w, hd_h = _where_hd_size(image, thw, hr_scale, hd_cap)
+        win = _where_pad_window(box, ground_pad, min_cells, hd_w, hd_h)
+        crop = _where_crop_image(image, win, crop_tok)
+        lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
+        hint = {"type": "text", "text": "Zoomed-in view of the relevant region:"}
+        q = {"type": "text", "text": question}
+        content = [{"type": "image", "image": lr_img}, q, hint,
+                   {"type": "image", "image": crop}, dict(q)]
+        messages = [{"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": content}]
+        text = hr_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        ans_inp = hr_processor(text=[text], images=[lr_img, crop], return_tensors="pt")
+        ans_kw = _tensors(ans_inp, ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"))
+        gen = self.generate(**ans_kw, max_new_tokens=max_new_tokens, do_sample=False,
+                            temperature=None, top_p=None, top_k=None)
+        n_prompt = ans_kw["input_ids"].shape[1]
+        answer = hr_processor.tokenizer.decode(gen[0][n_prompt:], skip_special_tokens=True).strip()
+        return {"text": answer, "box": box, "window": win}
 
     def prepare_inputs_for_generation(
         self,
