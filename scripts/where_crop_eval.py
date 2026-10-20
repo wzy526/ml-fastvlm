@@ -31,6 +31,8 @@ def main():
     ap.add_argument("--min_cells", type=int, default=20)
     ap.add_argument("--ground_pad", type=float, default=2.0)
     ap.add_argument("--lr_tok", type=int, default=640)
+    ap.add_argument("--where_tok", type=int, default=0,
+                    help="LR token budget of the head's prefill; 0 = same as --lr_tok")
     ap.add_argument("--out", default=None)
     ap.add_argument("--attn", default="sdpa")
     args = ap.parse_args()
@@ -50,13 +52,17 @@ def main():
         args.model_path, min_pixels=1024, max_pixels=args.lr_tok * 1024)
     hr_processor = AutoProcessor.from_pretrained(
         args.model_path, min_pixels=1024, max_pixels=100_000_000)
+    where_processor = None
+    if args.where_tok and args.where_tok != args.lr_tok:
+        where_processor = AutoProcessor.from_pretrained(
+            args.model_path, min_pixels=1024, max_pixels=args.where_tok * 1024)
 
     probe_args = argparse.Namespace(vstar_root=args.vstar_root, max_samples=args.max_samples)
     samples = load_vstar(probe_args)
     mine = [s for i, s in enumerate(samples) if i % args.shards == args.shard]
     print(f"[where_crop] shard {args.shard}/{args.shards}: {len(mine)}/{len(samples)} samples, "
           f"hidden {c}, layer {args.layer}, min_cells {args.min_cells}, "
-          f"ground_pad {args.ground_pad}", flush=True)
+          f"ground_pad {args.ground_pad}, where_tok {args.where_tok or args.lr_tok}", flush=True)
 
     rows, n_ok = [], 0
     per = {}
@@ -65,7 +71,7 @@ def main():
         rec = model.where_crop_generate(
             s["image"], s["prompt"], processor, hr_processor,
             where_question=where_q, layer=args.layer, min_cells=args.min_cells,
-            ground_pad=args.ground_pad)
+            ground_pad=args.ground_pad, where_processor=where_processor)
         pred = extract_letter(rec["text"])
         ok = pred == s["gt"]
         n_ok += ok
@@ -77,6 +83,7 @@ def main():
         rows.append({"i": args.shard + i * args.shards, "pred": pred, "gt": s["gt"],
                      "ok": bool(ok), "cat": cat,
                      "box": list(rec["box"]), "window": list(win),
+                     "where_grid": list(rec.get("where_grid", ())),
                      "area": (win[2] - win[0]) * (win[3] - win[1])})
         print(f"[where_crop] {rows[-1]['i']} pred={pred} gt={s['gt']} ok={int(ok)} "
               f"cat={cat} area={rows[-1]['area']:.3f}", flush=True)

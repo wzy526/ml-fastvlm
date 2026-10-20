@@ -2851,6 +2851,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         hr_scale=3,
         hd_cap=5017600,
         max_new_tokens=8,
+        where_processor=None,
     ):
         """Answer from a cropped window instead of the HD K/V bypass.
 
@@ -2863,6 +2864,13 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
            original image and re-encoded as a normal second image.
         3. generate() on [LR image, question, crop, question]. pixel_values_hd
            is not passed, so the K/V bypass stays off.
+
+        `where_processor` (optional) sizes the head's prefill separately from
+        the answer's LR image (`processor`): V* targets under 16 LR px at 640
+        tokens are invisible to the head, and the same head zero-shot at 1600
+        tokens covers 82.7% vs 76.4%. The window keeps the same fraction of
+        the image: `out_cells` is in answer-LR cells and is rescaled to the
+        head's grid, so a finer head grid does not shrink the crop.
 
         Returns {text, box, window}. `where_question` is what the head sees
         (the question's first line); `question` is the full answering prompt.
@@ -2887,26 +2895,34 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 out[k] = v.to(device=device, dtype=dtype) if k == "pixel_values" else v.to(device)
             return out
 
+        loc_proc = where_processor if where_processor is not None else processor
         messages = [{"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": [{"type": "image", "image": image},
                                                  {"type": "text", "text": where_question}]}]
-        text = processor.apply_chat_template(
+        text = loc_proc.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        loc_inp = processor(text=[text], images=[image], return_tensors="pt")
+        loc_inp = loc_proc(text=[text], images=[image], return_tensors="pt")
         loc_kw = _tensors(loc_inp, None)
         out = self(**loc_kw, output_hidden_states=True, return_dict=True)
         ids = loc_kw["input_ids"][0]
         image_id = self.config.image_token_id
         is_img = ids == image_id
-        thw = loc_inp["image_grid_thw"][0]
-        gh, gw = int(thw[1]) // 2, int(thw[2]) // 2
+        loc_thw = loc_inp["image_grid_thw"][0]
+        gh, gw = int(loc_thw[1]) // 2, int(loc_thw[2]) // 2
         hs = out.hidden_states[layer][0]
         cells = hs[is_img]
         if cells.shape[0] != gh * gw:
             raise RuntimeError(f"where_crop: image tokens {cells.shape[0]} != grid {gh}x{gw}")
         txt = hs[int(torch.nonzero(is_img)[-1]) + 1:]
         logits = self.where_head(cells.reshape(gh, gw, -1), txt)
-        box = _where_top_box(logits, out_cells)
+        # Answer-LR grid: the LR image generate() sees, and the unit of out_cells.
+        if loc_proc is processor:
+            thw = loc_thw
+            cells_eff = float(out_cells)
+        else:
+            thw = processor.image_processor(images=[image], return_tensors="pt")["image_grid_thw"][0]
+            cells_eff = out_cells * gw / float(int(thw[2]) // 2)
+        box = _where_top_box(logits, cells_eff)
         hd_w, hd_h = _where_hd_size(image, thw, hr_scale, hd_cap)
         win = _where_pad_window(box, ground_pad, min_cells, hd_w, hd_h)
         crop = _where_crop_image(image, win, crop_tok)
@@ -2925,7 +2941,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                             temperature=None, top_p=None, top_k=None)
         n_prompt = ans_kw["input_ids"].shape[1]
         answer = hr_processor.tokenizer.decode(gen[0][n_prompt:], skip_special_tokens=True).strip()
-        return {"text": answer, "box": box, "window": win}
+        return {"text": answer, "box": box, "window": win, "where_grid": (gh, gw)}
 
     def prepare_inputs_for_generation(
         self,
