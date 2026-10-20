@@ -72,13 +72,18 @@ def window_hd_cells(path, frac):
     return min(frac * hd_w, frac * hd_h) / FACTOR
 
 
-def crop_cells(feat, win):
-    """HD feature cells (H, W, C) inside the fractional window -> (h, w, C)."""
-    H, W, _ = feat.shape
+def crop_bounds(H, W, win):
+    """Cell range [y0, y1) x [x0, x1) of a fractional window on an H x W grid."""
     x0, x1 = int(math.floor(win[0] * W)), int(math.ceil(win[2] * W))
     y0, y1 = int(math.floor(win[1] * H)), int(math.ceil(win[3] * H))
     x0, x1 = max(0, x0), min(W, max(x1, x0 + 1))
     y0, y1 = max(0, y0), min(H, max(y1, y0 + 1))
+    return y0, y1, x0, x1
+
+
+def crop_cells(feat, win):
+    """HD feature cells (H, W, C) inside the fractional window -> (h, w, C)."""
+    y0, y1, x0, x1 = crop_bounds(feat.shape[0], feat.shape[1], win)
     return feat[y0:y1, x0:x1]
 
 
@@ -109,7 +114,7 @@ class FineHead(nn.Module):
         self.blocks = nn.ModuleList(wh.XBlock(d, heads) for _ in range(layers))
         self.out = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 4))
 
-    def forward(self, feat, txt):
+    def _encode(self, feat, txt):
         H, W, _ = feat.shape
         x = self.img_in(feat.float())
         n = self.row.num_embeddings
@@ -120,6 +125,19 @@ class FineHead(nn.Module):
         tt = t[None]
         for blk in self.blocks:
             cells, tt = blk(cells, tt, H, W)
+        return cells, t, H, W
+
+    def cell_scores(self, feat, txt):
+        """(H, W) attention the question puts on each cell. This is the map the
+        box regression reads; a peak on the target means the head found the
+        cell and the regression threw it away."""
+        cells, t, H, W = self._encode(feat, txt)
+        q = t.mean(0)
+        attn = torch.softmax(cells[0] @ q / math.sqrt(q.numel()), 0)
+        return attn.reshape(H, W)
+
+    def forward(self, feat, txt):
+        cells, t, H, W = self._encode(feat, txt)
         q = t.mean(0)
         attn = torch.softmax(cells[0] @ q / math.sqrt(q.numel()), 0)
         pooled = (attn[:, None] * cells[0]).sum(0)
