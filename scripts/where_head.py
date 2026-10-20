@@ -422,7 +422,10 @@ def main():
         # Qwen3.5 trunk) against one cache dir deadlocked on the first HD
         # forward (py-spy: all ranks inside _generate_hd_features): give every
         # rank its own cache and stagger the first forward
-        os.environ["TRITON_CACHE_DIR"] = os.path.expanduser(f"~/.triton_cache/rank{local_rank}")
+        # Local disk, not the quota'd JuiceFS home (1020: rank 1/4 died with
+        # 'Disk quota exceeded' writing a new kernel). TRITON_CACHE_ROOT overrides.
+        cache_root = os.environ.get("TRITON_CACHE_ROOT", f"/tmp/triton_cache_{os.environ.get('USER', 'u')}")
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_root, f"rank{local_rank}")
         os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
 
     frozen = Frozen(args.model_path, args.txt_layer, args.hd_cap, args.attn, device, local_rank)

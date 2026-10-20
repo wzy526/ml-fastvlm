@@ -147,7 +147,8 @@ def main():
     if world > 1:
         import torch.distributed as dist
         dist.init_process_group("nccl", timeout=timedelta(hours=3))
-        os.environ["TRITON_CACHE_DIR"] = os.path.expanduser(f"~/.triton_cache/rank{local_rank}")
+        cache_root = os.environ.get("TRITON_CACHE_ROOT", f"/tmp/triton_cache_{os.environ.get('USER', 'u')}")
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_root, f"rank{local_rank}")
         os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
     main_rank = rank == 0
     say = print if main_rank else (lambda *a, **k: None)
