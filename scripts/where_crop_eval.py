@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--layer", type=int, default=8)
+    ap.add_argument("--min_cells", type=int, default=20)
     ap.add_argument("--lr_tok", type=int, default=640)
     ap.add_argument("--out", default=None)
     ap.add_argument("--attn", default="sdpa")
@@ -53,7 +54,7 @@ def main():
     samples = load_vstar(probe_args)
     mine = [s for i, s in enumerate(samples) if i % args.shards == args.shard]
     print(f"[where_crop] shard {args.shard}/{args.shards}: {len(mine)}/{len(samples)} samples, "
-          f"hidden {c}, layer {args.layer}", flush=True)
+          f"hidden {c}, layer {args.layer}, min_cells {args.min_cells}", flush=True)
 
     rows, n_ok = [], 0
     per = {}
@@ -61,7 +62,7 @@ def main():
         where_q = s["prompt"].split("\n")[0]
         rec = model.where_crop_generate(
             s["image"], s["prompt"], processor, hr_processor,
-            where_question=where_q, layer=args.layer)
+            where_question=where_q, layer=args.layer, min_cells=args.min_cells)
         pred = extract_letter(rec["text"])
         ok = pred == s["gt"]
         n_ok += ok
