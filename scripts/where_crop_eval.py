@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Score model.where_crop_generate on V*. The probe path this has to match is
-ground_window + where_lm8_mix.json boxes: V* 75.4 at LR 640 (off is 64.4).
+"""Score model.where_crop_generate on V*. The head is read from the checkpoint
+(where_head.pt next to config.json). The live path this has to match scored
+V* 77.5 at LR 640 (the external-pt run; off is 64.4).
 
+  cp -n $E/loc/where_lm8_mix.pt $E/checkpoint-1000/where_head.pt
   CUDA_VISIBLE_DEVICES=0 python scripts/where_crop_eval.py \
-      --model_path $E/checkpoint-1000 --load $E/loc/where_lm8_mix.pt \
-      --shard 0 --shards 8 --out $E/loc/where_crop_0.json
+      --model_path $E/checkpoint-1000 \
+      --shard 0 --shards 8 --out $E/loc/where_crop2_0.json
 """
 import argparse
 import json
@@ -15,19 +17,16 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import where_head as wh
 from probe_whd_qwen35 import extract_letter, load_vstar
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
-    ap.add_argument("--load", required=True)
     ap.add_argument("--vstar_root", default="~/data/vstar_bench")
     ap.add_argument("--max_samples", type=int, default=300)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
-    ap.add_argument("--d", type=int, default=384)
     ap.add_argument("--layer", type=int, default=8)
     ap.add_argument("--lr_tok", type=int, default=640)
     ap.add_argument("--out", default=None)
@@ -42,10 +41,9 @@ def main():
     model = Qwen3_5DATForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
         attn_implementation=args.attn).eval()
+    if not model._where_head_loaded:
+        raise SystemExit(f"no where-head in {args.model_path} (expected where_head.pt)")
     c = model.config.text_config.hidden_size
-    head = wh.XAttnHead(c, c, args.d).to(next(model.parameters()).device)
-    head.load_state_dict(torch.load(os.path.expanduser(args.load), map_location="cpu"))
-    head.eval()
     processor = AutoProcessor.from_pretrained(
         args.model_path, min_pixels=1024, max_pixels=args.lr_tok * 1024)
     hr_processor = AutoProcessor.from_pretrained(
@@ -62,7 +60,7 @@ def main():
     for i, s in enumerate(mine):
         where_q = s["prompt"].split("\n")[0]
         rec = model.where_crop_generate(
-            s["image"], s["prompt"], head, processor, hr_processor,
+            s["image"], s["prompt"], processor, hr_processor,
             where_question=where_q, layer=args.layer)
         pred = extract_letter(rec["text"])
         ok = pred == s["gt"]

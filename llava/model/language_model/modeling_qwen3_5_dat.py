@@ -2441,6 +2441,100 @@ def _where_crop_image(image, win, crop_tok):
     return crop.resize((nw, nh), Image.BICUBIC)
 
 
+class _WhereXBlock(nn.Module):
+    """Same block as scripts/where_head.py XBlock. Parameter names must match
+    where_lm8_mix.pt so the checkpoint sidecar loads without a key rename."""
+
+    def __init__(self, d, heads):
+        super().__init__()
+        self.t_norm = nn.LayerNorm(d)
+        self.t_attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.c_norm = nn.LayerNorm(d)
+        self.c_attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.conv = nn.Conv2d(d, d, 3, padding=1, groups=d)
+        self.f_norm = nn.LayerNorm(d)
+        self.ffn = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(), nn.Linear(2 * d, d))
+
+    def forward(self, cells, txt, H, W):
+        tq = self.t_norm(txt)
+        txt = txt + self.t_attn(tq, cells, cells, need_weights=False)[0]
+        cq = self.c_norm(cells)
+        cells = cells + self.c_attn(cq, txt, txt, need_weights=False)[0]
+        g = cells.transpose(1, 2).reshape(1, -1, H, W)
+        cells = cells + self.conv(g).flatten(2).transpose(1, 2)
+        cells = cells + self.ffn(self.f_norm(cells))
+        return cells, txt
+
+
+class _WhereXAttnHead(nn.Module):
+    """Same module as scripts/where_head.py XAttnHead (d=384, 2 layers, 6 heads)."""
+
+    def __init__(self, c_img, c_txt, d=384, layers=2, heads=6, max_hw=512):
+        super().__init__()
+        self.img_in = nn.Sequential(nn.LayerNorm(c_img), nn.Linear(c_img, d))
+        self.txt_in = nn.Sequential(nn.LayerNorm(c_txt), nn.Linear(c_txt, d))
+        self.row = nn.Embedding(max_hw, d)
+        self.col = nn.Embedding(max_hw, d)
+        nn.init.normal_(self.row.weight, std=0.02)
+        nn.init.normal_(self.col.weight, std=0.02)
+        self.blocks = nn.ModuleList(_WhereXBlock(d, heads) for _ in range(layers))
+        self.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+
+    def forward(self, feat, txt):
+        H, W, _ = feat.shape
+        x = self.img_in(feat.float())
+        n_pos = self.row.num_embeddings
+        ri = torch.arange(H, device=x.device).clamp_max(n_pos - 1)
+        ci = torch.arange(W, device=x.device).clamp_max(n_pos - 1)
+        pos = self.row(ri)[:, None] + self.col(ci)[None]
+        cells = (x + pos).reshape(1, H * W, -1)
+        t = self.txt_in(txt.float())[None]
+        for blk in self.blocks:
+            cells, t = blk(cells, t, H, W)
+        return self.out(cells)[0, :, 0].reshape(H, W)
+
+
+def _where_head_state_from_dir(path):
+    """Head weights stored with the checkpoint.
+
+    Sharded `where_head.*` tensors win. Otherwise `where_head.pt` in the
+    checkpoint directory, saved as XAttnHead.state_dict() (no prefix).
+    """
+    if not isinstance(path, (str, os.PathLike)) or not os.path.isdir(path):
+        return None
+    path = os.fspath(path)
+    index = os.path.join(path, "model.safetensors.index.json")
+    shard_keys = {}
+    if os.path.isfile(index):
+        weight_map = json.load(open(index))["weight_map"]
+        for k, fn in weight_map.items():
+            if k.startswith("where_head."):
+                shard_keys.setdefault(fn, []).append(k)
+    elif os.path.isfile(os.path.join(path, "model.safetensors")):
+        shard_keys = {"model.safetensors": None}
+    if shard_keys:
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            safe_open = None
+        if safe_open is not None:
+            sd = {}
+            for fn, keys in shard_keys.items():
+                with safe_open(os.path.join(path, fn), framework="pt") as st:
+                    use = keys if keys is not None else [k for k in st.keys() if k.startswith("where_head.")]
+                    for k in use:
+                        sd[k[len("where_head."):]] = st.get_tensor(k)
+            if sd:
+                return sd
+    sidecar = os.path.join(path, "where_head.pt")
+    if os.path.isfile(sidecar):
+        sd = torch.load(sidecar, map_location="cpu")
+        if any(k.startswith("where_head.") for k in sd):
+            sd = {k[len("where_head."):]: v for k, v in sd.items() if k.startswith("where_head.")}
+        return sd
+    return None
+
+
 class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     """Qwen3.5 with DAT: uses the native vision encoder for both LR and HD features.
 
@@ -2567,6 +2661,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         """
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         cls._manual_load_dat_raw_params(model, pretrained_model_name_or_path)
+        cls._attach_where_head(model, pretrained_model_name_or_path)
         return model
 
     # substrings that mark a DAT-specific param that _dat_init_weights (re)inits;
@@ -2643,6 +2738,30 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 f"[DAT post-load] re-asserted {n_loaded} on-disk DAT params "
                 f"over HF's post-load re-init (incl. hd_gate)"
             )
+
+    @classmethod
+    def _attach_where_head(cls, model, path):
+        """Register the frozen localisation head when the checkpoint has its weights.
+
+        Absent on older checkpoints: nothing is added, so training loads stay the
+        same. where_crop_generate refuses to run until this has loaded.
+        Kept in fp32 — the 77.5 V* run used an fp32 head, and its forward casts
+        the LM states to float against these weights.
+        """
+        sd = _where_head_state_from_dir(path)
+        model._where_head_loaded = False
+        if not sd:
+            return
+        hidden = model.config.text_config.hidden_size
+        head = _WhereXAttnHead(hidden, hidden, d=384, layers=2, heads=6, max_hw=512)
+        head.load_state_dict(sd)
+        device = next(model.parameters()).device
+        head.to(device=device, dtype=torch.float32)
+        head.requires_grad_(False)
+        head.eval()
+        model.where_head = head
+        model._where_head_loaded = True
+        logger.info(f"[where_head] loaded {len(sd)} tensors from {path}")
 
     def _patch_text_model_init_weights(self):
         """Monkey-patch text model's _init_weights for DAT-specific initialization."""
@@ -2721,7 +2840,6 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self,
         image,
         question,
-        where_head,
         processor,
         hr_processor,
         where_question=None,
@@ -2736,8 +2854,10 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     ):
         """Answer from a cropped window instead of the HD K/V bypass.
 
-        1. One LR prefill (no HD) and the frozen where-head on layer-`layer`
-           image-token states — the same features scripts/where_head.py trains on.
+        1. One LR prefill (no HD) and this checkpoint's frozen where-head on
+           layer-`layer` image-token states — the same features
+           scripts/where_head.py trains on. Weights come from where_head.pt
+           (or where_head.* tensors) in the checkpoint directory.
         2. The head's top cell, expanded like probe_whd_qwen35.py's ground_window
            (pad x ground_pad, at least min_cells HD cells), cropped from the
            original image and re-encoded as a normal second image.
@@ -2749,6 +2869,10 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         """
         from PIL import Image  # noqa: F401  (crop returns a PIL image)
 
+        if not getattr(self, "_where_head_loaded", False):
+            raise RuntimeError(
+                "this checkpoint has no where-head weights; put where_head.pt "
+                "next to config.json (the XAttnHead state_dict)")
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         where_question = where_question if where_question is not None else question
@@ -2781,7 +2905,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         if cells.shape[0] != gh * gw:
             raise RuntimeError(f"where_crop: image tokens {cells.shape[0]} != grid {gh}x{gw}")
         txt = hs[int(torch.nonzero(is_img)[-1]) + 1:]
-        logits = where_head(cells.reshape(gh, gw, -1), txt)
+        logits = self.where_head(cells.reshape(gh, gw, -1), txt)
         box = _where_top_box(logits, out_cells)
         hd_w, hd_h = _where_hd_size(image, thw, hr_scale, hd_cap)
         win = _where_pad_window(box, ground_pad, min_cells, hd_w, hd_h)
