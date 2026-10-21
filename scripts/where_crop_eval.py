@@ -20,12 +20,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from probe_whd_qwen35 import extract_letter, load_vstar
 
 
-class OracleHead:
+class OracleHead(torch.nn.Module):
     """Stands in for model.where_head: a one-hot map at the GT union-box centre.
     Everything downstream (square, pad, crop, prompt) is unchanged, so this is
-    the ceiling of THIS pipeline given a perfect head, per question."""
+    the ceiling of THIS pipeline given a perfect head, per question.
+    An nn.Module because where_head is a registered child of the model."""
 
     def __init__(self):
+        super().__init__()
         self.centre = None
 
     def set_sample(self, s):
@@ -35,7 +37,7 @@ class OracleHead:
         x1, y1 = max(b[0] + b[2] for b in bb), max(b[1] + b[3] for b in bb)
         self.centre = ((x0 + x1) / 2 / W, (y0 + y1) / 2 / H)
 
-    def __call__(self, feat, txt):
+    def forward(self, feat, txt):
         gh, gw, _ = feat.shape
         logits = torch.full((gh, gw), -1e4, device=feat.device)
         cx, cy = self.centre
