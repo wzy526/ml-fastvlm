@@ -49,6 +49,11 @@ def main():
                     help="per --add: keep only samples whose `source` starts with this ('' = all)")
     ap.add_argument("--max_n", action="append", type=int, default=[],
                     help="per --add: random cap after filtering (0 = no cap)")
+    ap.add_argument("--where_only", action="append", type=int, default=[],
+                    help="per --add: 1 = mark samples `where_only` (train_qwen_dat.py masks every "
+                         "label: only the where-head loss applies; for box sets without answers "
+                         "such as coco_small_bbox / refcoco_bbox)")
+    ap.add_argument("--base_max_n", type=int, default=0, help="random cap on the base set (0 = all)")
     ap.add_argument("--tag", default="base", help="`source` for samples that carry none")
     ap.add_argument("--require_bbox", type=int, default=1,
                     help="1 = a side set must contain bbox samples (guards against passing the wrong json)")
@@ -61,13 +66,18 @@ def main():
         return lst[i] if i < len(lst) else default
 
     base = load(args.base)
+    n_base0 = len(base)
+    if args.base_max_n and len(base) > args.base_max_n:
+        rng.shuffle(base)
+        base = base[:args.base_max_n]
     for s in base:
         s.setdefault("source", args.tag)
-    print(f"base {args.base}: {len(base)}")
+    print(f"base {args.base}: {n_base0} -> kept {len(base)}")
     mixed = list(base)
 
     for i, path in enumerate(args.add):
         rep, only, cap = opt(args.repeat, i, 1), opt(args.only_source, i, ""), opt(args.max_n, i, 0)
+        wonly = bool(opt(args.where_only, i, 0))
         d = load(path)
         n0 = len(d)
         if only:
@@ -80,6 +90,8 @@ def main():
         nb = sum(1 for s in d if s.get("bbox"))
         for s in d:
             s.setdefault("source", os.path.splitext(os.path.basename(path))[0])
+            if wonly:
+                s["where_only"] = True
         for k in range(rep):
             for s in d:
                 y = dict(s)
@@ -96,7 +108,8 @@ def main():
     by_src = collections.Counter(s["source"] for s in mixed)
     nbox = sum(1 for s in mixed if s.get("bbox"))
     print(f"\nwrote {len(mixed)} -> {args.out}")
-    print(f"bbox samples: {nbox} ({nbox / len(mixed):.1%} -> expected dat/tf_frac)")
+    nwo = sum(1 for s in mixed if s.get("where_only"))
+    print(f"bbox samples: {nbox} ({nbox / len(mixed):.1%} -> expected dat/tf_frac); where_only {nwo}")
     for src, n in by_src.most_common():
         nb = sum(1 for s in mixed if s["source"] == src and s.get("bbox"))
         print(f"  {src:32s} {n:8d} ({n / len(mixed):5.1%})" + (f"  bbox {nb}" if nb else ""))

@@ -882,6 +882,15 @@ class Qwen3_5DATConfig(Qwen3_5Config):
             'use_shared_vit': False,
             'use_spatial_attn_guide': True,
             'image_hd_for_question': False,
+            # Where-head (1021): a small question<->cell transformer on the LM
+            # layer-`layer` states of the LR image tokens (scripts/where_head.py
+            # XAttnHead, 76% V* window hit frozen). None = absent. A dict
+            # {layer, d, layers, heads, loss_weight, trunk_grad, dilate, focal_w}
+            # registers it as self.where_head; forward(where_target=...) adds
+            # loss_weight * (soft CE + focal) over the LR grid for every sample
+            # that carries a GT cell mask. trunk_grad 0 = the head learns from
+            # the trunk's features as they are (the 76% was measured that way).
+            'where_head': None,
             'hd_early_exit_k': 0,      # HD ViT early exit: run only the first k vision blocks
                                        # (0 = off, full depth). Only affects the separate HD path
                                        # (_generate_hd_features); ignored by use_fused_vit /
@@ -2482,16 +2491,67 @@ class _WhereXAttnHead(nn.Module):
 
     def forward(self, feat, txt):
         H, W, _ = feat.shape
-        x = self.img_in(feat.float())
+        wd = self.img_in[1].weight.dtype            # fp32 when kept there, else the model dtype
+        x = self.img_in(feat.to(wd))
         n_pos = self.row.num_embeddings
         ri = torch.arange(H, device=x.device).clamp_max(n_pos - 1)
         ci = torch.arange(W, device=x.device).clamp_max(n_pos - 1)
         pos = self.row(ri)[:, None] + self.col(ci)[None]
         cells = (x + pos).reshape(1, H * W, -1)
-        t = self.txt_in(txt.float())[None]
+        t = self.txt_in(txt.to(wd))[None]
         for blk in self.blocks:
             cells, t = blk(cells, t, H, W)
         return self.out(cells)[0, :, 0].reshape(H, W)
+
+
+# Text placed between the question and the crop, in training and in
+# where_crop_generate. Keep the two identical.
+WHERE_HINT = "Zoomed-in view of the relevant region:"
+
+
+def _where_head_loss(logits, mask, focal_w=0.5):
+    """scripts/where_head.py head_loss: soft CE (uniform over the GT cells) +
+    focal BCE. logits / mask (H, W)."""
+    flat, m = logits.reshape(-1).float(), mask.reshape(-1).to(logits.device).float()
+    ce = -(torch.log_softmax(flat, -1) * (m / m.sum().clamp(min=1))).sum()
+    p = torch.sigmoid(flat)
+    pt = torch.where(m > 0, p, 1 - p)
+    focal = (-(1 - pt) ** 2 * torch.log(pt.clamp(min=1e-6))).mean()
+    return ce + focal_w * focal * 100.0
+
+
+def _where_token_runs(ids, image_token_id):
+    """Contiguous runs of image tokens in a 1-D id tensor -> [(start, end)]."""
+    idx = torch.nonzero(ids == image_token_id).flatten().tolist()
+    if not idx:
+        return []
+    runs, start, prev = [], idx[0], idx[0]
+    for i in idx[1:]:
+        if i != prev + 1:
+            runs.append((start, prev + 1))
+            start = i
+        prev = i
+    runs.append((start, prev + 1))
+    return runs
+
+
+def _where_shards_have_head(path):
+    """True when the checkpoint's safetensors carry where_head.* tensors."""
+    if not isinstance(path, (str, os.PathLike)) or not os.path.isdir(path):
+        return False
+    path = os.fspath(path)
+    index = os.path.join(path, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        return any(k.startswith("where_head.") for k in json.load(open(index))["weight_map"])
+    single = os.path.join(path, "model.safetensors")
+    if os.path.isfile(single):
+        try:
+            from safetensors import safe_open
+            with safe_open(single, framework="pt") as st:
+                return any(k.startswith("where_head.") for k in st.keys())
+        except ImportError:
+            return False
+    return False
 
 
 def _where_head_state_from_dir(path):
@@ -2552,6 +2612,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         'conv_lr_dw', 'ln_1', 'conv_lr_proj', 'proj_intention',
         'ln_2', 'conv_off_proj', 'conv_glob', 'glob_q', 'glob_k',
         'hd_gate', 'hd_input_layernorm',
+        'where_head',          # 5.6M, trained in fp32 in scripts/where_head.py
     )
     _keep_in_fp32_modules = list(dict.fromkeys(
         (getattr(Qwen3_5ForConditionalGeneration, '_keep_in_fp32_modules', None) or [])
@@ -2602,6 +2663,91 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self.model.language_model.register_forward_pre_hook(
             self._lr_drop_pre_hook, with_kwargs=True,
         )
+
+        # Where-head: registered here when configured so it is saved / loaded /
+        # sharded with the checkpoint. Reads the output of decoder layer
+        # `layer - 1` (= hidden_states[layer] of a full forward, the index
+        # scripts/where_head.py --feat lm:L uses) through a forward hook.
+        self._where_cfg = dict(dat_args.get('where_head') or {}) or None
+        self._where_h = None
+        self._where_head_loaded = False
+        self._where_loss_val = 0.0
+        self._where_hit_val = 0.0
+        self._where_n_val = 0
+        if self._where_cfg is not None:
+            hidden = text_config.hidden_size
+            self.where_head = _WhereXAttnHead(
+                hidden, hidden,
+                d=int(self._where_cfg.get('d', 384)),
+                layers=int(self._where_cfg.get('layers', 2)),
+                heads=int(self._where_cfg.get('heads', 6)),
+                max_hw=int(self._where_cfg.get('max_hw', 512)),
+            )
+            self._where_head_loaded = True
+            li = int(self._where_cfg.get('layer', 8)) - 1
+            self.model.language_model.layers[li].register_forward_hook(self._where_layer_hook)
+
+    def _where_layer_hook(self, module, args, output):
+        self._where_h = output[0] if isinstance(output, (tuple, list)) else output
+        return None
+
+    def _where_aux(self, input_ids, labels, attention_mask, image_grid_thw, where_target):
+        """Head loss over the samples carrying a GT cell mask.
+
+        Per sample: cells = layer-L states of the FIRST image's tokens, text =
+        the states from the end of that image up to the second image's
+        <|vision_start|> (crop layout) or the first answer token (no crop) --
+        i.e. the question (+ hint). Returns (loss or None, hits, n)."""
+        h = self._where_h
+        self._where_h = None
+        cfg = self._where_cfg
+        if h is None or where_target is None or not any(t is not None for t in where_target):
+            return None, 0, 0
+        if float(cfg.get('trunk_grad', 0.0)) <= 0:
+            h = h.detach()
+        image_token_id = self.config.image_token_id
+        merge = self.config.vision_config.spatial_merge_size
+        losses, hits, n = [], 0, 0
+        img_idx = 0
+        B = input_ids.shape[0]
+        for b in range(B):
+            ids = input_ids[b]
+            runs = _where_token_runs(ids, image_token_id)
+            tgt = where_target[b] if b < len(where_target) else None
+            if tgt is None or not runs:
+                img_idx += len(runs)
+                continue
+            thw = image_grid_thw[img_idx]
+            img_idx += len(runs)
+            gh, gw = int(thw[1]) // merge, int(thw[2]) // merge
+            s0, e0 = runs[0]
+            if e0 - s0 != gh * gw:
+                continue
+            if len(runs) > 1:
+                t_end = runs[1][0] - 1                 # exclude the crop's <|vision_start|>
+            else:
+                t_end = int(ids.shape[0])
+                if labels is not None:
+                    ans = torch.nonzero(labels[b] != -100).flatten()
+                    if ans.numel() > 0:
+                        t_end = int(ans[0])
+                if attention_mask is not None:
+                    t_end = min(t_end, int(attention_mask[b].sum()))
+            if t_end <= e0 + 1:
+                continue
+            cells = h[b, s0:e0].reshape(gh, gw, -1)
+            txt = h[b, e0:t_end]
+            logits = self.where_head(cells, txt)
+            m = tgt.to(logits.device)
+            if tuple(m.shape) != (gh, gw) or m.sum() <= 0:
+                continue
+            losses.append(_where_head_loss(logits, m, float(cfg.get('focal_w', 0.5))))
+            cy, cx = divmod(int(logits.detach().reshape(-1).argmax()), gw)
+            hits += int(m[cy, cx] > 0)
+            n += 1
+        if not losses:
+            return None, 0, 0
+        return torch.stack(losses).mean(), hits, n
 
     # ------------------------------------------------------------------
     # LR dropout
@@ -2748,6 +2894,27 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         Kept in fp32 — the 77.5 V* run used an fp32 head, and its forward casts
         the LM states to float against these weights.
         """
+        if getattr(model, '_where_cfg', None) is not None:
+            # Configured head. If the checkpoint shards carry where_head.*
+            # (a trained run) HF already loaded them; otherwise this is the
+            # first run on top of a plain DAT checkpoint and the head is
+            # initialised from cfg['init'] (explicit state_dict path) or the
+            # where_head.pt sidecar next to config.json.
+            model.where_head.float()
+            if _where_shards_have_head(path):
+                logger.info("[where_head] weights loaded from checkpoint shards")
+                return
+            sidecar = model._where_cfg.get('init') or None
+            if not sidecar and isinstance(path, (str, os.PathLike)) and os.path.isdir(path):
+                sidecar = os.path.join(os.fspath(path), "where_head.pt")
+            if sidecar and os.path.isfile(sidecar):
+                sd = torch.load(sidecar, map_location="cpu")
+                sd = {k[len("where_head."):] if k.startswith("where_head.") else k: v for k, v in sd.items()}
+                model.where_head.load_state_dict(sd)
+                logger.info(f"[where_head] initialised from {sidecar}")
+            else:
+                logger.warning("[where_head] configured but no init found: random head")
+            return
         sd = _where_head_state_from_dir(path)
         model._where_head_loaded = False
         if not sd:
@@ -2852,6 +3019,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         hd_cap=5017600,
         max_new_tokens=8,
         where_processor=None,
+        head_prefix="legacy",
     ):
         """Answer from a cropped window instead of the HD K/V bypass.
 
@@ -2874,6 +3042,11 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
         Returns {text, box, window}. `where_question` is what the head sees
         (the question's first line); `question` is the full answering prompt.
+
+        `head_prefix`: 'legacy' = the head's text span is where_question +
+        the assistant generation prompt (what scripts/where_head.py trained
+        on); 'train' = where_question + WHERE_HINT and nothing after, the
+        span the in-model head sees during train_qwen_dat.py crop samples.
         """
         from PIL import Image  # noqa: F401  (crop returns a PIL image)
 
@@ -2896,11 +3069,22 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             return out
 
         loc_proc = where_processor if where_processor is not None else processor
-        messages = [{"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": [{"type": "image", "image": image},
-                                                 {"type": "text", "text": where_question}]}]
-        text = loc_proc.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        if head_prefix == "train":
+            messages = [{"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": [{"type": "image", "image": image},
+                                                     {"type": "text", "text": where_question},
+                                                     {"type": "text", "text": WHERE_HINT}]}]
+            text = loc_proc.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False, enable_thinking=False)
+            text = text.rstrip()
+            if text.endswith("<|im_end|>"):
+                text = text[:-len("<|im_end|>")]
+        else:
+            messages = [{"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": [{"type": "image", "image": image},
+                                                     {"type": "text", "text": where_question}]}]
+            text = loc_proc.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         loc_inp = loc_proc(text=[text], images=[image], return_tensors="pt")
         loc_kw = _tensors(loc_inp, None)
         out = self(**loc_kw, output_hidden_states=True, return_dict=True)
@@ -2927,7 +3111,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         win = _where_pad_window(box, ground_pad, min_cells, hd_w, hd_h)
         crop = _where_crop_image(image, win, crop_tok)
         lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
-        hint = {"type": "text", "text": "Zoomed-in view of the relevant region:"}
+        hint = {"type": "text", "text": WHERE_HINT}
         q = {"type": "text", "text": question}
         content = [{"type": "image", "image": lr_img}, q, hint,
                    {"type": "image", "image": crop}, dict(q)]
@@ -3184,6 +3368,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         image_hd_features: Optional[List[torch.Tensor]] = None,
         image_range_list: Optional[List[List]] = None,
         dat_force_window: Optional[List[Optional[torch.Tensor]]] = None,
+        where_target: Optional[List[Optional[torch.Tensor]]] = None,
         **kwargs,
     ) -> Union[Tuple, Qwen3_5CausalLMOutputWithPast]:
         """Forward pass with DAT HD feature injection.
@@ -3193,7 +3378,10 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             image_grid_thw_hd: Grid dimensions for HD images
             image_hd_features: Pre-computed HD features (alternative to pixel_values_hd)
             image_range_list: Pre-computed image/answer ranges (optional, auto-computed)
+            where_target: per-sample (gh, gw) 0/1 GT cell mask on the first
+                image's LR grid (None = no where-head loss for that sample)
         """
+        self._where_h = None
         # === Step 1: ViT feature extraction ===
         _pixel_values_for_model = pixel_values
         _image_grid_thw_for_model = image_grid_thw
@@ -3377,7 +3565,12 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = F.cross_entropy(shift_logits, shift_labels)
+            if self._where_cfg is not None and not bool((shift_labels != -100).any()):
+                # A micro-batch of where_only samples: no LM targets at all
+                # (mean CE would be NaN); keep the graph, contribute 0.
+                loss = shift_logits.sum() * 0.0
+            else:
+                loss = F.cross_entropy(shift_logits, shift_labels)
             if os.environ.get("DAT_LOSS_PROBE"):
                 _nv = int((shift_labels != -100).sum())
                 _lf = bool(torch.isfinite(logits.detach()).all())
@@ -3387,6 +3580,19 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 print(f"[LOSSPROBE] loss={float(loss):.6g} finite_logits={_lf} "
                       f"finite_hidden={_hf} n_valid={_nv}/{shift_labels.numel()} "
                       f"logits_absmax={_lam:.4g} hidden_absmax={_ham:.4g}", flush=True)
+
+        # === Where-head auxiliary loss (training only; eval reads the hook itself) ===
+        if self._where_cfg is not None:
+            self._where_n_val = 0
+            if where_target is not None and labels is not None:
+                w_loss, w_hit, w_n = self._where_aux(
+                    input_ids, labels, attention_mask, image_grid_thw, where_target)
+                if w_loss is not None:
+                    self._where_loss_val = float(w_loss.detach())
+                    self._where_hit_val = float(w_hit)
+                    self._where_n_val = int(w_n)
+                    loss = loss + float(self._where_cfg.get('loss_weight', 1.0)) * w_loss
+        self._where_h = None
 
         return Qwen3_5CausalLMOutputWithPast(
             loss=loss,
@@ -3409,6 +3615,8 @@ DAT_KEYS_MATCH = [
     # use_global_offset extras (None unless enabled; conv_glob for 'conv'/'both',
     # glob_q/glob_k for 'qk'/'both'/'attn+qk'; 'attn' itself is parameter-free)
     'conv_glob', 'glob_q', 'glob_k',
+    # where-head (dat_extra_args['where_head'] != None)
+    'where_head',
 ]
 
 

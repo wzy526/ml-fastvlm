@@ -62,6 +62,12 @@ def main():
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--oracle_box", action="store_true",
                     help="replace the head with the GT box centre (pipeline ceiling)")
+    ap.add_argument("--where_head_pt", default=None,
+                    help="override the head weights with this XAttnHead state_dict "
+                         "(e.g. the 640 head while <ckpt>/where_head.pt holds the 1600 one)")
+    ap.add_argument("--head_prefix", default="legacy", choices=["legacy", "train"],
+                    help="text span the head reads: legacy = question + generation prompt "
+                         "(scripts/where_head.py), train = question + hint (train_qwen_dat.py crops)")
     args = ap.parse_args()
 
     from transformers import AutoProcessor
@@ -74,6 +80,11 @@ def main():
         attn_implementation=args.attn).eval()
     if not model._where_head_loaded:
         raise SystemExit(f"no where-head in {args.model_path} (expected where_head.pt)")
+    if args.where_head_pt:
+        sd = torch.load(args.where_head_pt, map_location="cpu")
+        sd = {k[len("where_head."):] if k.startswith("where_head.") else k: v for k, v in sd.items()}
+        model.where_head.load_state_dict(sd)
+        print(f"[where_crop] head weights <- {args.where_head_pt}", flush=True)
     oracle = None
     if args.oracle_box:
         oracle = OracleHead()
@@ -96,7 +107,8 @@ def main():
     print(f"[where_crop] shard {args.shard}/{args.shards}: {len(mine)}/{len(samples)} samples, "
           f"{'ORACLE box centre, ' if oracle is not None else ''}"
           f"hidden {c}, layer {args.layer}, min_cells {args.min_cells}, "
-          f"ground_pad {args.ground_pad}, where_tok {args.where_tok or args.lr_tok}", flush=True)
+          f"ground_pad {args.ground_pad}, where_tok {args.where_tok or args.lr_tok}, "
+          f"head_prefix {args.head_prefix}", flush=True)
 
     rows, n_ok = [], 0
     per = {}
@@ -107,7 +119,8 @@ def main():
         rec = model.where_crop_generate(
             s["image"], s["prompt"], processor, hr_processor,
             where_question=where_q, layer=args.layer, min_cells=args.min_cells,
-            ground_pad=args.ground_pad, where_processor=where_processor)
+            ground_pad=args.ground_pad, where_processor=where_processor,
+            head_prefix=args.head_prefix)
         pred = extract_letter(rec["text"])
         ok = pred == s["gt"]
         n_ok += ok

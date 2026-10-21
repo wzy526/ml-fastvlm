@@ -147,6 +147,7 @@ DAT_KEYS_MATCH = [
     'ln_2', 'conv_off_proj', 'k_proj_hd', 'v_proj_hd',
     'hd_gate', 'hd_input_layernorm',
     'conv_glob', 'glob_q', 'glob_k',   # Qwen3.5 DAT with dat_use_global_offset
+    'where_head',                      # Qwen3.5 DAT with dat_where_head
 ]
 
 
@@ -178,6 +179,25 @@ def _apply_hd_gate_freeze(model, model_args) -> None:
         f"[dat_hd_gate_freeze=True] froze {frozen} hd_gate parameter(s) "
         f"(stays at dat_hd_gate_init for the entire run)"
     )
+
+
+def _apply_dat_trainable_filter(model, model_args) -> None:
+    """Keep only the DAT params matching ``dat_trainable_keys`` trainable.
+    Called at the same points as :func:`_apply_hd_gate_freeze` (after every
+    pass that flips all DAT_KEYS_MATCH params on). No-op when unset."""
+    keys = [k.strip() for k in (getattr(model_args, 'dat_trainable_keys', None) or '').split(',') if k.strip()]
+    if not keys:
+        return
+    kept, frozen = 0, 0
+    for name, param in model.named_parameters():
+        if not any(k in name for k in DAT_KEYS_MATCH):
+            continue
+        if any(k in name for k in keys):
+            kept += 1
+        elif param.requires_grad:
+            param.requires_grad = False
+            frozen += 1
+    rank0_print(f"[dat_trainable_keys={keys}] DAT params kept trainable {kept}, frozen {frozen}")
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +559,41 @@ class ModelArguments:
                   "no 'close the door' escape route and must learn useful HD content. "
                   "Requires dat_hd_gate_init to be set."}
     )
+    # ---- Where-head (1021): localisation head + crop readout ----
+    # The head (scripts/where_head.py XAttnHead, 76% V* window hit when
+    # frozen) becomes a model submodule trained jointly on the LM's layer-8
+    # LR image-token states. The readout is a re-encoded crop placed in the
+    # sequence as a second image (data side: dat_where_crop_prob).
+    dat_where_head: bool = field(
+        default=False,
+        metadata={"help": "Register the where-head (dat_extra_args['where_head']) and add its "
+                          "cell-mask loss for samples carrying `where_target`."}
+    )
+    dat_where_layer: int = field(default=8, metadata={"help": "LM layer whose states the head reads."})
+    dat_where_loss_weight: float = field(default=1.0)
+    dat_where_trunk_grad: float = field(
+        default=0.0,
+        metadata={"help": "0 = head loss does not reach the LM (features detached); >0 = lets it through."}
+    )
+    dat_where_focal_w: float = field(default=0.5)
+    dat_where_init: Optional[str] = field(
+        default=None,
+        metadata={"help": "XAttnHead state_dict (e.g. where_lm8_mix.pt) to initialise the head from "
+                          "when the checkpoint shards carry none; default = <ckpt>/where_head.pt."}
+    )
+    dat_inherit_ckpt_args: bool = field(
+        default=False,
+        metadata={"help": "Take dat_extra_args verbatim from <model_name_or_path>/config.json (a DAT "
+                          "checkpoint) instead of rebuilding them from the CLI; only 'where_head' is "
+                          "overlaid. Removes the 'DAT args MUST match stage 1' footgun when the K/V "
+                          "path is not being trained."}
+    )
+    dat_trainable_keys: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated substrings; DAT params (DAT_KEYS_MATCH) whose name matches "
+                          "none of them are frozen after the unfreeze passes. e.g. 'where_head' = train "
+                          "the head only and leave the K/V bypass untouched."}
+    )
     dat_inject_lr_image: bool = field(
         default=False,
         metadata={"help": "D1: in addition to the answer-span Q, also feed lr_image-"
@@ -641,6 +696,27 @@ class DataArguments:
     dat_tf_max_window_frac: float = field(
         default=0.5,
         metadata={"help": "Force only if the window covers <= this fraction of the image area."}
+    )
+
+    # ---- Where-head crop readout (1021) ----
+    # For dat_where_crop_prob of the bbox samples the user turn becomes
+    # [LR image, question, WHERE_HINT, crop, question] where the crop is the
+    # window where_crop_generate --oracle_box would pick (GT centre -> out_cells
+    # square -> x pad, >= min_cells HD cells -> original pixels -> crop_tok),
+    # and the sample carries `where_target` = the GT cells on the LR grid for
+    # the head loss. When > 0 the dataset emits NO pixel_values_hd: the crop
+    # path replaces the K/V bypass, exactly as where_crop_generate runs it.
+    dat_where_crop_prob: float = field(default=0.0)
+    dat_where_out_cells: int = field(default=4, metadata={"help": "where_crop_generate out_cells"})
+    dat_where_pad: float = field(default=2.0, metadata={"help": "where_crop_generate ground_pad"})
+    dat_where_min_cells: int = field(default=20, metadata={"help": "where_crop_generate min_cells"})
+    dat_where_crop_tok: int = field(default=400, metadata={"help": "where_crop_generate crop_tok"})
+    dat_where_hd_cap: int = field(default=5017600, metadata={"help": "where_crop_generate hd_cap"})
+    dat_where_dilate: int = field(default=0, metadata={"help": "cell_targets dilation (LR cells)"})
+    dat_where_max_box_frac: float = field(
+        default=0.25,
+        metadata={"help": "Skip the crop (plain sample, no head loss) when the GT box covers more "
+                          "than this fraction of the image: nothing to zoom into."}
     )
 
     # ---- HR-first resize (DEPRECATED: kept for ablation but not recommended) ----
@@ -1297,6 +1373,22 @@ class Qwen2VLCoupledDATDataset(Dataset):
             f"HD = LR * {self.hr_scale}² "
             f"(capped at orig_pixels and hd_max_pixels={self.hd_max_pixels})"
         )
+
+        # Where-head crop readout (see DataArguments.dat_where_crop_prob).
+        self.where_crop_prob = float(getattr(data_args, "dat_where_crop_prob", 0.0) or 0.0)
+        self.where_mode = self.where_crop_prob > 0.0
+        self._where_n_crop = 0
+        self._where_n_skip_big = 0
+        self._where_n_bbox = 0
+        if self.where_mode:
+            n_bbox = sum(1 for s in self.list_data_dict if s.get("bbox"))
+            rank0_print(
+                f"[where] crop readout ON: prob={self.where_crop_prob}, bbox samples "
+                f"{n_bbox}/{len(self.list_data_dict)}, out_cells={data_args.dat_where_out_cells}, "
+                f"pad={data_args.dat_where_pad}, min_cells={data_args.dat_where_min_cells}, "
+                f"crop_tok={data_args.dat_where_crop_tok}, max_box_frac={data_args.dat_where_max_box_frac}; "
+                f"pixel_values_hd is NOT emitted in this mode"
+            )
         if self.kd_enabled:
             rank0_print(
                 f"[KD-data] Teacher image resolution: min_pixels={self.kd_teacher_min_pixels}, "
@@ -1326,6 +1418,88 @@ class Qwen2VLCoupledDATDataset(Dataset):
                     i = random.randint(0, len(self) - 1)
                 else:
                     raise RuntimeError(f"Failed after {MAX_RETRIES} attempts: {e}")
+
+    @staticmethod
+    def _union_box(item, img):
+        """item['bbox'] (fractions, or pixels if any value > 1; several boxes
+        -> their union) as [x0, y0, x1, y1] fractions, or None."""
+        box = item.get("bbox")
+        if not box or img is None:
+            return None
+        boxes = box if isinstance(box[0], (list, tuple)) else [box]
+        W, H = img.size
+        xs0, ys0, xs1, ys1 = [], [], [], []
+        for b in boxes:
+            if len(b) != 4:
+                continue
+            x0, y0, x1, y1 = map(float, b)
+            if max(x0, y0, x1, y1) > 1.0:            # pixel coords
+                x0, x1, y0, y1 = x0 / W, x1 / W, y0 / H, y1 / H
+            xs0.append(x0); ys0.append(y0); xs1.append(x1); ys1.append(y1)
+        if not xs0:
+            return None
+        x0, y0, x1, y1 = min(xs0), min(ys0), max(xs1), max(ys1)
+        if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+            return None
+        return [x0, y0, x1, y1]
+
+    def _where_crop(self, item, img, lr_thw):
+        """(crop PIL image, where_target (gh, gw) mask) for a bbox sample, or
+        None. Geometry = where_crop_generate with --oracle_box: the head's
+        top cell is replaced by the GT box centre on the LR grid."""
+        from llava.model.language_model.modeling_qwen3_5_dat import (
+            _where_top_box, _where_hd_size, _where_pad_window, _where_crop_image)
+        da = self.data_args
+        box = self._union_box(item, img)
+        if box is None:
+            return None
+        self._where_n_bbox += 1
+        if (box[2] - box[0]) * (box[3] - box[1]) > float(da.dat_where_max_box_frac):
+            self._where_n_skip_big += 1
+            return None
+        p = self.where_crop_prob
+        if p < 1.0 and random.random() >= p:
+            return None
+        gh, gw = int(lr_thw[1]) // self.MERGE_SIZE, int(lr_thw[2]) // self.MERGE_SIZE
+        # GT cells on the LR grid (scripts/where_head.py cell_targets)
+        d = int(da.dat_where_dilate)
+        x0 = max(0, int(box[0] * gw) - d)
+        y0 = max(0, int(box[1] * gh) - d)
+        x1 = min(gw - 1, int(math.ceil(box[2] * gw)) - 1 + d)
+        y1 = min(gh - 1, int(math.ceil(box[3] * gh)) - 1 + d)
+        mask = torch.zeros(gh, gw)
+        mask[y0:y1 + 1, x0:x1 + 1] = 1.0
+        # OracleHead: one-hot at the box centre -> out_cells square -> window
+        onehot = torch.full((gh, gw), -1e4)
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        onehot[min(int(cy * gh), gh - 1), min(int(cx * gw), gw - 1)] = 0.0
+        sq = _where_top_box(onehot, float(da.dat_where_out_cells))
+        hd_w, hd_h = _where_hd_size(img, lr_thw, self.hr_scale, int(da.dat_where_hd_cap))
+        win = _where_pad_window(sq, float(da.dat_where_pad), int(da.dat_where_min_cells), hd_w, hd_h)
+        crop = _where_crop_image(img, win, int(da.dat_where_crop_tok))
+        self._where_n_crop += 1
+        return crop, mask
+
+    @staticmethod
+    def _where_messages(messages, crop):
+        """Insert [WHERE_HINT, crop image, question] after the first user
+        turn's text, the layout where_crop_generate answers from."""
+        from llava.model.language_model.modeling_qwen3_5_dat import WHERE_HINT
+        out = []
+        done = False
+        for m in messages:
+            if not done and m["role"] == "user" and isinstance(m["content"], list) \
+                    and any(c.get("type") == "image" for c in m["content"]):
+                parts = list(m["content"])
+                q = [c for c in parts if c.get("type") == "text"]
+                q = q[-1] if q else {"type": "text", "text": ""}
+                parts += [{"type": "text", "text": WHERE_HINT},
+                          {"type": "image", "image": crop},
+                          dict(q)]
+                m = {"role": "user", "content": parts}
+                done = True
+            out.append(m)
+        return out, done
 
     def _teacher_force_window(self, item, img, hd_thw, lr_thw=None):
         """[x0, y0, x1, y1] window (fractions of the image) for teacher-forced
@@ -1391,7 +1565,32 @@ class Qwen2VLCoupledDATDataset(Dataset):
         )
 
         inputs_hd = None
-        if has_image and img is not None:
+        where_target = None
+        if has_image and img is not None and self.where_mode:
+            # ---- Where-head crop readout: LR (+ crop as a 2nd image), no HD ----
+            inputs = self.processor(
+                images=[img], text=[text],
+                return_tensors="pt", padding=False,
+                min_pixels=self.data_args.lr_min_pixels,
+                max_pixels=self.data_args.lr_max_pixels,
+            )
+            wc = self._where_crop(item, img, inputs["image_grid_thw"][0])
+            if wc is not None:
+                crop, where_target = wc
+                messages2, ok = self._where_messages(messages, crop)
+                if ok:
+                    text = self.processor.apply_chat_template(
+                        messages2, tokenize=False, add_generation_prompt=False
+                    )
+                    inputs = self.processor(
+                        images=[img, crop], text=[text],
+                        return_tensors="pt", padding=False,
+                        min_pixels=self.data_args.lr_min_pixels,
+                        max_pixels=self.data_args.lr_max_pixels,
+                    )
+                else:
+                    where_target = None
+        elif has_image and img is not None:
             if getattr(self.data_args, "use_decoupled_hr_lr", False):
                 # ---- Decoupled mode (DAT-canonical) -----------------------------
                 # LR uses [lr_min, lr_max] -- short LLM seq, base-VLM-compatible.
@@ -1479,6 +1678,10 @@ class Qwen2VLCoupledDATDataset(Dataset):
             input_ids = input_ids[:, :self.model_max_length]
 
         labels = _apply_label_mask(input_ids)
+        if item.get("where_only"):
+            # Box sets without answers (coco_small / refcoco): head loss only
+            # (an empty gpt turn must never become an LM target).
+            labels = torch.full_like(labels, IGNORE_INDEX)
 
         result = {
             "input_ids": input_ids.squeeze(0),
@@ -1489,6 +1692,9 @@ class Qwen2VLCoupledDATDataset(Dataset):
         if "pixel_values" in inputs:
             result["pixel_values"] = inputs["pixel_values"]
             result["image_grid_thw"] = inputs["image_grid_thw"]
+
+        if where_target is not None:
+            result["where_target"] = where_target
 
         if inputs_hd is not None:
             result["pixel_values_hd"] = inputs_hd["pixel_values"]
@@ -1727,6 +1933,11 @@ class Qwen2VLDataCollator:
         windows = [inst.get("dat_force_window") for inst in instances]
         if any(w is not None for w in windows):
             batch["dat_force_window"] = windows
+
+        # Where-head GT cell masks (per-sample list, None = no head loss).
+        wts = [inst.get("where_target") for inst in instances]
+        if any(w is not None for w in wts):
+            batch["where_target"] = wts
 
         # ---- KD teacher: separate inputs with possibly different image resolution ----
         has_teacher = any("input_ids_teacher" in inst for inst in instances)
@@ -2308,6 +2519,18 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
                 self._tf_forced_frac_buf.append(float(getattr(module, '_dat_tf_forced_frac', 0.0)))
                 self._tf_sup_frac_buf.append(float(getattr(module, '_dat_tf_sup_frac', 0.0)))
                 break
+        # Where-head: (loss, hits, n) of the samples with a cell mask this forward.
+        for module in model.modules():
+            # __dict__ lookup: PeftModel.__getattr__ would proxy the inner
+            # model's attributes and the reset below would miss it.
+            if module.__dict__.get('_where_cfg') is not None:
+                if not hasattr(self, '_where_buf'):
+                    self._where_buf = []
+                n = int(getattr(module, '_where_n_val', 0))
+                if n > 0:
+                    self._where_buf.append((float(module._where_loss_val), float(module._where_hit_val), n))
+                    module._where_n_val = 0
+                break
         # Offset supervision: (weighted huber, mean point->target distance) per
         # (layer, sample) with a target this forward; drained here.
         pending = []
@@ -2501,6 +2724,16 @@ class WandbDATMonitorCallback(transformers.TrainerCallback):
             self._tf_frac_buf.clear()
             self._tf_forced_frac_buf.clear()
             self._tf_sup_frac_buf.clear()
+        if getattr(self, '_where_buf', None):
+            # where_loss = head loss (soft CE + focal, unweighted) over masked
+            # samples; where_hit = top-1 cell inside the GT cells (the frozen
+            # 640 head sits ~0.76 on V*, ~0.98 on held-out viscot);
+            # where_n = masked samples per forward (crop fraction x batch).
+            tot_n = sum(n for _, _, n in self._where_buf)
+            metrics["where/loss"] = sum(l * n for l, _, n in self._where_buf) / tot_n
+            metrics["where/hit"] = sum(h for _, h, _ in self._where_buf) / tot_n
+            metrics["where/n"] = tot_n / len(self._where_buf)
+            self._where_buf.clear()
         # Offset supervision: off_sup_loss is the weighted huber term (what the
         # hook injects); off_sup_dist the mean distance of a sampling point to
         # its target in [-1, 1] grid units (2.0 = full image width). A learned
@@ -2902,7 +3135,7 @@ class Qwen2VLTrainer(transformers.Trainer):
     _TEACHER_DROP_KEYS = (
         'pixel_values_hd', 'image_grid_thw_hd',
         'image_hd_features', 'image_range_list',
-        'image_paths', 'dat_force_window',
+        'image_paths', 'dat_force_window', 'where_target',
     )
 
     def __init__(self, *args, kd_teacher: Optional[torch.nn.Module] = None,
@@ -3631,6 +3864,14 @@ def train():
             'hd_skip_merger_mlp': model_args.dat_hd_skip_merger_mlp,
             'use_fused_vit': model_args.dat_fused_vit,
             'use_shared_vit': model_args.dat_shared_vit,
+            'where_head': ({
+                'layer': model_args.dat_where_layer,
+                'd': 384, 'layers': 2, 'heads': 6, 'max_hw': 512,
+                'loss_weight': model_args.dat_where_loss_weight,
+                'trunk_grad': model_args.dat_where_trunk_grad,
+                'focal_w': model_args.dat_where_focal_w,
+                'init': model_args.dat_where_init,
+            } if model_args.dat_where_head else None),
         }
         if model_args.dat_sampler_only:
             from llava.model.dat_experiments import sampler_dat_config
@@ -3644,6 +3885,19 @@ def train():
             model_args.dat_hr_scale = dat_extra_args.get('hr_scale', 3)
             model_args.dat_hd_proj = dat_extra_args.get('hd_proj', True)
             rank0_print('[sampler-only] inherited DAT architecture/readers from checkpoint config')
+        if model_args.dat_inherit_ckpt_args:
+            source_path = pathlib.Path(model_args.model_name_or_path) / 'config.json'
+            ckpt_dat = json.loads(source_path.read_text()).get('dat_extra_args')
+            if not ckpt_dat:
+                raise ValueError(f"dat_inherit_ckpt_args: {source_path} carries no dat_extra_args")
+            where_cfg = dat_extra_args.get('where_head')
+            dat_extra_args = dict(ckpt_dat)
+            dat_extra_args['where_head'] = where_cfg
+            model_args.dat_layers = dat_extra_args.get('layers', model_args.dat_layers)
+            model_args.dat_hr_scale = dat_extra_args.get('hr_scale', model_args.dat_hr_scale)
+            model_args.dat_hd_proj = dat_extra_args.get('hd_proj', model_args.dat_hd_proj)
+            rank0_print('[dat_inherit_ckpt_args] dat_extra_args taken from the checkpoint config '
+                        f'(+ where_head={where_cfg is not None})')
 
         rank0_print(f"Loading DAT model ({model_args.model_family}) from {model_args.model_name_or_path}...")
         rank0_print(f"DAT config: {dat_extra_args}")
@@ -3711,6 +3965,7 @@ def train():
         # wraps the model and runs its own DAT unfreeze loop.
         if not training_args.lora_enable:
             _apply_hd_gate_freeze(model, model_args)
+            _apply_dat_trainable_filter(model, model_args)
     else:
         rank0_print(f"Loading model ({model_args.model_family}) from {model_args.model_name_or_path}...")
         model = _load_base_vlm(_family, model_args.model_name_or_path, compute_dtype)
@@ -3802,6 +4057,7 @@ def train():
             rank0_print(f"Unfroze {dat_unfrozen} DAT parameters after LoRA wrapping")
             # Re-apply hd_gate freeze (the loop above just flipped it back on).
             _apply_hd_gate_freeze(model, model_args)
+            _apply_dat_trainable_filter(model, model_args)
 
             # LoRA + DAT warmup: register the two-phase callback here (after
             # PEFT wrapping, so LoRA adapter params are present in the
