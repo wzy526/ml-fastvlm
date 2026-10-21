@@ -3431,16 +3431,19 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         # shared running counter). Requires mm_token_type_ids — build it from
         # input_ids when the processor didn't supply it.
         mrope_position_ids = None
+        # Qwen3_5Model.forward refuses image inputs without mm_token_type_ids
+        # when position_ids is None (the training collator never builds them;
+        # the no-HD where-crop path hits this). Build from input_ids whenever
+        # absent, not only on the HD path.
+        if mm_token_type_ids is None and input_ids is not None and position_ids is None:
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            image_token_id = getattr(self.config, 'image_token_id', None)
+            if image_token_id is not None:
+                mm_token_type_ids[input_ids == image_token_id] = 1
+            video_token_id = getattr(self.config, 'video_token_id', None)
+            if video_token_id is not None:
+                mm_token_type_ids[input_ids == video_token_id] = 2
         if image_hd_features is not None and position_ids is None and input_ids is not None:
-            if mm_token_type_ids is None:
-                mm_token_type_ids = torch.zeros_like(input_ids)
-                image_token_id = getattr(self.config, 'image_token_id', None)
-                if image_token_id is not None:
-                    mm_token_type_ids[input_ids == image_token_id] = 1
-                video_token_id = getattr(self.config, 'video_token_id', None)
-                if video_token_id is not None:
-                    mm_token_type_ids[input_ids == video_token_id] = 2
-
             position_ids_3d, rope_deltas = self.model.get_rope_index(
                 input_ids,
                 mm_token_type_ids,
