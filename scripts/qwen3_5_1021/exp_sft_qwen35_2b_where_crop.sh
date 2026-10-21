@@ -150,7 +150,7 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40995}" ll
     --gradient_accumulation_steps "${GRAD_ACCUM:-2}" \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps "${SAVE_STEPS:-500}" \
+    --save_steps "${SAVE_STEPS:-250}" \
     --save_total_limit "${SAVE_TOTAL_LIMIT:-2}" \
     --learning_rate 2e-5 \
     --weight_decay 0. \

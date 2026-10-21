@@ -3587,6 +3587,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         # === Where-head auxiliary loss (training only; eval reads the hook itself) ===
         if self._where_cfg is not None:
             self._where_n_val = 0
+            w_loss = None
             if where_target is not None and labels is not None:
                 w_loss, w_hit, w_n = self._where_aux(
                     input_ids, labels, attention_mask, image_grid_thw, where_target)
@@ -3595,6 +3596,15 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                     self._where_hit_val = float(w_hit)
                     self._where_n_val = int(w_n)
                     loss = loss + float(self._where_cfg.get('loss_weight', 1.0)) * w_loss
+            if w_loss is None and loss is not None and self.training:
+                # No masked sample in this micro-batch: still give every head
+                # parameter a (zero) gradient. ZeRO-2 reduces grads in buckets
+                # as hooks fire; a rank whose head got no grad issues one
+                # allreduce fewer than the others and the step deadlocks
+                # (1021 p1: 5 ranks waiting on a 3.7M-element allreduce,
+                # 3 ranks never called it, watchdog at step ~450).
+                loss = loss + 0.0 * sum(p.float().sum() for p in self.where_head.parameters()
+                                        if p.requires_grad)
         self._where_h = None
 
         return Qwen3_5CausalLMOutputWithPast(
