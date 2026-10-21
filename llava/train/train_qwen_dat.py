@@ -3893,6 +3893,14 @@ def train():
             where_cfg = dat_extra_args.get('where_head')
             dat_extra_args = dict(ckpt_dat)
             dat_extra_args['where_head'] = where_cfg
+            # Architecture only: the checkpoint's TRAINING-time knobs (E1 ran
+            # LR dropout 0.5x0.75, offset supervision, forced windows) must not
+            # leak into this run -- the where-head reads the LR tokens that
+            # lr_drop blanks (smoke: lr_drop_frac 0.28, where/hit 0.4).
+            dat_extra_args.update(
+                lr_drop_prob=0.0, route_by_lr_drop=False, off_sup_weight=0.0,
+                rel_sup_weight=0.0, off_penalty=0.0, tf_force_prob=None,
+                hd_lse_bias=0.0)
             model_args.dat_layers = dat_extra_args.get('layers', model_args.dat_layers)
             model_args.dat_hr_scale = dat_extra_args.get('hr_scale', model_args.dat_hr_scale)
             model_args.dat_hd_proj = dat_extra_args.get('hd_proj', model_args.dat_hd_proj)
