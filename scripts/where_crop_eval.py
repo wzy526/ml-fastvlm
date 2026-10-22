@@ -45,6 +45,23 @@ class OracleHead(torch.nn.Module):
         return logits
 
 
+@torch.inference_mode()
+def plain_generate(model, processor, image, prompt, max_new_tokens=8):
+    """where_crop_generate's answer call without the hint/crop: [system, image, question]."""
+    messages = [{"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": [{"type": "image", "image": image},
+                                             {"type": "text", "text": prompt}]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                         enable_thinking=False)
+    inp = processor(text=[text], images=[image], return_tensors="pt")
+    kw = {k: inp[k].to(model.device) for k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")}
+    gen = model.generate(**kw, max_new_tokens=max_new_tokens, do_sample=False,
+                         temperature=None, top_p=None, top_k=None)
+    n = kw["input_ids"].shape[1]
+    return {"text": processor.tokenizer.decode(gen[0][n:], skip_special_tokens=True).strip(),
+            "box": (0.0, 0.0, 1.0, 1.0), "window": (0.0, 0.0, 1.0, 1.0), "where_grid": ()}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
@@ -65,6 +82,8 @@ def main():
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--oracle_box", action="store_true",
                     help="replace the head with the GT box centre (pipeline ceiling)")
+    ap.add_argument("--no_crop", action="store_true",
+                    help="baseline: same system prompt / LR image / question, no head, no crop (= off@lr_tok)")
     ap.add_argument("--where_head_pt", default=None,
                     help="override the head weights with this XAttnHead state_dict "
                          "(e.g. the 640 head while <ckpt>/where_head.pt holds the 1600 one)")
@@ -81,7 +100,7 @@ def main():
     model = Qwen3_5DATForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
         attn_implementation=args.attn).eval()
-    if not model._where_head_loaded:
+    if not model._where_head_loaded and not args.no_crop:
         raise SystemExit(f"no where-head in {args.model_path} (expected where_head.pt)")
     if args.where_head_pt:
         sd = torch.load(args.where_head_pt, map_location="cpu")
@@ -123,11 +142,14 @@ def main():
         where_q = s["prompt"].split("\n")[0]
         if oracle is not None:
             oracle.set_sample(s)
-        rec = model.where_crop_generate(
-            s["image"], s["prompt"], processor, hr_processor,
-            where_question=where_q, layer=args.layer, min_cells=args.min_cells,
-            ground_pad=args.ground_pad, where_processor=where_processor,
-            head_prefix=args.head_prefix)
+        if args.no_crop:
+            rec = plain_generate(model, processor, s["image"], s["prompt"])
+        else:
+            rec = model.where_crop_generate(
+                s["image"], s["prompt"], processor, hr_processor,
+                where_question=where_q, layer=args.layer, min_cells=args.min_cells,
+                ground_pad=args.ground_pad, where_processor=where_processor,
+                head_prefix=args.head_prefix)
         pred = extract_letter(rec["text"])
         ok = pred == s["gt"]
         n_ok += ok
