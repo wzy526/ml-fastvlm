@@ -173,11 +173,31 @@ def grad_pass(model, processor, base, hd_extra, target_grid, gt_letter, off_para
                                 + torch.tensor(0.0, device=grids[0].device)))
 
     n_lm, n_box = pt_norms(g_lm_pts), pt_norms(g_box_pts)
+    # Direction, not magnitude: does the LM gradient push the sampling points
+    # toward the oracle grid?  cos(g_lm, p - p*) > 0 means descent moves the
+    # point toward the target (noise hypothesis: mean ~0, half positive).
+    # Coherence: |mean_j g_j| / mean_j |g_j| over the Ns points of one grid
+    # (1 = all points pushed the same way, ~1/sqrt(Ns) = independent noise).
+    cos_l, coh_l = [], []
+    for gi_, g in enumerate(g_lm_pts):
+        if g is None:
+            continue
+        gp = g.detach().float().reshape(g.shape[0], -1, 2)      # [(l g), Ns, 2]
+        pts = grids[gi_].detach().float().reshape(gp.shape)
+        diff = pts - tgt[None].float()
+        far = diff.norm(dim=-1) > 1e-3
+        c = F.cosine_similarity(gp, diff, dim=-1)[far]
+        cos_l.append(c)
+        coh_l.append(gp.mean(dim=1).norm(dim=-1) / gp.norm(dim=-1).mean(dim=1).clamp(min=1e-12))
+    cos_all = torch.cat(cos_l) if cos_l else torch.zeros(1)
+    coh_all = torch.cat(coh_l) if coh_l else torch.zeros(1)
     return {
         "loss_lm": float(loss_lm),
         "pt_lm_median": float(n_lm.median()), "pt_lm_p90": float(n_lm.quantile(0.9)),
         "pt_box_median": float(n_box.median()),
         "par_lm": par_norm(g_lm_par), "par_box": par_norm(g_box_par),
+        "cos_mean": float(cos_all.mean()), "cos_pos_frac": float((cos_all > 0).float().mean()),
+        "coh_mean": float(coh_all.mean()), "ns": int(tgt.shape[0]),
     }
 
 
@@ -213,6 +233,12 @@ def summarize(rows):
               f"vs ||dL_box/dp|| {np.median([x['pt_box_median'] for x in g]):.2e}  -> ratio median {np.median(r_pt):.3g}")
         print(f"            on conv_off_proj: ||g_LM|| / ||g_box|| median {np.median(r_par):.3g} "
               f"(q25 {np.quantile(r_par, .25):.3g}, q75 {np.quantile(r_par, .75):.3g})")
+        if "cos_mean" in g[0]:
+            ns = g[0].get("ns", 0)
+            print(f"            direction: cos(g_LM, p - p*) mean {np.mean([x['cos_mean'] for x in g]):+.3f} "
+                  f"(toward-target fraction {np.mean([x['cos_pos_frac'] for x in g]):.3f}; noise -> 0 / 0.5); "
+                  f"coherence |mean g|/mean|g| {np.mean([x['coh_mean'] for x in g]):.3f} "
+                  f"(noise -> {1 / math.sqrt(max(ns, 1)):.3f}, Ns={ns})")
 
 
 def main():
