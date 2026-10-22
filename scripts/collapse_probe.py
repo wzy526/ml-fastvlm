@@ -28,15 +28,19 @@ Collapse 2 (sampler: where learned through read, gradient vanishes)
   ||dL_LM/dp_j|| per sampling point vs the direct box-pull
   ||dL_box/dp_j|| (huber to the oracle grid, delta 0.1, the off_sup target),
   and the same ratio on the offset parameters (conv_off_proj.weight) --
-  what the coupled sampler receives vs what a decoupled supervision gives.
+  what the coupled sampler receives vs what a decoupled supervision gives;
+  direction: cos(dL_LM/dp_j, p_j - p_j*) per point (40-bin histogram per
+  sample), within-grid coherence; --dump_grad N writes per-point grids and
+  gradients of N samples per shard for the quiver figure (collapse_fig.py).
 
 Shard with --shard/--shards; --summarize DIR merges the shard jsons.
 
   E=~/vldat_experiments/0924_miniE1_2k
   for i in 0..7: CUDA_VISIBLE_DEVICES=$i python scripts/collapse_probe.py \
-      --model_path $E/checkpoint-1000 --tok_budget 640 --grad \
+      --model_path $E/checkpoint-1000 --tok_budget 640 --grad --dump_grad 2 \
       --shard $i --shards 8 --out $E/loc/collapse/s$i.json
   python scripts/collapse_probe.py --summarize $E/loc/collapse
+  python scripts/collapse_fig.py --dir $E/loc/collapse --out fig_collapse2.pdf
 """
 import argparse
 import glob
@@ -58,7 +62,8 @@ from probe_whd_qwen35 import (  # noqa: E402
 )
 
 CFGS = ["off", "oracle", "oracle_rand", "oracle_mean_v", "oracle_mean_kv", "real"]
-REC = {"mode": None, "stats": None, "beta": None, "grids": None}
+REC = {"mode": None, "stats": None, "beta": None, "grids": None, "grid_layers": None, "cur_layer": None}
+COS_BINS = 40                                   # histogram of cos(g_LM, p - p*) over [-1, 1]
 
 
 def install_hooks():
@@ -67,6 +72,7 @@ def install_hooks():
     orig_sample = A._sample_hd_from_off_guide
 
     def sample_patched(self, *a, **kw):
+        REC["cur_layer"] = self.layer_idx
         key_hd, value_hd, locs = orig_sample(self, *a, **kw)
         li = self.layer_idx
         if REC["stats"] is not None and li not in REC["stats"]:
@@ -105,6 +111,7 @@ def install_hooks():
     def gs_patched(inp, grid, *a, **kw):
         if REC["grids"] is not None and grid.requires_grad:
             REC["grids"].append(grid)
+            REC["grid_layers"].append(REC["cur_layer"])
         return orig_gs(inp, grid, *a, **kw)
 
     F.grid_sample = gs_patched
@@ -130,15 +137,18 @@ def run_cfg(model, processor, base, hd_extra, locs, mode, gen_kwargs, want_stats
     return text, (float(np.mean(list(beta.values()))) if beta else None), stats
 
 
-def grad_pass(model, processor, base, hd_extra, target_grid, gt_letter, off_params):
-    """Learned grid: ||dL_LM/dp|| vs ||dL_box/dp|| per point and on the offset params."""
+def grad_pass(model, processor, base, hd_extra, target, gt_letter, off_params, dump=None):
+    """Learned grid: ||dL_LM/dp|| vs ||dL_box/dp|| per point and on the offset params.
+    dump: path prefix -> <prefix>.npz with the per-layer grids / LM gradients
+    (for the quiver figure, scripts/collapse_fig.py)."""
+    target_grid, target_box = target
     set_force_locs(model, None)
     tok = processor.tokenizer
     tid = tok.encode(gt_letter, add_special_tokens=False)
     if not tid:
         return None
     tid = tid[0]
-    REC["grids"] = []
+    REC["grids"], REC["grid_layers"] = [], []
     inputs = dict(base)
     inputs.update(hd_extra)
     for p in off_params:
@@ -147,8 +157,8 @@ def grad_pass(model, processor, base, hd_extra, target_grid, gt_letter, off_para
         out = model(**inputs, use_cache=False)
         logits = out.logits[0, -1].float()
         loss_lm = F.cross_entropy(logits[None], torch.tensor([tid], device=logits.device))
-        grids = REC["grids"]
-        REC["grids"] = None
+        grids, grid_layers = REC["grids"], REC["grid_layers"]
+        REC["grids"] = REC["grid_layers"] = None
         if not grids:
             return None
         g_lm_pts = torch.autograd.grad(loss_lm, grids, retain_graph=True, allow_unused=True)
@@ -178,7 +188,7 @@ def grad_pass(model, processor, base, hd_extra, target_grid, gt_letter, off_para
     # point toward the target (noise hypothesis: mean ~0, half positive).
     # Coherence: |mean_j g_j| / mean_j |g_j| over the Ns points of one grid
     # (1 = all points pushed the same way, ~1/sqrt(Ns) = independent noise).
-    cos_l, coh_l = [], []
+    cos_l, coh_l, cos_layer, dump_arrays = [], [], {}, {}
     for gi_, g in enumerate(g_lm_pts):
         if g is None:
             continue
@@ -189,8 +199,20 @@ def grad_pass(model, processor, base, hd_extra, target_grid, gt_letter, off_para
         c = F.cosine_similarity(gp, diff, dim=-1)[far]
         cos_l.append(c)
         coh_l.append(gp.mean(dim=1).norm(dim=-1) / gp.norm(dim=-1).mean(dim=1).clamp(min=1e-12))
+        li = grid_layers[gi_]
+        cos_layer[str(li)] = float(c.mean()) if c.numel() else float("nan")
+        if dump is not None:
+            dump_arrays[f"grid_{li}"] = pts.cpu().numpy().astype(np.float16)
+            dump_arrays[f"glm_{li}"] = gp.cpu().numpy().astype(np.float32)
     cos_all = torch.cat(cos_l) if cos_l else torch.zeros(1)
     coh_all = torch.cat(coh_l) if coh_l else torch.zeros(1)
+    hist = torch.histc(cos_all.clamp(-1, 1), bins=COS_BINS, min=-1, max=1)
+    if dump is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(dump)), exist_ok=True)
+        np.savez_compressed(dump + ".npz", target_grid=target_grid.cpu().numpy(),
+                            target_box=target_box.cpu().numpy(),
+                            layers=np.array(sorted({grid_layers[k] for k in range(len(grids)) if g_lm_pts[k] is not None})),
+                            **dump_arrays)
     return {
         "loss_lm": float(loss_lm),
         "pt_lm_median": float(n_lm.median()), "pt_lm_p90": float(n_lm.quantile(0.9)),
@@ -198,6 +220,7 @@ def grad_pass(model, processor, base, hd_extra, target_grid, gt_letter, off_para
         "par_lm": par_norm(g_lm_par), "par_box": par_norm(g_box_par),
         "cos_mean": float(cos_all.mean()), "cos_pos_frac": float((cos_all > 0).float().mean()),
         "coh_mean": float(coh_all.mean()), "ns": int(tgt.shape[0]),
+        "cos_hist": [int(x) for x in hist.tolist()], "cos_layer": cos_layer,
     }
 
 
@@ -239,6 +262,10 @@ def summarize(rows):
                   f"(toward-target fraction {np.mean([x['cos_pos_frac'] for x in g]):.3f}; noise -> 0 / 0.5); "
                   f"coherence |mean g|/mean|g| {np.mean([x['coh_mean'] for x in g]):.3f} "
                   f"(noise -> {1 / math.sqrt(max(ns, 1)):.3f}, Ns={ns})")
+        if "cos_layer" in g[0]:
+            lay = sorted({int(k) for x in g for k in x["cos_layer"]})
+            print("            cos by layer: " + "  ".join(
+                f"L{li} {np.nanmean([x['cos_layer'].get(str(li), np.nan) for x in g]):+.3f}" for li in lay))
 
 
 def main():
@@ -254,6 +281,10 @@ def main():
     ap.add_argument("--attn", default="flash_attention_2")
     ap.add_argument("--max_new_tokens", type=int, default=8)
     ap.add_argument("--grad", action="store_true")
+    ap.add_argument("--dump_grad", type=int, default=0,
+                    help="with --grad: save per-point grids / LM gradients (+ a 1024px image copy) "
+                         "for the first N boxed samples of this shard, for the quiver figure")
+    ap.add_argument("--dump_dir", default=None, help="default: <dir of --out>/grad_dump")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--out", default=None)
@@ -300,6 +331,9 @@ def main():
     mine = [(i, s) for i, s in enumerate(samples) if i % args.shards == args.shard]
     print(f"[collapse] shard {args.shard}/{args.shards}: {len(mine)} samples, grid {args.grid_size}, "
           f"tok {args.tok_budget}, grad={args.grad}", flush=True)
+    dump_dir = args.dump_dir or (os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(args.out))),
+                                             "grad_dump") if args.out else "grad_dump")
+    n_dumped = 0
     rows = []
     for gi, s in mine:
         STATE["sample_idx"] = gi
@@ -330,8 +364,17 @@ def main():
             cos = float(F.cosine_similarity(st["vbar"], vr["vbar"], dim=0)) if vr else float("nan")
             row["layer"][str(li)] = {"spread": st["spread"], "pr": st["pr"], "cos_rand": cos}
         if args.grad and STATE.get("target") is not None:
+            dump = None
+            if n_dumped < args.dump_grad:
+                dump = os.path.join(dump_dir, f"{gi:04d}")
+                os.makedirs(dump_dir, exist_ok=True)
+                im = s["image"].copy()
+                im.thumbnail((1024, 1024))
+                im.save(dump + ".jpg", quality=90)
+                n_dumped += 1
             try:
-                row["grad"] = grad_pass(model, processor, base, hd_extra, STATE["target"][0], s["gt"], off_params)
+                row["grad"] = grad_pass(model, processor, base, hd_extra, STATE["target"], s["gt"], off_params,
+                                        dump=dump)
             except Exception as e:  # keep the run going; report
                 print(f"[collapse] {gi} grad failed: {e}", flush=True)
                 row["grad"] = None
