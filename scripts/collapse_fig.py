@@ -61,6 +61,15 @@ def quiver_panel(ax, img, pts, vec, box, tgt, title, color, every):
     tx, ty = norm_to_px(tgt, w, h)
     ax.add_patch(Rectangle((tx.min(), ty.min()), tx.max() - tx.min(), ty.max() - ty.min(),
                            fill=False, ec="lime", lw=1.0, ls="--"))
+    # zoom to the learned grid + oracle window (the learned grid is compact;
+    # at full-image scale the arrows pile up), square-ish, 20% margin
+    ax_all, ay_all = norm_to_px(pts, w, h)
+    x0, x1 = min(ax_all.min(), tx.min()), max(ax_all.max(), tx.max())
+    y0, y1 = min(ay_all.min(), ty.min()), max(ay_all.max(), ty.max())
+    side = max(x1 - x0, y1 - y0) * 1.2
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    ax.set_xlim(max(cx - side / 2, 0), min(cx + side / 2, w))
+    ax.set_ylim(min(cy + side / 2, h), max(cy - side / 2, 0))
     ax.set_title(title, fontsize=9)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -94,18 +103,24 @@ def main():
     ax = fig.add_subplot(gs[0])
     ax.bar(centres, hist / n_pts / (edges[1] - edges[0]), width=edges[1] - edges[0],
            color="#c0392b", alpha=0.75, label=r"coupled sampler: $\partial L_{LM}/\partial p_j$")
+    # reference: isotropic random direction in 2D -> cos has the arcsine law
+    # 1 / (pi sqrt(1 - c^2)); drawn as per-bin averages so the end bins match
+    arc = (np.arcsin(edges[1:]) - np.arcsin(edges[:-1])) / np.pi / (edges[1] - edges[0])
+    ax.step(edges, np.r_[arc, arc[-1]], where="post", color="k", lw=1.0,
+            label="isotropic random direction (arcsine law)")
     ax.axvline(1.0, color="#1f77b4", lw=2.5)
-    ax.text(0.96, 0.5, "decoupled head\n(by construction)", ha="right", va="center",
+    ax.text(0.93, 0.5, "decoupled head\n(by construction)", ha="right", va="center",
             color="#1f77b4", fontsize=8, transform=ax.get_xaxis_transform())
     ax.axvline(0.0, color="k", lw=0.6, ls=":")
     ax.set_xlabel(r"$\cos(\partial L_{LM}/\partial p_j,\ p_j - p_j^*)$", fontsize=9)
     ax.set_ylabel("density", fontsize=9)
     ax.set_xlim(-1.05, 1.05)
     ax.tick_params(labelsize=8)
-    ax.text(0.03, 0.95, f"{len(rows)} samples, {int(n_pts):,} points\nmean {cos_mean:+.3f}, "
+    ax.text(0.5, 0.97, f"{len(rows)} samples, {int(n_pts):,} points\nmean {cos_mean:+.3f}, "
             f"toward target {100 * pos_frac:.1f}%\ncoherence {coh:.2f} (noise {1 / np.sqrt(ns):.2f})",
-            transform=ax.transAxes, fontsize=7.5, va="top")
-    ax.legend(loc="lower left", fontsize=7.5, frameon=False)
+            transform=ax.transAxes, fontsize=7.5, va="top", ha="center")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 0.78), fontsize=7, frameon=False)
+    ax.set_ylim(0, max(arc.max(), (hist / n_pts / (edges[1] - edges[0])).max()) * 1.35)
     ax.set_title("(c) gradient on the sampling points", fontsize=9, loc="left")
 
     dump_dir = os.path.expanduser(args.dump_dir) if args.dump_dir else os.path.join(d, "grad_dump")
