@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from probe_whd_qwen35 import extract_letter, load_vstar
+from probe_whd_qwen35 import extract_letter, load_samples
 
 
 class OracleHead(torch.nn.Module):
@@ -48,8 +48,11 @@ class OracleHead(torch.nn.Module):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
+    ap.add_argument("--dataset", choices=["vstar", "hrbench4k", "hrbench8k"], default="vstar")
     ap.add_argument("--vstar_root", default="~/data/vstar_bench")
-    ap.add_argument("--max_samples", type=int, default=300)
+    ap.add_argument("--hrbench_parquet", default=None, help="see probe_whd_qwen35.py")
+    ap.add_argument("--max_samples", type=int, default=300,
+                    help="V* has 191; HR-Bench 4K/8K 800 each -> raise this")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--layer", type=int, default=8)
@@ -99,10 +102,14 @@ def main():
         where_processor = AutoProcessor.from_pretrained(
             args.model_path, min_pixels=1024, max_pixels=args.where_tok * 1024)
 
-    probe_args = argparse.Namespace(vstar_root=args.vstar_root, max_samples=args.max_samples)
-    samples = load_vstar(probe_args)
+    probe_args = argparse.Namespace(dataset=args.dataset, vstar_root=args.vstar_root,
+                                    hrbench_parquet=args.hrbench_parquet, image_folder=None,
+                                    max_samples=args.max_samples)
+    samples = load_samples(probe_args)
     mine = [(i, s) for i, s in enumerate(samples) if i % args.shards == args.shard]
     if oracle is not None:
+        if args.dataset != "vstar":
+            raise SystemExit("--oracle_box needs GT boxes; only V* has them")
         mine = [(i, s) for i, s in mine if s["bboxes"]]
     print(f"[where_crop] shard {args.shard}/{args.shards}: {len(mine)}/{len(samples)} samples, "
           f"{'ORACLE box centre, ' if oracle is not None else ''}"
