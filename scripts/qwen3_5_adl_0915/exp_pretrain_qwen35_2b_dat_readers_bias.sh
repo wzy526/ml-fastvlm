@@ -10,7 +10,7 @@ conda activate "${CONDA_ENV:-fastvlm}"
 # Same recipe / data / hyper-params as 0908_pretrain_qwen35_2b_dat_exactgrad,
 # which trained an HD pathway that was ALIVE but CONTENT-BLIND (HR-Bench 4k
 # on/off within +-1; probe real == shuffle; K_hd behaves as a shared sink).
-# The no-training leverage test on the 0908 ckpt (scripts/_test_lr_drop_leverage.py,
+# The no-training leverage test on the 0908 ckpt (scripts/archive/_test_lr_drop_leverage.py,
 # 32 SFT samples) located the bottleneck in how little gradient reaches
 # k/v_proj_hd (grad hd/lr = 0.07) and measured three knobs:
 #   E  question tokens also read HD    grad(k/v_hd) x2.67  hd/lr 0.235  loss -0.060
@@ -27,7 +27,7 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   - exact merged-gradient two-pass attention (_TwoPassMergedAttnFn on the
 #     FA2 raw backward; c454f72). The legacy detached-LSE path starved
 #     k_proj_hd (stuck at init) and v_proj_hd (~25% of base rms) on every
-#     ckpt so far — scripts/_test_exact_merge_grad.py: legacy dk_hd rel err
+#     ckpt so far — scripts/archive/_test_exact_merge_grad.py: legacy dk_hd rel err
 #     1.2-2.2e-1 vs 3e-3 exact.
 #   - k_proj_hd / v_proj_hd / hd_input_layernorm warm-started from the layer's
 #     own k_proj / v_proj / input_layernorm (was K=kaiming, V=0).

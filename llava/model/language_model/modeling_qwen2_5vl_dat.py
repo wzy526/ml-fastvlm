@@ -594,7 +594,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         # spacing ≈ 4e-4 — comparable to per-step AdamW update lr*grad ≈
         # 1e-4). Empirically Run B's trained offset behavior is virtually
         # identical to a kaiming-random-init DAT (see
-        # scripts/qwen2_5vl_adl_0515/_diagnose_offsets*.py).
+        # scripts/archive/qwen2_5vl_adl_0515/_diagnose_offsets*.py).
         self.conv_lr_dw = _FP32WeightConv2d(
             self.off_dim, self.off_dim,
             kernel_size=self.off_ksize, stride=1, padding=self.off_ksize // 2,
@@ -691,7 +691,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         # also feed lr_image-position Q into the HD cross-attention. This
         # lets HD info enter the residual stream via lr_image tokens (the
         # path actually used by Qwen2.5-VL: image → qa_prefix tokens →
-        # answer query, verified via scripts/qwen2_5vl_adl_0519/_diagnose_baseline_attn.py).
+        # answer query, verified via scripts/archive/qwen2_5vl_adl_0519/_diagnose_baseline_attn.py).
         self.dat_inject_lr_image = bool(dat.get('inject_lr_image', False))
 
         # Direction A: image-conditioned HD for question tokens. Offsets are a
@@ -731,7 +731,7 @@ class Qwen2_5_VLAttentionDAT(Qwen2_5_VLAttention):
         grid. The update is silently rounded back to -8.0 and ``hd_gate``
         appears frozen even though gradients flow correctly (other DAT
         params and ``dat/grad_norm`` keep moving). Verified in
-        ``scripts/qwen2_5vl_adl_0514/_verify_hd_gate_bf16_roundoff.py``:
+        ``scripts/archive/qwen2_5vl_adl_0514/_verify_hd_gate_bf16_roundoff.py``:
         1000 bf16 Adam steps with grad ≈ 1.4 produce zero motion; the same
         loop in fp32 walks cleanly from -8.0 to -8.09.
 

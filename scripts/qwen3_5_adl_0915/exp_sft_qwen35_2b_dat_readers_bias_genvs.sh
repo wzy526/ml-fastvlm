@@ -103,7 +103,7 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   TF_PROB=1 OFF_SUP_WEIGHT=0 LR_DROP_PROB=1 LR_DROP_RATIO=0.75 OFF_HEAD_TRUNK_GRAD=0 \
 #   FREEZE_BASE=True LORA_ENABLE=False TUNE_MM_MLP=False MAX_STEPS=400 WARMUP_STEPS=20 \
 #   SAVE_STEPS=200 EXP_NAME=0919_mini_readout_tforacle_lrdrop bash <this script>
-# Then scripts/_test_lr_drop_leverage.py on the HELD-OUT split before/after:
+# Then scripts/archive/_test_lr_drop_leverage.py on the HELD-OUT split before/after:
 # loss(S)-loss(O) must open up (oracle HD beats wrong-image HD under LR drop).
 # Result: loss(O) 1.38 -> 0.94, S-O 0.06 -> 0.71, full-LR D-P 0.018 -> 0.055,
 # held-out acc oracle +2.5 / shuffle -1. Readout is trainable; side effect:

@@ -134,7 +134,7 @@ print(f"Saved {len(subset)} samples; checkpoint grid_size=20")
 python scripts/verify_sampling_coordinates.py \
   2>&1 | tee "$RUN_ROOT/sampling_geometry.log"
 
-python scripts/_test_exact_merge_grad.py \
+python scripts/archive/_test_exact_merge_grad.py \
   2>&1 | tee "$RUN_ROOT/exact_merge_grad.log"
 ```
 
@@ -176,7 +176,7 @@ done
 ### 3.3 HD 内容是否影响答案 CE
 
 ```bash
-python scripts/_test_lr_drop_leverage.py \
+python scripts/archive/_test_lr_drop_leverage.py \
   --model_path "$MODEL_PATH" \
   --data_json "$RUN_ROOT/eval_subset.json" \
   --image_folder "$IMAGE_FOLDER" \
@@ -363,7 +363,7 @@ reader 共训放在 sampler-only 之后，使用独立的 2×2 对照：固定/�
 - [ ] local 头读取实际粗位置附近的证据，观察范围与移动范围均以 HD 单元记录。
 - [ ] 固定预算对照显示泛化收益，而不只是训练 loss 或框内点数改善。
 
-主要代码入口：[模型与采样](../llava/model/language_model/modeling_qwen3_5_dat.py)、[训练与冻结](../llava/train/train_qwen_dat.py)、[推理 probe/diag12](../scripts/probe_whd_qwen35.py)、[读出 leverage](../scripts/_test_lr_drop_leverage.py)。
+主要代码入口：[模型与采样](../llava/model/language_model/modeling_qwen3_5_dat.py)、[训练与冻结](../llava/train/train_qwen_dat.py)、[推理 probe/diag12](../scripts/probe_whd_qwen35.py)、[读出 leverage](../scripts/archive/_test_lr_drop_leverage.py)。
 
 ## 9. 已实现的 sampler-only 控制与坐标检查
 

@@ -75,7 +75,7 @@ if [[ "$CKPT" == /* && ! -d "$CKPT" ]]; then
 fi
 
 # Default grid = the token axis 256/640/1280/2560/6400/11520 from
-# scripts/qwen2_5vl_adl_0528/_eval_pareto.sh, converted to pixels with the
+# scripts/archive/qwen2_5vl_adl_0528/_eval_pareto.sh, converted to pixels with the
 # family's TOK_PX so qwen2.5 (784) and qwen3.5 (1024) rows line up by tokens.
 if [[ -z "${PIXELS:-}" ]]; then
     PIXELS=""

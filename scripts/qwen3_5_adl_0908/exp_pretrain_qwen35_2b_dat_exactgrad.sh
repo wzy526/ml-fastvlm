@@ -13,7 +13,7 @@ conda activate "${CONDA_ENV:-fastvlm}"
 #   - exact merged-gradient two-pass attention (_TwoPassMergedAttnFn on the
 #     FA2 raw backward; c454f72). The legacy detached-LSE path starved
 #     k_proj_hd (stuck at init) and v_proj_hd (~25% of base rms) on every
-#     ckpt so far — scripts/_test_exact_merge_grad.py: legacy dk_hd rel err
+#     ckpt so far — scripts/archive/_test_exact_merge_grad.py: legacy dk_hd rel err
 #     1.2-2.2e-1 vs 3e-3 exact.
 #   - k_proj_hd / v_proj_hd / hd_input_layernorm warm-started from the layer's
 #     own k_proj / v_proj / input_layernorm (was K=kaiming, V=0).

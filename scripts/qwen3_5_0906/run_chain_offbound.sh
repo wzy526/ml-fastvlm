@@ -58,7 +58,7 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 #                  Gradient is exactly 1 inside the region and the penalty
 #                  supplies the pull-back a bare clamp lacks, so nothing is
 #                  damped and the in-region reach stays unbounded. Verified
-#                  against the loss-routed form in scripts/_test_off_penalty.py.
+#                  against the loss-routed form in scripts/archive/_test_off_penalty.py.
 export OFF_RANGE="${OFF_RANGE:-0}"
 export OFF_PENALTY="${OFF_PENALTY:-1.0}"
 export EARLY_K="${EARLY_K:-0}"          # full-depth HD, so k is not a confound
