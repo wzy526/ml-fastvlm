@@ -23,6 +23,10 @@ image, so the stock processor / ViT / prompt / single-pass path are untouched
   qb0.25    25% of the mass on the GT BOX itself (the pixel warp_oracle's
             density; over-zooms V*'s tiny boxes, kept for that comparison)
   --block square (default): isotropic blocks; aniso: cell resized = piecewise warp
+  mg2       multi-group: one uniform window per head peak (NMS, >= 4 cells apart),
+            stacked into one mosaic; mg2 = forced 2 groups, 400 tok split;
+            mg2x2 = 400 tok each; mg2a0.3 = adaptive (2nd group only if its
+            peak >= 0.3 x main, else identical to crop). Needs --head real.
 
   for i in 0 1 2 3 4 5 6 7; do CUDA_VISIBLE_DEVICES=$i setsid nohup python scripts/patch_sample_probe.py \
       --model_path $E/checkpoint-1000 --shard $i --shards 8 \
@@ -188,6 +192,57 @@ def head_map(logits, temp=1.0):
     return [[ex[i * gw + j] / z for j in range(gw)] for i in range(len(logits))]
 
 
+def multi_group(image, win, crop_tok, cfg, box, head, orig_crop):
+    """mg<K>[a<tau>][x<B>]: one uniform group (window of the live window's size,
+    centred on a head peak) per NMS peak of the head map, stacked vertically
+    into one mosaic. K = max groups; with a<tau> the count is adaptive (peaks
+    with prob >= tau * main), else forced to K; the token budget is crop_tok
+    (split over the groups) or B * crop_tok with x<B>. One group -> the live
+    crop, so adaptive K = 1 is identical to `crop`."""
+    from PIL import Image
+    from where_peaks_probe import nms_peaks, softmax2d
+    spec = cfg[2:]
+    budget_mult = 1.0
+    if "x" in spec:
+        spec, b = spec.split("x")
+        budget_mult = float(b)
+    tau = 0.0
+    if "a" in spec:
+        spec, t = spec.split("a")
+        tau = float(t)
+    K = int(spec)
+    p = softmax2d(head["logits"])
+    gh_m, gw_m = len(p), len(p[0])
+    peaks = nms_peaks(p, 4, tau, K)
+    if len(peaks) <= 1:
+        return orig_crop(image, win, crop_tok), {"groups": 1, "peaks": peaks, "in_box": 0, "blocks": 0,
+                                                 "side_in_box": None, "side_mean": 0.0}
+    W, H = image.size
+    ww, wh = win[2] - win[0], win[3] - win[1]
+    tok_g = int(round(crop_tok * budget_mult / len(peaks)))
+    gh, gw = grid_shape((ww * W) / max(wh * H, 1e-6), tok_g)
+    parts, stats = [], {"groups": len(peaks), "peaks": peaks, "in_box": 0, "blocks": 0, "side_in_box": None}
+    side_in, n_in, side_all = 0.0, 0, 0.0
+    for _, cy, cx in peaks:
+        cxn, cyn = (cx + 0.5) / gw_m, (cy + 0.5) / gh_m
+        x0 = min(max(cxn - ww / 2, 0.0), 1.0 - ww)
+        y0 = min(max(cyn - wh / 2, 0.0), 1.0 - wh)
+        px0, py0, px1, py1 = x0 * W, y0 * H, (x0 + ww) * W, (y0 + wh) * H
+        img, st = mosaic(image, linspace(px0, px1, gw), linspace(py0, py1, gh), "aniso", box)
+        parts.append(img)
+        stats["blocks"] += st["blocks"]
+        n_in += st["in_box"]
+        side_in += (st["side_in_box"] or 0.0) * st["in_box"]
+        side_all += st["side_mean"]
+    stats["in_box"] = n_in
+    stats["side_in_box"] = side_in / n_in if n_in else None
+    stats["side_mean"] = side_all / len(parts)
+    out = Image.new("RGB", (gw * BLOCK, gh * BLOCK * len(parts)))
+    for k, img in enumerate(parts):
+        out.paste(img, (0, k * gh * BLOCK))
+    return out, stats
+
+
 def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
     """The 2nd image for config `cfg`. `box` is the GT box (stats, qb*);
     `head` = {"box": the head's top box, "map": (gh, gw) cell probabilities}
@@ -195,6 +250,8 @@ def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
     W, H = image.size
     if cfg == "crop":
         return orig_crop(image, win, crop_tok), {}
+    if cfg.startswith("mg"):
+        return multi_group(image, win, crop_tok, cfg, box, head, orig_crop)
     if cfg == "uni_win":
         px0, py0, px1, py1, gh, gw = crop_geometry(image, win, crop_tok)
         return mosaic(image, linspace(px0, px1, gw), linspace(py0, py1, gh), "aniso", box)
@@ -242,8 +299,10 @@ def summarize(pattern):
         sin = [s["side_in_box"] for s in st if s.get("side_in_box")]
         sin = sum(sin) / len(sin) if sin else float("nan")
         sall = sum(s["side_mean"] for s in st) / len(st) if st else float("nan")
+        grp = [s["groups"] for s in st if "groups" in s]
+        grp = f"  groups>1: {sum(g > 1 for g in grp)}/{len(grp)}" if grp else ""
         print(f"{cfg:10s} {ok:4d}/{n:<4d}{100 * ok / max(n, 1):5.1f} {agree:7d}/{n:<6d} {tok:6.0f} "
-              f"{inb:14.1f} {sin:7.1f}/{sall:<8.1f}")
+              f"{inb:14.1f} {sin:7.1f}/{sall:<8.1f}{grp}")
     cats = sorted({r["cat"] for rows in runs.values() for r in rows})
     print("per category: " + "  ".join(cats))
     for cfg, rows in runs.items():
