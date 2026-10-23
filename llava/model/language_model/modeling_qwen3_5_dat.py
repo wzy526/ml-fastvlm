@@ -3020,6 +3020,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         max_new_tokens=8,
         where_processor=None,
         head_prefix="legacy",
+        single_pass=False,
     ):
         """Answer from a cropped window instead of the HD K/V bypass.
 
@@ -3047,6 +3048,18 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         the assistant generation prompt (what scripts/where_head.py trained
         on); 'train' = where_question + WHERE_HINT and nothing after, the
         span the in-model head sees during train_qwen_dat.py crop samples.
+
+        `single_pass`: the answer continues from the head prefill's KV cache
+        instead of re-encoding [LR, question, hint]. The prefix the head read
+        is byte-identical to the answer prompt up to the hint (head_prefix
+        'train', where_question = question, same LR processor), so the
+        causal LM state is the same; only [crop, question, turn end,
+        assistant start] is fed on top. The crop's 2-D mRoPE positions are
+        computed over the full sequence with get_rope_index and sliced (HF
+        would give cached continuations 1-D text positions). LM tokens:
+        |prefix| + |suffix| ~ 640 + 400 + text, vs 2x prefix two-pass.
+        Returns extra keys n_tokens (LM tokens actually processed) and
+        n_tokens_two_pass (what the two-pass path would have cost).
         """
         from PIL import Image  # noqa: F401  (crop returns a PIL image)
 
@@ -3057,6 +3070,17 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         where_question = where_question if where_question is not None else question
+        if single_pass:
+            if where_question != question:
+                logger.warning("where_crop single_pass: head reads the full question "
+                                    "(prefix must equal the answer prompt); where_question ignored")
+                where_question = question
+            if head_prefix != "train":
+                logger.warning("where_crop single_pass: head_prefix forced to 'train'")
+                head_prefix = "train"
+            if where_processor is not None and where_processor is not processor:
+                raise ValueError("single_pass needs the head and the answer to share the LR image "
+                                 "(where_processor must be None)")
 
         def _tensors(inp, keep):
             out = {}
@@ -3087,7 +3111,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         loc_inp = loc_proc(text=[text], images=[image], return_tensors="pt")
         loc_kw = _tensors(loc_inp, None)
-        out = self(**loc_kw, output_hidden_states=True, return_dict=True)
+        out = self(**loc_kw, output_hidden_states=True, return_dict=True, use_cache=single_pass)
         ids = loc_kw["input_ids"][0]
         image_id = self.config.image_token_id
         is_img = ids == image_id
@@ -3121,11 +3145,79 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         ans_inp = hr_processor(text=[text], images=[lr_img, crop], return_tensors="pt")
         ans_kw = _tensors(ans_inp, ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"))
+        rec = {"box": box, "window": win, "where_grid": (gh, gw)}
+        n_full = int(ans_kw["input_ids"].shape[1])
+        rec["n_tokens_two_pass"] = int(ids.shape[0]) + n_full
+
+        if single_pass:
+            answer = self._where_answer_from_cache(
+                out.past_key_values, ids, ans_kw, hr_processor, max_new_tokens)
+            if answer is not None:
+                rec.update(text=answer, n_tokens=n_full, single_pass=True)
+                return rec
+            logger.warning("where_crop single_pass: prefix mismatch, fell back to two passes")
+
         gen = self.generate(**ans_kw, max_new_tokens=max_new_tokens, do_sample=False,
                             temperature=None, top_p=None, top_k=None)
-        n_prompt = ans_kw["input_ids"].shape[1]
-        answer = hr_processor.tokenizer.decode(gen[0][n_prompt:], skip_special_tokens=True).strip()
-        return {"text": answer, "box": box, "window": win, "where_grid": (gh, gw)}
+        answer = hr_processor.tokenizer.decode(gen[0][n_full:], skip_special_tokens=True).strip()
+        rec.update(text=answer, n_tokens=rec["n_tokens_two_pass"], single_pass=False)
+        return rec
+
+    @torch.inference_mode()
+    def _where_answer_from_cache(self, cache, prefix_ids, ans_kw, hr_processor, max_new_tokens):
+        """Continue the head prefill's KV cache with [crop, question, turn end,
+        assistant start] and decode greedily. Returns None when the answer
+        prompt does not start with the prefix the cache was built from (then
+        the caller re-encodes everything)."""
+        full = ans_kw["input_ids"][0]
+        P, F = int(prefix_ids.shape[0]), int(full.shape[0])
+        if cache is None or F <= P or not torch.equal(full[:P], prefix_ids.to(full.device)):
+            return None
+        image_id = self.config.image_token_id
+        thw = ans_kw["image_grid_thw"]
+        n_lr = int(torch.prod(thw[0])) // (self.config.vision_config.spatial_merge_size ** 2)
+        if int((prefix_ids == image_id).sum()) != n_lr:
+            return None                          # the LR view is not the same grid
+        # 2-D positions of the crop tokens: mRoPE over the whole sequence, sliced.
+        mm = torch.zeros_like(full[None])
+        mm[full[None] == image_id] = 1
+        pos3d, rope_deltas = self.model.get_rope_index(full[None], mm, image_grid_thw=thw)
+        self.model.rope_deltas = rope_deltas
+        # The crop's pixel_values are the second image's patches.
+        n_lr_patches = int(torch.prod(thw[0]))
+        o = self(input_ids=full[None, P:],
+                 position_ids=pos3d[:, :, P:],
+                 mm_token_type_ids=mm[:, P:],
+                 past_key_values=cache,
+                 pixel_values=ans_kw["pixel_values"][n_lr_patches:],
+                 image_grid_thw=thw[1:],
+                 cache_position=torch.arange(P, F, device=full.device),
+                 use_cache=True, return_dict=True)
+        cache = o.past_key_values
+        eos = set()
+        for v in (self.generation_config.eos_token_id, hr_processor.tokenizer.eos_token_id,
+                  hr_processor.tokenizer.convert_tokens_to_ids("<|im_end|>")):
+            if isinstance(v, (list, tuple)):
+                eos.update(int(x) for x in v)
+            elif v is not None:
+                eos.add(int(v))
+        next_pos = int(pos3d.max()) + 1
+        toks = []
+        tok = int(o.logits[0, -1].argmax())
+        for k in range(max_new_tokens):
+            if tok in eos:
+                break
+            toks.append(tok)
+            if k == max_new_tokens - 1:
+                break
+            o = self(input_ids=full.new_tensor([[tok]]),
+                     position_ids=full.new_full((3, 1, 1), next_pos + k),
+                     past_key_values=cache,
+                     cache_position=full.new_tensor([F + k]),
+                     use_cache=True, return_dict=True)
+            cache = o.past_key_values
+            tok = int(o.logits[0, -1].argmax())
+        return hr_processor.tokenizer.decode(toks, skip_special_tokens=True).strip()
 
     def prepare_inputs_for_generation(
         self,

@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import torch
 
@@ -85,6 +86,10 @@ def main():
     ap.add_argument("--where_full_prompt", action="store_true",
                     help="head reads the full prompt (question + options) instead of its first line; "
                          "makes the head prefix identical to the answer prefix (KV-cache single pass)")
+    ap.add_argument("--single_pass", action="store_true",
+                    help="answer from the head prefill's KV cache (LR encoded once); implies --where_full_prompt")
+    ap.add_argument("--equiv", action="store_true",
+                    help="with --single_pass: also run the two-pass path per question and report agreement")
     ap.add_argument("--no_crop", action="store_true",
                     help="baseline: same system prompt / LR image / question, no head, no crop (= off@lr_tok)")
     ap.add_argument("--where_head_pt", default=None,
@@ -141,18 +146,33 @@ def main():
 
     rows, n_ok = [], 0
     per = {}
+    tok_sum, tok2_sum, t_sum, n_sp = 0, 0, 0.0, 0
+    agree = ok_two = 0
     for gi, s in mine:
-        where_q = s["prompt"] if args.where_full_prompt else s["prompt"].split("\n")[0]
+        where_q = s["prompt"] if (args.where_full_prompt or args.single_pass) else s["prompt"].split("\n")[0]
         if oracle is not None:
             oracle.set_sample(s)
         if args.no_crop:
             rec = plain_generate(model, processor, s["image"], s["prompt"])
         else:
-            rec = model.where_crop_generate(
-                s["image"], s["prompt"], processor, hr_processor,
-                where_question=where_q, layer=args.layer, min_cells=args.min_cells,
-                ground_pad=args.ground_pad, where_processor=where_processor,
-                head_prefix=args.head_prefix)
+            kw = dict(where_question=where_q, layer=args.layer, min_cells=args.min_cells,
+                      ground_pad=args.ground_pad, where_processor=where_processor,
+                      head_prefix=args.head_prefix)
+            torch.cuda.synchronize()
+            t0 = time.time()
+            rec = model.where_crop_generate(s["image"], s["prompt"], processor, hr_processor,
+                                            single_pass=args.single_pass, **kw)
+            torch.cuda.synchronize()
+            t_sum += time.time() - t0
+            tok_sum += rec.get("n_tokens", 0)
+            tok2_sum += rec.get("n_tokens_two_pass", 0)
+            n_sp += bool(rec.get("single_pass", False))
+            if args.equiv:
+                rec2 = model.where_crop_generate(s["image"], s["prompt"], processor, hr_processor,
+                                                 single_pass=False, **kw)
+                p2 = extract_letter(rec2["text"])
+                agree += p2 == extract_letter(rec["text"])
+                ok_two += p2 == s["gt"]
         pred = extract_letter(rec["text"])
         ok = pred == s["gt"]
         n_ok += ok
@@ -165,13 +185,21 @@ def main():
                      "ok": bool(ok), "cat": cat,
                      "box": list(rec["box"]), "window": list(win),
                      "where_grid": list(rec.get("where_grid", ())),
-                     "area": (win[2] - win[0]) * (win[3] - win[1])})
+                     "area": (win[2] - win[0]) * (win[3] - win[1]),
+                     "n_tokens": rec.get("n_tokens"), "single_pass": rec.get("single_pass")})
         print(f"[where_crop] {rows[-1]['i']} pred={pred} gt={s['gt']} ok={int(ok)} "
-              f"cat={cat} area={rows[-1]['area']:.3f}", flush=True)
+              f"cat={cat} area={rows[-1]['area']:.3f}"
+              + (f" tok={rec.get('n_tokens')}" if "n_tokens" in rec else ""), flush=True)
     n = len(rows)
     print(f"[where_crop] shard {args.shard} acc {n_ok}/{n} ({100 * n_ok / max(n, 1):.1f}%)", flush=True)
     for cat, (m, hit) in sorted(per.items()):
         print(f"[where_crop]   {cat}: {hit}/{m}", flush=True)
+    if tok_sum:
+        print(f"[where_crop] tokens: mean LM tokens {tok_sum / n:.0f} (two-pass would be {tok2_sum / n:.0f}); "
+              f"single_pass used on {n_sp}/{n}; {t_sum / n:.2f} s/question", flush=True)
+    if args.equiv:
+        print(f"[where_crop] equivalence: single vs two-pass answers agree {agree}/{n}; "
+              f"acc single {n_ok}/{n} two-pass {ok_two}/{n}", flush=True)
     if args.out:
         json.dump(rows, open(os.path.expanduser(args.out), "w"))
         print(f"[where_crop] wrote {args.out}", flush=True)
