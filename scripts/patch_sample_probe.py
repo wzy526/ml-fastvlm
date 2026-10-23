@@ -251,6 +251,7 @@ def main():
                     help="also hb<m> (head's top box) / hm<m> (head's probability map) with --head real")
     ap.add_argument("--head", choices=["oracle", "real"], default="oracle",
                     help="oracle: GT-centre one-hot head (window + qb* are oracle); real: the checkpoint's head")
+    ap.add_argument("--where_head_pt", default=None, help="--head real: load this state_dict instead of where_head.pt")
     ap.add_argument("--block", choices=["square", "aniso"], default="square",
                     help="q*/uni_full blocks: isotropic squares (default) or the cell resized (= piecewise warp)")
     ap.add_argument("--crop_tok", type=int, default=400)
@@ -286,6 +287,11 @@ def main():
         model.where_head = oracle
     elif not model._where_head_loaded:
         raise SystemExit(f"--head real: no where_head.pt in {args.model_path}")
+    if args.where_head_pt:
+        sd = torch.load(os.path.expanduser(args.where_head_pt), map_location="cpu")
+        sd = {k[len("where_head."):] if k.startswith("where_head.") else k: v for k, v in sd.items()}
+        model.where_head.load_state_dict(sd)
+        print(f"[psp] head weights <- {args.where_head_pt}", flush=True)
     processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=args.lr_tok * 1024)
     hr_processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=100_000_000)
 

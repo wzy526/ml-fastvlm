@@ -263,13 +263,24 @@ def cell_targets(box, H, W, dilate):
     return m
 
 
-def head_loss(logits, mask, focal_w=0.5):
+def head_loss(logits, mask, focal_w=0.5, ce_weight=1.0):
+    """ce_weight 1 is the original loss. The focal term (~x100) swamps the CE, so
+    the softmax spreads even when the argmax is right; --ce_weight raises the CE,
+    whose target (uniform on the GT-box cells, 0 elsewhere) is the sampling density."""
     flat, m = logits.reshape(-1), mask.reshape(-1).to(logits.device)
     ce = -(torch.log_softmax(flat, -1) * (m / m.sum().clamp(min=1))).sum()
     p = torch.sigmoid(flat)
     pt = torch.where(m > 0, p, 1 - p)
     focal = (-(1 - pt) ** 2 * torch.log(pt.clamp(min=1e-6))).mean()
-    return ce + focal_w * focal * 100.0
+    return ce_weight * ce + focal_w * focal * 100.0
+
+
+def softmax_mass(logits, mask):
+    """Fraction of the softmax sitting on the positive cells. This, not the argmax,
+    is what a density-driven DAT grid samples from."""
+    p = torch.softmax(logits.detach().float().reshape(-1), -1)
+    m = (mask.reshape(-1) > 0).to(p)
+    return float((p * m).sum())
 
 
 def top_boxes(logits, k, cells):
@@ -302,6 +313,7 @@ def vstar_query(s, mode):
 def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="", query="question"):
     head.eval()
     n = n_win = n_box = n_win3 = n_box3 = 0
+    mass_sum = 0.0
     ious, rows, per_cat = [], [], {}
     for i, s in enumerate(samples):
         gt = gt_box_frac(s)
@@ -311,6 +323,7 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
         feat, txt = frozen.pair(s["image"], vstar_query(s, query))
         logits = head(feat, txt)
         H, W = logits.shape
+        mass_sum += softmax_mass(logits, cell_targets(gt, H, W, 0))
         hd_w, hd_h = hd_size(s["image"])
         win = gt_window(gt, hd_w, hd_h, min_cells)
         tops = top_boxes(logits, 3, out_cells)
@@ -329,7 +342,8 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
                      "grid": [H, W], "in_win": bool(hits[0][0]), "in_box": bool(hits[0][1])})
     print(f"[where]{tag} V* {n} (query={query}): top-1 cell centre in GT window {n_win}/{n} ({100 * n_win / max(n, 1):.1f}%), "
           f"in GT box {n_box}/{n}; top-3 any: window {n_win3}/{n}, box {n_box3}/{n}; "
-          f"IoU of a {out_cells}-cell square {sum(ious) / max(len(ious), 1):.3f}")
+          f"IoU of a {out_cells}-cell square {sum(ious) / max(len(ious), 1):.3f}; "
+          f"softmax mass on the GT-box cells {mass_sum / max(n, 1):.3f}")
     for c, (m, w, b) in sorted(per_cat.items()):
         print(f"         {c}: n={m} window {w} box {b}")
     if out_path:
@@ -343,6 +357,7 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
 def eval_heldout(frozen, head, rows, min_cells, out_cells, tag=""):
     head.eval()
     n = n_win = n_box = 0
+    mass_sum = 0.0
     for r in rows:
         try:
             img = Image.open(r["path"]).convert("RGB")
@@ -355,7 +370,9 @@ def eval_heldout(frozen, head, rows, min_cells, out_cells, tag=""):
         h = box_hits(top_boxes(logits, 1, out_cells)[0][1], r["box"], win)
         n_win += h[0]
         n_box += h[1]
-    print(f"[where]{tag} held-out {n}: window {n_win}/{n} ({100 * n_win / max(n, 1):.1f}%), in box {n_box}/{n}")
+        mass_sum += softmax_mass(logits, cell_targets(r["box"], *logits.shape, 0))
+    print(f"[where]{tag} held-out {n}: window {n_win}/{n} ({100 * n_win / max(n, 1):.1f}%), in box {n_box}/{n}; "
+          f"softmax mass on the GT-box cells {mass_sum / max(n, 1):.3f}")
     head.train()
 
 
@@ -374,6 +391,9 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--d", type=int, default=256)
     ap.add_argument("--dilate", type=int, default=1)
+    ap.add_argument("--ce_weight", type=float, default=1.0,
+                    help="weight of the softmax CE. 1 = original loss; 20 makes the softmax "
+                         "track the GT-box density instead of being set by the focal term")
     ap.add_argument("--txt_layer", type=int, default=15)
     ap.add_argument("--hd_cap", type=int, default=5017600)
     ap.add_argument("--attn", default="sdpa")
@@ -472,7 +492,7 @@ def main():
     opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / 100) * 0.5 * (1 + math.cos(math.pi * min(s, args.steps) / args.steps)))
-    t0, seen, run_loss, skipped = time.time(), 0, 0.0, 0
+    t0, seen, run_loss, run_mass, run_n, skipped = time.time(), 0, 0.0, 0.0, 0, 0
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
         for _ in range(args.accum):
@@ -491,16 +511,19 @@ def main():
                 skipped += 1
                 loss = logits.sum() * 0.0                      # keep DDP's collective in step
             else:
-                loss = head_loss(logits, mask) / args.accum
+                loss = head_loss(logits, mask, ce_weight=args.ce_weight) / args.accum
+                run_mass += softmax_mass(logits, mask)
+                run_n += 1
             loss.backward()
             run_loss += loss.item()
         torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
         opt.step()
         sched.step()
         if step % 50 == 0:
-            say(f"[where] step {step}/{args.steps} loss {run_loss / 50:.3f} lr {sched.get_last_lr()[0]:.2e} "
+            say(f"[where] step {step}/{args.steps} loss {run_loss / 50:.3f} "
+                f"mass_in {run_mass / max(run_n, 1):.3f} lr {sched.get_last_lr()[0]:.2e} "
                 f"{(time.time() - t0) / step:.2f}s/step skipped {skipped}", flush=True)
-            run_loss = 0.0
+            run_loss, run_mass, run_n = 0.0, 0.0, 0
         if step % args.eval_every == 0 or step == args.steps:
             if main_rank:
                 eval_heldout(frozen, head, held, args.min_cells, args.out_cells, f" [step {step}]")
