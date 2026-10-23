@@ -12,7 +12,7 @@ object. There is deliberately no single `bbox` key, so the current where_head
 (single box only) skips these rows until it learns the multi-box target.
 
     python scripts/build_gqa_multibox_data.py \
-        --questions $OSS_DATA/gqa_ann/train_balanced_questions.json \
+        --questions $OSS_DATA/gqa_ann/train_balanced_instructions.parquet \
         --scene_graphs $OSS_DATA/gqa_ann/train_sceneGraphs.json \
         --image_prefix gqa/images \
         --out $OSS_DATA/extra_1023/gqa_multibox.json --max_samples 60000
@@ -33,6 +33,39 @@ def iou(a, b):
     inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
     ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
     return inter / ua if ua > 0 else 0.0
+
+
+def _plain(v):
+    """numpy arrays / structs from a parquet row -> python lists / dicts."""
+    if hasattr(v, "tolist") and not isinstance(v, (str, bytes)):
+        v = v.tolist()
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    return v
+
+
+def load_questions(path):
+    """{qid: question dict} from the official JSON or the lmms-lab parquet
+    (train_balanced_instructions). The parquet stores each annotation part as
+    [{'objectId': <word index>, 'value': <scene-graph object id>}]; convert it
+    back to the JSON's {word index: object id}."""
+    path = os.path.expanduser(path)
+    if not path.endswith(".parquet"):
+        return json.load(open(path))
+    import pandas as pd
+    d = pd.read_parquet(path, columns=["id", "imageId", "question", "answer", "fullAnswer",
+                                       "types", "annotations"])
+    qs = {}
+    for r in d.itertuples(index=False):
+        ann = _plain(r.annotations) or {}
+        ann = {part: {str(e["objectId"]): str(e["value"]) for e in (ann.get(part) or [])}
+               for part in ("question", "answer", "fullAnswer")}
+        qs[str(r.id)] = {"imageId": r.imageId, "question": r.question, "answer": r.answer,
+                         "fullAnswer": r.fullAnswer, "types": _plain(r.types) or {},
+                         "annotations": ann}
+    return qs
 
 
 def referenced_objects(q):
@@ -103,7 +136,7 @@ def main():
     print(f"[gqa] loading {args.scene_graphs}")
     sgs = json.load(open(os.path.expanduser(args.scene_graphs)))
     print(f"[gqa] {len(sgs)} scene graphs; loading {args.questions}")
-    qs = json.load(open(os.path.expanduser(args.questions)))
+    qs = load_questions(args.questions)
     print(f"[gqa] {len(qs)} questions")
 
     c, per_img, out = Counter(), Counter(), []
