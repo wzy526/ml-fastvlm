@@ -148,8 +148,11 @@ def mosaic(image, xe, ye, block, box=None):
 
 
 def gt_box(s):
+    """Normalised union GT box, or None when the dataset has no boxes (HR-Bench)."""
     W, H = s["image"].size
-    bb = s["bboxes"]
+    bb = s.get("bboxes") or []
+    if not bb:
+        return None
     x0, y0 = min(b[0] for b in bb), min(b[1] for b in bb)
     x1, y1 = max(b[0] + b[2] for b in bb), max(b[1] + b[3] for b in bb)
     return (x0 / W, y0 / H, x1 / W, y1 / H)
@@ -197,10 +200,12 @@ def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
         return mosaic(image, linspace(px0, px1, gw), linspace(py0, py1, gh), "aniso", box)
     gh, gw = grid_shape(W / H, crop_tok)
     if cfg == "uni_full":
-        mx, my = density_marginals(box, 0.0)
+        mx, my = density_marginals(win, 0.0)
     elif cfg.startswith("qw"):             # mass on the WINDOW (what crop shows), rest context
         mx, my = density_marginals(win, float(cfg[2:]))
     elif cfg.startswith("qb"):             # mass on the GT BOX itself (oracle density)
+        if box is None:
+            raise ValueError(f"{cfg} needs GT boxes (V* only)")
         mx, my = density_marginals(box, float(cfg[2:]))
     elif cfg.startswith("hb"):             # mass on the HEAD's top box (4 cells), rest context
         hb = [min(max(v, 0.0), 1.0) for v in head["box"]]
@@ -255,7 +260,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--summarize", default=None, help="glob of --out jsons; no GPU")
     ap.add_argument("--model_path")
+    ap.add_argument("--dataset", choices=["vstar", "hrbench4k", "hrbench8k"], default="vstar",
+                    help="HR-Bench has no GT boxes: --head real with crop / hm* / hb* / uni_* only")
     ap.add_argument("--vstar_root", default="~/data/vstar_bench")
+    ap.add_argument("--hrbench_parquet", default=None, help="see probe_whd_qwen35.py")
     ap.add_argument("--max_samples", type=int, default=300)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
@@ -307,12 +315,16 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=args.lr_tok * 1024)
     hr_processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=100_000_000)
 
-    probe_args = argparse.Namespace(dataset="vstar", vstar_root=args.vstar_root, hrbench_parquet=None,
+    if args.head == "oracle" and args.dataset != "vstar":
+        raise SystemExit("--head oracle needs GT boxes; only V* has them")
+    probe_args = argparse.Namespace(dataset=args.dataset, vstar_root=args.vstar_root,
+                                    hrbench_parquet=args.hrbench_parquet,
                                     image_folder=None, max_samples=args.max_samples)
     samples = load_samples(probe_args)
-    mine = [(i, s) for i, s in enumerate(samples) if i % args.shards == args.shard and s["bboxes"]]
+    mine = [(i, s) for i, s in enumerate(samples) if i % args.shards == args.shard
+            and (args.head == "real" or s.get("bboxes"))]
     configs = [c for c in args.configs.split(",") if c]
-    print(f"[psp] shard {args.shard}/{args.shards}: {len(mine)} samples x {configs}; head={args.head} block={args.block} "
+    print(f"[psp] {args.dataset} shard {args.shard}/{args.shards}: {len(mine)} samples x {configs}; head={args.head} block={args.block} "
           f"crop_tok={args.crop_tok} single_pass={args.single_pass}", flush=True)
 
     state = {"cfg": None, "box": None, "i": None, "stats": {}, "dumped": 0, "head": None}
