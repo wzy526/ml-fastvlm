@@ -175,6 +175,16 @@ def map_marginals(p2d, mass, G=200):
     return axis(col), axis(row)
 
 
+def head_map(logits, temp=1.0):
+    """(gh, gw) list of logits -> softmax(logits / temp) as nested lists."""
+    flat = [v / temp for row in logits for v in row]
+    mx = max(flat)
+    ex = [math.exp(v - mx) for v in flat]
+    z = sum(ex)
+    gw = len(logits[0])
+    return [[ex[i * gw + j] / z for j in range(gw)] for i in range(len(logits))]
+
+
 def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
     """The 2nd image for config `cfg`. `box` is the GT box (stats, qb*);
     `head` = {"box": the head's top box, "map": (gh, gw) cell probabilities}
@@ -195,8 +205,10 @@ def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
     elif cfg.startswith("hb"):             # mass on the HEAD's top box (4 cells), rest context
         hb = [min(max(v, 0.0), 1.0) for v in head["box"]]
         mx, my = density_marginals(hb, float(cfg[2:]))
-    elif cfg.startswith("hm"):             # the head's whole probability map as the density
-        mx, my = map_marginals(head["map"], float(cfg[2:]))
+    elif cfg.startswith("hm"):             # the head's probability map as the density; hm<m>t<T>
+        spec = cfg[2:].split("t")           # sharpens it: softmax(logits / T), T < 1 (zero training)
+        mass, temp = float(spec[0]), float(spec[1]) if len(spec) > 1 else 1.0
+        mx, my = map_marginals(head_map(head["logits"], temp), mass)
     else:
         raise ValueError(cfg)
     xe = [e * W for e in inv_cdf_edges(mx, gw)]
@@ -248,7 +260,7 @@ def main():
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--configs", default="crop,uni_win,uni_full,qw0.5,qw0.75,qb0.25",
-                    help="also hb<m> (head's top box) / hm<m> (head's probability map) with --head real")
+                    help="also hb<m> (head's top box) / hm<m>[t<T>] (head's softmax(logits/T) map) with --head real")
     ap.add_argument("--head", choices=["oracle", "real"], default="oracle",
                     help="oracle: GT-centre one-hot head (window + qb* are oracle); real: the checkpoint's head")
     ap.add_argument("--where_head_pt", default=None, help="--head real: load this state_dict instead of where_head.pt")
@@ -309,8 +321,7 @@ def main():
 
     def top_box_capture(logits, cells):
         box = orig_top_box(logits, cells)
-        p = torch.softmax(logits.float().reshape(-1), -1).reshape(logits.shape)
-        state["head"] = {"box": tuple(float(v) for v in box), "map": p.tolist()}
+        state["head"] = {"box": tuple(float(v) for v in box), "logits": logits.float().tolist()}
         return box
 
     def patched(image, win, crop_tok):
