@@ -155,24 +155,50 @@ def gt_box(s):
     return (x0 / W, y0 / H, x1 / W, y1 / H)
 
 
-def second_image(image, win, crop_tok, cfg, box, block, orig_crop):
-    """The 2nd image for config `cfg`. Returns (PIL, stats)."""
+def map_marginals(p2d, mass, G=200):
+    """p2d: (gh, gw) non-negative map (the head's cell probabilities), used as
+    a sampling density: mass * p + (1 - mass) * uniform. Separable marginals
+    on a G-bin axis (cells are resampled to G bins so all densities share the
+    same resolution as density_marginals)."""
+    gh, gw = len(p2d), len(p2d[0])
+    tot = sum(sum(r) for r in p2d) or 1.0
+    col = [sum(p2d[i][j] for i in range(gh)) / tot for j in range(gw)]
+    row = [sum(p2d[i]) / tot for i in range(gh)]
+
+    def axis(marg):
+        n = len(marg)
+        out = []
+        for b in range(G):
+            c = min(int(b * n / G), n - 1)
+            out.append(mass * marg[c] * n / G + (1.0 - mass) / G)
+        return out
+    return axis(col), axis(row)
+
+
+def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
+    """The 2nd image for config `cfg`. `box` is the GT box (stats, qb*);
+    `head` = {"box": the head's top box, "map": (gh, gw) cell probabilities}
+    for the hb* / hm* configs. Returns (PIL, stats)."""
     W, H = image.size
     if cfg == "crop":
         return orig_crop(image, win, crop_tok), {}
     if cfg == "uni_win":
         px0, py0, px1, py1, gh, gw = crop_geometry(image, win, crop_tok)
         return mosaic(image, linspace(px0, px1, gw), linspace(py0, py1, gh), "aniso", box)
+    gh, gw = grid_shape(W / H, crop_tok)
     if cfg == "uni_full":
-        mass, target = 0.0, box
-    elif cfg.startswith("qw"):             # mass on the oracle WINDOW (what crop shows), rest context
-        mass, target = float(cfg[2:]), win
-    elif cfg.startswith("qb"):             # mass on the GT BOX itself (peaked, over-zooms tiny targets)
-        mass, target = float(cfg[2:]), box
+        mx, my = density_marginals(box, 0.0)
+    elif cfg.startswith("qw"):             # mass on the WINDOW (what crop shows), rest context
+        mx, my = density_marginals(win, float(cfg[2:]))
+    elif cfg.startswith("qb"):             # mass on the GT BOX itself (oracle density)
+        mx, my = density_marginals(box, float(cfg[2:]))
+    elif cfg.startswith("hb"):             # mass on the HEAD's top box (4 cells), rest context
+        hb = [min(max(v, 0.0), 1.0) for v in head["box"]]
+        mx, my = density_marginals(hb, float(cfg[2:]))
+    elif cfg.startswith("hm"):             # the head's whole probability map as the density
+        mx, my = map_marginals(head["map"], float(cfg[2:]))
     else:
         raise ValueError(cfg)
-    gh, gw = grid_shape(W / H, crop_tok)
-    mx, my = density_marginals(target, mass)
     xe = [e * W for e in inv_cdf_edges(mx, gw)]
     ye = [e * H for e in inv_cdf_edges(my, gh)]
     return mosaic(image, xe, ye, block, box)
@@ -221,7 +247,10 @@ def main():
     ap.add_argument("--max_samples", type=int, default=300)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
-    ap.add_argument("--configs", default="crop,uni_win,uni_full,qw0.5,qw0.75,qb0.25")
+    ap.add_argument("--configs", default="crop,uni_win,uni_full,qw0.5,qw0.75,qb0.25",
+                    help="also hb<m> (head's top box) / hm<m> (head's probability map) with --head real")
+    ap.add_argument("--head", choices=["oracle", "real"], default="oracle",
+                    help="oracle: GT-centre one-hot head (window + qb* are oracle); real: the checkpoint's head")
     ap.add_argument("--block", choices=["square", "aniso"], default="square",
                     help="q*/uni_full blocks: isotropic squares (default) or the cell resized (= piecewise warp)")
     ap.add_argument("--crop_tok", type=int, default=400)
@@ -251,8 +280,12 @@ def main():
     model = dat_mod.Qwen3_5DATForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map={"": 0},
         attn_implementation=args.attn).eval()
-    oracle = OracleHead()
-    model.where_head = oracle
+    oracle = None
+    if args.head == "oracle":
+        oracle = OracleHead()
+        model.where_head = oracle
+    elif not model._where_head_loaded:
+        raise SystemExit(f"--head real: no where_head.pt in {args.model_path}")
     processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=args.lr_tok * 1024)
     hr_processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=100_000_000)
 
@@ -261,14 +294,22 @@ def main():
     samples = load_samples(probe_args)
     mine = [(i, s) for i, s in enumerate(samples) if i % args.shards == args.shard and s["bboxes"]]
     configs = [c for c in args.configs.split(",") if c]
-    print(f"[psp] shard {args.shard}/{args.shards}: {len(mine)} samples x {configs}; block={args.block} "
+    print(f"[psp] shard {args.shard}/{args.shards}: {len(mine)} samples x {configs}; head={args.head} block={args.block} "
           f"crop_tok={args.crop_tok} single_pass={args.single_pass}", flush=True)
 
-    state = {"cfg": None, "box": None, "i": None, "stats": {}, "dumped": 0}
+    state = {"cfg": None, "box": None, "i": None, "stats": {}, "dumped": 0, "head": None}
     orig_crop = dat_mod._where_crop_image
+    orig_top_box = dat_mod._where_top_box
+
+    def top_box_capture(logits, cells):
+        box = orig_top_box(logits, cells)
+        p = torch.softmax(logits.float().reshape(-1), -1).reshape(logits.shape)
+        state["head"] = {"box": tuple(float(v) for v in box), "map": p.tolist()}
+        return box
 
     def patched(image, win, crop_tok):
-        img, st = second_image(image, win, crop_tok, state["cfg"], state["box"], args.block, orig_crop)
+        img, st = second_image(image, win, crop_tok, state["cfg"], state["box"], args.block, orig_crop,
+                               head=state["head"])
         state["stats"] = st
         if args.dump_dir and state["dumped"] < args.dump_n * len(configs):
             os.makedirs(os.path.expanduser(args.dump_dir), exist_ok=True)
@@ -277,12 +318,14 @@ def main():
         return img
 
     dat_mod._where_crop_image = patched
+    dat_mod._where_top_box = top_box_capture
 
     out = {}
     for cfg in configs:
         rows, n_ok, t0 = [], 0, time.time()
         for gi, s in mine:
-            oracle.set_sample(s)
+            if oracle is not None:
+                oracle.set_sample(s)
             state.update(cfg=cfg, box=gt_box(s), i=gi, stats={})
             where_q = s["prompt"] if args.single_pass else s["prompt"].split("\n")[0]
             rec = model.where_crop_generate(
@@ -303,6 +346,7 @@ def main():
               f"{(time.time() - t0) / max(len(rows), 1):.2f} s/q", flush=True)
         out[cfg] = rows
     dat_mod._where_crop_image = orig_crop
+    dat_mod._where_top_box = orig_top_box
     if args.out:
         os.makedirs(os.path.dirname(os.path.expanduser(args.out)) or ".", exist_ok=True)
         json.dump(out, open(os.path.expanduser(args.out), "w"))
