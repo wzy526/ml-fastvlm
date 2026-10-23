@@ -57,11 +57,16 @@ def load_train(jsons, image_root, max_per_json, say=print):
         random.shuffle(data)
         k = 0
         for s in data:
-            b = s.get("bbox")
-            if not (isinstance(b, (list, tuple)) and len(b) == 4):
-                continue
-            b = [float(v) for v in b]
-            if not (b[2] > b[0] and b[3] > b[1] and max(b) <= 1.0):
+            boxes = s.get("bboxes") or [s.get("bbox")]
+            ok = []
+            for b in boxes:
+                if not (isinstance(b, (list, tuple)) and len(b) == 4):
+                    break
+                b = [float(v) for v in b]
+                if not (b[2] > b[0] and b[3] > b[1] and max(b) <= 1.0):
+                    break
+                ok.append(tuple(b))
+            if not ok or len(ok) != len(boxes):
                 continue
             im = s.get("image")
             im = im[0] if isinstance(im, list) else im
@@ -71,11 +76,12 @@ def load_train(jsons, image_root, max_per_json, say=print):
             if not q:
                 continue
             path = im if os.path.isabs(im) else os.path.join(image_root, im)
-            rows.append({"path": path, "box": tuple(b), "q": q, "src": os.path.basename(j)})
+            rows.append({"path": path, "box": ok[0], "boxes": ok, "q": q, "src": os.path.basename(j)})
             k += 1
             if k >= cap:
                 break
-        say(f"[where] {os.path.basename(j)}: {k} samples with a box")
+        n_multi = sum(len(r["boxes"]) > 1 for r in rows[len(rows) - k:])
+        say(f"[where] {os.path.basename(j)}: {k} samples with a box ({n_multi} with >= 2 boxes)")
     random.shuffle(rows)
     return rows
 
@@ -263,12 +269,25 @@ def cell_targets(box, H, W, dilate):
     return m
 
 
-def head_loss(logits, mask, focal_w=0.5, ce_weight=1.0):
+def multi_targets(boxes, H, W, dilate):
+    """(union mask, CE target) for one or more GT boxes. Each box gets 1/K of the
+    mass, uniform on its own cells: uniform on the union would let a large box
+    take nearly all of it (GQA box areas span 40x) and the small object's peak
+    would never be learned. One box -> the original target."""
+    masks = [cell_targets(b, H, W, dilate) for b in boxes]
+    union = torch.stack(masks).amax(0)
+    tgt = sum(m / m.sum().clamp(min=1) for m in masks) / len(masks)
+    return union, tgt
+
+
+def head_loss(logits, mask, focal_w=0.5, ce_weight=1.0, target=None):
     """ce_weight 1 is the original loss. The focal term (~x100) swamps the CE, so
     the softmax spreads even when the argmax is right; --ce_weight raises the CE,
-    whose target (uniform on the GT-box cells, 0 elsewhere) is the sampling density."""
+    whose target (uniform on the GT-box cells, 0 elsewhere) is the sampling density.
+    `target` (multi_targets) replaces that uniform target for multi-box rows."""
     flat, m = logits.reshape(-1), mask.reshape(-1).to(logits.device)
-    ce = -(torch.log_softmax(flat, -1) * (m / m.sum().clamp(min=1))).sum()
+    t = (m / m.sum().clamp(min=1)) if target is None else target.reshape(-1).to(logits.device)
+    ce = -(torch.log_softmax(flat, -1) * t).sum()
     p = torch.sigmoid(flat)
     pt = torch.where(m > 0, p, 1 - p)
     focal = (-(1 - pt) ** 2 * torch.log(pt.clamp(min=1e-6))).mean()
@@ -281,6 +300,44 @@ def softmax_mass(logits, mask):
     p = torch.softmax(logits.detach().float().reshape(-1), -1)
     m = (mask.reshape(-1) > 0).to(p)
     return float((p * m).sum())
+
+
+def peak_stats(logits, boxes, tau=0.3, min_dist=4):
+    """NMS peaks of the head map (where_peaks_probe) vs the GT boxes (xyxy
+    fractions): (n_peaks, missed: peak 1's window misses some box centre,
+    recovered: every box peak 1 misses is covered by another peak)."""
+    from where_peaks_probe import nms_peaks, softmax2d, covers
+    p = softmax2d(logits.detach().float().tolist())
+    gh, gw = len(p), len(p[0])
+    peaks = nms_peaks(p, min_dist, tau, 4)
+    centres = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
+    miss = [c for c in centres if not covers(peaks[0], c, gh, gw)]
+    rec = bool(miss) and all(any(covers(pk, c, gh, gw) for pk in peaks[1:]) for c in miss)
+    return len(peaks), bool(miss), rec
+
+
+class PeakTally:
+    """>= 2-peak rate for one- vs multi-box questions (should be low / high),
+    and how often a box missed by peak 1 is picked up by a later peak."""
+
+    def __init__(self):
+        self.n = {1: 0, 2: 0}
+        self.two = {1: 0, 2: 0}
+        self.miss = self.rec = 0
+
+    def add(self, logits, boxes):
+        k = 1 if len(boxes) == 1 else 2
+        n_pk, miss, rec = peak_stats(logits, boxes)
+        self.n[k] += 1
+        self.two[k] += n_pk >= 2
+        if k == 2:
+            self.miss += miss
+            self.rec += rec
+
+    def line(self):
+        f = lambda k: f"{self.two[k]}/{self.n[k]} ({100 * self.two[k] / max(self.n[k], 1):.0f}%)"
+        return (f">=2 peaks@0.3: one-box {f(1)}, multi-box {f(2)}; "
+                f"multi-box: peak 1 misses a box {self.miss}, a later peak covers it {self.rec}")
 
 
 def top_boxes(logits, k, cells):
@@ -315,6 +372,7 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
     n = n_win = n_box = n_win3 = n_box3 = 0
     mass_sum = 0.0
     ious, rows, per_cat = [], [], {}
+    peaks = PeakTally()
     for i, s in enumerate(samples):
         gt = gt_box_frac(s)
         if gt is None:
@@ -324,6 +382,8 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
         logits = head(feat, txt)
         H, W = logits.shape
         mass_sum += softmax_mass(logits, cell_targets(gt, H, W, 0))
+        iw, ih = s["image"].size
+        peaks.add(logits, [(b[0] / iw, b[1] / ih, (b[0] + b[2]) / iw, (b[1] + b[3]) / ih) for b in s["bboxes"]])
         hd_w, hd_h = hd_size(s["image"])
         win = gt_window(gt, hd_w, hd_h, min_cells)
         tops = top_boxes(logits, 3, out_cells)
@@ -346,6 +406,7 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
           f"softmax mass on the GT-box cells {mass_sum / max(n, 1):.3f}")
     for c, (m, w, b) in sorted(per_cat.items()):
         print(f"         {c}: n={m} window {w} box {b}")
+    print(f"         V* {peaks.line()}")
     if out_path:
         json.dump(rows, open(os.path.expanduser(out_path), "w"))
         print(f"[where] boxes -> {out_path}  (probe_whd_qwen35.py --hd_source ground_window --box_json ...)")
@@ -356,8 +417,9 @@ def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="
 @torch.no_grad()
 def eval_heldout(frozen, head, rows, min_cells, out_cells, tag=""):
     head.eval()
-    n = n_win = n_box = 0
-    mass_sum = 0.0
+    n = n1 = n_win = n_box = 0
+    mass_sum = mass_multi = 0.0
+    peaks = PeakTally()
     for r in rows:
         try:
             img = Image.open(r["path"]).convert("RGB")
@@ -365,14 +427,25 @@ def eval_heldout(frozen, head, rows, min_cells, out_cells, tag=""):
             continue
         n += 1
         logits = head(*frozen.pair(img, r["q"]))
+        boxes = r.get("boxes") or [r["box"]]
+        union, _ = multi_targets(boxes, *logits.shape, 0)
+        m = softmax_mass(logits, union)
+        mass_sum += m
+        peaks.add(logits, boxes)
+        if len(boxes) > 1:
+            mass_multi += m
+            continue
+        n1 += 1
         hd_w, hd_h = hd_size(img)
         win = gt_window(r["box"], hd_w, hd_h, min_cells)
         h = box_hits(top_boxes(logits, 1, out_cells)[0][1], r["box"], win)
         n_win += h[0]
         n_box += h[1]
-        mass_sum += softmax_mass(logits, cell_targets(r["box"], *logits.shape, 0))
-    print(f"[where]{tag} held-out {n}: window {n_win}/{n} ({100 * n_win / max(n, 1):.1f}%), in box {n_box}/{n}; "
-          f"softmax mass on the GT-box cells {mass_sum / max(n, 1):.3f}")
+    nm = n - n1
+    print(f"[where]{tag} held-out {n} ({n1} one-box): one-box window {n_win}/{n1} ({100 * n_win / max(n1, 1):.1f}%), "
+          f"in box {n_box}/{n1}; softmax mass on the GT-box cells {mass_sum / max(n, 1):.3f} "
+          f"(multi-box {mass_multi / max(nm, 1):.3f})")
+    print(f"         held-out {peaks.line()}")
     head.train()
 
 
@@ -506,12 +579,12 @@ def main():
                     skipped += 1
             feat, txt = frozen.pair(img, r["q"])
             logits = train_head(feat, txt)
-            mask = cell_targets(r["box"], *logits.shape, args.dilate)
+            mask, tgt = multi_targets(r["boxes"], *logits.shape, args.dilate)
             if mask.sum() == 0:
                 skipped += 1
                 loss = logits.sum() * 0.0                      # keep DDP's collective in step
             else:
-                loss = head_loss(logits, mask, ce_weight=args.ce_weight) / args.accum
+                loss = head_loss(logits, mask, ce_weight=args.ce_weight, target=tgt) / args.accum
                 run_mass += softmax_mass(logits, mask)
                 run_n += 1
             loss.backward()
