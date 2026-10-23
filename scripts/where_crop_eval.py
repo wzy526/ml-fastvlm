@@ -46,6 +46,46 @@ class OracleHead(torch.nn.Module):
         return logits
 
 
+def load_mmbench(args):
+    """lmms-lab/MMBench (en, dev) from the HF hub cache; prompt as in lmms-eval's
+    mmbench en doc_to_text. A general-purpose MCQ set: most questions do not need
+    localisation, so it is the regression check for "always crop"."""
+    import glob
+    import io
+    import math
+    from PIL import Image
+    from datasets import load_dataset
+    pq = args.mmbench_parquet
+    if not pq:
+        hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+            os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+        hits = sorted(glob.glob(os.path.join(hub, "datasets--lmms-lab--MMBench", "snapshots", "*", "en", "dev-*.parquet")))
+        if not hits:
+            raise SystemExit(f"MMBench en/dev parquet not found under {hub}; pass --mmbench_parquet")
+        pq = hits[-1]
+    print(f"[where_crop] MMBench from {pq}", flush=True)
+    ds = load_dataset("parquet", data_files=pq, split="train")
+
+    def ok(v):
+        return v is not None and not (isinstance(v, float) and math.isnan(v)) and str(v).strip() not in ("", "nan")
+
+    samples = []
+    for doc in ds:
+        if len(samples) >= args.max_samples:
+            break
+        img = doc["image"]
+        if isinstance(img, dict):
+            img = Image.open(io.BytesIO(img["bytes"]))
+        img = img.convert("RGB")
+        opts = [(c, doc[c]) for c in "ABCDE" if c in doc and ok(doc[c])]
+        q = (f"{doc['hint']}\n" if ok(doc.get("hint")) else "") + str(doc["question"]).strip()
+        prompt = q + "\n" + "\n".join(f"{c}. {v}" for c, v in opts) + \
+            "\nAnswer with the option's letter from the given choices directly."
+        samples.append({"image": img, "prompt": prompt, "gt": str(doc["answer"]).strip().upper(),
+                        "category": str(doc.get("category", "n/a")), "bboxes": []})
+    return samples
+
+
 @torch.inference_mode()
 def plain_generate(model, processor, image, prompt, max_new_tokens=8):
     """where_crop_generate's answer call without the hint/crop: [system, image, question]."""
@@ -66,9 +106,10 @@ def plain_generate(model, processor, image, prompt, max_new_tokens=8):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
-    ap.add_argument("--dataset", choices=["vstar", "hrbench4k", "hrbench8k"], default="vstar")
+    ap.add_argument("--dataset", choices=["vstar", "hrbench4k", "hrbench8k", "mmbench"], default="vstar")
     ap.add_argument("--vstar_root", default="~/data/vstar_bench")
     ap.add_argument("--hrbench_parquet", default=None, help="see probe_whd_qwen35.py")
+    ap.add_argument("--mmbench_parquet", default=None, help="lmms-lab/MMBench en dev parquet (default: hub cache)")
     ap.add_argument("--max_samples", type=int, default=300,
                     help="V* has 191; HR-Bench 4K/8K 800 each -> raise this")
     ap.add_argument("--shard", type=int, default=0)
@@ -135,7 +176,7 @@ def main():
     probe_args = argparse.Namespace(dataset=args.dataset, vstar_root=args.vstar_root,
                                     hrbench_parquet=args.hrbench_parquet, image_folder=None,
                                     max_samples=args.max_samples)
-    samples = load_samples(probe_args)
+    samples = load_mmbench(args) if args.dataset == "mmbench" else load_samples(probe_args)
     mine = [(i, s) for i, s in enumerate(samples) if i % args.shards == args.shard]
     if oracle is not None:
         if args.dataset != "vstar":
