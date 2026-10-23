@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--oracle_box", action="store_true",
                     help="replace the head with the GT box centre (pipeline ceiling)")
+    ap.add_argument("--where_full_prompt", action="store_true",
+                    help="head reads the full prompt (question + options) instead of its first line; "
+                         "makes the head prefix identical to the answer prefix (KV-cache single pass)")
     ap.add_argument("--no_crop", action="store_true",
                     help="baseline: same system prompt / LR image / question, no head, no crop (= off@lr_tok)")
     ap.add_argument("--where_head_pt", default=None,
@@ -139,7 +142,7 @@ def main():
     rows, n_ok = [], 0
     per = {}
     for gi, s in mine:
-        where_q = s["prompt"].split("\n")[0]
+        where_q = s["prompt"] if args.where_full_prompt else s["prompt"].split("\n")[0]
         if oracle is not None:
             oracle.set_sample(s)
         if args.no_crop:
