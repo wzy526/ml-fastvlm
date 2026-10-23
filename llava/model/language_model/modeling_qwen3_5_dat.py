@@ -3111,7 +3111,7 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         loc_inp = loc_proc(text=[text], images=[image], return_tensors="pt")
         loc_kw = _tensors(loc_inp, None)
-        out = self(**loc_kw, output_hidden_states=True, return_dict=True, use_cache=single_pass)
+        out = self(**loc_kw, output_hidden_states=True, return_dict=True, use_cache=single_pass is True)
         ids = loc_kw["input_ids"][0]
         image_id = self.config.image_token_id
         is_img = ids == image_id
@@ -3149,6 +3149,14 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         n_full = int(ans_kw["input_ids"].shape[1])
         rec["n_tokens_two_pass"] = int(ids.shape[0]) + n_full
 
+        if single_pass == "nocache":
+            # Diagnostic: the whole answer sequence in one forward (no cache
+            # reuse) but with the same explicit position_ids / greedy loop as
+            # the cached path. Differs from single_pass only by cache/kernel
+            # path, from two-pass only by the LR pixels + generate().
+            answer = self._where_answer_from_cache(None, None, ans_kw, hr_processor, max_new_tokens)
+            rec.update(text=answer, n_tokens=rec["n_tokens_two_pass"], single_pass="nocache")
+            return rec
         if single_pass:
             answer = self._where_answer_from_cache(
                 out.past_key_values, ids, ans_kw, hr_processor, max_new_tokens)
@@ -3170,27 +3178,30 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         prompt does not start with the prefix the cache was built from (then
         the caller re-encodes everything)."""
         full = ans_kw["input_ids"][0]
-        P, F = int(prefix_ids.shape[0]), int(full.shape[0])
-        if cache is None or F <= P or not torch.equal(full[:P], prefix_ids.to(full.device)):
-            return None
+        F = int(full.shape[0])
         image_id = self.config.image_token_id
         thw = ans_kw["image_grid_thw"]
-        n_lr = int(torch.prod(thw[0])) // (self.config.vision_config.spatial_merge_size ** 2)
-        if int((prefix_ids == image_id).sum()) != n_lr:
-            return None                          # the LR view is not the same grid
+        if prefix_ids is None:                   # diagnostic: no prefix, whole sequence
+            P, n_lr_patches = 0, 0
+        else:
+            P = int(prefix_ids.shape[0])
+            if cache is None or F <= P or not torch.equal(full[:P], prefix_ids.to(full.device)):
+                return None
+            n_lr = int(torch.prod(thw[0])) // (self.config.vision_config.spatial_merge_size ** 2)
+            if int((prefix_ids == image_id).sum()) != n_lr:
+                return None                      # the LR view is not the same grid
+            n_lr_patches = int(torch.prod(thw[0]))   # the crop's patches follow the LR's
         # 2-D positions of the crop tokens: mRoPE over the whole sequence, sliced.
         mm = torch.zeros_like(full[None])
         mm[full[None] == image_id] = 1
         pos3d, rope_deltas = self.model.get_rope_index(full[None], mm, image_grid_thw=thw)
         self.model.rope_deltas = rope_deltas
-        # The crop's pixel_values are the second image's patches.
-        n_lr_patches = int(torch.prod(thw[0]))
         o = self(input_ids=full[None, P:],
                  position_ids=pos3d[:, :, P:],
                  mm_token_type_ids=mm[:, P:],
                  past_key_values=cache,
                  pixel_values=ans_kw["pixel_values"][n_lr_patches:],
-                 image_grid_thw=thw[1:],
+                 image_grid_thw=thw[1:] if P else thw,
                  cache_position=torch.arange(P, F, device=full.device),
                  use_cache=True, return_dict=True)
         cache = o.past_key_values

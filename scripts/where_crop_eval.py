@@ -88,6 +88,9 @@ def main():
                          "makes the head prefix identical to the answer prefix (KV-cache single pass)")
     ap.add_argument("--single_pass", action="store_true",
                     help="answer from the head prefill's KV cache (LR encoded once); implies --where_full_prompt")
+    ap.add_argument("--diag_nocache", action="store_true",
+                    help="diagnostic: whole answer sequence in one forward with the single-pass "
+                         "position_ids/greedy loop but no cache reuse (isolates cache/kernel effects)")
     ap.add_argument("--equiv", action="store_true",
                     help="with --single_pass: also run the two-pass path per question and report agreement")
     ap.add_argument("--no_crop", action="store_true",
@@ -149,7 +152,8 @@ def main():
     tok_sum, tok2_sum, t_sum, n_sp = 0, 0, 0.0, 0
     agree = ok_two = 0
     for gi, s in mine:
-        where_q = s["prompt"] if (args.where_full_prompt or args.single_pass) else s["prompt"].split("\n")[0]
+        where_q = (s["prompt"] if (args.where_full_prompt or args.single_pass or args.diag_nocache)
+                   else s["prompt"].split("\n")[0])
         if oracle is not None:
             oracle.set_sample(s)
         if args.no_crop:
@@ -161,7 +165,8 @@ def main():
             torch.cuda.synchronize()
             t0 = time.time()
             rec = model.where_crop_generate(s["image"], s["prompt"], processor, hr_processor,
-                                            single_pass=args.single_pass, **kw)
+                                            single_pass="nocache" if args.diag_nocache else args.single_pass,
+                                            **kw)
             torch.cuda.synchronize()
             t_sum += time.time() - t0
             tok_sum += rec.get("n_tokens", 0)
