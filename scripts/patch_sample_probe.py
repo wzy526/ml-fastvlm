@@ -23,6 +23,11 @@ image, so the stock processor / ViT / prompt / single-pass path are untouched
   qb0.25    25% of the mass on the GT BOX itself (the pixel warp_oracle's
             density; over-zooms V*'s tiny boxes, kept for that comparison)
   --block square (default): isotropic blocks; aniso: cell resized = piecewise warp
+  dw0.5     DAT inside the head's window (dat_window): reference = crop's grid,
+            offsets toward the head map (alpha 0.5), neighbour scale ratio
+            <= 1.5 (r<ratio>), k<mass> = adaptive window scale, sq = square
+            blocks. dw0 = the crop exactly; dw0k0.7 = crop of the adaptive window.
+  --summarize --dataset hrbench4k: also paired per-question comparison vs crop
   mg2       multi-group: one uniform window per head peak (NMS, >= 4 cells apart),
             stacked into one mosaic; mg2 = forced 2 groups, 400 tok split;
             mg2x2 = 400 tok each; mg2a0.3 = adaptive (2nd group only if its
@@ -39,6 +44,7 @@ import glob
 import json
 import math
 import os
+import re
 import sys
 import time
 
@@ -243,6 +249,113 @@ def multi_group(image, win, crop_tok, cfg, box, head, orig_crop):
     return out, stats
 
 
+DW_RE = re.compile(r"^dw([\d.]+)(?:r([\d.]+))?(?:k([\d.]+))?(sq)?$")
+
+
+def _overlap(a0, a1, b0, b1):
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def window_mass(p2d, win):
+    """Head probability inside the normalised window (cells weighted by overlap)."""
+    gh, gw = len(p2d), len(p2d[0])
+    tot = 0.0
+    for i in range(gh):
+        oy = _overlap(i / gh, (i + 1) / gh, win[1], win[3]) * gh
+        if oy <= 0:
+            continue
+        for j in range(gw):
+            ox = _overlap(j / gw, (j + 1) / gw, win[0], win[2]) * gw
+            if ox > 0:
+                tot += p2d[i][j] * ox * oy
+    return tot
+
+
+def adaptive_window(head, win, k, smin=0.6, smax=1.8):
+    """DAT's scale term s: the live window (same aspect) rescaled by the
+    smallest sigma in [smin, smax] whose window around the head's top box
+    holds >= k of the head's probability. Returns (window, sigma)."""
+    p = head_map(head["logits"])
+    hb = head["box"]
+    cx, cy = (hb[0] + hb[2]) / 2, (hb[1] + hb[3]) / 2
+    hw, hh = (win[2] - win[0]) / 2, (win[3] - win[1]) / 2
+    best = None
+    steps = int(round((smax - smin) / 0.1))
+    for t in range(steps + 1):
+        sg = smin + 0.1 * t
+        w2, h2 = min(sg * hw, 0.5), min(sg * hh, 0.5)
+        x0 = min(max(cx - w2, 0.0), 1.0 - 2 * w2)
+        y0 = min(max(cy - h2, 0.0), 1.0 - 2 * h2)
+        best = ((x0, y0, x0 + 2 * w2, y0 + 2 * h2), sg)
+        if window_mass(p, best[0]) >= k:
+            break
+    return best
+
+
+def window_marginals(p2d, win, alpha, ratio, G=64):
+    """Sampling density inside the window, per axis: (1 - alpha) uniform +
+    alpha * the head map's marginal over the window (linearly interpolated
+    between cell centres, so the grid spacing changes smoothly), then floored
+    so max / min <= ratio: neighbouring tokens differ in scale by little and
+    the warp stays mild. alpha = 0 -> uniform = the crop's grid."""
+    gh, gw = len(p2d), len(p2d[0])
+    col = [sum(p2d[i][j] * _overlap(i / gh, (i + 1) / gh, win[1], win[3]) * gh for i in range(gh))
+           for j in range(gw)]
+    row = [sum(p2d[i][j] * _overlap(j / gw, (j + 1) / gw, win[0], win[2]) * gw for j in range(gw))
+           for i in range(gh)]
+
+    def axis(vals, a0, a1):
+        n = len(vals)
+        samp = []
+        for b in range(G):
+            u = a0 + (b + 0.5) / G * (a1 - a0)
+            f = min(max(u * n - 0.5, 0.0), n - 1.0)
+            lo = int(f)
+            hi = min(lo + 1, n - 1)
+            samp.append(vals[lo] * (1 - (f - lo)) + vals[hi] * (f - lo))
+        tot = sum(samp)
+        d = [(1.0 - alpha) / G + (alpha * v / tot if tot > 0 else alpha / G) for v in samp]
+        if ratio and ratio > 1:
+            fl = max(d) / ratio
+            d = [max(v, fl) for v in d]
+        return d
+    return axis(col, win[0], win[2]), axis(row, win[1], win[3])
+
+
+def dat_window(image, win, crop_tok, cfg, box, head, orig_crop):
+    """dw<alpha>[r<ratio>][k<mass>][sq]: DAT inside the localisation window.
+    x = c + s * reference + offset: c = the head's window centre, s = the live
+    window size (or, with k<mass>, adaptive_window), reference = the crop's
+    uniform gh x gw grid, offset = the inverse-CDF shift of the grid lines
+    toward the head's mass (alpha), bounded by ratio (default 1.5). Blocks are
+    the cells themselves (contiguous piecewise-linear warp, no seams); `sq`
+    uses isotropic squares instead. alpha = 0 -> exactly the crop of the
+    (possibly adaptive) window; nothing is spent outside the window."""
+    m = DW_RE.match(cfg)
+    if not m:
+        raise ValueError(cfg)
+    alpha = float(m.group(1))
+    ratio = float(m.group(2)) if m.group(2) else 1.5
+    k = float(m.group(3)) if m.group(3) else None
+    blk = "square" if m.group(4) else "aniso"
+    stats = {}
+    if k is not None:
+        win, sg = adaptive_window(head, win, k)
+        stats["sigma"] = sg
+    if alpha == 0 and blk == "aniso":
+        return orig_crop(image, win, crop_tok), stats
+    px0, py0, px1, py1, gh, gw = crop_geometry(image, win, crop_tok)
+    nwin = (px0 / image.width, py0 / image.height, px1 / image.width, py1 / image.height)
+    dx, dy = window_marginals(head_map(head["logits"]), nwin, alpha, ratio)
+    xe = [px0 + e * (px1 - px0) for e in inv_cdf_edges(dx, gw)]
+    ye = [py0 + e * (py1 - py0) for e in inv_cdf_edges(dy, gh)]
+    img, st = mosaic(image, xe, ye, blk, box)
+    widths = [xe[j + 1] - xe[j] for j in range(gw)]
+    st["scale_ratio"] = max(widths) / max(min(widths), 1e-6)
+    st.update(stats)
+    return img, st
+
+
 def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
     """The 2nd image for config `cfg`. `box` is the GT box (stats, qb*);
     `head` = {"box": the head's top box, "map": (gh, gw) cell probabilities}
@@ -252,6 +365,8 @@ def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
         return orig_crop(image, win, crop_tok), {}
     if cfg.startswith("mg"):
         return multi_group(image, win, crop_tok, cfg, box, head, orig_crop)
+    if cfg.startswith("dw"):
+        return dat_window(image, win, crop_tok, cfg, box, head, orig_crop)
     if cfg == "uni_win":
         px0, py0, px1, py1, gh, gw = crop_geometry(image, win, crop_tok)
         return mosaic(image, linspace(px0, px1, gw), linspace(py0, py1, gh), "aniso", box)
@@ -280,7 +395,74 @@ def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
 
 # ───────────────────────── summary ─────────────────────────
 
-def summarize(pattern):
+def prompt_key(prompt):
+    """HR-Bench repeats each question with its options permuted: the question
+    line + the SET of option texts identifies it."""
+    lines = [l.strip() for l in str(prompt).split("\n") if l.strip()]
+    opts = frozenset(re.sub(r"^[A-Z]\.\s*", "", l) for l in lines[1:] if re.match(r"^[A-Z]\.", l))
+    return (lines[0] if lines else "", opts)
+
+
+def question_groups(rows, dataset=None, parquet=None):
+    """{row index i: group id}. Rows carry `prompt` (new runs); older jsons get
+    it from the HR-Bench parquet (--dataset). Same key only merges indices
+    within 8 of the group's first one (the repeats sit next to each other;
+    'How many people are there?' on another image is another question)."""
+    prompts = {r["i"]: r["prompt"] for r in rows if r.get("prompt")}
+    if not prompts and dataset and dataset.startswith("hrbench"):
+        import pandas as pd
+        from probe_whd_qwen35 import _local_hrbench_parquet
+        split = {"hrbench4k": "hrbench_4k", "hrbench8k": "hrbench_8k"}[dataset]
+        d = pd.read_parquet(parquet or _local_hrbench_parquet(split), columns=["question"] + list("ABCD"))
+        for i in range(len(d)):
+            r = d.iloc[i]
+            opts = "".join(f"{c}. {r[c]}\n" for c in "ABCD" if isinstance(r[c], str))
+            prompts[i] = f"{str(r['question']).strip()}\n{opts}"
+    if not prompts:
+        return {r["i"]: r["i"] for r in rows}
+    groups, first = {}, {}
+    for i in sorted({r["i"] for r in rows}):
+        k = prompt_key(prompts.get(i, i))
+        if k in first and i - first[k][0] <= 8:
+            groups[i] = first[k][1]
+        else:
+            first[k] = (i, i)
+            groups[i] = i
+    return groups
+
+
+def sign_test(w, l):
+    n = w + l
+    if n == 0:
+        return 1.0
+    tail = sum(math.comb(n, j) for j in range(min(w, l) + 1)) / 2.0 ** n
+    return min(1.0, 2 * tail)
+
+
+def paired_vs_crop(runs, groups):
+    """Per question (repeats averaged): how many questions a config gets more /
+    less right than crop, and the two-sided sign-test p."""
+    if "crop" not in runs:
+        return
+    def per_q(rows):
+        acc = {}
+        for r in rows:
+            acc.setdefault(groups.get(r["i"], r["i"]), []).append(r["ok"])
+        return {g: sum(v) / len(v) for g, v in acc.items()}
+    ref = per_q(runs["crop"])
+    print(f"paired vs crop over {len(ref)} questions (repeats averaged): better / worse / sign-test p")
+    for cfg, rows in runs.items():
+        if cfg == "crop":
+            continue
+        q = per_q(rows)
+        common = [g for g in q if g in ref]
+        w = sum(q[g] > ref[g] for g in common)
+        l = sum(q[g] < ref[g] for g in common)
+        net = sum(q[g] - ref[g] for g in common)
+        print(f"  {cfg:12s} {w:4d} / {l:<4d} p={sign_test(w, l):.3f}   net {net:+.2f} questions")
+
+
+def summarize(pattern, dataset=None, parquet=None):
     runs = {}
     for f in sorted(glob.glob(os.path.expanduser(pattern))):
         for cfg, rows in json.load(open(f)).items():
@@ -301,6 +483,12 @@ def summarize(pattern):
         sall = sum(s["side_mean"] for s in st) / len(st) if st else float("nan")
         grp = [s["groups"] for s in st if "groups" in s]
         grp = f"  groups>1: {sum(g > 1 for g in grp)}/{len(grp)}" if grp else ""
+        sg = [s["sigma"] for s in st if "sigma" in s]
+        if sg:
+            grp += f"  sigma mean {sum(sg) / len(sg):.2f} (<1: {sum(v < 0.95 for v in sg)}, >1: {sum(v > 1.05 for v in sg)})"
+        sr = [s["scale_ratio"] for s in st if "scale_ratio" in s]
+        if sr:
+            grp += f"  col scale ratio {sum(sr) / len(sr):.2f}"
         print(f"{cfg:10s} {ok:4d}/{n:<4d}{100 * ok / max(n, 1):5.1f} {agree:7d}/{n:<6d} {tok:6.0f} "
               f"{inb:14.1f} {sin:7.1f}/{sall:<8.1f}{grp}")
     cats = sorted({r["cat"] for rows in runs.values() for r in rows})
@@ -311,6 +499,8 @@ def summarize(pattern):
             rs = [r for r in rows if r["cat"] == c]
             parts.append(f"{sum(r['ok'] for r in rs)}/{len(rs)}")
         print(f"  {cfg:10s} " + "  ".join(parts))
+    any_rows = next(iter(runs.values()))
+    paired_vs_crop(runs, question_groups(any_rows, dataset, parquet))
 
 
 # ───────────────────────── main ─────────────────────────
@@ -346,7 +536,7 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     if args.summarize:
-        summarize(args.summarize)
+        summarize(args.summarize, args.dataset if args.dataset != "vstar" else None, args.hrbench_parquet)
         return
     if not args.model_path:
         raise SystemExit("--model_path required")
@@ -424,6 +614,7 @@ def main():
             ok = pred == s["gt"]
             n_ok += ok
             rows.append({"i": gi, "pred": pred, "gt": s["gt"], "ok": bool(ok), "cat": s["category"],
+                         "prompt": s["prompt"],
                          "window": list(rec["window"]), "n_tokens": rec.get("n_tokens"),
                          "stats": state["stats"]})
             st = state["stats"]
