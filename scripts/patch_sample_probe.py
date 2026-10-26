@@ -338,7 +338,7 @@ def dat_window(image, win, crop_tok, cfg, box, head, orig_crop):
     ratio = float(m.group(2)) if m.group(2) else 1.5
     k = float(m.group(3)) if m.group(3) else None
     blk = "square" if m.group(4) else "aniso"
-    stats = {}
+    stats = {"in_box": 0, "blocks": 0, "side_in_box": None, "side_mean": 0.0}
     if k is not None:
         win, sg = adaptive_window(head, win, k)
         stats["sigma"] = sg
@@ -352,7 +352,8 @@ def dat_window(image, win, crop_tok, cfg, box, head, orig_crop):
     img, st = mosaic(image, xe, ye, blk, box)
     widths = [xe[j + 1] - xe[j] for j in range(gw)]
     st["scale_ratio"] = max(widths) / max(min(widths), 1e-6)
-    st.update(stats)
+    if "sigma" in stats:
+        st["sigma"] = stats["sigma"]
     return img, st
 
 
@@ -619,17 +620,17 @@ def main():
                          "stats": state["stats"]})
             st = state["stats"]
             print(f"[psp] {cfg} {gi} pred={pred} gt={s['gt']} ok={int(ok)} tok={rec.get('n_tokens')}"
-                  + (f" in_box={st['in_box']}/{st['blocks']} side_in={st['side_in_box'] and round(st['side_in_box'], 1)}"
-                     if st else ""), flush=True)
+                  + (f" in_box={st.get('in_box')}/{st.get('blocks')} sigma={st.get('sigma')}" if st else ""),
+                  flush=True)
         print(f"[psp] {cfg}: {n_ok}/{len(rows)} ({100 * n_ok / max(len(rows), 1):.1f}%) "
               f"{(time.time() - t0) / max(len(rows), 1):.2f} s/q", flush=True)
         out[cfg] = rows
+        if args.out:                                  # after every config: a crash keeps what finished
+            os.makedirs(os.path.dirname(os.path.expanduser(args.out)) or ".", exist_ok=True)
+            json.dump(out, open(os.path.expanduser(args.out), "w"))
+            print(f"[psp] wrote {args.out} ({len(out)} configs)", flush=True)
     dat_mod._where_crop_image = orig_crop
     dat_mod._where_top_box = orig_top_box
-    if args.out:
-        os.makedirs(os.path.dirname(os.path.expanduser(args.out)) or ".", exist_ok=True)
-        json.dump(out, open(os.path.expanduser(args.out), "w"))
-        print(f"[psp] wrote {args.out}", flush=True)
 
 
 if __name__ == "__main__":
