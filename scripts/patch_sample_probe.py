@@ -34,6 +34,10 @@ image, so the stock processor / ViT / prompt / single-pass path are untouched
             stacked into one mosaic; mg2 = forced 2 groups, 400 tok split;
             mg2x2 = 400 tok each; mg2a0.3 = adaptive (2nd group only if its
             peak >= 0.3 x main, else identical to crop). Needs --head real.
+  nf0.5k0.6 nested fovea: outer = adaptive window (k0.6) at half the budget,
+            inner = half its side around the head's top box at the other half,
+            both undistorted crops stacked in one image; nf0.5 = outer is the
+            live window; b<frac> = inner's budget share. Needs --head real.
 
   for i in 0 1 2 3 4 5 6 7; do CUDA_VISIBLE_DEVICES=$i setsid nohup python scripts/patch_sample_probe.py \
       --model_path $E/checkpoint-1000 --shard $i --shards 8 \
@@ -359,6 +363,51 @@ def dat_window(image, win, crop_tok, cfg, box, head, orig_crop):
     return img, st
 
 
+NF_RE = re.compile(r"^nf([\d.]+)(?:k([\d.]+))?(?:b([\d.]+))?$")
+
+
+def nested_fovea(image, win, crop_tok, cfg, box, head, orig_crop):
+    """nf<ratio>[k<mass>][b<frac>]: two undistorted uniform groups sharing the
+    head's centre. Outer = the live window (or adaptive_window with k<mass>)
+    for context; inner = the outer's size x ratio centred on the head's top
+    box for detail, with frac (default 0.5) of crop_tok. Both are plain crops
+    of their windows, stacked along the shorter side into one image."""
+    from PIL import Image
+    m = NF_RE.match(cfg)
+    if not m:
+        raise ValueError(cfg)
+    ratio = float(m.group(1))
+    k = float(m.group(2)) if m.group(2) else None
+    frac = float(m.group(3)) if m.group(3) else 0.5
+    stats = {"in_box": 0, "blocks": 0, "side_in_box": None, "side_mean": 0.0}
+    if k is not None:
+        win, sg = adaptive_window(head, win, k)
+        stats["sigma"] = sg
+    hb = head["box"]
+    cx, cy = (hb[0] + hb[2]) / 2, (hb[1] + hb[3]) / 2
+    w2 = min((win[2] - win[0]) * ratio, 1.0) / 2
+    h2 = min((win[3] - win[1]) * ratio, 1.0) / 2
+    x0 = min(max(cx - w2, 0.0), 1.0 - 2 * w2)
+    y0 = min(max(cy - h2, 0.0), 1.0 - 2 * h2)
+    inner = (x0, y0, x0 + 2 * w2, y0 + 2 * h2)
+    t_in = max(1, int(round(crop_tok * frac)))
+    a = orig_crop(image, win, crop_tok - t_in)
+    b = orig_crop(image, inner, t_in)
+    if a.width >= a.height:                     # wide windows: stack vertically
+        out = Image.new("RGB", (max(a.width, b.width), a.height + b.height))
+        out.paste(a, (0, 0))
+        out.paste(b, (0, a.height))
+    else:
+        out = Image.new("RGB", (a.width + b.width, max(a.height, b.height)))
+        out.paste(a, (0, 0))
+        out.paste(b, (a.width, 0))
+    stats["inner"] = list(inner)
+    if box is not None:
+        stats["inner_has_box"] = bool(_overlap(inner[0], inner[2], box[0], box[2]) > 0
+                                      and _overlap(inner[1], inner[3], box[1], box[3]) > 0)
+    return out, stats
+
+
 def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
     """The 2nd image for config `cfg`. `box` is the GT box (stats, qb*);
     `head` = {"box": the head's top box, "map": (gh, gw) cell probabilities}
@@ -370,6 +419,8 @@ def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
         return multi_group(image, win, crop_tok, cfg, box, head, orig_crop)
     if cfg.startswith("dw"):
         return dat_window(image, win, crop_tok, cfg, box, head, orig_crop)
+    if cfg.startswith("nf"):
+        return nested_fovea(image, win, crop_tok, cfg, box, head, orig_crop)
     if cfg == "uni_win":
         px0, py0, px1, py1, gh, gw = crop_geometry(image, win, crop_tok)
         return mosaic(image, linspace(px0, px1, gw), linspace(py0, py1, gh), "aniso", box)
@@ -494,6 +545,9 @@ def summarize(pattern, dataset=None, parquet=None):
         sr = [s["scale_ratio"] for s in st if "scale_ratio" in s]
         if sr:
             grp += f"  col scale ratio {sum(sr) / len(sr):.2f}"
+        ihb = [s["inner_has_box"] for s in st if "inner_has_box" in s]
+        if ihb:
+            grp += f"  inner hits GT box {sum(ihb)}/{len(ihb)}"
         print(f"{cfg:10s} {ok:4d}/{n:<4d}{100 * ok / max(n, 1):5.1f} {agree:7d}/{n:<6d} {tok:6.0f} "
               f"{inb:14.1f} {sin:7.1f}/{sall:<8.1f}{grp}")
     cats = sorted({r["cat"] for rows in runs.values() for r in rows})
