@@ -409,8 +409,10 @@ def question_groups(rows, dataset=None, parquet=None):
     it from the HR-Bench parquet (--dataset). Same key only merges indices
     within 8 of the group's first one (the repeats sit next to each other;
     'How many people are there?' on another image is another question)."""
+    if not (dataset and dataset.startswith("hrbench")):
+        return {r["i"]: r["i"] for r in rows}          # V*: every item is its own image
     prompts = {r["i"]: r["prompt"] for r in rows if r.get("prompt")}
-    if not prompts and dataset and dataset.startswith("hrbench"):
+    if not prompts:
         import pandas as pd
         from probe_whd_qwen35 import _local_hrbench_parquet
         split = {"hrbench4k": "hrbench_4k", "hrbench8k": "hrbench_8k"}[dataset]
