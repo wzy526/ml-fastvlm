@@ -27,6 +27,8 @@ image, so the stock processor / ViT / prompt / single-pass path are untouched
             offsets toward the head map (alpha 0.5), neighbour scale ratio
             <= 1.5 (r<ratio>), k<mass> = adaptive window scale, sq = square
             blocks. dw0 = the crop exactly; dw0k0.7 = crop of the adaptive window.
+  model_dat where_crop_generate(sample_mode='dat') = the in-model port of
+            dw0.5k0.6 (defaults); must match dw0.5k0.6 prediction for prediction
   --summarize --dataset hrbench4k: also paired per-question comparison vs crop
   mg2       multi-group: one uniform window per head peak (NMS, >= 4 cells apart),
             stacked into one mosaic; mg2 = forced 2 groups, 400 tok split;
@@ -362,7 +364,7 @@ def second_image(image, win, crop_tok, cfg, box, block, orig_crop, head=None):
     `head` = {"box": the head's top box, "map": (gh, gw) cell probabilities}
     for the hb* / hm* configs. Returns (PIL, stats)."""
     W, H = image.size
-    if cfg == "crop":
+    if cfg in ("crop", "model_dat"):         # model_dat: the model's own sample_mode='dat' path
         return orig_crop(image, win, crop_tok), {}
     if cfg.startswith("mg"):
         return multi_group(image, win, crop_tok, cfg, box, head, orig_crop)
@@ -612,7 +614,8 @@ def main():
             rec = model.where_crop_generate(
                 s["image"], s["prompt"], processor, hr_processor, where_question=where_q,
                 layer=args.layer, crop_tok=args.crop_tok, min_cells=args.min_cells,
-                ground_pad=args.ground_pad, head_prefix=args.head_prefix, single_pass=args.single_pass)
+                ground_pad=args.ground_pad, head_prefix=args.head_prefix, single_pass=args.single_pass,
+                sample_mode="dat" if cfg == "model_dat" else "crop")
             pred = extract_letter(rec["text"])
             ok = pred == s["gt"]
             n_ok += ok

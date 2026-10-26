@@ -35,6 +35,7 @@ Attention mechanism: Two-pass + LSE merge (GC-safe, shape-static):
     Gate:   out = merge(o₁, o₂) * sigmoid(gate);  out = o_proj(out)
 """
 
+import bisect
 import contextlib
 import logging
 import json
@@ -2450,6 +2451,139 @@ def _where_crop_image(image, win, crop_tok):
     return crop.resize((nw, nh), Image.BICUBIC)
 
 
+# ---- DAT sampling inside the localisation window (sample_mode='dat') ----
+# Ported from scripts/patch_sample_probe.py (dat_window, config dw<a>r<r>k<k>);
+# keep the two identical so probe numbers carry over.
+# x = c + s * reference + offset: c = the head's window centre, s = the window
+# scale (adaptive: smallest that holds `k` of the head's mass), reference = the
+# crop's uniform grid, offset = inverse-CDF shift of the grid lines toward the
+# head map (strength alpha, neighbour scale ratio <= ratio). alpha = 0 and no
+# adaptive scale -> exactly _where_crop_image.
+
+def _wdat_overlap(a0, a1, b0, b1):
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _wdat_softmax(logits):
+    flat = [v for row in logits for v in row]
+    mx = max(flat)
+    ex = [math.exp(v - mx) for v in flat]
+    z = sum(ex)
+    gw = len(logits[0])
+    return [[ex[i * gw + j] / z for j in range(gw)] for i in range(len(logits))]
+
+
+def _wdat_window_mass(p, win):
+    gh, gw = len(p), len(p[0])
+    tot = 0.0
+    for i in range(gh):
+        oy = _wdat_overlap(i / gh, (i + 1) / gh, win[1], win[3]) * gh
+        if oy <= 0:
+            continue
+        for j in range(gw):
+            ox = _wdat_overlap(j / gw, (j + 1) / gw, win[0], win[2]) * gw
+            if ox > 0:
+                tot += p[i][j] * ox * oy
+    return tot
+
+
+def _wdat_adaptive_window(p, box, win, k, smin=0.6, smax=1.8):
+    """The window (same aspect as `win`) around the head's top box, rescaled
+    by the smallest sigma in [smin, smax] (0.1 steps) holding >= k of p."""
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    hw, hh = (win[2] - win[0]) / 2, (win[3] - win[1]) / 2
+    best = None
+    for t in range(int(round((smax - smin) / 0.1)) + 1):
+        sg = smin + 0.1 * t
+        w2, h2 = min(sg * hw, 0.5), min(sg * hh, 0.5)
+        x0 = min(max(cx - w2, 0.0), 1.0 - 2 * w2)
+        y0 = min(max(cy - h2, 0.0), 1.0 - 2 * h2)
+        best = ((x0, y0, x0 + 2 * w2, y0 + 2 * h2), sg)
+        if _wdat_window_mass(p, best[0]) >= k:
+            break
+    return best
+
+
+def _wdat_marginals(p, win, alpha, ratio, G=64):
+    gh, gw = len(p), len(p[0])
+    col = [sum(p[i][j] * _wdat_overlap(i / gh, (i + 1) / gh, win[1], win[3]) * gh for i in range(gh))
+           for j in range(gw)]
+    row = [sum(p[i][j] * _wdat_overlap(j / gw, (j + 1) / gw, win[0], win[2]) * gw for j in range(gw))
+           for i in range(gh)]
+
+    def axis(vals, a0, a1):
+        n = len(vals)
+        samp = []
+        for b in range(G):
+            u = a0 + (b + 0.5) / G * (a1 - a0)
+            f = min(max(u * n - 0.5, 0.0), n - 1.0)
+            lo = int(f)
+            hi = min(lo + 1, n - 1)
+            samp.append(vals[lo] * (1 - (f - lo)) + vals[hi] * (f - lo))
+        tot = sum(samp)
+        d = [(1.0 - alpha) / G + (alpha * v / tot if tot > 0 else alpha / G) for v in samp]
+        if ratio and ratio > 1:
+            fl = max(d) / ratio
+            d = [max(v, fl) for v in d]
+        return d
+    return axis(col, win[0], win[2]), axis(row, win[1], win[3])
+
+
+def _wdat_inv_cdf_edges(marg, n):
+    G = len(marg)
+    tot = sum(marg) or 1.0
+    cdf = [0.0]
+    for v in marg:
+        cdf.append(cdf[-1] + v / tot)
+    cdf[-1] = 1.0
+    edges = []
+    for k in range(n + 1):
+        u = k / n
+        c = min(max(bisect.bisect_right(cdf, u) - 1, 0), G - 1)
+        span = cdf[c + 1] - cdf[c]
+        frac = (u - cdf[c]) / span if span > 1e-12 else 0.0
+        edges.append((c + min(max(frac, 0.0), 1.0)) / G)
+    edges[0], edges[-1] = 0.0, 1.0
+    return edges
+
+
+def _where_dat_image(image, win, crop_tok, logits, box, alpha=0.5, ratio=1.5, k=0.6):
+    """sample_mode='dat': the 2nd image sampled by a DAT grid inside the
+    head's window. Same pixel box / gh x gw grid as _where_crop_image on the
+    (adaptive) window, so the token count matches the crop; each grid cell
+    is resized to 32x32 and the cells tile contiguously (piecewise-linear
+    warp, no seams). Returns (PIL image, info dict)."""
+    from PIL import Image
+    p = _wdat_softmax(logits.float().tolist())
+    info = {"window": tuple(win)}
+    if k is not None:
+        win, sg = _wdat_adaptive_window(p, box, win, k)
+        info.update(window=win, sigma=sg)
+    if not alpha:
+        return _where_crop_image(image, win, crop_tok), info
+    W, H = image.size
+    px0, py0 = int(win[0] * W), int(win[1] * H)
+    px1 = min(max(int(math.ceil(win[2] * W)), px0 + 1), W)
+    py1 = min(max(int(math.ceil(win[3] * H)), py0 + 1), H)
+    cw, ch = px1 - px0, py1 - py0
+    sc = math.sqrt(min(crop_tok * 1024, cw * ch) / float(cw * ch))
+    gw = max(32, int(cw * sc) // 32 * 32) // 32
+    gh = max(32, int(ch * sc) // 32 * 32) // 32
+    dx, dy = _wdat_marginals(p, (px0 / W, py0 / H, px1 / W, py1 / H), alpha, ratio)
+    xe = [px0 + e * cw for e in _wdat_inv_cdf_edges(dx, gw)]
+    ye = [py0 + e * ch for e in _wdat_inv_cdf_edges(dy, gh)]
+    out = Image.new("RGB", (gw * 32, gh * 32))
+    for i in range(gh):
+        for j in range(gw):
+            bx0, by0 = int(math.floor(xe[j])), int(math.floor(ye[i]))
+            bx1 = max(int(math.ceil(min(xe[j + 1], W))), bx0 + 1)
+            by1 = max(int(math.ceil(min(ye[i + 1], H))), by0 + 1)
+            out.paste(image.crop((bx0, by0, bx1, by1)).resize((32, 32), Image.BICUBIC), (j * 32, i * 32))
+    widths = [xe[j + 1] - xe[j] for j in range(gw)]
+    info["scale_ratio"] = max(widths) / max(min(widths), 1e-6)
+    return out, info
+
+
 class _WhereXBlock(nn.Module):
     """Same block as scripts/where_head.py XBlock. Parameter names must match
     where_lm8_mix.pt so the checkpoint sidecar loads without a key rename."""
@@ -3021,8 +3155,17 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         where_processor=None,
         head_prefix="legacy",
         single_pass=False,
+        sample_mode="crop",
+        dat_alpha=0.5,
+        dat_ratio=1.5,
+        dat_k=0.6,
     ):
         """Answer from a cropped window instead of the HD K/V bypass.
+
+        `sample_mode`: 'crop' = the window resized (_where_crop_image); 'dat' =
+        _where_dat_image: the window rescaled to hold dat_k of the head's mass
+        (None keeps it) and sampled by a grid shifted toward the head map
+        (dat_alpha, neighbour scale ratio <= dat_ratio). Same token budget.
 
         1. One LR prefill (no HD) and this checkpoint's frozen where-head on
            layer-`layer` image-token states — the same features
@@ -3133,7 +3276,14 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         box = _where_top_box(logits, cells_eff)
         hd_w, hd_h = _where_hd_size(image, thw, hr_scale, hd_cap)
         win = _where_pad_window(box, ground_pad, min_cells, hd_w, hd_h)
-        crop = _where_crop_image(image, win, crop_tok)
+        dat_info = None
+        if sample_mode == "dat":
+            crop, dat_info = _where_dat_image(image, win, crop_tok, logits, box,
+                                              dat_alpha, dat_ratio, dat_k)
+        elif sample_mode == "crop":
+            crop = _where_crop_image(image, win, crop_tok)
+        else:
+            raise ValueError(f"sample_mode {sample_mode!r}: expected 'crop' or 'dat'")
         lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
         hint = {"type": "text", "text": WHERE_HINT}
         q = {"type": "text", "text": question}
@@ -3146,6 +3296,8 @@ class Qwen3_5DATForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         ans_inp = hr_processor(text=[text], images=[lr_img, crop], return_tensors="pt")
         ans_kw = _tensors(ans_inp, ("input_ids", "attention_mask", "pixel_values", "image_grid_thw"))
         rec = {"box": box, "window": win, "where_grid": (gh, gw)}
+        if dat_info is not None:
+            rec["dat"] = dat_info
         n_full = int(ans_kw["input_ids"].shape[1])
         rec["n_tokens_two_pass"] = int(ids.shape[0]) + n_full
 
