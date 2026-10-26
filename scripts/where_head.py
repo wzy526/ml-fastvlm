@@ -324,6 +324,8 @@ class PeakTally:
         self.n = {1: 0, 2: 0}
         self.two = {1: 0, 2: 0}
         self.miss = self.rec = 0
+        self.m_hi = self.m_lo = 0.0
+        self.lo_small = 0
 
     def add(self, logits, boxes):
         k = 1 if len(boxes) == 1 else 2
@@ -333,11 +335,18 @@ class PeakTally:
         if k == 2:
             self.miss += miss
             self.rec += rec
+            H, W = logits.shape
+            ms = sorted(softmax_mass(logits, cell_targets(b, H, W, 0)) for b in boxes)
+            self.m_hi += ms[-1]
+            self.m_lo += ms[0]
+            self.lo_small += ms[0] < 0.05
 
     def line(self):
         f = lambda k: f"{self.two[k]}/{self.n[k]} ({100 * self.two[k] / max(self.n[k], 1):.0f}%)"
+        n2 = max(self.n[2], 1)
         return (f">=2 peaks@0.3: one-box {f(1)}, multi-box {f(2)}; "
-                f"multi-box: peak 1 misses a box {self.miss}, a later peak covers it {self.rec}")
+                f"multi-box: peak 1 misses a box {self.miss}, a later peak covers it {self.rec}; "
+                f"per-box mass hi {self.m_hi / n2:.3f} lo {self.m_lo / n2:.3f}, lo < 0.05 in {self.lo_small}/{self.n[2]}")
 
 
 def top_boxes(logits, k, cells):
@@ -554,6 +563,11 @@ def main():
     held, rows = rows[: args.heldout], rows[args.heldout:]
     rows = rows[rank::world]                                   # same shuffle on every rank (seeded)
     say(f"[where] {len(rows)} train rows per rank, {len(held)} held-out")
+    if args.steps == 0:                                        # eval-only on the same held-out split
+        if main_rank:
+            eval_heldout(frozen, head, held, args.min_cells, args.out_cells, " [loaded]")
+            eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells, None, " [loaded]")
+        return
     if main_rank:
         eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells, None, " [untrained]")
     barrier()
