@@ -140,8 +140,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--where_head_pt", required=True)
-    ap.add_argument("--train_json", required=True)
-    ap.add_argument("--held_json", required=True)
+    ap.add_argument("--train_json", default=None)
+    ap.add_argument("--held_json", default=None)
+    ap.add_argument("--eval_dataset", default=None, choices=["vstar", "hrbench4k", "hrbench8k"],
+                    help="accuracy mode (no training): crop (zero offsets) / net (--load) / dat (dw0.5), "
+                         "same window and pipeline; writes a patch_sample_probe-style json (--out)")
+    ap.add_argument("--load", default=None, help="offset net state_dict for --eval_dataset")
+    ap.add_argument("--vstar_root", default="~/data/vstar_bench")
+    ap.add_argument("--hrbench_parquet", default=None)
+    ap.add_argument("--max_samples", type=int, default=1000)
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--shards", type=int, default=1)
+    ap.add_argument("--out", default=None)
     ap.add_argument("--image_root", default="~/sft_data/train_split")
     ap.add_argument("--max_train", type=int, default=20000)
     ap.add_argument("--n_held", type=int, default=320)
@@ -159,6 +169,8 @@ def main():
     ap.add_argument("--save", default=None)
     args = ap.parse_args()
 
+    if not args.eval_dataset and not (args.train_json and args.held_json):
+        raise SystemExit("training needs --train_json and --held_json (or use --eval_dataset)")
     ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if ddp:
         dist.init_process_group("nccl")
@@ -208,7 +220,7 @@ def main():
     @torch.no_grad()
     def prepare(row):
         """Head prefill on the LR view -> window, LR states, answer-prompt tensors. None on skip."""
-        image = Image.open(row["path"]).convert("RGB")
+        image = row["image"] if row.get("image") is not None else Image.open(row["path"]).convert("RGB")
         W, H = image.size
         thw = processor.image_processor(images=[image], return_tensors="pt")["image_grid_thw"][0]
         lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
@@ -283,6 +295,57 @@ def main():
         P = pr["P"]
         lg = o.logits[0, P - 1:-1].float()
         return F.cross_entropy(lg, pr["ids"][0, P:])
+
+    if args.eval_dataset:
+        from probe_whd_qwen35 import extract_letter, load_samples
+        if args.load:
+            net.load_state_dict(torch.load(os.path.expanduser(args.load), map_location="cpu"))
+        net.eval()
+        samples = load_samples(argparse.Namespace(dataset=args.eval_dataset, vstar_root=args.vstar_root,
+                                                  hrbench_parquet=args.hrbench_parquet, image_folder=None,
+                                                  max_samples=args.max_samples))
+        mine = [(i, s) for i, s in enumerate(samples) if i % args.shards == args.shard]
+        cfgs = ["crop", "net", "dat"] if args.load else ["crop", "dat"]
+        out = {c: [] for c in cfgs}
+        print(f"[oct-eval] {args.eval_dataset} shard {args.shard}/{args.shards}: {len(mine)} samples, "
+              f"crop_tok {args.crop_tok}, configs {cfgs}", flush=True)
+
+        @torch.no_grad()
+        def generate(pr, img):
+            pvals = torch.cat([pr["pv_lr"], patchify(img[0].clamp(0, 1))], 0).to(torch.bfloat16)
+            ids = pr["ids"][:, :pr["P"]]
+            model.model.rope_deltas = None
+            g = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), pixel_values=pvals,
+                               image_grid_thw=pr["thw"], max_new_tokens=8, do_sample=False)
+            return tok.decode(g[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+        for gi, s in mine:
+            pr = prepare({"image": s["image"], "q": s["prompt"], "a": "", "box": None})
+            if pr is None:
+                print(f"[oct-eval] {gi}: skipped", flush=True)
+                continue
+            g = pr["geo"]
+            with torch.no_grad():
+                off = net(pr["cells"], pr["txt"], pr["nwin"], g["gh"], g["gw"])
+            imgs = {"crop": draw(g, torch.zeros_like(off))[0], "dat": draw(g, edges=(pr["xe"], pr["ye"]))[0]}
+            if "net" in cfgs:
+                imgs["net"] = draw(g, off)[0]
+            line = []
+            for c in cfgs:
+                pred = extract_letter(generate(pr, imgs[c]))
+                ok = pred == s["gt"]
+                out[c].append({"i": gi, "pred": pred, "gt": s["gt"], "ok": bool(ok), "cat": s["category"],
+                               "prompt": s["prompt"], "window": list(pr["nwin"]), "n_tokens": int(pr["P"]),
+                               "stats": {}})
+                line.append(f"{c}={pred}{'+' if ok else '-'}")
+            print(f"[oct-eval] {gi} gt={s['gt']} " + " ".join(line) + f" |off| {float(off.abs().mean()):.2f}",
+                  flush=True)
+        if args.out:
+            os.makedirs(os.path.dirname(os.path.expanduser(args.out)) or ".", exist_ok=True)
+            json.dump(out, open(os.path.expanduser(args.out), "w"))
+        for c in cfgs:
+            print(f"[oct-eval] {c}: {sum(r['ok'] for r in out[c])}/{len(out[c])}", flush=True)
+        return
 
     train = load_rows(args.train_json, args.image_root, args.max_train, args.seed)
     held = load_rows(args.held_json, args.image_root, args.n_held, args.seed)
