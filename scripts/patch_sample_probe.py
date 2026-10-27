@@ -34,6 +34,7 @@ image, so the stock processor / ViT / prompt / single-pass path are untouched
             stacked into one mosaic; mg2 = forced 2 groups, 400 tok split;
             mg2x2 = 400 tok each; mg2a0.3 = adaptive (2nd group only if its
             peak >= 0.3 x main, else identical to crop). Needs --head real.
+  lr_only   no 2nd image: the LR view + question (the floor every zoom must beat)
   nf0.5k0.6 nested fovea: outer = adaptive window (k0.6) at half the budget,
             inner = half its side around the head's top box at the other half,
             both undistorted crops stacked in one image; nf0.5 = outer is the
@@ -601,6 +602,7 @@ def main():
         raise SystemExit("--model_path required")
 
     import torch
+    from PIL import Image
     from transformers import AutoProcessor
     from probe_whd_qwen35 import extract_letter, load_samples
     from where_crop_eval import OracleHead
@@ -654,6 +656,25 @@ def main():
             state["dumped"] += 1
         return img
 
+    @torch.inference_mode()
+    def lr_only_generate(image, prompt):
+        """No 2nd image: the LR view (the same lr_tok grid the pipeline's prefix
+        uses) + the question, greedy."""
+        thw = processor.image_processor(images=[image], return_tensors="pt")["image_grid_thw"][0]
+        lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
+        msgs = [{"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": [{"type": "image", "image": lr_img},
+                                             {"type": "text", "text": prompt}]}]
+        text = hr_processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                enable_thinking=False)
+        enc = hr_processor(text=[text], images=[lr_img], return_tensors="pt")
+        inp = {k: enc[k].to(model.device) for k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")}
+        inp["pixel_values"] = inp["pixel_values"].to(torch.bfloat16)
+        gen = model.generate(**inp, max_new_tokens=8, do_sample=False)
+        n = int(inp["input_ids"].shape[1])
+        return {"text": hr_processor.tokenizer.decode(gen[0, n:], skip_special_tokens=True).strip(),
+                "window": [0.0, 0.0, 1.0, 1.0], "n_tokens": n}
+
     dat_mod._where_crop_image = patched
     dat_mod._where_top_box = top_box_capture
 
@@ -665,11 +686,14 @@ def main():
                 oracle.set_sample(s)
             state.update(cfg=cfg, box=gt_box(s), i=gi, stats={})
             where_q = s["prompt"] if args.single_pass else s["prompt"].split("\n")[0]
-            rec = model.where_crop_generate(
-                s["image"], s["prompt"], processor, hr_processor, where_question=where_q,
-                layer=args.layer, crop_tok=args.crop_tok, min_cells=args.min_cells,
-                ground_pad=args.ground_pad, head_prefix=args.head_prefix, single_pass=args.single_pass,
-                sample_mode="dat" if cfg == "model_dat" else "crop")
+            if cfg == "lr_only":
+                rec = lr_only_generate(s["image"], s["prompt"])
+            else:
+                rec = model.where_crop_generate(
+                    s["image"], s["prompt"], processor, hr_processor, where_question=where_q,
+                    layer=args.layer, crop_tok=args.crop_tok, min_cells=args.min_cells,
+                    ground_pad=args.ground_pad, head_prefix=args.head_prefix, single_pass=args.single_pass,
+                    sample_mode="dat" if cfg == "model_dat" else "crop")
             pred = extract_letter(rec["text"])
             ok = pred == s["gt"]
             n_ok += ok
