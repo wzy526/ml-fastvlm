@@ -27,6 +27,12 @@ delta vs zero is logged too: train down + held-out flat = not learnable.
         --train_json $OSS_DATA/extra_0916/viscot_bbox.train.json \
         --held_json $OSS_DATA/extra_0916/viscot_bbox.heldout.json --image_root ~/sft_data/train_split \
         --steps 400 --accum 1 --save $E/loc/offset_conv.pt > $E/loc/offset_conv.log 2>&1
+
+v2 (DAT's offset net + fixed square grid, only samples with room to gain):
+--k 7 (dwconv 7x7 -> LayerNorm -> GELU -> 1x1), --grid 10 (every window -> 10 x 10 = 100
+tokens, anisotropic), --min_win_ratio 2 (window >= 200 native tokens, so moving points
+can add information), --held_from_train 3000 (held-out rows disjoint from training).
+--eval_dataset with the same --grid / --k scores crop / net / dat on HR-Bench.
 """
 import argparse
 import json
@@ -51,8 +57,19 @@ def sign_p(w, l):
     return min(1.0, 2 * sum(math.comb(n, j) for j in range(min(w, l) + 1)) / 2.0 ** n)
 
 
+class ChannelNorm(nn.Module):
+    """LayerNorm over the channel dim of (B, C, H, W) (DAT's LayerNormProxy)."""
+
+    def __init__(self, d):
+        super().__init__()
+        self.ln = nn.LayerNorm(d)
+
+    def forward(self, x):
+        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
 class OffsetNet(nn.Module):
-    def __init__(self, c_in, d=128, k=5, max_off=2.0):
+    def __init__(self, c_in, d=128, k=7, max_off=2.0):
         super().__init__()
         self.max_off = max_off
         self.ln = nn.LayerNorm(c_in)
@@ -62,6 +79,7 @@ class OffsetNet(nn.Module):
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
         self.dw = nn.Conv2d(d, d, k, padding=k // 2, groups=d)
+        self.norm = ChannelNorm(d)
         self.act = nn.GELU()
         self.pw = nn.Conv2d(d, 2, 1)
         nn.init.zeros_(self.pw.weight)
@@ -77,7 +95,7 @@ class OffsetNet(nn.Module):
         x = F.grid_sample(x, grid, mode="bilinear", padding_mode="border", align_corners=False)
         g, b = self.film(self.ln_t(txt.float().mean(0))).chunk(2)
         x = x * (1 + g[None, :, None, None]) + b[None, :, None, None]
-        return torch.tanh(self.pw(self.act(self.dw(x)))) * self.max_off
+        return torch.tanh(self.pw(self.act(self.norm(self.dw(x))))) * self.max_off
 
 
 def draw(geo, off=None, edges=None):
@@ -160,6 +178,13 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--max_off", type=float, default=2.0, help="offset bound, in tokens")
     ap.add_argument("--d", type=int, default=128)
+    ap.add_argument("--k", type=int, default=7, help="depthwise conv kernel")
+    ap.add_argument("--grid", type=int, default=0,
+                    help=">0: fixed N x N reference grid (N*N tokens) on the window, any aspect; 0: crop's grid")
+    ap.add_argument("--min_win_ratio", type=float, default=0.0,
+                    help="skip samples whose window holds < ratio x (grid tokens) native tokens (no room to gain)")
+    ap.add_argument("--held_from_train", type=int, default=0,
+                    help=">0: held-out = the last N rows of --train_json (disjoint from training), not --held_json")
     ap.add_argument("--crop_tok", type=int, default=400)
     ap.add_argument("--lr_tok", type=int, default=640)
     ap.add_argument("--max_ans_tok", type=int, default=32)
@@ -169,8 +194,8 @@ def main():
     ap.add_argument("--save", default=None)
     args = ap.parse_args()
 
-    if not args.eval_dataset and not (args.train_json and args.held_json):
-        raise SystemExit("training needs --train_json and --held_json (or use --eval_dataset)")
+    if not args.eval_dataset and not (args.train_json and (args.held_json or args.held_from_train)):
+        raise SystemExit("training needs --train_json and --held_json / --held_from_train (or --eval_dataset)")
     ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if ddp:
         dist.init_process_group("nccl")
@@ -206,7 +231,8 @@ def main():
     image_id = model.config.image_token_id
     C = model.config.text_config.hidden_size
 
-    net = OffsetNet(C, d=args.d, max_off=args.max_off).to(dev)
+    net = OffsetNet(C, d=args.d, k=args.k, max_off=args.max_off).to(dev)
+    skips = {"small": 0, "other": 0}
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=0.0)
     say(f"[oct] offset net {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M params, world {world}")
 
@@ -220,8 +246,13 @@ def main():
     @torch.no_grad()
     def prepare(row):
         """Head prefill on the LR view -> window, LR states, answer-prompt tensors. None on skip."""
-        image = row["image"] if row.get("image") is not None else Image.open(row["path"]).convert("RGB")
+        image = row["image"] if row.get("image") is not None else Image.open(row["path"])
         W, H = image.size
+        n_pts = args.grid * args.grid if args.grid else args.crop_tok
+        if args.min_win_ratio and W * H * 0.25 / 1024 < args.min_win_ratio * n_pts:
+            skips["small"] += 1                        # even a generous window is too small
+            return None
+        image = image.convert("RGB")
         thw = processor.image_processor(images=[image], return_tensors="pt")["image_grid_thw"][0]
         lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
         q = row["q"]
@@ -250,6 +281,11 @@ def main():
         hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600)
         win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h)
         px0, py0, px1, py1, gh, gw = crop_geometry(image, win, args.crop_tok)
+        if args.grid:
+            gh = gw = args.grid
+        if args.min_win_ratio and (px1 - px0) * (py1 - py0) / 1024 < args.min_win_ratio * gh * gw:
+            skips["small"] += 1
+            return None
         Ho, Wo = gh * 32, gw * 32
         sx, sy = Wo / (px1 - px0), Ho / (py1 - py0)
         Wr, Hr = max(1, round(W * sx)), max(1, round(H * sy))
@@ -347,8 +383,12 @@ def main():
             print(f"[oct-eval] {c}: {sum(r['ok'] for r in out[c])}/{len(out[c])}", flush=True)
         return
 
-    train = load_rows(args.train_json, args.image_root, args.max_train, args.seed)
-    held = load_rows(args.held_json, args.image_root, args.n_held, args.seed)
+    if args.held_from_train:
+        rows = load_rows(args.train_json, args.image_root, args.max_train + args.held_from_train, args.seed)
+        train, held = rows[:-args.held_from_train], rows[-args.held_from_train:]
+    else:
+        train = load_rows(args.train_json, args.image_root, args.max_train, args.seed)
+        held = load_rows(args.held_json, args.image_root, args.n_held, args.seed)
     say(f"[oct] train {len(train)}  held-out {len(held)}")
     mine_held = held[rank::world]
     zero_cache = {}
@@ -394,11 +434,16 @@ def main():
         opt.zero_grad(set_to_none=True)
         n_ok = 0
         for _ in range(args.accum):
-            row = train[rng.randrange(len(train))]
-            try:
-                pr = prepare(row)
-            except Exception:
-                pr = None
+            pr = None
+            for _try in range(40):                     # --min_win_ratio rejects most small images
+                row = train[rng.randrange(len(train))]
+                try:
+                    pr = prepare(row)
+                except Exception:
+                    skips["other"] += 1
+                    pr = None
+                if pr is not None:
+                    break
             if pr is None:
                 continue
             g = pr["geo"]
@@ -428,7 +473,7 @@ def main():
                 dist.all_reduce(r)
             n = max(float(r[0]), 1.0)
             say(f"[oct] step {step}: train loss net {r[1] / n:.4f} zero {r[2] / n:.4f} (delta {(r[1] - r[2]) / n:+.4f})  "
-                f"{(time.time() - t0) / step:.2f} s/step")
+                f"{(time.time() - t0) / step:.2f} s/step  skipped small-window {skips['small']} (rank 0)")
             run.zero_()
         if step % args.eval_every == 0 or step == args.steps:
             evaluate(step)
