@@ -29,7 +29,8 @@ delta vs zero is logged too: train down + held-out flat = not learnable.
         --steps 400 --accum 1 --save $E/loc/offset_conv.pt > $E/loc/offset_conv.log 2>&1
 
 v2 (DAT's offset net + fixed square grid, only samples with room to gain):
---k 7 (dwconv 7x7 -> LayerNorm -> GELU -> 1x1), --grid 10 (every window -> 10 x 10 = 100
+--k 7 (dwconv 7x7 -> LayerNorm -> GELU -> 1x1 no bias; --d 0 = on all LM channels,
+one offset group), --grid 10 (every window -> 10 x 10 = 100
 tokens, anisotropic), --min_win_ratio 2 (window >= 200 native tokens, so moving points
 can add information), --held_from_train 3000 (held-out rows disjoint from training).
 --eval_dataset with the same --grid / --k scores crop / net / dat on HR-Bench.
@@ -69,11 +70,17 @@ class ChannelNorm(nn.Module):
 
 
 class OffsetNet(nn.Module):
-    def __init__(self, c_in, d=128, k=7, max_off=2.0):
+    def __init__(self, c_in, d=0, k=7, max_off=2.0):
+        """d <= 0: no channel reduction, the conv runs on all c_in channels (DAT with one
+        offset group; the windows play the role of DAT's groups)."""
         super().__init__()
         self.max_off = max_off
         self.ln = nn.LayerNorm(c_in)
-        self.proj = nn.Linear(c_in, d)
+        if d <= 0 or d == c_in:
+            d = c_in
+            self.proj = nn.Identity()
+        else:
+            self.proj = nn.Linear(c_in, d)
         self.ln_t = nn.LayerNorm(c_in)
         self.film = nn.Linear(c_in, 2 * d)
         nn.init.zeros_(self.film.weight)
@@ -81,9 +88,8 @@ class OffsetNet(nn.Module):
         self.dw = nn.Conv2d(d, d, k, padding=k // 2, groups=d)
         self.norm = ChannelNorm(d)
         self.act = nn.GELU()
-        self.pw = nn.Conv2d(d, 2, 1)
+        self.pw = nn.Conv2d(d, 2, 1, bias=False)
         nn.init.zeros_(self.pw.weight)
-        nn.init.zeros_(self.pw.bias)
 
     def forward(self, cells, txt, nwin, gh, gw):
         """cells (h, w, C) LR states, txt (T, C), nwin = window in [0,1] -> (1, 2, gh, gw) in tokens."""
@@ -177,7 +183,7 @@ def main():
     ap.add_argument("--accum", type=int, default=1, help="samples per rank per step")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--max_off", type=float, default=2.0, help="offset bound, in tokens")
-    ap.add_argument("--d", type=int, default=128)
+    ap.add_argument("--d", type=int, default=0, help="conv channels; 0 = all LM channels, no reduction")
     ap.add_argument("--k", type=int, default=7, help="depthwise conv kernel")
     ap.add_argument("--grid", type=int, default=0,
                     help=">0: fixed N x N reference grid (N*N tokens) on the window, any aspect; 0: crop's grid")
