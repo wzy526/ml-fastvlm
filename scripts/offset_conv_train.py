@@ -55,7 +55,7 @@ def sign_p(w, l):
     n = w + l
     if n == 0:
         return 1.0
-    return min(1.0, 2 * sum(math.comb(n, j) for j in range(min(w, l) + 1)) / 2.0 ** n)
+    return min(1.0, 2 * sum(math.comb(n, j) for j in range(min(w, l) + 1)) / 2 ** n)
 
 
 class ChannelNorm(nn.Module):
