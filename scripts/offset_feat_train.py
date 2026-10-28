@@ -89,6 +89,39 @@ class OffsetHead(nn.Module):
         return torch.tanh(o) * self.max_off if self.max_off > 0 else o
 
 
+LORA_TARGETS = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base, r, alpha):
+        super().__init__()
+        self.base, self.scale, self.enabled = base, alpha / r, True
+        dev = base.weight.device
+        self.lora_A = nn.Parameter(torch.empty(r, base.in_features, device=dev))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, r, device=dev))
+
+    def forward(self, x):
+        y = self.base(x)
+        if not self.enabled:
+            return y
+        return y + ((x.to(self.lora_A.dtype) @ self.lora_A.t()) @ self.lora_B.t()).to(y.dtype) * self.scale
+
+
+def add_lora(model, r, alpha):
+    """Wrap the LM's attention / MLP projections (never the ViT or the where-head) -> {name: LoRALinear}."""
+    names = [n for n, m in model.named_modules()
+             if isinstance(m, nn.Linear) and n.split(".")[-1] in LORA_TARGETS
+             and "visual" not in n and "where_head" not in n]
+    out = {}
+    for n in names:
+        parent, leaf = n.rsplit(".", 1)
+        p = model.get_submodule(parent)
+        out[n] = LoRALinear(getattr(p, leaf), r, alpha)
+        setattr(p, leaf, out[n])
+    return out
+
+
 def ref_grid(gh, gw, dev):
     xs = (torch.arange(gw, device=dev, dtype=torch.float32) + 0.5) / gw * 2 - 1
     ys = (torch.arange(gh, device=dev, dtype=torch.float32) + 0.5) / gh * 2 - 1
@@ -187,6 +220,12 @@ def main():
     ap.add_argument("--no_conv_bias", action="store_true", help="no bias on the 1x1 projection / dwconv")
     ap.add_argument("--pw_std", type=float, default=0.0,
                     help="init std of the last 1x1 (offset) conv; 0 = zero init (step 0 = reference grid)")
+    ap.add_argument("--lora_r", type=int, default=0, help=">0: LoRA on the LM projections, trained with the head")
+    ap.add_argument("--lora_alpha", type=float, default=32.0)
+    ap.add_argument("--lora_lr", type=float, default=1e-4)
+    ap.add_argument("--train_cfg", choices=["net", "fzero", "crop"], default="net",
+                    help="what the second image is during training: learned offsets / zero offsets / pixel crop")
+    ap.add_argument("--held_eval_n", type=int, default=0, help=">0: held-out eval on the first N held-out rows")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -238,10 +277,22 @@ def main():
 
     head = OffsetHead(C, k=args.k, max_off=args.max_off, d=args.d, pool=args.pool, norm=args.norm,
                       in_ln=args.in_ln, conv_bias=not args.no_conv_bias, pw_std=args.pw_std).to(dev)
-    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=0.0)
+    loras = add_lora(model, args.lora_r, args.lora_alpha) if args.lora_r > 0 else {}
+    lora_params = [p for m in loras.values() for p in (m.lora_A, m.lora_B)]
+
+    def set_lora(on):
+        for m in loras.values():
+            m.enabled = on
+
+    groups = [{"params": lora_params, "lr": args.lora_lr}] if lora_params else []
+    if args.train_cfg == "net":
+        groups.append({"params": list(head.parameters()), "lr": args.lr})
+    trainable = [p for g in groups for p in g["params"]]
+    opt = torch.optim.AdamW(groups, weight_decay=0.0) if groups else None
     skips = {"small": 0, "other": 0}
-    say(f"[oft] offset head {sum(p.numel() for p in head.parameters()) / 1e6:.2f}M params, world {world}, "
-        f"{args.n_win} window(s), {args.crop_tok} tokens")
+    say(f"[oft] offset head {sum(p.numel() for p in head.parameters()) / 1e6:.2f}M params, "
+        f"LoRA r={args.lora_r} on {len(loras)} LM projections ({sum(p.numel() for p in lora_params) / 1e6:.2f}M), "
+        f"train_cfg {args.train_cfg}, world {world}, {args.n_win} window(s), {args.crop_tok} tokens")
 
     def patchify(x):
         _, H, W = x.shape
@@ -283,7 +334,11 @@ def main():
         inp = processor(text=[text], images=[lr_img], return_tensors="pt")
         inp = {k: v.to(dev) for k, v in inp.items() if torch.is_tensor(v)}
         inp["pixel_values"] = inp["pixel_values"].to(torch.bfloat16)
-        out = model(**inp, output_hidden_states=True, return_dict=True, use_cache=False)
+        set_lora(False)                       # the where-head was trained on the stock LM's layer 8
+        try:
+            out = model(**inp, output_hidden_states=True, return_dict=True, use_cache=False)
+        finally:
+            set_lora(True)
         ids = inp["input_ids"][0]
         is_img = ids == image_id
         gh_l, gw_l = int(thw[1]) // 2, int(thw[2]) // 2
@@ -401,11 +456,33 @@ def main():
             tot += m.numel()
         return hit / max(tot, 1.0)
 
+    def save_ckpt(path):
+        if not loras:
+            torch.save(head.state_dict(), path)
+            return
+        torch.save({"head": head.state_dict(), "train_cfg": args.train_cfg,
+                    "lora": {n: (m.lora_A.detach().cpu(), m.lora_B.detach().cpu()) for n, m in loras.items()}}, path)
+
+    def load_ckpt(path):
+        sd = torch.load(path, map_location="cpu")
+        if "head" not in sd:
+            head.load_state_dict(sd)
+            return
+        head.load_state_dict(sd["head"])
+        if sd.get("lora"):
+            if set(sd["lora"]) != set(loras):
+                raise SystemExit(f"--load has LoRA on {len(sd['lora'])} modules, this run {len(loras)}: pass --lora_r")
+            for n, (A, B) in sd["lora"].items():
+                loras[n].lora_A.data.copy_(A)
+                loras[n].lora_B.data.copy_(B)
+        print(f"[oft] loaded head + LoRA ({len(sd.get('lora') or {})} modules), trained on {sd.get('train_cfg')}",
+              flush=True)
+
     # ───────────────────────── accuracy mode ─────────────────────────
     if args.eval_dataset:
         from probe_whd_qwen35 import load_samples
         if args.load:
-            head.load_state_dict(torch.load(os.path.expanduser(args.load), map_location="cpu"))
+            load_ckpt(os.path.expanduser(args.load))
         head.eval()
         samples = load_samples(argparse.Namespace(dataset=args.eval_dataset, vstar_root=args.vstar_root,
                                                   hrbench_parquet=args.hrbench_parquet, image_folder=None,
@@ -444,9 +521,13 @@ def main():
     # ───────────────────────── training ─────────────────────────
     rows = load_rows(args.train_json, args.image_root, args.max_train + args.held_from_train, args.seed)
     train, held = rows[:-args.held_from_train], rows[-args.held_from_train:]
+    if opt is None:
+        raise SystemExit("nothing to train: --train_cfg fzero / crop needs --lora_r > 0")
+    if args.held_eval_n > 0:
+        held = held[:args.held_eval_n]
     say(f"[oft] train {len(train)}  held-out {len(held)}")
     mine_held = held[rank::world]
-    cache = {}
+    cache = {}                          # zero-shot losses; only valid while the LM is frozen
 
     def evaluate(step):
         head.eval()
@@ -464,8 +545,12 @@ def main():
                     lc = float(answer_loss(pr, *feats_for(pr, "crop")[:2]))
                     lp = float(answer_loss(pr, *feats_for(pr, "fpool")[:2]))
                     fz, pz, _ = feats_for(pr, "fzero")
-                    cache[hi] = (lc, lp, float(answer_loss(pr, fz, pz)), inbox(pr, pz))
-                lc, lp, lz, ibz = cache[hi]
+                    val = (lc, lp, float(answer_loss(pr, fz, pz)), inbox(pr, pz))
+                    if not loras:
+                        cache[hi] = val
+                else:
+                    val = cache[hi]
+                lc, lp, lz, ibz = val
                 fn, pn, mo = feats_for(pr, "net")
                 ln = float(answer_loss(pr, fn, pn))
             acc += torch.tensor([1, lc, lp, lz, ln, ln < lz - 1e-4, ln > lz + 1e-4, ln < lc - 1e-4, ln > lc + 1e-4,
@@ -500,37 +585,44 @@ def main():
                     break
             if pr is None:
                 continue
-            loss = answer_loss(pr, *feats_for(pr, "net")[:2])
+            loss = answer_loss(pr, *feats_for(pr, args.train_cfg)[:2])
             (loss / args.accum).backward()
             with torch.no_grad():
-                l0 = answer_loss(pr, *feats_for(pr, "fzero")[:2])
+                if loras:                                  # reference: the same input on the stock LM
+                    set_lora(False)
+                    l0 = answer_loss(pr, *feats_for(pr, args.train_cfg)[:2])
+                    set_lora(True)
+                else:
+                    l0 = answer_loss(pr, *feats_for(pr, "fzero")[:2])
             run += torch.tensor([1.0, float(loss), float(l0)], device=dev)
             n_ok += 1
         cnt = torch.tensor([float(n_ok)], device=dev)
         if ddp:
-            for p in head.parameters():
+            for p in trainable:
                 if p.grad is None:
                     p.grad = torch.zeros_like(p)
                 dist.all_reduce(p.grad)
             dist.all_reduce(cnt)
         if float(cnt) > 0:
-            for p in head.parameters():
+            for p in trainable:
                 if p.grad is not None:
                     p.grad /= max(float(cnt) / args.accum, 1.0)
-            torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt.step()
         if step % 10 == 0:
             r = run.clone()
             if ddp:
                 dist.all_reduce(r)
             n = max(float(r[0]), 1.0)
-            say(f"[oft] step {step}: train loss net {r[1] / n:.4f} fzero {r[2] / n:.4f} (delta {(r[1] - r[2]) / n:+.4f})  "
-                f"{(time.time() - t0) / step:.2f} s/step  skipped small-window {skips['small']} (rank 0)")
+            ref = "stock LM" if loras else "fzero"
+            say(f"[oft] step {step}: train loss {args.train_cfg} {r[1] / n:.4f} {ref} {r[2] / n:.4f} "
+                f"(delta {(r[1] - r[2]) / n:+.4f})  {(time.time() - t0) / step:.2f} s/step  "
+                f"skipped small-window {skips['small']} (rank 0)")
             run.zero_()
         if step % args.eval_every == 0 or step == args.steps:
             evaluate(step)
             if rank == 0 and args.save:
-                torch.save(head.state_dict(), os.path.expanduser(args.save))
+                save_ckpt(os.path.expanduser(args.save))
     if ddp:
         dist.destroy_process_group()
 
