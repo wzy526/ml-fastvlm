@@ -2,15 +2,17 @@
 """Coarse-to-fine DAT on HR ViT tokens: question only in the coarse stage, a plain
 (text-free) DAT offset head inside each window, sampling on the HR feature map.
 
-  LR image + question -> LM layer 8 -> where-head map -> K windows (NMS peaks)
-  window k: pixels at native resolution (<= --hr_cap tokens) -> frozen ViT -> X_k (C, Hh, Wh)
+  LR image + question -> LM layer 8 -> where-head map -> K windows (NMS peaks, default 4)
+  whole image (<= --hr_full_cap tokens) -> frozen ViT -> HR map; X_k = the map under window k
+  (--hr_source window: each window's pixels through the ViT on their own instead)
   offset head (shared over windows, one offset group, all C channels, no FiLM):
       X_k -> dwconv kxk -> LayerNorm -> GELU -> adaptive pool to (gh, gw) -> 1x1 (no bias,
       zero init) -> tanh * max_off            (offsets in reference-cell units)
   P_k = R_k + 2 * off / (gw, gh)   (R_k = cell centres of a uniform gh x gw grid, window-local
       [-1, 1] coords, clamped to the window)  ->  Z_k = grid_sample(X_k, P_k)  (gh*gw, C)
-  Z_1..Z_K replace the image tokens of K second images in [LR, q, hint, img_1..img_K, q]
-  (each its own M-RoPE grid); loss = CE over the GT answer tokens; only the head trains.
+  Z_1..Z_K replace the image tokens of K second images in [LR, q, hint, img_1..img_K, q];
+  --pe global: their M-RoPE h / w come from the sample points mapped back to full-image
+  coordinates (global_positions); loss = CE over the GT answer tokens; only the head trains.
 
 Budget: --crop_tok total, split evenly over the K windows (each window's grid keeps its
 aspect, crop_geometry), or --grid N for N x N per window.
@@ -73,13 +75,36 @@ def ref_grid(gh, gw, dev):
     return torch.stack([gx, gy], -1)
 
 
-def sample_tokens(hr, off):
-    """hr (1, C, Hh, Wh), off (1, 2, gh, gw) -> tokens (gh*gw, C), points (gh, gw, 2) in [-1, 1]."""
+def sample_tokens(src, off, sbox=(0.0, 0.0, 1.0, 1.0)):
+    """src (1, C, Hs, Ws) feature map, sbox = the window inside src as [0, 1] fractions,
+    off (1, 2, gh, gw) -> tokens (gh*gw, C), window-local points (gh, gw, 2) in [-1, 1]."""
     gh, gw = off.shape[-2:]
     shift = torch.stack([2 * off[0, 0] / gw, 2 * off[0, 1] / gh], -1)
-    P = (ref_grid(gh, gw, hr.device) + shift).clamp(-1, 1)
-    z = F.grid_sample(hr, P[None], mode="bilinear", padding_mode="border", align_corners=False)
+    P = (ref_grid(gh, gw, src.device) + shift).clamp(-1, 1)
+    x0, y0, x1, y1 = sbox
+    G = torch.stack([(x0 + (P[..., 0] + 1) / 2 * (x1 - x0)) * 2 - 1,
+                     (y0 + (P[..., 1] + 1) / 2 * (y1 - y0)) * 2 - 1], -1)
+    z = F.grid_sample(src, G[None], mode="bilinear", padding_mode="border", align_corners=False)
     return z[0].flatten(1).t(), P
+
+
+def global_positions(pos3d, blocks, wins, pts):
+    """M-RoPE (t, h, w) of each window's tokens from where its points sit in the full image:
+    h / w = start + the point's coordinate on a full-image grid at that window's reference
+    spacing (zero offsets on a window at the image origin = the stock grid). Later positions
+    shift so text keeps following the image's largest position."""
+    pos = pos3d.clone().float()
+    for (a, b), w, P in zip(blocks, wins, pts):
+        s = float(pos[0, 0, a])
+        px0, py0, px1, py1 = w["px"]
+        P = P.detach().float()
+        xg = px0 / (px1 - px0) * w["gw"] + (P[..., 0] + 1) / 2 * w["gw"] - 0.5
+        yg = py0 / (py1 - py0) * w["gh"] + (P[..., 1] + 1) / 2 * w["gh"] - 0.5
+        old_max = float(pos[:, 0, a:b].max())
+        pos[1, 0, a:b] = s + yg.flatten()
+        pos[2, 0, a:b] = s + xg.flatten()
+        pos[:, 0, b:] += float(pos[:, 0, a:b].max()) - old_max
+    return pos
 
 
 def nms_peaks(logits, k, dist_cells, tau):
@@ -118,10 +143,17 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--crop_tok", type=int, default=400, help="total sampled tokens, split over the windows")
     ap.add_argument("--grid", type=int, default=0, help=">0: N x N tokens per window instead of the budget split")
-    ap.add_argument("--n_win", type=int, default=1)
+    ap.add_argument("--n_win", type=int, default=4)
     ap.add_argument("--peak_dist", type=int, default=4, help="NMS distance between window centres, LR cells")
     ap.add_argument("--peak_tau", type=float, default=0.0, help="window k>1 needs >= tau x top cell probability")
-    ap.add_argument("--hr_cap", type=int, default=4096, help="max HR tokens per window for the ViT")
+    ap.add_argument("--hr_source", choices=["full", "window"], default="full",
+                    help="full: one ViT pass on the whole image (<= --hr_full_cap tokens), windows cut from that "
+                         "map; window: each window's pixels through the ViT on their own (<= --hr_cap tokens)")
+    ap.add_argument("--hr_full_cap", type=int, default=16384)
+    ap.add_argument("--hr_cap", type=int, default=4096, help="max HR tokens per window for --hr_source window")
+    ap.add_argument("--pe", choices=["global", "local"], default="global",
+                    help="global: window tokens' M-RoPE h/w from their sample points in full-image coordinates; "
+                         "local: each window its own stock grid")
     ap.add_argument("--min_win_ratio", type=float, default=0.0,
                     help="skip samples whose window holds < ratio x its sampled tokens natively")
     ap.add_argument("--k", type=int, default=7)
@@ -231,6 +263,11 @@ def main():
             return None
         logits = model.where_head(cells.reshape(gh_l, gw_l, -1), hs[int(torch.nonzero(is_img)[-1]) + 1:])
         hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600)
+        full = None
+        if args.hr_source == "full":
+            sc = math.sqrt(min(args.hr_full_cap * 1024, W * H) / float(W * H))
+            Wf, Hf = max(32, int(W * sc) // 32 * 32), max(32, int(H * sc) // 32 * 32)
+            full = vit_image(image.resize((Wf, Hf), Image.BICUBIC)).permute(2, 0, 1)[None].float()
 
         wins = []
         for cy, cx in nms_peaks(logits, args.n_win, args.peak_dist, args.peak_tau):
@@ -244,11 +281,18 @@ def main():
                 skips["small"] += 1
                 return None
             crop = image.crop((px0, py0, px1, py1))
-            sc = math.sqrt(min(args.hr_cap * 1024, cw * ch) / float(cw * ch))
-            hw_, hh_ = max(32, int(cw * sc) // 32 * 32), max(32, int(ch * sc) // 32 * 32)
-            hr = vit_image(crop.resize((hw_, hh_), Image.BICUBIC)).permute(2, 0, 1)[None].float()
+            if full is not None:
+                Hg, Wg = full.shape[-2:]
+                ty0, tx0 = min(int(py0 / H * Hg), Hg - 1), min(int(px0 / W * Wg), Wg - 1)
+                ty1, tx1 = max(ty0 + 1, math.ceil(py1 / H * Hg)), max(tx0 + 1, math.ceil(px1 / W * Wg))
+                hr, src, sbox = full[..., ty0:ty1, tx0:tx1], full, (px0 / W, py0 / H, px1 / W, py1 / H)
+            else:
+                sc = math.sqrt(min(args.hr_cap * 1024, cw * ch) / float(cw * ch))
+                hw_, hh_ = max(32, int(cw * sc) // 32 * 32), max(32, int(ch * sc) // 32 * 32)
+                hr = vit_image(crop.resize((hw_, hh_), Image.BICUBIC)).permute(2, 0, 1)[None].float()
+                src, sbox = hr, (0.0, 0.0, 1.0, 1.0)
             lo = vit_image(crop.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
-            wins.append(dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, hr=hr, crop=lo))
+            wins.append(dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, hr=hr, src=src, sbox=sbox, crop=lo))
 
         dummies = [Image.new("RGB", (w["gw"] * 32, w["gh"] * 32)) for w in wins]
         qd = {"type": "text", "text": q}
@@ -273,35 +317,41 @@ def main():
         img_pos = torch.nonzero(ids[0] == image_id).flatten()
         if img_pos.numel() != lr_emb.shape[0] + sum(w["gh"] * w["gw"] for w in wins):
             return None
-        return dict(wins=wins, ids=ids, mm=mm, pos3d=pos3d, rope_deltas=rope_deltas, P=P,
+        blocks = dat_mod._where_token_runs(ids[0], image_id)[1:]
+        if len(blocks) != len(wins) or any(b - a != w["gh"] * w["gw"] for (a, b), w in zip(blocks, wins)):
+            return None
+        return dict(wins=wins, ids=ids, mm=mm, pos3d=pos3d, rope_deltas=rope_deltas, P=P, blocks=blocks,
                     emb=embed(ids), lr_emb=lr_emb, img_pos=img_pos, W=W, H=H, box=row.get("box"))
 
-    def run_lm(pr, feats, prompt_only=False):
+    def run_lm(pr, feats, pts, prompt_only=False):
         e = pr["emb"].clone()
         e[0, pr["img_pos"]] = torch.cat([pr["lr_emb"]] + list(feats), 0).to(e.dtype)
         n = pr["P"] if prompt_only else e.shape[1]
+        pos = global_positions(pr["pos3d"], pr["blocks"], pr["wins"], pts) if args.pe == "global" else pr["pos3d"]
         model.model.rope_deltas = pr["rope_deltas"]
-        o = model(inputs_embeds=e[:, :n], position_ids=pr["pos3d"][..., :n], mm_token_type_ids=pr["mm"][:, :n],
+        o = model(inputs_embeds=e[:, :n], position_ids=pos[..., :n], mm_token_type_ids=pr["mm"][:, :n],
                   use_cache=False, return_dict=True, logits_to_keep=1 if prompt_only else 0)
         return o.logits
 
-    def answer_loss(pr, feats):
-        lg = run_lm(pr, feats)[0, pr["P"] - 1:-1].float()
+    def answer_loss(pr, feats, pts):
+        lg = run_lm(pr, feats, pts)[0, pr["P"] - 1:-1].float()
         return F.cross_entropy(lg, pr["ids"][0, pr["P"]:])
 
     def feats_for(pr, cfg):
-        """-> (list of (gh*gw, C) token blocks, list of sample points or None, mean |off|)."""
-        if cfg == "crop":
-            return [w["crop"] for w in pr["wins"]], None, 0.0
-        if cfg == "fpool":
-            return [F.adaptive_avg_pool2d(w["hr"], (w["gh"], w["gw"]))[0].flatten(1).t() for w in pr["wins"]], None, 0.0
+        """-> (list of (gh*gw, C) token blocks, list of window-local points, mean |off|).
+        crop / fpool sit on the reference grid."""
+        if cfg in ("crop", "fpool"):
+            pts = [ref_grid(w["gh"], w["gw"], dev) for w in pr["wins"]]
+            if cfg == "crop":
+                return [w["crop"] for w in pr["wins"]], pts, 0.0
+            return [F.adaptive_avg_pool2d(w["hr"], (w["gh"], w["gw"]))[0].flatten(1).t() for w in pr["wins"]], pts, 0.0
         zs, ps_, mo = [], [], 0.0
         for w in pr["wins"]:
             if cfg == "net":
                 off = head(w["hr"], w["gh"], w["gw"])
             else:
                 off = torch.zeros(1, 2, w["gh"], w["gw"], device=dev)
-            z, P = sample_tokens(w["hr"], off)
+            z, P = sample_tokens(w["src"], off, w["sbox"])
             zs.append(z)
             ps_.append(P)
             mo += float(off.detach().abs().mean()) / len(pr["wins"])
@@ -345,8 +395,8 @@ def main():
             line = []
             with torch.no_grad():
                 for c in cfgs:
-                    feats, _, mo = feats_for(pr, c)
-                    lg = run_lm(pr, feats, prompt_only=True)[0, -1].float()
+                    feats, pts, mo = feats_for(pr, c)
+                    lg = run_lm(pr, feats, pts, prompt_only=True)[0, -1].float()
                     pred = letters[int(lg[lid].argmax())]
                     ok = pred == s["gt"]
                     out[c].append({"i": gi, "pred": pred, "gt": s["gt"], "ok": bool(ok), "cat": s["category"],
@@ -381,13 +431,13 @@ def main():
                 continue
             with torch.no_grad():
                 if hi not in cache:
-                    lc = float(answer_loss(pr, feats_for(pr, "crop")[0]))
-                    lp = float(answer_loss(pr, feats_for(pr, "fpool")[0]))
+                    lc = float(answer_loss(pr, *feats_for(pr, "crop")[:2]))
+                    lp = float(answer_loss(pr, *feats_for(pr, "fpool")[:2]))
                     fz, pz, _ = feats_for(pr, "fzero")
-                    cache[hi] = (lc, lp, float(answer_loss(pr, fz)), inbox(pr, pz))
+                    cache[hi] = (lc, lp, float(answer_loss(pr, fz, pz)), inbox(pr, pz))
                 lc, lp, lz, ibz = cache[hi]
                 fn, pn, mo = feats_for(pr, "net")
-                ln = float(answer_loss(pr, fn))
+                ln = float(answer_loss(pr, fn, pn))
             acc += torch.tensor([1, lc, lp, lz, ln, ln < lz - 1e-4, ln > lz + 1e-4, ln < lc - 1e-4, ln > lc + 1e-4,
                                  ibz, inbox(pr, pn), mo], device=dev)
         if ddp:
@@ -420,10 +470,10 @@ def main():
                     break
             if pr is None:
                 continue
-            loss = answer_loss(pr, feats_for(pr, "net")[0])
+            loss = answer_loss(pr, *feats_for(pr, "net")[:2])
             (loss / args.accum).backward()
             with torch.no_grad():
-                l0 = answer_loss(pr, feats_for(pr, "fzero")[0])
+                l0 = answer_loss(pr, *feats_for(pr, "fzero")[:2])
             run += torch.tensor([1.0, float(loss), float(l0)], device=dev)
             n_ok += 1
         cnt = torch.tensor([float(n_ok)], device=dev)
