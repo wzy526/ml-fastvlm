@@ -533,7 +533,7 @@ def summarize(pattern, dataset=None, parquet=None):
         ok = sum(r["ok"] for r in rows)
         agree = sum(r["pred"] == ref[r["i"]]["pred"] for r in rows if r["i"] in ref)
         tok = sum(r.get("n_tokens") or 0 for r in rows) / max(n, 1)
-        st = [r["stats"] for r in rows if r.get("stats")]
+        st = [r["stats"] for r in rows if r.get("stats") and "in_box" in r["stats"]]
         inb = sum(s["in_box"] for s in st) / len(st) if st else float("nan")
         sin = [s["side_in_box"] for s in st if s.get("side_in_box")]
         sin = sum(sin) / len(sin) if sin else float("nan")
