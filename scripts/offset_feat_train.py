@@ -52,20 +52,35 @@ from offset_conv_train import ChannelNorm, load_rows, sign_p
 
 
 class OffsetHead(nn.Module):
-    def __init__(self, c, k=7, max_off=2.0):
+    """[LN] -> [1x1 C->d] -> [pool] -> dwconv kxk -> norm -> GELU -> [pool] -> 1x1 d->2.
+    pool 'before': the dwconv runs on the gh x gw reference grid (k reference cells of
+    context); 'after': on the HR tokens (k HR tokens, ~1-2 reference cells at 3-6x down).
+    max_off <= 0: unconstrained offsets (the window clamp in sample_tokens still applies)."""
+
+    def __init__(self, c, k=7, max_off=2.0, d=0, pool="after", norm="ln", in_ln=False):
         super().__init__()
-        self.max_off = max_off
-        self.dw = nn.Conv2d(c, c, k, padding=k // 2, groups=c)
-        self.norm = ChannelNorm(c)
+        self.max_off, self.pool = max_off, pool
+        self.in_ln = ChannelNorm(c) if in_ln else nn.Identity()
+        if d > 0 and d != c:
+            self.proj = nn.Conv2d(c, d, 1)
+        else:
+            self.proj, d = nn.Identity(), c
+        self.dw = nn.Conv2d(d, d, k, padding=k // 2, groups=d)
+        self.norm = ChannelNorm(d) if norm == "ln" else nn.InstanceNorm2d(d, affine=True)
         self.act = nn.GELU()
-        self.pw = nn.Conv2d(c, 2, 1, bias=False)
+        self.pw = nn.Conv2d(d, 2, 1, bias=False)
         nn.init.zeros_(self.pw.weight)
 
     def forward(self, x, gh, gw):
         """x (1, C, Hh, Wh) HR window tokens -> (1, 2, gh, gw) offsets in reference cells."""
+        x = self.proj(self.in_ln(x))
+        if self.pool == "before":
+            x = F.adaptive_avg_pool2d(x, (gh, gw))
         h = self.act(self.norm(self.dw(x)))
-        h = F.adaptive_avg_pool2d(h, (gh, gw))
-        return torch.tanh(self.pw(h)) * self.max_off
+        if self.pool == "after":
+            h = F.adaptive_avg_pool2d(h, (gh, gw))
+        o = self.pw(h)
+        return torch.tanh(o) * self.max_off if self.max_off > 0 else o
 
 
 def ref_grid(gh, gw, dev):
@@ -157,7 +172,12 @@ def main():
     ap.add_argument("--min_win_ratio", type=float, default=0.0,
                     help="skip samples whose window holds < ratio x its sampled tokens natively")
     ap.add_argument("--k", type=int, default=7)
-    ap.add_argument("--max_off", type=float, default=2.0)
+    ap.add_argument("--max_off", type=float, default=2.0, help="tanh bound in reference cells; <= 0: unconstrained")
+    ap.add_argument("--d", type=int, default=0, help="1x1 projection C -> d before the dwconv; 0: none (all C)")
+    ap.add_argument("--pool", choices=["before", "after"], default="after",
+                    help="pool the HR tokens to the reference grid before or after the dwconv")
+    ap.add_argument("--norm", choices=["ln", "in"], default="ln", help="per-position LayerNorm or InstanceNorm")
+    ap.add_argument("--in_ln", action="store_true", help="LayerNorm the ViT tokens before the head")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -207,7 +227,8 @@ def main():
     C = model.config.text_config.hidden_size
     embed = model.get_input_embeddings()
 
-    head = OffsetHead(C, k=args.k, max_off=args.max_off).to(dev)
+    head = OffsetHead(C, k=args.k, max_off=args.max_off, d=args.d, pool=args.pool, norm=args.norm,
+                      in_ln=args.in_ln).to(dev)
     opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=0.0)
     skips = {"small": 0, "other": 0}
     say(f"[oft] offset head {sum(p.numel() for p in head.parameters()) / 1e6:.2f}M params, world {world}, "
