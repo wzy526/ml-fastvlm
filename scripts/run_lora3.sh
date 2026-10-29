@@ -18,7 +18,7 @@ for cfg in ${CFGS:-net fzero crop}; do
   echo "$(date '+%F %T') train $cfg" >> "$L/chain.log"
   torchrun --nproc_per_node 8 --master_port 29570 scripts/offset_feat_train.py $MODEL \
     --train_json "$OSS_DATA/extra_0916/viscot_bbox.train.json" --held_from_train 3000 --held_eval_n 1000 \
-    --image_root ~/sft_data/train_split $WIN --min_win_ratio 2 $HEAD $LORA --train_cfg $cfg \
+    --image_root ~/sft_data/train_split $WIN --min_win_ratio ${MIN_WIN:-0} $HEAD $LORA --train_cfg $cfg \
     --accum 4 --lr 1e-4 --lora_lr ${LORA_LR:-1e-4} --steps ${STEPS:-800} --eval_every 200 \
     --save "$ck" > "$L/train_$cfg.log" 2>&1
   cp "$L/train_$cfg.log" "$O/"
