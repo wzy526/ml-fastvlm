@@ -278,6 +278,8 @@ def main():
     ap.add_argument("--ldat_n", type=int, default=16, help="ldat: window cells per side for the density map")
     ap.add_argument("--ldat_d", type=int, default=256)
     ap.add_argument("--box_w", type=float, default=1.0, help="ldat: weight of the box KL on the density map")
+    ap.add_argument("--ans_w", type=float, default=1.0,
+                    help="weight of the answer CE in training; 0: logged only (ldat trains on the box KL alone)")
     ap.add_argument("--box_lambda", type=float, default=0.8,
                     help="ldat: box target = (1 - lambda) uniform + lambda uniform-in-box over the window cells")
     ap.add_argument("--src_scale", type=float, default=2.0,
@@ -859,9 +861,17 @@ def main():
                     break
             if pr is None:
                 continue
-            loss = answer_loss(pr, *feats_for(pr, args.train_cfg)[:2])
+            fz, pz, _ = feats_for(pr, args.train_cfg)
             kl = aux["kl"] if args.train_cfg == "ldat" else None
-            ((loss + (args.box_w * kl if kl is not None else 0.0)) / args.accum).backward()
+            if args.ans_w > 0:
+                loss = answer_loss(pr, fz, pz)
+                total = args.ans_w * loss + (args.box_w * kl if kl is not None else 0.0)
+            else:
+                with torch.no_grad():
+                    loss = answer_loss(pr, [z.detach() for z in fz], pz)
+                total = args.box_w * kl if kl is not None else None
+            if total is not None and total.requires_grad:
+                (total / args.accum).backward()
             run[3] += float(kl) if kl is not None else 0.0
             run[4] += float(kl is not None)
             with torch.no_grad():
