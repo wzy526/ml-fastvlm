@@ -243,6 +243,9 @@ def main():
                          "tiled with other training images (HR-Bench-8K-style); box remapped")
     ap.add_argument("--comp_max_frac", type=float, default=0.4,
                     help="composite: downscale the pasted image if a side exceeds this fraction of the canvas")
+    ap.add_argument("--comp_bg", choices=["tiles", "blur", "grey"], default="tiles",
+                    help="composite background: other training images / the same at 1/32 resolution "
+                         "(colour blobs, nothing to confuse the question with) / flat grey")
     ap.add_argument("--held_eval_n", type=int, default=0, help=">0: held-out eval on the first N held-out rows")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--accum", type=int, default=4)
@@ -391,12 +394,15 @@ def main():
         canvas = Image.new("RGB", (Wc, Hc), (128, 128, 128))
         nx, ny = 4, 3
         tw, th = Wc // nx, Hc // ny
-        for i in range(ny):
+        for i in range(ny if args.comp_bg != "grey" else 0):
             for j in range(nx):
                 try:
                     d = Image.open(r.choice(pool))
                     d.draft("RGB", (tw, th))
-                    canvas.paste(d.convert("RGB").resize((tw, th), Image.BILINEAR), (j * tw, i * th))
+                    d = d.convert("RGB")
+                    if args.comp_bg == "blur":
+                        d = d.resize((max(1, tw // 32), max(1, th // 32)), Image.BILINEAR)
+                    canvas.paste(d.resize((tw, th), Image.BILINEAR), (j * tw, i * th))
                 except Exception:
                     pass
         ox, oy = r.randint(0, Wc - W), r.randint(0, Hc - H)
