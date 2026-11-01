@@ -231,7 +231,8 @@ def main():
                     help="what the second image is during training: learned feature offsets / zero offsets / "
                          "pixel crop / analytic pixel DAT / learned pixel warp")
     ap.add_argument("--cfgs", default="crop,fpool,fzero,net",
-                    help="configs scored in held-out eval and accuracy mode (pixel run: crop,dat,pwarp)")
+                    help="configs scored in held-out eval and accuracy mode (pixel run: crop,dat,pwarp); "
+                         "zS = the crop window scaled by S about its centre, same tokens (z0.5 = 2x zoom in)")
     ap.add_argument("--src_scale", type=float, default=2.0,
                     help="pwarp: the window is resized to this x the output resolution (capped at native) "
                          "and grid-sampled from there")
@@ -470,6 +471,21 @@ def main():
                 return None
             crop = image.crop((px0, py0, px1, py1))
             ext = {}
+            for c in cfgs:
+                if not re.fullmatch(r"z[0-9.]+", c):
+                    continue
+                s = float(c[1:])
+                mx, my, hw_, hh_ = (px0 + px1) / 2, (py0 + py1) / 2, cw * s / 2, ch * s / 2
+                hw_, hh_ = min(hw_, W / 2), min(hh_, H / 2)
+                zx0, zy0 = min(max(mx - hw_, 0.0), W - 2 * hw_), min(max(my - hh_, 0.0), H - 2 * hh_)
+                zx1, zy1 = zx0 + 2 * hw_, zy0 + 2 * hh_
+                zc = image.crop((int(zx0), int(zy0), max(int(math.ceil(zx1)), int(zx0) + 1),
+                                 max(int(math.ceil(zy1)), int(zy0) + 1)))
+                ext[c] = vit_image(zc.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
+                ux = zx0 + (torch.arange(gw, device=dev) + 0.5) / gw * (zx1 - zx0)
+                uy = zy0 + (torch.arange(gh, device=dev) + 0.5) / gh * (zy1 - zy0)
+                gy, gx = torch.meshgrid((uy - py0) / ch * 2 - 1, (ux - px0) / cw * 2 - 1, indexing="ij")
+                ext[c + "_pts"] = torch.stack([gx, gy], -1).float()
             if "half" in cfgs:
                 half = crop.resize((gw * 16, gh * 16), Image.BICUBIC).resize((gw * 32, gh * 32), Image.BICUBIC)
                 ext["half"] = vit_image(half).reshape(gh * gw, -1)
@@ -549,6 +565,8 @@ def main():
             return [w["dat"] for w in pr["wins"]], [w["dat_pts"] for w in pr["wins"]], 0.0
         if cfg == "half":
             return [w["half"] for w in pr["wins"]], [ref_grid(w["gh"], w["gw"], dev) for w in pr["wins"]], 0.0
+        if re.fullmatch(r"z[0-9.]+", cfg):
+            return [w[cfg] for w in pr["wins"]], [w[cfg + "_pts"] for w in pr["wins"]], 0.0
         zs, ps_, mo = [], [], 0.0
         for w in pr["wins"]:
             if cfg == "pwarp":
