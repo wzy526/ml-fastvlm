@@ -1,6 +1,7 @@
 #!/bin/bash
 # LoRA + {learned offsets, zero offsets, pixel crop}: train on 8 GPUs, then eval V* / HR-4K / HR-8K, one after another.
 # Run from the repo root with the conda env active. Override with CFGS="crop" STEPS=400 etc.
+# Pixel-space run: CFGS="pwarp dat" EVAL_CFGS=crop,dat,pwarp O=<oss>/lora_pix L=/tmp/lora_pix
 set -u
 E=${E:-$HOME/vldat_experiments/0924_miniE1_2k}
 OSS_DATA=${OSS_DATA:-/data/oss_bucket_0/wangziyi/models_data}
@@ -11,7 +12,7 @@ mkdir -p "$O" "$L"
 MODEL="--model_path $E/checkpoint-1000 --where_head_pt $E/loc/where_lm8_ce20.pt"
 WIN="--n_win 1 --crop_tok 400 --hr_source full --pe global --k 7"
 HEAD="--in_ln --d 256 --pool before --norm in --max_off 0 --no_conv_bias --pw_std 0.01"
-LORA="--lora_r ${LORA_R:-16} --lora_alpha ${LORA_ALPHA:-32}"
+LORA="--lora_r ${LORA_R:-16} --lora_alpha ${LORA_ALPHA:-32} --cfgs ${EVAL_CFGS:-crop,fpool,fzero,net}"
 
 for cfg in ${CFGS:-net fzero crop}; do
   ck=$O/lora_$cfg.pt

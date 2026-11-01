@@ -12,9 +12,7 @@ import json
 import math
 import os
 
-VERSIONS = {"net": "net", "fzero": "fzero", "crop": "crop"}   # version -> config it was trained on
 DATASETS = ["vstar", "hrbench4k", "hrbench8k"]
-CFGS = ["crop", "fpool", "fzero", "net"]
 
 
 def sign_p(w, l):
@@ -37,7 +35,11 @@ def load(d, version, dataset):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="/data/oss_bucket_0/wangziyi/vldat_experiments/lora3")
+    ap.add_argument("--versions", default="net,fzero,crop", help="LoRA versions = the config each was trained on")
+    ap.add_argument("--cfgs", default="crop,fpool,fzero,net")
     args = ap.parse_args()
+    VERSIONS = {v: v for v in args.versions.split(",")}
+    CFGS = args.cfgs.split(",")
     res = {(v, ds): load(args.dir, v, ds) for v in VERSIONS for ds in DATASETS}
 
     for ds in DATASETS:

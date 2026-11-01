@@ -22,6 +22,10 @@ Held-out (training) and accuracy (--eval_dataset) both score the same windows fo
   fpool  X_k average-pooled to gh x gw
   fzero  X_k bilinearly sampled at R_k (the head at step 0)
   net    X_k sampled at R_k + learned offsets
+Pixel-space configs (--cfgs crop,dat,pwarp; no HR feature map is computed then):
+  dat    analytic DAT warp of the window pixels (_where_dat_image on the crop's gh x gw grid) -> ViT
+  pwarp  offsets predicted from the crop's tokens, upsampled to a pixel grid, grid_sample of the
+         window (resized to --src_scale x the output, capped at native) -> ViT, gradients through it
 Accuracy uses option-letter scoring (argmax over the option letters' logits at the first
 answer position), the same for all four.
 
@@ -223,8 +227,17 @@ def main():
     ap.add_argument("--lora_r", type=int, default=0, help=">0: LoRA on the LM projections, trained with the head")
     ap.add_argument("--lora_alpha", type=float, default=32.0)
     ap.add_argument("--lora_lr", type=float, default=1e-4)
-    ap.add_argument("--train_cfg", choices=["net", "fzero", "crop"], default="net",
-                    help="what the second image is during training: learned offsets / zero offsets / pixel crop")
+    ap.add_argument("--train_cfg", choices=["net", "fzero", "crop", "dat", "pwarp"], default="net",
+                    help="what the second image is during training: learned feature offsets / zero offsets / "
+                         "pixel crop / analytic pixel DAT / learned pixel warp")
+    ap.add_argument("--cfgs", default="crop,fpool,fzero,net",
+                    help="configs scored in held-out eval and accuracy mode (pixel run: crop,dat,pwarp)")
+    ap.add_argument("--src_scale", type=float, default=2.0,
+                    help="pwarp: the window is resized to this x the output resolution (capped at native) "
+                         "and grid-sampled from there")
+    ap.add_argument("--dat_alpha", type=float, default=0.5)
+    ap.add_argument("--dat_ratio", type=float, default=1.5)
+    ap.add_argument("--dat_k", type=float, default=0.6, help="adaptive window mass; <= 0: keep the window")
     ap.add_argument("--held_eval_n", type=int, default=0, help=">0: held-out eval on the first N held-out rows")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--accum", type=int, default=4)
@@ -238,6 +251,11 @@ def main():
     args = ap.parse_args()
     if not args.eval_dataset and not args.train_json:
         raise SystemExit("training needs --train_json (or --eval_dataset)")
+    cfgs = [c for c in args.cfgs.split(",") if c]
+    if not args.eval_dataset and args.train_cfg not in cfgs:
+        raise SystemExit(f"--train_cfg {args.train_cfg} must be one of --cfgs {cfgs}")
+    learned = "pwarp" if "pwarp" in cfgs else ("net" if "net" in cfgs else None)
+    need_hr = any(c in cfgs for c in ("fpool", "fzero", "net"))
 
     ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if ddp:
@@ -285,7 +303,7 @@ def main():
             m.enabled = on
 
     groups = [{"params": lora_params, "lr": args.lora_lr}] if lora_params else []
-    if args.train_cfg == "net":
+    if args.train_cfg in ("net", "pwarp"):
         groups.append({"params": list(head.parameters()), "lr": args.lr})
     trainable = [p for g in groups for p in g["params"]]
     opt = torch.optim.AdamW(groups, weight_decay=0.0) if groups else None
@@ -311,6 +329,48 @@ def main():
         h, w = x.shape[1] // ps, x.shape[2] // ps
         e = vit_pv(patchify(x), torch.tensor([[1, h, w]], device=dev))
         return e.reshape(h // ms, w // ms, -1)
+
+    def dat_window(image, win, box, logits, px, gh, gw):
+        """Analytic DAT (= _where_dat_image, on this window's gh x gw grid) -> (merged tokens
+        (gh*gw, C), cell centres (gh, gw, 2) in the crop window's [-1, 1] coords)."""
+        p = dat_mod._wdat_softmax(logits.float().tolist())
+        if args.dat_k > 0:
+            win = dat_mod._wdat_adaptive_window(p, box, win, args.dat_k)[0]
+        W, H = image.size
+        x0, y0 = int(win[0] * W), int(win[1] * H)
+        x1 = min(max(int(math.ceil(win[2] * W)), x0 + 1), W)
+        y1 = min(max(int(math.ceil(win[3] * H)), y0 + 1), H)
+        cw, ch = x1 - x0, y1 - y0
+        dx, dy = dat_mod._wdat_marginals(p, (x0 / W, y0 / H, x1 / W, y1 / H), args.dat_alpha, args.dat_ratio)
+        xe = [x0 + e * cw for e in dat_mod._wdat_inv_cdf_edges(dx, gw)]
+        ye = [y0 + e * ch for e in dat_mod._wdat_inv_cdf_edges(dy, gh)]
+        out = Image.new("RGB", (gw * 32, gh * 32))
+        for i in range(gh):
+            for j in range(gw):
+                bx0, by0 = int(math.floor(xe[j])), int(math.floor(ye[i]))
+                bx1 = max(int(math.ceil(min(xe[j + 1], W))), bx0 + 1)
+                by1 = max(int(math.ceil(min(ye[i + 1], H))), by0 + 1)
+                out.paste(image.crop((bx0, by0, bx1, by1)).resize((32, 32), Image.BICUBIC), (j * 32, i * 32))
+        cx = torch.tensor([(xe[j] + xe[j + 1]) / 2 for j in range(gw)], device=dev)
+        cy = torch.tensor([(ye[i] + ye[i + 1]) / 2 for i in range(gh)], device=dev)
+        gy, gx = torch.meshgrid((cy - px[1]) / (px[3] - px[1]) * 2 - 1, (cx - px[0]) / (px[2] - px[0]) * 2 - 1,
+                                indexing="ij")
+        return vit_image(out).reshape(gh * gw, -1), torch.stack([gx, gy], -1).float()
+
+    def pwarp_tokens(w):
+        """Learned pixel warp: offsets (cells) from the crop's tokens, upsampled to pixels, grid-sample
+        the window source image, ViT (frozen, differentiable) -> tokens, sample points, mean |off|."""
+        gh, gw = w["gh"], w["gw"]
+        off = head(w["crop"].t().reshape(1, -1, gh, gw).float(), gh, gw)
+        Ho, Wo = gh * 32, gw * 32
+        offp = F.interpolate(off, size=(Ho, Wo), mode="bilinear", align_corners=False)[0]
+        g = ref_grid(Ho, Wo, dev)
+        G = torch.stack([g[..., 0] + 2 * offp[0] / gw, g[..., 1] + 2 * offp[1] / gh], -1).clamp(-1, 1)
+        img = F.grid_sample(w["psrc"][None], G[None], mode="bilinear", padding_mode="border",
+                            align_corners=False)[0]
+        z = vit_pv(patchify(img), torch.tensor([[1, Ho // ps, Wo // ps]], device=dev)).reshape(gh * gw, -1)
+        shift = torch.stack([2 * off[0, 0] / gw, 2 * off[0, 1] / gh], -1)
+        return z, (ref_grid(gh, gw, dev) + shift).clamp(-1, 1), float(off.detach().abs().mean())
 
     @torch.no_grad()
     def prepare(row):
@@ -349,7 +409,7 @@ def main():
         logits = model.where_head(cells.reshape(gh_l, gw_l, -1), hs[int(torch.nonzero(is_img)[-1]) + 1:])
         hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600)
         full = None
-        if args.hr_source == "full":
+        if need_hr and args.hr_source == "full":
             sc = math.sqrt(min(args.hr_full_cap * 1024, W * H) / float(W * H))
             Wf, Hf = max(32, int(W * sc) // 32 * 32), max(32, int(H * sc) // 32 * 32)
             full = vit_image(image.resize((Wf, Hf), Image.BICUBIC)).permute(2, 0, 1)[None].float()
@@ -366,7 +426,16 @@ def main():
                 skips["small"] += 1
                 return None
             crop = image.crop((px0, py0, px1, py1))
-            if full is not None:
+            ext = {}
+            if "dat" in cfgs:
+                ext["dat"], ext["dat_pts"] = dat_window(image, win, box, logits, (px0, py0, px1, py1), gh, gw)
+            if "pwarp" in cfgs:
+                sw, sh = min(cw, round(args.src_scale * gw * 32)), min(ch, round(args.src_scale * gh * 32))
+                ext["psrc"] = torch.from_numpy(np.asarray(crop.resize((sw, sh), Image.BICUBIC), dtype=np.float32)
+                                               / 255.0).permute(2, 0, 1).to(dev)
+            if not need_hr:
+                hr = src = sbox = None
+            elif full is not None:
                 Hg, Wg = full.shape[-2:]
                 ty0, tx0 = min(int(py0 / H * Hg), Hg - 1), min(int(px0 / W * Wg), Wg - 1)
                 ty1, tx1 = max(ty0 + 1, math.ceil(py1 / H * Hg)), max(tx0 + 1, math.ceil(px1 / W * Wg))
@@ -377,7 +446,7 @@ def main():
                 hr = vit_image(crop.resize((hw_, hh_), Image.BICUBIC)).permute(2, 0, 1)[None].float()
                 src, sbox = hr, (0.0, 0.0, 1.0, 1.0)
             lo = vit_image(crop.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
-            wins.append(dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, hr=hr, src=src, sbox=sbox, crop=lo))
+            wins.append(dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, hr=hr, src=src, sbox=sbox, crop=lo, **ext))
 
         dummies = [Image.new("RGB", (w["gw"] * 32, w["gh"] * 32)) for w in wins]
         qd = {"type": "text", "text": q}
@@ -430,8 +499,16 @@ def main():
             if cfg == "crop":
                 return [w["crop"] for w in pr["wins"]], pts, 0.0
             return [F.adaptive_avg_pool2d(w["hr"], (w["gh"], w["gw"]))[0].flatten(1).t() for w in pr["wins"]], pts, 0.0
+        if cfg == "dat":
+            return [w["dat"] for w in pr["wins"]], [w["dat_pts"] for w in pr["wins"]], 0.0
         zs, ps_, mo = [], [], 0.0
         for w in pr["wins"]:
+            if cfg == "pwarp":
+                z, P, m = pwarp_tokens(w)
+                zs.append(z)
+                ps_.append(P)
+                mo += m / len(pr["wins"])
+                continue
             if cfg == "net":
                 off = head(w["hr"], w["gh"], w["gw"])
             else:
@@ -488,7 +565,8 @@ def main():
                                                   hrbench_parquet=args.hrbench_parquet, image_folder=None,
                                                   max_samples=args.max_samples))
         mine = [(i, s) for i, s in enumerate(samples) if i % args.shards == args.shard]
-        cfgs = ["crop", "fpool", "fzero"] + (["net"] if args.load else [])
+        if not args.load:
+            cfgs = [c for c in cfgs if c != learned]
         out = {c: [] for c in cfgs}
         print(f"[oft-eval] {args.eval_dataset} shard {args.shard}/{args.shards}: {len(mine)} samples, configs {cfgs}",
               flush=True)
@@ -522,17 +600,20 @@ def main():
     rows = load_rows(args.train_json, args.image_root, args.max_train + args.held_from_train, args.seed)
     train, held = rows[:-args.held_from_train], rows[-args.held_from_train:]
     if opt is None:
-        raise SystemExit("nothing to train: --train_cfg fzero / crop needs --lora_r > 0")
+        raise SystemExit("nothing to train: --train_cfg fzero / crop / dat needs --lora_r > 0")
     if args.held_eval_n > 0:
         held = held[:args.held_eval_n]
     say(f"[oft] train {len(train)}  held-out {len(held)}")
     mine_held = held[rank::world]
     cache = {}                          # zero-shot losses; only valid while the LM is frozen
 
+    key = args.train_cfg
+    others = [c for c in cfgs if c != key]
+
     def evaluate(step):
         head.eval()
-        # n, L crop, L pool, L zero, L net, net<zero, net>zero, net<crop, net>crop, ib zero, ib net, |off|
-        acc = torch.zeros(12, device=dev)
+        # n, loss per cfg, (key better, key worse) vs each other cfg, inbox(key), |off|(key)
+        acc = torch.zeros(1 + len(cfgs) + 2 * len(others) + 2, device=dev)
         for hi, row in enumerate(mine_held):
             try:
                 pr = prepare(row)
@@ -540,35 +621,38 @@ def main():
                 pr = None
             if pr is None:
                 continue
+            L, ib, mo = {}, 0.0, 0.0
             with torch.no_grad():
-                if hi not in cache:
-                    lc = float(answer_loss(pr, *feats_for(pr, "crop")[:2]))
-                    lp = float(answer_loss(pr, *feats_for(pr, "fpool")[:2]))
-                    fz, pz, _ = feats_for(pr, "fzero")
-                    val = (lc, lp, float(answer_loss(pr, fz, pz)), inbox(pr, pz))
-                    if not loras:
-                        cache[hi] = val
-                else:
-                    val = cache[hi]
-                lc, lp, lz, ibz = val
-                fn, pn, mo = feats_for(pr, "net")
-                ln = float(answer_loss(pr, fn, pn))
-            acc += torch.tensor([1, lc, lp, lz, ln, ln < lz - 1e-4, ln > lz + 1e-4, ln < lc - 1e-4, ln > lc + 1e-4,
-                                 ibz, inbox(pr, pn), mo], device=dev)
+                for c in cfgs:
+                    if (hi, c) in cache:
+                        L[c] = cache[(hi, c)]
+                        continue
+                    f, P, m = feats_for(pr, c)
+                    L[c] = float(answer_loss(pr, f, P))
+                    if c == key:
+                        ib, mo = inbox(pr, P), m
+                    if not loras and c != learned:
+                        cache[(hi, c)] = L[c]
+            v = [1.0] + [L[c] for c in cfgs]
+            for c in others:
+                v += [float(L[key] < L[c] - 1e-4), float(L[key] > L[c] + 1e-4)]
+            acc += torch.tensor(v + [ib, mo], device=dev)
         if ddp:
             dist.all_reduce(acc)
         n = max(float(acc[0]), 1.0)
-        a = [int(acc[i]) for i in (5, 6, 7, 8)]
-        say(f"[oft] EVAL step {step}: n={int(acc[0])}  loss crop {acc[1] / n:.4f}  fpool {acc[2] / n:.4f}  "
-            f"fzero {acc[3] / n:.4f}  net {acc[4] / n:.4f}  net vs fzero {a[0]}/{a[1]} p={sign_p(a[0], a[1]):.3f}  "
-            f"net vs crop {a[2]}/{a[3]} p={sign_p(a[2], a[3]):.3f}  inbox fzero {acc[9] / n:.3f} net {acc[10] / n:.3f}  "
-            f"|off| {acc[11] / n:.3f} cells")
+        msg = "  ".join(f"{c} {acc[1 + i] / n:.4f}" for i, c in enumerate(cfgs))
+        cmp = "  ".join(f"{key} vs {c} {int(acc[1 + len(cfgs) + 2 * j])}/{int(acc[2 + len(cfgs) + 2 * j])} "
+                        f"p={sign_p(int(acc[1 + len(cfgs) + 2 * j]), int(acc[2 + len(cfgs) + 2 * j])):.3f}"
+                        for j, c in enumerate(others))
+        say(f"[oft] EVAL step {step}: n={int(acc[0])}  loss {msg}  |  {cmp}  inbox {key} {acc[-2] / n:.3f}  "
+            f"|off| {acc[-1] / n:.3f} cells")
         head.train()
 
     evaluate(0)
     rng = random.Random(args.seed + 17 * rank)
     t0 = time.time()
     run = torch.zeros(3, device=dev)
+    head_gn = 0.0
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
         n_ok = 0
@@ -593,7 +677,7 @@ def main():
                     l0 = answer_loss(pr, *feats_for(pr, args.train_cfg)[:2])
                     set_lora(True)
                 else:
-                    l0 = answer_loss(pr, *feats_for(pr, "fzero")[:2])
+                    l0 = answer_loss(pr, *feats_for(pr, "fzero" if need_hr else "crop")[:2])
             run += torch.tensor([1.0, float(loss), float(l0)], device=dev)
             n_ok += 1
         cnt = torch.tensor([float(n_ok)], device=dev)
@@ -607,6 +691,8 @@ def main():
             for p in trainable:
                 if p.grad is not None:
                     p.grad /= max(float(cnt) / args.accum, 1.0)
+            hg = [p.grad for p in head.parameters() if p.grad is not None]
+            head_gn = float(torch.norm(torch.stack([g.norm() for g in hg]))) if hg else 0.0
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt.step()
         if step % 10 == 0:
@@ -614,9 +700,9 @@ def main():
             if ddp:
                 dist.all_reduce(r)
             n = max(float(r[0]), 1.0)
-            ref = "stock LM" if loras else "fzero"
+            ref = "stock LM" if loras else ("fzero" if need_hr else "crop")
             say(f"[oft] step {step}: train loss {args.train_cfg} {r[1] / n:.4f} {ref} {r[2] / n:.4f} "
-                f"(delta {(r[1] - r[2]) / n:+.4f})  {(time.time() - t0) / step:.2f} s/step  "
+                f"(delta {(r[1] - r[2]) / n:+.4f})  head grad {head_gn:.2e}  {(time.time() - t0) / step:.2f} s/step  "
                 f"skipped small-window {skips['small']} (rank 0)")
             run.zero_()
         if step % args.eval_every == 0 or step == args.steps:
