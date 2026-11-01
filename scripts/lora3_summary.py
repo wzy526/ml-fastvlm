@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--dir", default="/data/oss_bucket_0/wangziyi/vldat_experiments/lora3")
     ap.add_argument("--versions", default="net,fzero,crop", help="LoRA versions = the config each was trained on")
     ap.add_argument("--cfgs", default="crop,fpool,fzero,net")
+    ap.add_argument("--oracle", action="append", default=[],
+                    help="comma list of configs: also print the accuracy of 'any of them right' (repeatable)")
     args = ap.parse_args()
     VERSIONS = {v: v for v in args.versions.split(",")}
     CFGS = args.cfgs.split(",")
@@ -58,6 +60,16 @@ def main():
                 k, n = sum(r[c].values()), len(r[c])
                 cells.append(f"{('*' if c == own else '') + f'{k}/{n} {100 * k / max(n, 1):.1f}%':>16}")
             print(f"{v:<14}" + "".join(cells))
+
+        for v in VERSIONS:
+            r = res[(v, ds)]
+            for spec in args.oracle:
+                group = [c for c in spec.split(",") if c in r]
+                if not group:
+                    continue
+                qs = set.intersection(*(set(r[c]) for c in group))
+                k = sum(any(r[c][i] for c in group) for i in qs)
+                print(f"  {v}: oracle over {{{','.join(group)}}}: {k}/{len(qs)} {100 * k / max(len(qs), 1):.1f}%")
 
         own = {v: res[(v, ds)].get(c) for v, c in VERSIONS.items() if res[(v, ds)].get(c)}
         names = list(own)
