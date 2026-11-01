@@ -114,11 +114,11 @@ class LDatHead(nn.Module):
         nn.init.zeros_(self.out.bias)
 
     def forward(self, f, t):
-        """f (1, C, n, n) window cells, t (C,) mean question state -> (n, n) residual logits."""
-        n = f.shape[-1]
+        """f (1, C, h, w) window cells, t (C,) mean question state -> (h, w) residual logits."""
+        h, w = f.shape[-2:]
         x = self.inp(f.flatten(2).transpose(1, 2))
         g, b = self.film(self.t_norm(t)).chunk(2, -1)
-        x = (x * (1 + g) + b).transpose(1, 2).reshape(1, -1, n, n)
+        x = (x * (1 + g) + b).transpose(1, 2).reshape(1, -1, h, w)
         return self.out(self.conv(x))[0, 0]
 
 
@@ -275,7 +275,9 @@ def main():
                          "zS = the crop window scaled by S about its centre, same tokens (z0.5 = 2x zoom in)")
     ap.add_argument("--supersample", type=int, default=2,
                     help="pwarp / ldat: sample at this x the output resolution, then bicubic anti-aliased downsample")
-    ap.add_argument("--ldat_n", type=int, default=16, help="ldat: window cells per side for the density map")
+    ap.add_argument("--ldat_in", choices=["crop", "lr"], default="crop",
+                    help="ldat density-head input: the window crop's ViT tokens (gh x gw) / LM layer-8 LR cells")
+    ap.add_argument("--ldat_n", type=int, default=16, help="ldat --ldat_in lr: window cells per side")
     ap.add_argument("--ldat_d", type=int, default=256)
     ap.add_argument("--box_w", type=float, default=1.0, help="ldat: weight of the box KL on the density map")
     ap.add_argument("--ans_w", type=float, default=1.0,
@@ -450,20 +452,42 @@ def main():
             d = torch.maximum(d, d.max() / args.dat_ratio)
         return d / d.sum()
 
-    def ldat_tokens(pr, w):
-        """Learned DAT: density q over n x n window cells = softmax(log p_head + head(cells, question)),
+    def ldat_tokens(pr, w, kl_only=False):
+        """Learned DAT: density q over the window cells = softmax(log p_head + head(features, question)),
         its x / y marginals -> inverse-CDF warp of the window pixels (supersampled) -> ViT.
-        Returns tokens, cell-centre points, box KL (tensor, or None without a box)."""
-        n, (x0, y0, x1, y1) = args.ldat_n, w["nbox"]
-        u = (torch.arange(n, device=dev) + 0.5) / n
-        gy, gx = torch.meshgrid((y0 + u * (y1 - y0)) * 2 - 1, (x0 + u * (x1 - x0)) * 2 - 1, indexing="ij")
+        --ldat_in crop: features = the window crop's ViT tokens (gh x gw); lr: LM layer-8 LR cells
+        resampled to ldat_n x ldat_n. Returns tokens, cell-centre points, box KL (tensor, or None
+        without a box); kl_only: (None, None, box KL), no image / ViT."""
+        x0, y0, x1, y1 = w["nbox"]
+        gh, gw, s = w["gh"], w["gw"], max(args.supersample, 1)
+        nh, nw = (gh, gw) if args.ldat_in == "crop" else (args.ldat_n, args.ldat_n)
+        uh = (torch.arange(nh, device=dev) + 0.5) / nh
+        uw = (torch.arange(nw, device=dev) + 0.5) / nw
+        gy, gx = torch.meshgrid((y0 + uh * (y1 - y0)) * 2 - 1, (x0 + uw * (x1 - x0)) * 2 - 1, indexing="ij")
         Gc = torch.stack([gx, gy], -1)[None]
-        f = F.grid_sample(pr["lr_map"], Gc, mode="bilinear", padding_mode="border", align_corners=False)
+        if args.ldat_in == "crop":
+            f = w["crop"].t().reshape(1, -1, gh, gw).float()
+        else:
+            f = F.grid_sample(pr["lr_map"], Gc, mode="bilinear", padding_mode="border", align_corners=False)
         pw = F.grid_sample(pr["head_p"][None, None], Gc, mode="bilinear", padding_mode="border",
                            align_corners=False)[0, 0].clamp_min(1e-8)
-        q = torch.softmax((pw.log() + head(f, pr["txt"])).flatten(), 0).reshape(n, n)
+        q = torch.softmax((pw.log() + head(f, pr["txt"])).flatten(), 0).reshape(nh, nw)
+        kl = None
+        if pr["box"] is not None:
+            b = pr["box"]
+            bx0, bx1 = (b[0] - x0) / (x1 - x0), (b[2] - x0) / (x1 - x0)
+            by0, by1 = (b[1] - y0) / (y1 - y0), (b[3] - y0) / (y1 - y0)
+            ew = torch.arange(nw + 1, device=dev, dtype=torch.float32) / nw
+            eh = torch.arange(nh + 1, device=dev, dtype=torch.float32) / nh
+            ox = (ew[1:].clamp(max=bx1) - ew[:-1].clamp(min=bx0)).clamp_min(0)
+            oy = (eh[1:].clamp(max=by1) - eh[:-1].clamp(min=by0)).clamp_min(0)
+            ov = oy[:, None] * ox[None, :]
+            if float(ov.sum()) > 0:
+                t = (1 - args.box_lambda) / (nh * nw) + args.box_lambda * ov / ov.sum()
+                kl = (t * (t.log() - q.clamp_min(1e-12).log())).sum()
+        if kl_only:
+            return None, None, kl
         dx, dy = axis_density(q.sum(0)), axis_density(q.sum(1))
-        gh, gw, s = w["gh"], w["gw"], max(args.supersample, 1)
         ux = (torch.arange(gw * 32 * s, device=dev) + 0.5) / (gw * 32 * s)
         uy = (torch.arange(gh * 32 * s, device=dev) + 0.5) / (gh * 32 * s)
         sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
@@ -474,18 +498,6 @@ def main():
         cy = inv_cdf(dy, (torch.arange(gh, device=dev) + 0.5) / gh) * 2 - 1
         cx = inv_cdf(dx, (torch.arange(gw, device=dev) + 0.5) / gw) * 2 - 1
         py, px_ = torch.meshgrid(cy.detach(), cx.detach(), indexing="ij")
-        kl = None
-        if pr["box"] is not None:
-            b = pr["box"]
-            bx0, bx1 = ((b[0] - x0) / (x1 - x0), (b[2] - x0) / (x1 - x0))
-            by0, by1 = ((b[1] - y0) / (y1 - y0), (b[3] - y0) / (y1 - y0))
-            e = torch.arange(n + 1, device=dev, dtype=torch.float32) / n
-            ox = (torch.minimum(e[1:], torch.tensor(bx1, device=dev)) - torch.maximum(e[:-1], torch.tensor(bx0, device=dev))).clamp_min(0)
-            oy = (torch.minimum(e[1:], torch.tensor(by1, device=dev)) - torch.maximum(e[:-1], torch.tensor(by0, device=dev))).clamp_min(0)
-            ov = oy[:, None] * ox[None, :]
-            if float(ov.sum()) > 0:
-                t = (1 - args.box_lambda) / (n * n) + args.box_lambda * ov / ov.sum()
-                kl = (t * (t.log() - q.clamp_min(1e-12).log())).sum()
         return z, torch.stack([px_, py], -1).float(), kl
 
     pool = []                             # image paths for composite backgrounds (filled with the train rows)
@@ -860,6 +872,16 @@ def main():
                 if pr is not None:
                     break
             if pr is None:
+                continue
+            if args.train_cfg == "ldat" and args.ans_w == 0:
+                kls = [k for k in (ldat_tokens(pr, w, kl_only=True)[2] for w in pr["wins"]) if k is not None]
+                kl = torch.stack(kls).mean() if kls else None
+                if kl is not None:
+                    (args.box_w * kl / args.accum).backward()
+                run[3] += float(kl) if kl is not None else 0.0
+                run[4] += float(kl is not None)
+                run[0] += 1.0
+                n_ok += 1
                 continue
             fz, pz, _ = feats_for(pr, args.train_cfg)
             kl = aux["kl"] if args.train_cfg == "ldat" else None
