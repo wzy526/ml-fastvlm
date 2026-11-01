@@ -238,6 +238,11 @@ def main():
     ap.add_argument("--dat_alpha", type=float, default=0.5)
     ap.add_argument("--dat_ratio", type=float, default=1.5)
     ap.add_argument("--dat_k", type=float, default=0.6, help="adaptive window mass; <= 0: keep the window")
+    ap.add_argument("--composite", type=int, default=0,
+                    help=">0: paste each training image at native resolution into a 16:9 canvas this wide, "
+                         "tiled with other training images (HR-Bench-8K-style); box remapped")
+    ap.add_argument("--comp_max_frac", type=float, default=0.4,
+                    help="composite: downscale the pasted image if a side exceeds this fraction of the canvas")
     ap.add_argument("--held_eval_n", type=int, default=0, help=">0: held-out eval on the first N held-out rows")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--accum", type=int, default=4)
@@ -372,6 +377,34 @@ def main():
         shift = torch.stack([2 * off[0, 0] / gw, 2 * off[0, 1] / gh], -1)
         return z, (ref_grid(gh, gw, dev) + shift).clamp(-1, 1), float(off.detach().abs().mean())
 
+    pool = []                             # image paths for composite backgrounds (filled with the train rows)
+
+    def composite(row, image):
+        r = random.Random(f"{row['path']}|{args.seed}")
+        Wc = args.composite
+        Hc = Wc * 9 // 16
+        W, H = image.size
+        s = min(1.0, args.comp_max_frac * Wc / W, args.comp_max_frac * Hc / H)
+        if s < 1:
+            image = image.resize((max(1, int(W * s)), max(1, int(H * s))), Image.BICUBIC)
+            W, H = image.size
+        canvas = Image.new("RGB", (Wc, Hc), (128, 128, 128))
+        nx, ny = 4, 3
+        tw, th = Wc // nx, Hc // ny
+        for i in range(ny):
+            for j in range(nx):
+                try:
+                    d = Image.open(r.choice(pool))
+                    d.draft("RGB", (tw, th))
+                    canvas.paste(d.convert("RGB").resize((tw, th), Image.BILINEAR), (j * tw, i * th))
+                except Exception:
+                    pass
+        ox, oy = r.randint(0, Wc - W), r.randint(0, Hc - H)
+        canvas.paste(image, (ox, oy))
+        b = row.get("box")
+        box = [(ox + b[0] * W) / Wc, (oy + b[1] * H) / Hc, (ox + b[2] * W) / Wc, (oy + b[3] * H) / Hc] if b else None
+        return canvas, box
+
     @torch.no_grad()
     def prepare(row):
         image = row["image"] if row.get("image") is not None else Image.open(row["path"])
@@ -381,6 +414,10 @@ def main():
             skips["small"] += 1
             return None
         image = image.convert("RGB")
+        row_box = row.get("box")
+        if args.composite and pool and row.get("path"):
+            image, row_box = composite(row, image)
+            W, H = image.size
         thw = processor.image_processor(images=[image], return_tensors="pt")["image_grid_thw"][0]
         lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
         q = row["q"]
@@ -427,6 +464,9 @@ def main():
                 return None
             crop = image.crop((px0, py0, px1, py1))
             ext = {}
+            if "half" in cfgs:
+                half = crop.resize((gw * 16, gh * 16), Image.BICUBIC).resize((gw * 32, gh * 32), Image.BICUBIC)
+                ext["half"] = vit_image(half).reshape(gh * gw, -1)
             if "dat" in cfgs:
                 ext["dat"], ext["dat_pts"] = dat_window(image, win, box, logits, (px0, py0, px1, py1), gh, gw)
             if "pwarp" in cfgs:
@@ -475,7 +515,7 @@ def main():
         if len(blocks) != len(wins) or any(b - a != w["gh"] * w["gw"] for (a, b), w in zip(blocks, wins)):
             return None
         return dict(wins=wins, ids=ids, mm=mm, pos3d=pos3d, rope_deltas=rope_deltas, P=P, blocks=blocks,
-                    emb=embed(ids), lr_emb=lr_emb, img_pos=img_pos, W=W, H=H, box=row.get("box"))
+                    emb=embed(ids), lr_emb=lr_emb, img_pos=img_pos, W=W, H=H, box=row_box)
 
     def run_lm(pr, feats, pts, prompt_only=False):
         e = pr["emb"].clone()
@@ -501,6 +541,8 @@ def main():
             return [F.adaptive_avg_pool2d(w["hr"], (w["gh"], w["gw"]))[0].flatten(1).t() for w in pr["wins"]], pts, 0.0
         if cfg == "dat":
             return [w["dat"] for w in pr["wins"]], [w["dat_pts"] for w in pr["wins"]], 0.0
+        if cfg == "half":
+            return [w["half"] for w in pr["wins"]], [ref_grid(w["gh"], w["gw"], dev) for w in pr["wins"]], 0.0
         zs, ps_, mo = [], [], 0.0
         for w in pr["wins"]:
             if cfg == "pwarp":
@@ -599,11 +641,12 @@ def main():
     # ───────────────────────── training ─────────────────────────
     rows = load_rows(args.train_json, args.image_root, args.max_train + args.held_from_train, args.seed)
     train, held = rows[:-args.held_from_train], rows[-args.held_from_train:]
-    if opt is None:
-        raise SystemExit("nothing to train: --train_cfg fzero / crop / dat needs --lora_r > 0")
+    if opt is None and args.steps > 0:
+        raise SystemExit("nothing to train: --train_cfg fzero / crop / dat needs --lora_r > 0 (or --steps 0)")
     if args.held_eval_n > 0:
         held = held[:args.held_eval_n]
-    say(f"[oft] train {len(train)}  held-out {len(held)}")
+    pool.extend(r["path"] for r in train)
+    say(f"[oft] train {len(train)}  held-out {len(held)}" + (f"  composite {args.composite}px" if args.composite else ""))
     mine_held = held[rank::world]
     cache = {}                          # zero-shot losses; only valid while the LM is frozen
 
