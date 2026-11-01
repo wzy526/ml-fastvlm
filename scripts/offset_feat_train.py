@@ -852,6 +852,8 @@ def main():
             f"{last} {acc[-1] / n:.3f}")
         head.train()
 
+    if args.load:
+        load_ckpt(os.path.expanduser(args.load))
     evaluate(0)
     rng = random.Random(args.seed + 17 * rank)
     t0 = time.time()
