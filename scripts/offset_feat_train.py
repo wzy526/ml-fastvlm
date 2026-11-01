@@ -26,6 +26,10 @@ Pixel-space configs (--cfgs crop,dat,pwarp; no HR feature map is computed then):
   dat    analytic DAT warp of the window pixels (_where_dat_image on the crop's gh x gw grid) -> ViT
   pwarp  offsets predicted from the crop's tokens, upsampled to a pixel grid, grid_sample of the
          window (resized to --src_scale x the output, capped at native) -> ViT, gradients through it
+  ldat   learned DAT: density over the window = softmax(log where-head p + LDatHead(layer-8 cells,
+         question)); its x / y marginals -> the analytic DAT's inverse-CDF warp (differentiable) of the
+         window pixels -> ViT. Step 0 = the analytic density on the crop window (no adaptive scale);
+         trained with answer CE + --box_w x KL(box target || density) when the row has a box.
 Accuracy uses option-letter scoring (argmax over the option letters' logits at the first
 answer position), the same for all four.
 
@@ -91,6 +95,42 @@ class OffsetHead(nn.Module):
             h = F.adaptive_avg_pool2d(h, (gh, gw))
         o = self.pw(h)
         return torch.tanh(o) * self.max_off if self.max_off > 0 else o
+
+
+class LDatHead(nn.Module):
+    """Learned DAT density: window LM layer-8 cells (n x n) FiLM'd by the question -> a residual
+    logit map added to log(where-head p) on the same cells. Last conv zero-init, so step 0 is the
+    analytic DAT density."""
+
+    def __init__(self, c, d=256):
+        super().__init__()
+        self.inp = nn.Sequential(nn.LayerNorm(c), nn.Linear(c, d))
+        self.t_norm = nn.LayerNorm(c)
+        self.film = nn.Linear(c, 2 * d)
+        self.conv = nn.Sequential(nn.Conv2d(d, d, 3, padding=1), nn.GELU(),
+                                  nn.Conv2d(d, d, 3, padding=1), nn.GELU())
+        self.out = nn.Conv2d(d, 1, 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, f, t):
+        """f (1, C, n, n) window cells, t (C,) mean question state -> (n, n) residual logits."""
+        n = f.shape[-1]
+        x = self.inp(f.flatten(2).transpose(1, 2))
+        g, b = self.film(self.t_norm(t)).chunk(2, -1)
+        x = (x * (1 + g) + b).transpose(1, 2).reshape(1, -1, n, n)
+        return self.out(self.conv(x))[0, 0]
+
+
+def inv_cdf(d, u):
+    """d (G,) positive bin densities on [0, 1], u (N,) in [0, 1] -> F^-1(u) in [0, 1],
+    piecewise linear, differentiable in d."""
+    G = d.shape[0]
+    c = torch.cat([d.new_zeros(1), torch.cumsum(d, 0)])
+    c = c / c[-1]
+    idx = (torch.searchsorted(c.detach(), u.contiguous(), right=True) - 1).clamp(0, G - 1)
+    c0, c1 = c[idx], c[idx + 1]
+    return (idx.to(d.dtype) + ((u - c0) / (c1 - c0).clamp_min(1e-8)).clamp(0, 1)) / G
 
 
 LORA_TARGETS = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
@@ -227,12 +267,19 @@ def main():
     ap.add_argument("--lora_r", type=int, default=0, help=">0: LoRA on the LM projections, trained with the head")
     ap.add_argument("--lora_alpha", type=float, default=32.0)
     ap.add_argument("--lora_lr", type=float, default=1e-4)
-    ap.add_argument("--train_cfg", choices=["net", "fzero", "crop", "dat", "pwarp"], default="net",
+    ap.add_argument("--train_cfg", choices=["net", "fzero", "crop", "dat", "pwarp", "ldat"], default="net",
                     help="what the second image is during training: learned feature offsets / zero offsets / "
                          "pixel crop / analytic pixel DAT / learned pixel warp")
     ap.add_argument("--cfgs", default="crop,fpool,fzero,net",
                     help="configs scored in held-out eval and accuracy mode (pixel run: crop,dat,pwarp); "
                          "zS = the crop window scaled by S about its centre, same tokens (z0.5 = 2x zoom in)")
+    ap.add_argument("--supersample", type=int, default=2,
+                    help="pwarp / ldat: sample at this x the output resolution, then bicubic anti-aliased downsample")
+    ap.add_argument("--ldat_n", type=int, default=16, help="ldat: window cells per side for the density map")
+    ap.add_argument("--ldat_d", type=int, default=256)
+    ap.add_argument("--box_w", type=float, default=1.0, help="ldat: weight of the box KL on the density map")
+    ap.add_argument("--box_lambda", type=float, default=0.8,
+                    help="ldat: box target = (1 - lambda) uniform + lambda uniform-in-box over the window cells")
     ap.add_argument("--src_scale", type=float, default=2.0,
                     help="pwarp: the window is resized to this x the output resolution (capped at native) "
                          "and grid-sampled from there")
@@ -263,7 +310,9 @@ def main():
     cfgs = [c for c in args.cfgs.split(",") if c]
     if not args.eval_dataset and args.train_cfg not in cfgs:
         raise SystemExit(f"--train_cfg {args.train_cfg} must be one of --cfgs {cfgs}")
-    learned = "pwarp" if "pwarp" in cfgs else ("net" if "net" in cfgs else None)
+    if sum(c in cfgs for c in ("net", "pwarp", "ldat")) > 1:
+        raise SystemExit("--cfgs: at most one learned config (net / pwarp / ldat)")
+    learned = next((c for c in ("ldat", "pwarp", "net") if c in cfgs), None)
     need_hr = any(c in cfgs for c in ("fpool", "fzero", "net"))
 
     ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -302,8 +351,11 @@ def main():
     C = model.config.text_config.hidden_size
     embed = model.get_input_embeddings()
 
-    head = OffsetHead(C, k=args.k, max_off=args.max_off, d=args.d, pool=args.pool, norm=args.norm,
-                      in_ln=args.in_ln, conv_bias=not args.no_conv_bias, pw_std=args.pw_std).to(dev)
+    if learned == "ldat":
+        head = LDatHead(C, d=args.ldat_d).to(dev)
+    else:
+        head = OffsetHead(C, k=args.k, max_off=args.max_off, d=args.d, pool=args.pool, norm=args.norm,
+                          in_ln=args.in_ln, conv_bias=not args.no_conv_bias, pw_std=args.pw_std).to(dev)
     loras = add_lora(model, args.lora_r, args.lora_alpha) if args.lora_r > 0 else {}
     lora_params = [p for m in loras.values() for p in (m.lora_A, m.lora_B)]
 
@@ -312,7 +364,7 @@ def main():
             m.enabled = on
 
     groups = [{"params": lora_params, "lr": args.lora_lr}] if lora_params else []
-    if args.train_cfg in ("net", "pwarp"):
+    if args.train_cfg in ("net", "pwarp", "ldat"):
         groups.append({"params": list(head.parameters()), "lr": args.lr})
     trainable = [p for g in groups for p in g["params"]]
     opt = torch.optim.AdamW(groups, weight_decay=0.0) if groups else None
@@ -366,20 +418,73 @@ def main():
                                 indexing="ij")
         return vit_image(out).reshape(gh * gw, -1), torch.stack([gx, gy], -1).float()
 
+    def aa_down(img, Ho, Wo):
+        """(1, 3, Ho*s, Wo*s) supersampled -> (3, Ho, Wo): bicubic anti-aliased, like PIL's resize
+        (a 2x2 average is a box filter and visibly blurrier on small text)."""
+        if img.shape[-2:] == (Ho, Wo):
+            return img[0]
+        return F.interpolate(img, size=(Ho, Wo), mode="bicubic", antialias=True, align_corners=False)[0].clamp(0, 1)
+
     def pwarp_tokens(w):
         """Learned pixel warp: offsets (cells) from the crop's tokens, upsampled to pixels, grid-sample
         the window source image, ViT (frozen, differentiable) -> tokens, sample points, mean |off|."""
         gh, gw = w["gh"], w["gw"]
         off = head(w["crop"].t().reshape(1, -1, gh, gw).float(), gh, gw)
-        Ho, Wo = gh * 32, gw * 32
-        offp = F.interpolate(off, size=(Ho, Wo), mode="bilinear", align_corners=False)[0]
-        g = ref_grid(Ho, Wo, dev)
+        Ho, Wo, s = gh * 32, gw * 32, max(args.supersample, 1)
+        offp = F.interpolate(off, size=(Ho * s, Wo * s), mode="bilinear", align_corners=False)[0]
+        g = ref_grid(Ho * s, Wo * s, dev)
         G = torch.stack([g[..., 0] + 2 * offp[0] / gw, g[..., 1] + 2 * offp[1] / gh], -1).clamp(-1, 1)
-        img = F.grid_sample(w["psrc"][None], G[None], mode="bilinear", padding_mode="border",
-                            align_corners=False)[0]
+        img = F.grid_sample(w["psrc"][None], G[None], mode="bilinear", padding_mode="border", align_corners=False)
+        img = aa_down(img, Ho, Wo)
         z = vit_pv(patchify(img), torch.tensor([[1, Ho // ps, Wo // ps]], device=dev)).reshape(gh * gw, -1)
         shift = torch.stack([2 * off[0, 0] / gw, 2 * off[0, 1] / gh], -1)
         return z, (ref_grid(gh, gw, dev) + shift).clamp(-1, 1), float(off.detach().abs().mean())
+
+    def axis_density(m, G=64):
+        """n-cell marginal -> G-bin DAT density: (1 - alpha) uniform + alpha m, neighbour ratio <= ratio."""
+        m = F.interpolate(m[None, None], size=G, mode="linear", align_corners=False)[0, 0].clamp_min(0)
+        d = (1 - args.dat_alpha) / G + args.dat_alpha * m / m.sum().clamp_min(1e-8)
+        if args.dat_ratio > 1:
+            d = torch.maximum(d, d.max() / args.dat_ratio)
+        return d / d.sum()
+
+    def ldat_tokens(pr, w):
+        """Learned DAT: density q over n x n window cells = softmax(log p_head + head(cells, question)),
+        its x / y marginals -> inverse-CDF warp of the window pixels (supersampled) -> ViT.
+        Returns tokens, cell-centre points, box KL (tensor, or None without a box)."""
+        n, (x0, y0, x1, y1) = args.ldat_n, w["nbox"]
+        u = (torch.arange(n, device=dev) + 0.5) / n
+        gy, gx = torch.meshgrid((y0 + u * (y1 - y0)) * 2 - 1, (x0 + u * (x1 - x0)) * 2 - 1, indexing="ij")
+        Gc = torch.stack([gx, gy], -1)[None]
+        f = F.grid_sample(pr["lr_map"], Gc, mode="bilinear", padding_mode="border", align_corners=False)
+        pw = F.grid_sample(pr["head_p"][None, None], Gc, mode="bilinear", padding_mode="border",
+                           align_corners=False)[0, 0].clamp_min(1e-8)
+        q = torch.softmax((pw.log() + head(f, pr["txt"])).flatten(), 0).reshape(n, n)
+        dx, dy = axis_density(q.sum(0)), axis_density(q.sum(1))
+        gh, gw, s = w["gh"], w["gw"], max(args.supersample, 1)
+        ux = (torch.arange(gw * 32 * s, device=dev) + 0.5) / (gw * 32 * s)
+        uy = (torch.arange(gh * 32 * s, device=dev) + 0.5) / (gh * 32 * s)
+        sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
+        img = F.grid_sample(w["psrc"][None], torch.stack([sx, sy], -1)[None], mode="bilinear",
+                            padding_mode="border", align_corners=False)
+        img = aa_down(img, gh * 32, gw * 32)
+        z = vit_pv(patchify(img), torch.tensor([[1, gh * 32 // ps, gw * 32 // ps]], device=dev)).reshape(gh * gw, -1)
+        cy = inv_cdf(dy, (torch.arange(gh, device=dev) + 0.5) / gh) * 2 - 1
+        cx = inv_cdf(dx, (torch.arange(gw, device=dev) + 0.5) / gw) * 2 - 1
+        py, px_ = torch.meshgrid(cy.detach(), cx.detach(), indexing="ij")
+        kl = None
+        if pr["box"] is not None:
+            b = pr["box"]
+            bx0, bx1 = ((b[0] - x0) / (x1 - x0), (b[2] - x0) / (x1 - x0))
+            by0, by1 = ((b[1] - y0) / (y1 - y0), (b[3] - y0) / (y1 - y0))
+            e = torch.arange(n + 1, device=dev, dtype=torch.float32) / n
+            ox = (torch.minimum(e[1:], torch.tensor(bx1, device=dev)) - torch.maximum(e[:-1], torch.tensor(bx0, device=dev))).clamp_min(0)
+            oy = (torch.minimum(e[1:], torch.tensor(by1, device=dev)) - torch.maximum(e[:-1], torch.tensor(by0, device=dev))).clamp_min(0)
+            ov = oy[:, None] * ox[None, :]
+            if float(ov.sum()) > 0:
+                t = (1 - args.box_lambda) / (n * n) + args.box_lambda * ov / ov.sum()
+                kl = (t * (t.log() - q.clamp_min(1e-12).log())).sum()
+        return z, torch.stack([px_, py], -1).float(), kl
 
     pool = []                             # image paths for composite backgrounds (filled with the train rows)
 
@@ -491,7 +596,7 @@ def main():
                 ext["half"] = vit_image(half).reshape(gh * gw, -1)
             if "dat" in cfgs:
                 ext["dat"], ext["dat_pts"] = dat_window(image, win, box, logits, (px0, py0, px1, py1), gh, gw)
-            if "pwarp" in cfgs:
+            if "pwarp" in cfgs or "ldat" in cfgs:
                 sw, sh = min(cw, round(args.src_scale * gw * 32)), min(ch, round(args.src_scale * gh * 32))
                 ext["psrc"] = torch.from_numpy(np.asarray(crop.resize((sw, sh), Image.BICUBIC), dtype=np.float32)
                                                / 255.0).permute(2, 0, 1).to(dev)
@@ -508,7 +613,8 @@ def main():
                 hr = vit_image(crop.resize((hw_, hh_), Image.BICUBIC)).permute(2, 0, 1)[None].float()
                 src, sbox = hr, (0.0, 0.0, 1.0, 1.0)
             lo = vit_image(crop.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
-            wins.append(dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, hr=hr, src=src, sbox=sbox, crop=lo, **ext))
+            wins.append(dict(px=(px0, py0, px1, py1), nbox=(px0 / W, py0 / H, px1 / W, py1 / H), gh=gh, gw=gw,
+                             hr=hr, src=src, sbox=sbox, crop=lo, **ext))
 
         dummies = [Image.new("RGB", (w["gw"] * 32, w["gh"] * 32)) for w in wins]
         qd = {"type": "text", "text": q}
@@ -536,8 +642,13 @@ def main():
         blocks = dat_mod._where_token_runs(ids[0], image_id)[1:]
         if len(blocks) != len(wins) or any(b - a != w["gh"] * w["gw"] for (a, b), w in zip(blocks, wins)):
             return None
+        extra = {}
+        if "ldat" in cfgs:
+            extra = dict(lr_map=cells.reshape(gh_l, gw_l, -1).permute(2, 0, 1)[None].float(),
+                         txt=hs[int(torch.nonzero(is_img)[-1]) + 1:].float().mean(0),
+                         head_p=torch.softmax(logits.float().flatten(), 0).reshape(logits.shape))
         return dict(wins=wins, ids=ids, mm=mm, pos3d=pos3d, rope_deltas=rope_deltas, P=P, blocks=blocks,
-                    emb=embed(ids), lr_emb=lr_emb, img_pos=img_pos, W=W, H=H, box=row_box)
+                    emb=embed(ids), lr_emb=lr_emb, img_pos=img_pos, W=W, H=H, box=row_box, **extra)
 
     def run_lm(pr, feats, pts, prompt_only=False):
         e = pr["emb"].clone()
@@ -552,6 +663,8 @@ def main():
     def answer_loss(pr, feats, pts):
         lg = run_lm(pr, feats, pts)[0, pr["P"] - 1:-1].float()
         return F.cross_entropy(lg, pr["ids"][0, pr["P"]:])
+
+    aux = {"kl": None}                    # ldat's box KL from the last feats_for(.., "ldat") call
 
     def feats_for(pr, cfg):
         """-> (list of (gh*gw, C) token blocks, list of window-local points, mean |off|).
@@ -568,6 +681,15 @@ def main():
         if re.fullmatch(r"z[0-9.]+", cfg):
             return [w[cfg] for w in pr["wins"]], [w[cfg + "_pts"] for w in pr["wins"]], 0.0
         zs, ps_, mo = [], [], 0.0
+        if cfg == "ldat":
+            aux["kl"] = None
+            for w in pr["wins"]:
+                z, P, kl = ldat_tokens(pr, w)
+                zs.append(z)
+                ps_.append(P)
+                if kl is not None:
+                    aux["kl"] = kl / len(pr["wins"]) if aux["kl"] is None else aux["kl"] + kl / len(pr["wins"])
+            return zs, ps_, float(aux["kl"]) if aux["kl"] is not None else 0.0
         for w in pr["wins"]:
             if cfg == "pwarp":
                 z, P, m = pwarp_tokens(w)
@@ -711,14 +833,15 @@ def main():
         cmp = "  ".join(f"{key} vs {c} {int(acc[1 + len(cfgs) + 2 * j])}/{int(acc[2 + len(cfgs) + 2 * j])} "
                         f"p={sign_p(int(acc[1 + len(cfgs) + 2 * j]), int(acc[2 + len(cfgs) + 2 * j])):.3f}"
                         for j, c in enumerate(others))
+        last = "box KL" if key == "ldat" else "|off| (cells)"
         say(f"[oft] EVAL step {step}: n={int(acc[0])}  loss {msg}  |  {cmp}  inbox {key} {acc[-2] / n:.3f}  "
-            f"|off| {acc[-1] / n:.3f} cells")
+            f"{last} {acc[-1] / n:.3f}")
         head.train()
 
     evaluate(0)
     rng = random.Random(args.seed + 17 * rank)
     t0 = time.time()
-    run = torch.zeros(3, device=dev)
+    run = torch.zeros(5, device=dev)      # n, loss, ref loss, box KL sum, n with a box
     head_gn = 0.0
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
@@ -737,7 +860,10 @@ def main():
             if pr is None:
                 continue
             loss = answer_loss(pr, *feats_for(pr, args.train_cfg)[:2])
-            (loss / args.accum).backward()
+            kl = aux["kl"] if args.train_cfg == "ldat" else None
+            ((loss + (args.box_w * kl if kl is not None else 0.0)) / args.accum).backward()
+            run[3] += float(kl) if kl is not None else 0.0
+            run[4] += float(kl is not None)
             with torch.no_grad():
                 if loras:                                  # reference: the same input on the stock LM
                     set_lora(False)
@@ -745,7 +871,7 @@ def main():
                     set_lora(True)
                 else:
                     l0 = answer_loss(pr, *feats_for(pr, "fzero" if need_hr else "crop")[:2])
-            run += torch.tensor([1.0, float(loss), float(l0)], device=dev)
+            run[:3] += torch.tensor([1.0, float(loss), float(l0)], device=dev)
             n_ok += 1
         cnt = torch.tensor([float(n_ok)], device=dev)
         if ddp:
@@ -769,7 +895,8 @@ def main():
             n = max(float(r[0]), 1.0)
             ref = "stock LM" if loras else ("fzero" if need_hr else "crop")
             say(f"[oft] step {step}: train loss {args.train_cfg} {r[1] / n:.4f} {ref} {r[2] / n:.4f} "
-                f"(delta {(r[1] - r[2]) / n:+.4f})  head grad {head_gn:.2e}  {(time.time() - t0) / step:.2f} s/step  "
+                f"(delta {(r[1] - r[2]) / n:+.4f})" + (f"  box KL {r[3] / max(float(r[4]), 1.0):.4f}" if r[4] > 0 else "") +
+                f"  head grad {head_gn:.2e}  {(time.time() - t0) / step:.2f} s/step  "
                 f"skipped small-window {skips['small']} (rank 0)")
             run.zero_()
         if step % args.eval_every == 0 or step == args.steps:
