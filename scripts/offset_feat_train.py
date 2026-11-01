@@ -327,7 +327,7 @@ def main():
     local = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local)
     dev = torch.device("cuda", local)
-    torch.manual_seed(args.seed + rank)
+    torch.manual_seed(args.seed)          # same head / LoRA init on every rank; per-rank seed set after
 
     def say(*a):
         if rank == 0:
@@ -371,6 +371,11 @@ def main():
     if args.train_cfg in ("net", "pwarp", "ldat"):
         groups.append({"params": list(head.parameters()), "lr": args.lr})
     trainable = [p for g in groups for p in g["params"]]
+    if ddp:
+        with torch.no_grad():
+            for p in list(head.parameters()) + lora_params:
+                dist.broadcast(p.data, 0)
+    torch.manual_seed(args.seed + rank)
     opt = torch.optim.AdamW(groups, weight_decay=0.0) if groups else None
     skips = {"small": 0, "other": 0}
     say(f"[oft] offset head {sum(p.numel() for p in head.parameters()) / 1e6:.2f}M params, "
