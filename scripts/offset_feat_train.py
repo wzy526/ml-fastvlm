@@ -281,6 +281,16 @@ def main():
     ap.add_argument("--ldat_n", type=int, default=16, help="ldat --ldat_in lr: window cells per side")
     ap.add_argument("--ldat_d", type=int, default=256)
     ap.add_argument("--box_w", type=float, default=1.0, help="ldat: weight of the box KL on the density map")
+    ap.add_argument("--tr_w", type=float, default=0.0,
+                    help="ldat: weight of KL(learned density || analytic where-head density) on the window cells "
+                         "(trust region around the finalized DAT)")
+    ap.add_argument("--save_best", action="store_true",
+                    help="--save only when the held-out loss of --train_cfg improves (step 0 counts)")
+    ap.add_argument("--tok_ratio", type=float, default=0.0,
+                    help=">0: tokens per window = this x the window's native tokens (w x h / 32^2), "
+                         "clamped to [--tok_min, --tok_max]; replaces --crop_tok / --n_win")
+    ap.add_argument("--tok_min", type=int, default=100)
+    ap.add_argument("--tok_max", type=int, default=1600)
     ap.add_argument("--ans_w", type=float, default=1.0,
                     help="weight of the answer CE in training; 0: logged only (ldat trains on the box KL alone)")
     ap.add_argument("--box_lambda", type=float, default=0.8,
@@ -482,6 +492,8 @@ def main():
                            align_corners=False)[0, 0].clamp_min(1e-8)
         lp = pw.log()
         q = torch.softmax((lp + head(f, lp)).flatten(), 0).reshape(nh, nw)
+        q0 = pw / pw.sum()
+        aux["tr_last"] = (q * (q.clamp_min(1e-12).log() - q0.log())).sum()
         kl = None
         if pr["box"] is not None:
             b = pr["box"]
@@ -593,6 +605,9 @@ def main():
             box = ((cx + 0.5 - 2) / gw_l, (cy + 0.5 - 2) / gh_l, (cx + 0.5 + 2) / gw_l, (cy + 0.5 + 2) / gh_l)
             win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h)
             px0, py0, px1, py1, gh, gw = crop_geometry(image, win, per_win)
+            if args.tok_ratio > 0:
+                n_tok = round(args.tok_ratio * (px1 - px0) * (py1 - py0) / 1024)
+                px0, py0, px1, py1, gh, gw = crop_geometry(image, win, min(max(n_tok, args.tok_min), args.tok_max))
             if args.grid:
                 gh = gw = args.grid
             cw, ch = px1 - px0, py1 - py0
@@ -706,7 +721,7 @@ def main():
         lg = run_lm(pr, feats, pts)[0, pr["P"] - 1:-1].float()
         return F.cross_entropy(lg, pr["ids"][0, pr["P"]:])
 
-    aux = {"kl": None}                    # ldat's box KL from the last feats_for(.., "ldat") call
+    aux = {"kl": None, "tr": 0.0, "tr_last": 0.0}   # ldat's box KL / trust-region KL, last feats_for(.., "ldat")
 
     def feats_for(pr, cfg):
         """-> (list of (gh*gw, C) token blocks, list of window-local points, mean |off|).
@@ -725,10 +740,12 @@ def main():
         zs, ps_, mo = [], [], 0.0
         if cfg == "ldat":
             aux["kl"] = None
+            aux["tr"] = 0.0
             for w in pr["wins"]:
                 z, P, kl = ldat_tokens(pr, w)
                 zs.append(z)
                 ps_.append(P)
+                aux["tr"] = aux["tr"] + aux["tr_last"] / len(pr["wins"])
                 if kl is not None:
                     aux["kl"] = kl / len(pr["wins"]) if aux["kl"] is None else aux["kl"] + kl / len(pr["wins"])
             return zs, ps_, float(aux["kl"]) if aux["kl"] is not None else 0.0
@@ -879,13 +896,16 @@ def main():
         say(f"[oft] EVAL step {step}: n={int(acc[0])}  loss {msg}  |  {cmp}  inbox {key} {acc[-2] / n:.3f}  "
             f"{last} {acc[-1] / n:.3f}")
         head.train()
+        return float(acc[1 + cfgs.index(key)] / n) if key in cfgs else 0.0
 
     if args.load:
         load_ckpt(os.path.expanduser(args.load))
-    evaluate(0)
+    best = evaluate(0)
+    if rank == 0 and args.save and args.save_best:
+        save_ckpt(os.path.expanduser(args.save))
     rng = random.Random(args.seed + 17 * rank)
     t0 = time.time()
-    run = torch.zeros(5, device=dev)      # n, loss, ref loss, box KL sum, n with a box
+    run = torch.zeros(6, device=dev)      # n, loss, ref loss, box KL sum, n with a box, trust-region KL sum
     head_gn = 0.0
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
@@ -915,9 +935,11 @@ def main():
                 continue
             fz, pz, _ = feats_for(pr, args.train_cfg)
             kl = aux["kl"] if args.train_cfg == "ldat" else None
+            tr = aux["tr"] if args.train_cfg == "ldat" else 0.0
+            run[5] += float(tr)
             if args.ans_w > 0:
                 loss = answer_loss(pr, fz, pz)
-                total = args.ans_w * loss + (args.box_w * kl if kl is not None else 0.0)
+                total = args.ans_w * loss + (args.box_w * kl if kl is not None else 0.0) + args.tr_w * tr
             else:
                 with torch.no_grad():
                     loss = answer_loss(pr, [z.detach() for z in fz], pz)
@@ -958,13 +980,18 @@ def main():
             ref = "stock LM" if loras else ("fzero" if need_hr else "crop")
             say(f"[oft] step {step}: train loss {args.train_cfg} {r[1] / n:.4f} {ref} {r[2] / n:.4f} "
                 f"(delta {(r[1] - r[2]) / n:+.4f})" + (f"  box KL {r[3] / max(float(r[4]), 1.0):.4f}" if r[4] > 0 else "") +
+                (f"  TR KL {r[5] / n:.4f}" if args.train_cfg == "ldat" else "") +
                 f"  head grad {head_gn:.2e}  {(time.time() - t0) / step:.2f} s/step  "
                 f"skipped small-window {skips['small']} (rank 0)")
             run.zero_()
         if step % args.eval_every == 0 or step == args.steps:
-            evaluate(step)
-            if rank == 0 and args.save:
+            hl = evaluate(step)
+            improved = hl < best
+            best = min(best, hl)
+            if rank == 0 and args.save and (improved or not args.save_best):
                 save_ckpt(os.path.expanduser(args.save))
+                if args.save_best:
+                    say(f"[oft] saved best (held-out {key} {hl:.4f}) at step {step}")
     if ddp:
         dist.destroy_process_group()
 
