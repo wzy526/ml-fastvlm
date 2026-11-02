@@ -277,6 +277,8 @@ def main():
                     help="pwarp / ldat: sample at this x the output resolution, then bicubic anti-aliased downsample")
     ap.add_argument("--ldat_in", choices=["crop", "lr"], default="crop",
                     help="ldat density-head input: the window crop's ViT tokens (gh x gw) / LM layer-8 LR cells")
+    ap.add_argument("--ldat_win", choices=["dat", "crop"], default="dat",
+                    help="ldat window: analytic DAT's adaptive window (--dat_k; zero residual ~= dat) / the crop's")
     ap.add_argument("--ldat_n", type=int, default=16, help="ldat --ldat_in lr: window cells per side")
     ap.add_argument("--ldat_d", type=int, default=256)
     ap.add_argument("--box_w", type=float, default=1.0, help="ldat: weight of the box KL on the density map")
@@ -463,7 +465,7 @@ def main():
         --ldat_in crop: features = the window crop's ViT tokens (gh x gw); lr: LM layer-8 LR cells
         resampled to ldat_n x ldat_n. Returns tokens, cell-centre points, box KL (tensor, or None
         without a box); kl_only: (None, None, box KL), no image / ViT."""
-        x0, y0, x1, y1 = w["nbox"]
+        x0, y0, x1, y1 = w["lnbox"]
         gh, gw, s = w["gh"], w["gw"], max(args.supersample, 1)
         nh, nw = (gh, gw) if args.ldat_in == "crop" else (args.ldat_n, args.ldat_n)
         uh = (torch.arange(nh, device=dev) + 0.5) / nh
@@ -471,7 +473,7 @@ def main():
         gy, gx = torch.meshgrid((y0 + uh * (y1 - y0)) * 2 - 1, (x0 + uw * (x1 - x0)) * 2 - 1, indexing="ij")
         Gc = torch.stack([gx, gy], -1)[None]
         if args.ldat_in == "crop":
-            f = w["crop"].t().reshape(1, -1, gh, gw).float()
+            f = w["lfeat"].t().reshape(1, -1, gh, gw).float()
         else:
             f = F.grid_sample(pr["lr_map"], Gc, mode="bilinear", padding_mode="border", align_corners=False)
         pw = F.grid_sample(pr["head_p"][None, None], Gc, mode="bilinear", padding_mode="border",
@@ -500,8 +502,9 @@ def main():
                             padding_mode="border", align_corners=False)
         img = aa_down(img, gh * 32, gw * 32)
         z = vit_pv(patchify(img), torch.tensor([[1, gh * 32 // ps, gw * 32 // ps]], device=dev)).reshape(gh * gw, -1)
-        cy = inv_cdf(dy, (torch.arange(gh, device=dev) + 0.5) / gh) * 2 - 1
-        cx = inv_cdf(dx, (torch.arange(gw, device=dev) + 0.5) / gw) * 2 - 1
+        (lx0, ly0, lx1, ly1), (cx0, cy0, cx1, cy1) = w["lpx"], w["px"]   # ldat window -> crop-window coords
+        cy = (ly0 + inv_cdf(dy, (torch.arange(gh, device=dev) + 0.5) / gh) * (ly1 - ly0) - cy0) / (cy1 - cy0) * 2 - 1
+        cx = (lx0 + inv_cdf(dx, (torch.arange(gw, device=dev) + 0.5) / gw) * (lx1 - lx0) - cx0) / (cx1 - cx0) * 2 - 1
         py, px_ = torch.meshgrid(cy.detach(), cx.detach(), indexing="ij")
         return z, torch.stack([px_, py], -1).float(), kl
 
@@ -616,9 +619,22 @@ def main():
             if "dat" in cfgs:
                 ext["dat"], ext["dat_pts"] = dat_window(image, win, box, logits, (px0, py0, px1, py1), gh, gw)
             if "pwarp" in cfgs or "ldat" in cfgs:
-                sw, sh = min(cw, round(args.src_scale * gw * 32)), min(ch, round(args.src_scale * gh * 32))
-                ext["psrc"] = torch.from_numpy(np.asarray(crop.resize((sw, sh), Image.BICUBIC), dtype=np.float32)
+                lpx, lcrop = (px0, py0, px1, py1), crop
+                if "ldat" in cfgs and args.ldat_win == "dat":
+                    lw = win
+                    if args.dat_k > 0:
+                        lw = dat_mod._wdat_adaptive_window(dat_mod._wdat_softmax(logits.float().tolist()),
+                                                           box, win, args.dat_k)[0]
+                    lx0, ly0 = int(lw[0] * W), int(lw[1] * H)
+                    lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * W)), lx0 + 1), W),
+                           min(max(int(math.ceil(lw[3] * H)), ly0 + 1), H))
+                    lcrop = image.crop(lpx)
+                    ext["lfeat"] = vit_image(lcrop.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
+                lcw, lch = lcrop.size
+                sw, sh = min(lcw, round(args.src_scale * gw * 32)), min(lch, round(args.src_scale * gh * 32))
+                ext["psrc"] = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32)
                                                / 255.0).permute(2, 0, 1).to(dev)
+                ext["lpx"], ext["lnbox"] = lpx, (lpx[0] / W, lpx[1] / H, lpx[2] / W, lpx[3] / H)
             if not need_hr:
                 hr = src = sbox = None
             elif full is not None:
@@ -632,6 +648,7 @@ def main():
                 hr = vit_image(crop.resize((hw_, hh_), Image.BICUBIC)).permute(2, 0, 1)[None].float()
                 src, sbox = hr, (0.0, 0.0, 1.0, 1.0)
             lo = vit_image(crop.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
+            ext.setdefault("lfeat", lo)
             wins.append(dict(px=(px0, py0, px1, py1), nbox=(px0 / W, py0 / H, px1 / W, py1 / H), gh=gh, gw=gw,
                              hr=hr, src=src, sbox=sbox, crop=lo, **ext))
 
