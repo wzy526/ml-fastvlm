@@ -26,9 +26,9 @@ Pixel-space configs (--cfgs crop,dat,pwarp; no HR feature map is computed then):
   dat    analytic DAT warp of the window pixels (_where_dat_image on the crop's gh x gw grid) -> ViT
   pwarp  offsets predicted from the crop's tokens, upsampled to a pixel grid, grid_sample of the
          window (resized to --src_scale x the output, capped at native) -> ViT, gradients through it
-  ldat   learned DAT: density over the window = softmax(log where-head p + LDatHead(layer-8 cells,
-         question)); its x / y marginals -> the analytic DAT's inverse-CDF warp (differentiable) of the
-         window pixels -> ViT. Step 0 = the analytic density on the crop window (no adaptive scale);
+  ldat   learned DAT: density over the window = softmax(log where-head p + LDatHead(window tokens,
+         log p)); its x / y marginals -> the analytic DAT's inverse-CDF warp (differentiable) of the
+         window pixels -> ViT. Window = analytic DAT's adaptive one (--ldat_win dat), so step 0 ~= dat;
          trained with answer CE + --box_w x KL(box target || density) when the row has a box.
 Accuracy uses option-letter scoring (argmax over the option letters' logits at the first
 answer position), the same for all four.
@@ -98,27 +98,24 @@ class OffsetHead(nn.Module):
 
 
 class LDatHead(nn.Module):
-    """Learned DAT density: window LM layer-8 cells (n x n) FiLM'd by the question -> a residual
-    logit map added to log(where-head p) on the same cells. Last conv zero-init, so step 0 is the
-    analytic DAT density."""
+    """Learned DAT density: window features (h x w) + the where-head's log p on the same cells (one
+    extra channel, window-centred; the question reaches the head only through p) -> a residual
+    logit map added to log p. Last conv zero-init, so step 0 is the analytic DAT density."""
 
     def __init__(self, c, d=256):
         super().__init__()
         self.inp = nn.Sequential(nn.LayerNorm(c), nn.Linear(c, d))
-        self.t_norm = nn.LayerNorm(c)
-        self.film = nn.Linear(c, 2 * d)
-        self.conv = nn.Sequential(nn.Conv2d(d, d, 3, padding=1), nn.GELU(),
+        self.conv = nn.Sequential(nn.Conv2d(d + 1, d, 3, padding=1), nn.GELU(),
                                   nn.Conv2d(d, d, 3, padding=1), nn.GELU())
         self.out = nn.Conv2d(d, 1, 1)
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
 
-    def forward(self, f, t):
-        """f (1, C, h, w) window cells, t (C,) mean question state -> (h, w) residual logits."""
+    def forward(self, f, lp):
+        """f (1, C, h, w) window cells, lp (h, w) log where-head p -> (h, w) residual logits."""
         h, w = f.shape[-2:]
-        x = self.inp(f.flatten(2).transpose(1, 2))
-        g, b = self.film(self.t_norm(t)).chunk(2, -1)
-        x = (x * (1 + g) + b).transpose(1, 2).reshape(1, -1, h, w)
+        x = self.inp(f.flatten(2).transpose(1, 2)).transpose(1, 2).reshape(1, -1, h, w)
+        x = torch.cat([x, (lp - lp.mean())[None, None]], 1)
         return self.out(self.conv(x))[0, 0]
 
 
@@ -478,7 +475,8 @@ def main():
             f = F.grid_sample(pr["lr_map"], Gc, mode="bilinear", padding_mode="border", align_corners=False)
         pw = F.grid_sample(pr["head_p"][None, None], Gc, mode="bilinear", padding_mode="border",
                            align_corners=False)[0, 0].clamp_min(1e-8)
-        q = torch.softmax((pw.log() + head(f, pr["txt"])).flatten(), 0).reshape(nh, nw)
+        lp = pw.log()
+        q = torch.softmax((lp + head(f, lp)).flatten(), 0).reshape(nh, nw)
         kl = None
         if pr["box"] is not None:
             b = pr["box"]
@@ -681,7 +679,6 @@ def main():
         extra = {}
         if "ldat" in cfgs:
             extra = dict(lr_map=cells.reshape(gh_l, gw_l, -1).permute(2, 0, 1)[None].float(),
-                         txt=hs[int(torch.nonzero(is_img)[-1]) + 1:].float().mean(0),
                          head_p=torch.softmax(logits.float().flatten(), 0).reshape(logits.shape))
         return dict(wins=wins, ids=ids, mm=mm, pos3d=pos3d, rope_deltas=rope_deltas, P=P, blocks=blocks,
                     emb=embed(ids), lr_emb=lr_emb, img_pos=img_pos, W=W, H=H, box=row_box, **extra)
