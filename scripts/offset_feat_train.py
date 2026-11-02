@@ -272,8 +272,10 @@ def main():
                          "zS = the crop window scaled by S about its centre, same tokens (z0.5 = 2x zoom in)")
     ap.add_argument("--supersample", type=int, default=2,
                     help="pwarp / ldat: sample at this x the output resolution, then bicubic anti-aliased downsample")
-    ap.add_argument("--ldat_in", choices=["crop", "lr"], default="crop",
-                    help="ldat density-head input: the window crop's ViT tokens (gh x gw) / LM layer-8 LR cells")
+    ap.add_argument("--ldat_in", choices=["crop", "native", "lr"], default="crop",
+                    help="ldat density-head input: the window resized to the gh x gw output grid -> ViT / the "
+                         "window at native resolution -> ViT (<= --hr_cap tokens; density on that grid) / "
+                         "LM layer-8 LR cells")
     ap.add_argument("--ldat_win", choices=["dat", "crop"], default="dat",
                     help="ldat window: analytic DAT's adaptive window (--dat_k; zero residual ~= dat) / the crop's")
     ap.add_argument("--ldat_n", type=int, default=16, help="ldat --ldat_in lr: window cells per side")
@@ -464,13 +466,16 @@ def main():
         without a box); kl_only: (None, None, box KL), no image / ViT."""
         x0, y0, x1, y1 = w["lnbox"]
         gh, gw, s = w["gh"], w["gw"], max(args.supersample, 1)
-        nh, nw = (gh, gw) if args.ldat_in == "crop" else (args.ldat_n, args.ldat_n)
+        nh, nw = {"crop": (gh, gw), "native": tuple(w.get("lmap", w["crop"]).shape[-2:]),
+                  "lr": (args.ldat_n, args.ldat_n)}[args.ldat_in]
         uh = (torch.arange(nh, device=dev) + 0.5) / nh
         uw = (torch.arange(nw, device=dev) + 0.5) / nw
         gy, gx = torch.meshgrid((y0 + uh * (y1 - y0)) * 2 - 1, (x0 + uw * (x1 - x0)) * 2 - 1, indexing="ij")
         Gc = torch.stack([gx, gy], -1)[None]
         if args.ldat_in == "crop":
             f = w["lfeat"].t().reshape(1, -1, gh, gw).float()
+        elif args.ldat_in == "native":
+            f = w["lmap"]
         else:
             f = F.grid_sample(pr["lr_map"], Gc, mode="bilinear", padding_mode="border", align_corners=False)
         pw = F.grid_sample(pr["head_p"][None, None], Gc, mode="bilinear", padding_mode="border",
@@ -629,6 +634,10 @@ def main():
                     lcrop = image.crop(lpx)
                     ext["lfeat"] = vit_image(lcrop.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
                 lcw, lch = lcrop.size
+                if "ldat" in cfgs and args.ldat_in == "native":
+                    sc = math.sqrt(min(args.hr_cap * 1024, lcw * lch) / float(lcw * lch))
+                    nW, nH = max(32, int(lcw * sc) // 32 * 32), max(32, int(lch * sc) // 32 * 32)
+                    ext["lmap"] = vit_image(lcrop.resize((nW, nH), Image.BICUBIC)).permute(2, 0, 1)[None].float()
                 sw, sh = min(lcw, round(args.src_scale * gw * 32)), min(lch, round(args.src_scale * gh * 32))
                 ext["psrc"] = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32)
                                                / 255.0).permute(2, 0, 1).to(dev)
