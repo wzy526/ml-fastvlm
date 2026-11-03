@@ -43,8 +43,16 @@ ABSTRACT = {"image", "scene", "picture", "photo", "photograph", "background", "f
             "right", "side", "top", "bottom", "center", "centre", "middle", "area", "part", "front", "back",
             "distance", "setting", "atmosphere", "overall", "sense", "variety", "number", "lot", "group", "mix",
             "array", "row", "line", "edge", "corner", "space", "surface", "shot", "frame", "composition", "day",
-            "time", "light", "lighting", "sky", "ground", "floor", "wall", "road", "street", "water", "grass"}
+            "time", "light", "lighting", "sky", "ground", "floor", "wall", "road", "street", "water", "grass",
+            "season", "weather", "environment", "landscape", "style", "color", "colour", "shade", "mood",
+            "texture", "pattern", "design", "feel", "look", "appearance", "condition", "nature", "life"}
 PROMPT_TAIL = "Answer with the option's letter from the given choices directly."
+OBJECTS = ["person", "bicycle", "car", "motorcycle", "bus", "truck", "boat", "traffic light", "fire hydrant",
+           "stop sign", "bench", "bird", "cat", "dog", "horse", "backpack", "umbrella", "handbag", "suitcase",
+           "kite", "ball", "bottle", "cup", "chair", "potted plant", "clock", "vase", "flag", "sign", "lamp",
+           "street light", "trash can", "mailbox", "hat", "helmet", "glove", "shoe", "bag", "box", "basket",
+           "bucket", "tire", "window", "door", "balloon", "flower", "statue", "scooter", "cone", "barrel",
+           "phone", "camera", "book", "bowl", "plate", "kayak", "surfboard", "skateboard", "cart", "tent"]
 
 
 def noun_phrases(caption, k):
@@ -241,21 +249,27 @@ def build_shard(args):
             if min(bin(h ^ v).count("1") for v in vh) <= 8:
                 stats["skip_vstar"] += 1
                 continue
-        phrases = noun_phrases(str(conv[1].get("value", "")), args.max_phrases)
+        phrases = []
+        if args.vocab in ("caption", "both"):
+            phrases += noun_phrases(str(conv[1].get("value", "")), args.max_phrases)
+        if args.vocab in ("objects", "both"):
+            phrases += [o for o in OBJECTS if o not in phrases]
         if not phrases:
             stats["no_np"] += 1
             continue
+        chunks = [phrases[i:i + args.chunk] for i in range(0, len(phrases), args.chunk)]
         W, H = img.size
         dets = []
         for (x0, y0, x1, y1) in tiles_of(W, H, args.tile, 0.2):
             crop = img if (x0, y0, x1, y1) == (0, 0, W, H) else img.crop((x0, y0, x1, y1))
-            for sc, b, lab in detect(model, processor, crop, phrases, device, args.thr, args.text_thr):
-                stats["raw"] += 1
-                if len(stats["labels"]) < 12:
-                    stats["labels"].append(str(lab))
-                p = label_to_phrase(lab, phrases)
-                if p:
-                    dets.append((sc, [b[0] + x0, b[1] + y0, b[2] + x0, b[3] + y0], p))
+            for ch in chunks:
+                for sc, b, lab in detect(model, processor, crop, ch, device, args.thr, args.text_thr):
+                    stats["raw"] += 1
+                    if len(stats["labels"]) < 12:
+                        stats["labels"].append(str(lab))
+                    p = label_to_phrase(lab, ch)
+                    if p:
+                        dets.append((sc, [b[0] + x0, b[1] + y0, b[2] + x0, b[3] + y0], p))
         stats["mapped"] += len(dets)
         dets.sort(key=lambda d: -d[0])
         keep = []
@@ -268,11 +282,11 @@ def build_shard(args):
             per.setdefault(d[2], []).append(d)
         cands = []
         for p, ds in per.items():
-            if len(ds) != 1:
-                stats["multi"] += 1
-                continue
             if ds[0][0] < args.min_score:
                 stats["low"] += 1
+                continue
+            if any(d[0] >= args.unique_ratio * ds[0][0] for d in ds[1:]):
+                stats["multi"] += 1
                 continue
             b = ds[0][1]
             side_lr = max(b[2] - b[0], b[3] - b[1]) * s_lr
@@ -366,12 +380,19 @@ def main():
     ap.add_argument("--gdino", default="IDEA-Research/grounding-dino-base")
     ap.add_argument("--n_images", type=int, default=60000, help="images considered over all shards")
     ap.add_argument("--max_phrases", type=int, default=16)
-    ap.add_argument("--tile", type=int, default=800, help="also detect on tiles of this side (0 = whole only)")
+    ap.add_argument("--vocab", choices=["objects", "caption", "both"], default="objects",
+                    help="detector prompts: the built-in small-object list, the caption's noun phrases, or both")
+    ap.add_argument("--chunk", type=int, default=20, help="phrases per detector prompt")
+    ap.add_argument("--dup_frac", type=float, default=0.7,
+                    help="a phrase counts as unique if its 2nd detection scores < this x the top one")
+    ap.add_argument("--tile", type=int, default=1024, help="also detect on tiles of this side (0 = whole only)")
     ap.add_argument("--thr", type=float, default=0.3)
     ap.add_argument("--text_thr", type=float, default=0.25)
     ap.add_argument("--min_score", type=float, default=0.4)
     ap.add_argument("--min_lr_side", type=float, default=6.0)
     ap.add_argument("--max_lr_side", type=float, default=24.0, help="box side in px at the 640-token LR view")
+    ap.add_argument("--unique_ratio", type=float, default=0.7,
+                    help="a phrase is unambiguous when every other detection of it scores < this x the top one")
     ap.add_argument("--min_mask_iou", type=float, default=0.5)
     ap.add_argument("--color_frac", type=float, default=0.5)
     ap.add_argument("--relpos_sep", type=float, default=0.08, help="min |centre x| gap, image-width fraction")
