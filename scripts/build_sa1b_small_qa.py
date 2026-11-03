@@ -305,11 +305,20 @@ def build_shard(args):
         for p, b in cands:
             bb = [b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy]
             best, bi = None, 0.0
+            inner, ia = None, 0.0
+            barea = max((bb[2] - bb[0]) * (bb[3] - bb[1]), 1e-9)
             for a in ann.get("annotations", []):
                 x, y, w, h = a["bbox"]
-                v = iou(bb, [x, y, x + w, y + h])
+                mb = [x, y, x + w, y + h]
+                v = iou(bb, mb)
                 if v > bi:
                     best, bi = a, v
+                ix = max(0.0, min(bb[2], mb[2]) - max(bb[0], mb[0]))
+                iy = max(0.0, min(bb[3], mb[3]) - max(bb[1], mb[1]))
+                if ix * iy >= 0.9 * max(w * h, 1e-9) and w * h >= args.min_mask_cover * barea and w * h > ia:
+                    inner, ia = a, w * h
+            if (best is None or bi < args.min_mask_iou) and inner is not None:
+                best, bi = inner, args.min_mask_iou
             if best is None or bi < args.min_mask_iou:
                 stats["no_mask_match"] += 1
                 rows.append({"_target": (p, [b[0] / W, b[1] / H, b[2] / W, b[3] / H])})
@@ -393,6 +402,8 @@ def main():
     ap.add_argument("--unique_ratio", type=float, default=0.7,
                     help="a phrase is unambiguous when every other detection of it scores < this x the top one")
     ap.add_argument("--min_mask_iou", type=float, default=0.3)
+    ap.add_argument("--min_mask_cover", type=float, default=0.3,
+                    help="no IoU match: the largest mask >= 90%% inside the box covering >= this of the box")
     ap.add_argument("--color_frac", type=float, default=0.5)
     ap.add_argument("--relpos_sep", type=float, default=0.08, help="min |centre x| gap, image-width fraction")
     ap.add_argument("--shard", type=int, default=0)
