@@ -65,20 +65,21 @@
 
 <tbody>
 <tr class="grp"><td colspan="11">Controlled comparison (Qwen3.5-2B, our evaluation)</td></tr>
-<tr class="new"><td>Native (LR)</td><td>Qwen3.5-2B</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td>59.70<sup>c</sup></td><td>–</td><td>–</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td></tr>
+<tr class="new"><td>Native (LR)</td><td>Qwen3.5-2B</td><td>57.12</td><td>48.75</td><td>60.73</td><td>–</td><td>–</td><td>55.54</td><td>0.68<sup>c</sup></td><td class="tbd">TBD</td><td>1.34<sup>f</sup></td></tr>
 <tr class="new"><td>Native (HR)</td><td>Qwen3.5-2B</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td>–</td><td>–</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td></tr>
 <tr class="new"><td>SFT control (LR)</td><td>Qwen3.5-2B</td><td>58.13</td><td>52.63</td><td>64.40</td><td>–</td><td>–</td><td>58.39</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td></tr>
-<tr class="new ours"><td>MM-DAT (ours)</td><td>Qwen3.5-2B</td><td>68.50</td><td>60.75</td><td>78.01</td><td>–</td><td>–</td><td>69.09</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td></tr>
+<tr class="new ours"><td>MM-DAT (ours)</td><td>Qwen3.5-2B</td><td>68.50</td><td>60.75</td><td>78.01</td><td>–</td><td>–</td><td>69.09</td><td>1.07<sup>c</sup></td><td class="tbd">TBD</td><td>0.68<sup>f</sup></td></tr>
 <tr class="new pre"><td>MM-DAT, adaptive budget (r=1/2)<sup>d</sup></td><td>Qwen3.5-2B</td><td>71.50</td><td>63.75</td><td>74.87</td><td>–</td><td>–</td><td>70.04</td><td>1.43 / 2.29<sup>e</sup></td><td>–</td><td>–</td></tr>
 </tbody>
 </table>
 
 <div class="note">
-<p><sup>c</sup> Qwen3.5-2B official V* number; replaced by our own run once <code>native_lr</code> finishes.</p>
+<p><sup>c</sup> Mean prompt tokens per question (LR image + DAT tokens + text), averaged over HR-Bench 4K, 8K and V*.</p>
+<p><sup>f</sup> Per-question wall time on one GPU including generation, averaged over the 3 sets; the two rows were measured in different runs and are not yet a controlled latency comparison.</p>
 <p><sup>d</sup> Preliminary: per-window tokens = 1/2 of the window's native tokens (clamped to 100–1600), single window, evaluated with <code>offset_feat_train.py</code> (fixed 400 tokens in the same pipeline: 70.75 / 60.13 / 78.01).</p>
 <p><sup>e</sup> Mean prompt tokens (LR image + window + text) on HR-Bench 4K / 8K; 0.91k on V*.</p>
 <p>MME-RW-Lite not evaluated for the controlled rows (no evaluation pipeline yet). Avg.<sub>3</sub> = mean of HR-Bench 4K, 8K and V*.
-MM-DAT: 548/800, 486/800, 149/191. SFT control: 465/800, 421/800, 123/191.</p>
+Native (LR): 457/800, 390/800, 116/191. MM-DAT: 548/800, 486/800, 149/191. SFT control: 465/800, 421/800, 123/191.</p>
 </div>
 </body>
 </html>
