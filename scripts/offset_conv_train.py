@@ -136,8 +136,10 @@ def inbox(geo, srcx, srcy, box):
 
 
 def load_rows(path, image_root, cap, seed):
+    """path: one json or several, comma-separated (pooled, then shuffled). Rows with "mc": true keep the whole
+    prompt (question + options), the rest only the question's first line."""
     from where_head import question_of
-    data = json.load(open(os.path.expanduser(path)))
+    data = [s for p in str(path).split(",") if p for s in json.load(open(os.path.expanduser(p)))]
     random.Random(seed).shuffle(data)
     rows = []
     for s in data:
@@ -148,7 +150,8 @@ def load_rows(path, image_root, cap, seed):
         b = [float(v) for v in b]
         if not (b[2] > b[0] and b[3] > b[1] and max(b) <= 1.0):
             continue
-        q, a = question_of(s), str(conv[1].get("value", "")).strip()
+        q = str(conv[0].get("value", "")).replace("<image>", "").strip() if s.get("mc") else question_of(s)
+        a = str(conv[1].get("value", "")).strip()
         im = s.get("image")
         im = im[0] if isinstance(im, list) else im
         if not q or not a or not im:
