@@ -51,7 +51,7 @@ OBJECTS = ["person", "bicycle", "car", "motorcycle", "bus", "truck", "boat", "tr
            "stop sign", "bench", "bird", "cat", "dog", "horse", "backpack", "umbrella", "handbag", "suitcase",
            "kite", "ball", "bottle", "cup", "chair", "potted plant", "clock", "vase", "flag", "sign", "lamp",
            "street light", "trash can", "mailbox", "hat", "helmet", "glove", "shoe", "bag", "box", "basket",
-           "bucket", "tire", "window", "door", "balloon", "flower", "statue", "scooter", "cone", "barrel",
+           "bucket", "tire", "balloon", "flower", "statue", "scooter", "cone", "barrel",
            "phone", "camera", "book", "bowl", "plate", "kayak", "surfboard", "skateboard", "cart", "tent"]
 
 
@@ -312,6 +312,7 @@ def build_shard(args):
                     best, bi = a, v
             if best is None or bi < args.min_mask_iou:
                 stats["no_mask_match"] += 1
+                rows.append({"_target": (p, [b[0] / W, b[1] / H, b[2] / W, b[3] / H])})
                 continue
             x, y, w, h = best["bbox"]
             tb = [x / iw, y / ih, (x + w) / iw, (y + h) / ih]
@@ -386,12 +387,12 @@ def main():
     ap.add_argument("--tile", type=int, default=1024, help="also detect on tiles of this side (0 = whole only)")
     ap.add_argument("--thr", type=float, default=0.3)
     ap.add_argument("--text_thr", type=float, default=0.25)
-    ap.add_argument("--min_score", type=float, default=0.4)
+    ap.add_argument("--min_score", type=float, default=0.3)
     ap.add_argument("--min_lr_side", type=float, default=6.0)
-    ap.add_argument("--max_lr_side", type=float, default=24.0, help="box side in px at the 640-token LR view")
+    ap.add_argument("--max_lr_side", type=float, default=32.0, help="box side in px at the 640-token LR view")
     ap.add_argument("--unique_ratio", type=float, default=0.7,
                     help="a phrase is unambiguous when every other detection of it scores < this x the top one")
-    ap.add_argument("--min_mask_iou", type=float, default=0.5)
+    ap.add_argument("--min_mask_iou", type=float, default=0.3)
     ap.add_argument("--color_frac", type=float, default=0.5)
     ap.add_argument("--relpos_sep", type=float, default=0.08, help="min |centre x| gap, image-width fraction")
     ap.add_argument("--shard", type=int, default=0)
