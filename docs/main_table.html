@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Main table</title>
+<style>
+  body { font-family: "Times New Roman", serif; margin: 32px; color: #111; }
+  table { border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 3px 9px; text-align: center; white-space: nowrap; }
+  td:first-child, th:first-child, td:nth-child(2), th:nth-child(2) { text-align: left; }
+  thead tr:first-child th { border-top: 2px solid #000; }
+  thead tr:last-child th { border-bottom: 1px solid #000; }
+  .grp td { font-style: italic; text-align: left; border-top: 1px solid #000; padding-top: 5px; }
+  tbody:last-of-type tr:last-child td { border-bottom: 2px solid #000; }
+  .tbd { color: #b00; }
+  .new { background: #eef6ee; }
+  .pre td { color: #666; }
+  .ours td { font-weight: bold; }
+  .ul { border-bottom: 1px solid #000; }
+  .note { font-size: 12.5px; max-width: 980px; line-height: 1.45; margin-top: 12px; }
+</style>
+</head>
+<body>
+<table>
+<thead>
+<tr>
+  <th rowspan="2">Method</th><th rowspan="2">Backbone</th>
+  <th colspan="2" class="ul">HR-Bench</th><th rowspan="2">V*</th>
+  <th colspan="2" class="ul">MME-RW-Lite</th><th rowspan="2">Avg.<sub>3</sub></th>
+  <th>Tokens</th><th>FLOPs</th><th>Latency</th>
+</tr>
+<tr><th>4K</th><th>8K</th><th>P</th><th>R</th><th>V/G (k)</th><th>(T)</th><th>(s)</th></tr>
+</thead>
+
+<tbody>
+<tr class="grp"><td colspan="11">Training-free methods: results from the original papers</td></tr>
+<tr><td>RAP [34]</td><td>LLaVA-1.5-7B</td><td>57.10</td><td>53.80</td><td>91.10</td><td>–</td><td>–</td><td>67.33</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>ZoomEye [27]</td><td>Qwen2.5-VL-3B</td><td>70.13</td><td>68.38</td><td>89.01<sup>†</sup></td><td>–</td><td>–</td><td>75.84</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>FOCUS [48]</td><td>Qwen2.5-VL-7B</td><td>79.25</td><td>76.25</td><td>90.58</td><td>–</td><td>–</td><td>82.03</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>HEE [16]</td><td>Qwen2.5-VL-7B</td><td>73.90</td><td>71.10</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+</tbody>
+
+<tbody>
+<tr class="grp"><td colspan="11">Training-free methods: FOCUS evaluation [48]; OV denotes OneVision</td></tr>
+<tr><td>ViCrop (rel-att-high) [42]</td><td>LLaVA-1.5-7B</td><td>42.50</td><td>39.38</td><td>59.16</td><td>–</td><td>–</td><td>47.01</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>Native</td><td>LLaVA-OV-7B</td><td>–</td><td>–</td><td>–</td><td>52.01</td><td>40.93</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>ZoomEye [27]</td><td>LLaVA-OV-7B</td><td>–</td><td>–</td><td>–</td><td>56.29</td><td>43.20</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>FOCUS [48]</td><td>LLaVA-OV-7B</td><td>–</td><td>–</td><td>–</td><td>54.15</td><td>44.53</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+</tbody>
+
+<tbody>
+<tr class="grp"><td colspan="11">RL-based visual agents</td></tr>
+<tr><td>Mini-o3<sup>a</sup> [10]</td><td>Qwen2.5-VL-7B</td><td>77.50</td><td>73.30</td><td>88.20</td><td>–</td><td>–</td><td>79.67</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>DeepEyes<sup>b</sup> [47]</td><td>Qwen2.5-VL-7B</td><td>73.10</td><td>69.10</td><td>84.80</td><td>56.20</td><td>49.20</td><td>75.67</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>Pixel-Reasoner<sup>b</sup> [31]</td><td>Qwen2.5-VL-7B</td><td>70.10</td><td>68.50</td><td>79.60</td><td>51.10</td><td>45.80</td><td>72.73</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>CodeV-RL<sup>b</sup> [8]</td><td>Qwen2.5-VL-7B</td><td>76.10</td><td>71.30</td><td>84.80</td><td>56.30</td><td>47.20</td><td>77.40</td><td>–</td><td>–</td><td>–</td></tr>
+</tbody>
+
+<tbody>
+<tr class="grp"><td colspan="11">On-policy self-distillation</td></tr>
+<tr><td>Vision-OPD [41]</td><td>Qwen3.5-4B</td><td>84.50</td><td>80.38</td><td>92.15</td><td>–</td><td>–</td><td>85.68</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>Vision-OPD [41]</td><td>Qwen3.5-9B</td><td>88.13</td><td>85.50</td><td>94.76</td><td>–</td><td>–</td><td>89.46</td><td>–</td><td>–</td><td>–</td></tr>
+<tr><td>OPD-V [2]</td><td>Qwen3.5-4B</td><td>85.75</td><td>83.25</td><td>94.76</td><td>–</td><td>–</td><td>87.92</td><td>–</td><td>–</td><td>–</td></tr>
+</tbody>
+
+<tbody>
+<tr class="grp"><td colspan="11">Controlled comparison (Qwen3.5-2B, our evaluation)</td></tr>
+<tr class="new"><td>Native (LR)</td><td>Qwen3.5-2B</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td>59.70<sup>c</sup></td><td>–</td><td>–</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td></tr>
+<tr class="new"><td>Native (HR)</td><td>Qwen3.5-2B</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td>–</td><td>–</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td></tr>
+<tr class="new"><td>SFT control (LR)</td><td>Qwen3.5-2B</td><td>58.13</td><td>52.63</td><td>64.40</td><td>–</td><td>–</td><td>58.39</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td></tr>
+<tr class="new ours"><td>MM-DAT (ours)</td><td>Qwen3.5-2B</td><td>68.50</td><td>60.75</td><td>78.01</td><td>–</td><td>–</td><td>69.09</td><td class="tbd">TBD</td><td class="tbd">TBD</td><td class="tbd">TBD</td></tr>
+<tr class="new pre"><td>MM-DAT, adaptive budget (r=1/2)<sup>d</sup></td><td>Qwen3.5-2B</td><td>71.50</td><td>63.75</td><td>74.87</td><td>–</td><td>–</td><td>70.04</td><td>1.43 / 2.29<sup>e</sup></td><td>–</td><td>–</td></tr>
+</tbody>
+</table>
+
+<div class="note">
+<p><sup>c</sup> Qwen3.5-2B official V* number; replaced by our own run once <code>native_lr</code> finishes.</p>
+<p><sup>d</sup> Preliminary: per-window tokens = 1/2 of the window's native tokens (clamped to 100–1600), single window, evaluated with <code>offset_feat_train.py</code> (fixed 400 tokens in the same pipeline: 70.75 / 60.13 / 78.01).</p>
+<p><sup>e</sup> Mean prompt tokens (LR image + window + text) on HR-Bench 4K / 8K; 0.91k on V*.</p>
+<p>MME-RW-Lite not evaluated for the controlled rows (no evaluation pipeline yet). Avg.<sub>3</sub> = mean of HR-Bench 4K, 8K and V*.
+MM-DAT: 548/800, 486/800, 149/191. SFT control: 465/800, 421/800, 123/191.</p>
+</div>
+</body>
+</html>
