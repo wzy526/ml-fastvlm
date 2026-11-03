@@ -383,8 +383,6 @@ def main():
     ap.add_argument("--vocab", choices=["objects", "caption", "both"], default="objects",
                     help="detector prompts: the built-in small-object list, the caption's noun phrases, or both")
     ap.add_argument("--chunk", type=int, default=20, help="phrases per detector prompt")
-    ap.add_argument("--dup_frac", type=float, default=0.7,
-                    help="a phrase counts as unique if its 2nd detection scores < this x the top one")
     ap.add_argument("--tile", type=int, default=1024, help="also detect on tiles of this side (0 = whole only)")
     ap.add_argument("--thr", type=float, default=0.3)
     ap.add_argument("--text_thr", type=float, default=0.25)
