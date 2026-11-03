@@ -22,10 +22,13 @@ QA=$X/data/sa1b_small_qa.json
 # 0. data: smoke on 100 images, then 8 shards, then merge
 if [ ! -f "$QA" ]; then
   say "data smoke"
+  rm -rf "$L/smoke"
   CUDA_VISIBLE_DEVICES=0 python scripts/build_sa1b_small_qa.py --caption_json "$CAP" --n_images 100 \
     --out_dir "$L/smoke" > "$L/data_smoke.log" 2>&1
   if grep -q Traceback "$L/data_smoke.log"; then say "data smoke FAILED, see $L/data_smoke.log"; exit 1; fi
   say "data smoke: $(tail -n 1 "$L/data_smoke.log")"
+  n=$(cat "$L"/smoke/shard_*.jsonl 2>/dev/null | wc -l)
+  if [ "$n" -lt 5 ]; then say "data smoke made $n rows, stopping"; exit 1; fi
   say "data build ($N_IMAGES images)"
   for i in 0 1 2 3 4 5 6 7; do
     CUDA_VISIBLE_DEVICES=$i python scripts/build_sa1b_small_qa.py --caption_json "$CAP" --n_images $N_IMAGES \

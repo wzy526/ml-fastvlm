@@ -144,6 +144,15 @@ def iou(a, b):
     return inter / max((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter, 1e-9)
 
 
+def same_obj(a, b):
+    """Same detection seen from the whole image and from overlapping tiles: high IoU, or one box mostly inside
+    the other (a tile cuts the object)."""
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return iou(a, b) > 0.5 or ix * iy > 0.6 * max(small, 1e-9)
+
+
 def tiles_of(W, H, tile, overlap):
     if tile <= 0 or (W <= tile and H <= tile):
         return [(0, 0, W, H)]
@@ -208,7 +217,9 @@ def build_shard(args):
         for line in open(out_path):
             done.add(json.loads(line)["image"])
     fout = open(out_path, "a")
-    stats = {"img": 0, "skip_vstar": 0, "no_mask": 0, "no_np": 0, "targets": 0, "color": 0, "relpos": 0}
+    stats = {"img": 0, "skip_vstar": 0, "no_mask": 0, "no_np": 0, "raw": 0, "mapped": 0, "multi": 0, "low": 0,
+             "big": 0, "tiny": 0, "small": 0, "no_mask_match": 0, "targets": 0, "color": 0, "relpos": 0,
+             "labels": []}
     for n, s in enumerate(data):
         im = s.get("image")
         im = im[0] if isinstance(im, list) else im
@@ -239,13 +250,17 @@ def build_shard(args):
         for (x0, y0, x1, y1) in tiles_of(W, H, args.tile, 0.2):
             crop = img if (x0, y0, x1, y1) == (0, 0, W, H) else img.crop((x0, y0, x1, y1))
             for sc, b, lab in detect(model, processor, crop, phrases, device, args.thr, args.text_thr):
+                stats["raw"] += 1
+                if len(stats["labels"]) < 12:
+                    stats["labels"].append(str(lab))
                 p = label_to_phrase(lab, phrases)
                 if p:
                     dets.append((sc, [b[0] + x0, b[1] + y0, b[2] + x0, b[3] + y0], p))
+        stats["mapped"] += len(dets)
         dets.sort(key=lambda d: -d[0])
         keep = []
         for d in dets:
-            if all(not (d[2] == k[2] and iou(d[1], k[1]) > 0.5) for k in keep):
+            if all(not (d[2] == k[2] and same_obj(d[1], k[1])) for k in keep):
                 keep.append(d)
         s_lr = math.sqrt(min(1.0, LR_PIXELS / float(W * H)))
         per = {}
@@ -253,14 +268,21 @@ def build_shard(args):
             per.setdefault(d[2], []).append(d)
         cands = []
         for p, ds in per.items():
-            if len(ds) != 1 or ds[0][0] < args.min_score:
+            if len(ds) != 1:
+                stats["multi"] += 1
+                continue
+            if ds[0][0] < args.min_score:
+                stats["low"] += 1
                 continue
             b = ds[0][1]
             side_lr = max(b[2] - b[0], b[3] - b[1]) * s_lr
             if args.min_lr_side <= side_lr <= args.max_lr_side:
                 cands.append((p, b))
+            else:
+                stats["big" if side_lr > args.max_lr_side else "tiny"] += 1
         if not cands:
             continue
+        stats["small"] += len(cands)
         ann = json.load(open(side))
         iw, ih = ann.get("image", {}).get("width", W), ann.get("image", {}).get("height", H)
         sx, sy = iw / W, ih / H
@@ -275,6 +297,7 @@ def build_shard(args):
                 if v > bi:
                     best, bi = a, v
             if best is None or bi < args.min_mask_iou:
+                stats["no_mask_match"] += 1
                 continue
             x, y, w, h = best["bbox"]
             tb = [x / iw, y / ih, (x + w) / iw, (y + h) / ih]
