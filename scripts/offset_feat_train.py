@@ -298,6 +298,10 @@ def main():
                     help="weight of the answer CE in training; 0: logged only (ldat trains on the box KL alone)")
     ap.add_argument("--box_lambda", type=float, default=0.8,
                     help="ldat: box target = (1 - lambda) uniform + lambda uniform-in-box over the window cells")
+    ap.add_argument("--hinge_w", type=float, default=0.0,
+                    help="ldat: weight of the box hinge on the sample points (0 inside the GT box, L1 outside)")
+    ap.add_argument("--ctr_w", type=float, default=0.0,
+                    help="ldat: weight of the L2 of every sample point to the GT-box centre")
     ap.add_argument("--src_scale", type=float, default=2.0,
                     help="pwarp: the window is resized to this x the output resolution (capped at native) "
                          "and grid-sampled from there")
@@ -541,7 +545,7 @@ def main():
         (lx0, ly0, lx1, ly1), (cx0, cy0, cx1, cy1) = w["lpx"], w["px"]   # ldat window -> crop-window coords
         cy = (ly0 + inv_cdf(dy, (torch.arange(gh, device=dev) + 0.5) / gh) * (ly1 - ly0) - cy0) / (cy1 - cy0) * 2 - 1
         cx = (lx0 + inv_cdf(dx, (torch.arange(gw, device=dev) + 0.5) / gw) * (lx1 - lx0) - cx0) / (cx1 - cx0) * 2 - 1
-        py, px_ = torch.meshgrid(cy.detach(), cx.detach(), indexing="ij")
+        py, px_ = torch.meshgrid(cy, cx, indexing="ij")
         return z, torch.stack([px_, py], -1).float(), kl
 
     pool = []                             # image paths for composite backgrounds (filled with the train rows)
@@ -796,6 +800,25 @@ def main():
             mo += float(off.detach().abs().mean()) / len(pr["wins"])
         return zs, ps_, mo
 
+    def point_box(pr, pts):
+        """(hinge, centre L2) over the sample points, in crop-window-widths, differentiable.
+        hinge: 0 inside the GT box, L1 distance outside it; centre L2: squared distance of every point
+        to the box centre. (None, None) without a box."""
+        if pr["box"] is None or pts is None:
+            return None, None
+        b, W, H = pr["box"], pr["W"], pr["H"]
+        hs, cs, tot = [], [], 0.0
+        for w, P in zip(pr["wins"], pts):
+            px0, py0, px1, py1 = w["px"]
+            cw, ch = px1 - px0, py1 - py0
+            u = px0 + (P[..., 0] + 1) / 2 * cw
+            v = py0 + (P[..., 1] + 1) / 2 * ch
+            hs.append((F.relu(b[0] * W - u) + F.relu(u - b[2] * W)) / cw
+                      + (F.relu(b[1] * H - v) + F.relu(v - b[3] * H)) / ch)
+            cs.append(((u - (b[0] + b[2]) / 2 * W) / cw) ** 2 + ((v - (b[1] + b[3]) / 2 * H) / ch) ** 2)
+            tot += P[..., 0].numel()
+        return torch.cat([h.flatten() for h in hs]).sum() / tot, torch.cat([c.flatten() for c in cs]).sum() / tot
+
     def inbox(pr, pts):
         if pr["box"] is None or pts is None:
             return 0.0
@@ -939,7 +962,8 @@ def main():
         save_ckpt(os.path.expanduser(args.save))
     rng = random.Random(args.seed + 17 * rank)
     t0 = time.time()
-    run = torch.zeros(6, device=dev)      # n, loss, ref loss, box KL sum, n with a box, trust-region KL sum
+    run = torch.zeros(9, device=dev)      # n, loss, ref loss, box KL sum, n with a box, trust-region KL sum,
+                                          # hinge sum, centre-L2 sum, n with a point-box loss
     head_gn = 0.0
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
@@ -971,17 +995,23 @@ def main():
             kl = aux["kl"] if args.train_cfg == "ldat" else None
             tr = aux["tr"] if args.train_cfg == "ldat" else 0.0
             run[5] += float(tr)
+            hinge, ctr = point_box(pr, pz) if args.train_cfg == "ldat" and (args.hinge_w or args.ctr_w) else (None, None)
+            pt = (args.hinge_w * hinge if hinge is not None else 0.0) + (args.ctr_w * ctr if ctr is not None else 0.0)
             if args.ans_w > 0:
                 loss = answer_loss(pr, fz, pz)
-                total = args.ans_w * loss + (args.box_w * kl if kl is not None else 0.0) + args.tr_w * tr
+                total = args.ans_w * loss + (args.box_w * kl if kl is not None else 0.0) + args.tr_w * tr + pt
             else:
                 with torch.no_grad():
                     loss = answer_loss(pr, [z.detach() for z in fz], pz)
-                total = args.box_w * kl if kl is not None else None
+                total = (args.box_w * kl if kl is not None else 0.0) + pt or None
             if total is not None and total.requires_grad:
                 (total / args.accum).backward()
             run[3] += float(kl) if kl is not None else 0.0
             run[4] += float(kl is not None)
+            if hinge is not None:
+                run[6] += float(hinge.detach())
+                run[7] += float(ctr.detach())
+                run[8] += 1.0
             with torch.no_grad():
                 if loras:                                  # reference: the same input on the stock LM
                     set_lora(False)
@@ -1015,6 +1045,7 @@ def main():
             say(f"[oft] step {step}: train loss {args.train_cfg} {r[1] / n:.4f} {ref} {r[2] / n:.4f} "
                 f"(delta {(r[1] - r[2]) / n:+.4f})" + (f"  box KL {r[3] / max(float(r[4]), 1.0):.4f}" if r[4] > 0 else "") +
                 (f"  TR KL {r[5] / n:.4f}" if args.train_cfg == "ldat" else "") +
+                (f"  hinge {r[6] / max(float(r[8]), 1.0):.4f}  ctrL2 {r[7] / max(float(r[8]), 1.0):.4f}" if r[8] > 0 else "") +
                 f"  head grad {head_gn:.2e}  {(time.time() - t0) / step:.2f} s/step  "
                 f"skipped small-window {skips['small']} (rank 0)")
             run.zero_()
