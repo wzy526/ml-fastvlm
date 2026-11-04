@@ -131,6 +131,7 @@ def inv_cdf(d, u):
 
 
 LORA_TARGETS = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+DAT_VARIANT = re.compile(r"(dr|ob)([0-9.]+)(?:a([0-9.]+))?")   # dr8 / ob8a0.9: DAT, ratio 8 (alpha 0.9), where-head / GT-box density
 
 
 class LoRALinear(nn.Module):
@@ -269,7 +270,9 @@ def main():
                          "pixel crop / analytic pixel DAT / learned pixel warp")
     ap.add_argument("--cfgs", default="crop,fpool,fzero,net",
                     help="configs scored in held-out eval and accuracy mode (pixel run: crop,dat,pwarp); "
-                         "zS = the crop window scaled by S about its centre, same tokens (z0.5 = 2x zoom in)")
+                         "zS = the crop window scaled by S about its centre, same tokens (z0.5 = 2x zoom in); "
+                         "drR[aA] / obR[aA] = analytic DAT with ratio R (0: no floor), alpha A, density from the "
+                         "where-head / from the GT box (oracle; held-out rows need a box)")
     ap.add_argument("--supersample", type=int, default=2,
                     help="pwarp / ldat: sample at this x the output resolution, then bicubic anti-aliased downsample")
     ap.add_argument("--ldat_in", choices=["crop", "native", "lr"], default="crop",
@@ -411,9 +414,25 @@ def main():
         e = vit_pv(patchify(x), torch.tensor([[1, h, w]], device=dev))
         return e.reshape(h // ms, w // ms, -1)
 
-    def dat_window(image, win, box, logits, px, gh, gw):
+    def box_marginals(gt, win, alpha, ratio, G=64):
+        """Oracle DAT marginals: the GT box's overlap with each of G bins per axis instead of the
+        where-head p, then the same alpha mix / ratio floor as _wdat_marginals (ratio <= 1: none)."""
+        def axis(b0, b1, a0, a1):
+            v = [max(0.0, min(b1, a0 + (k + 1) / G * (a1 - a0)) - max(b0, a0 + k / G * (a1 - a0))) for k in range(G)]
+            tot = sum(v)
+            d = [(1.0 - alpha) / G + (alpha * x / tot if tot > 0 else alpha / G) for x in v]
+            if ratio and ratio > 1:
+                fl = max(d) / ratio
+                d = [max(x, fl) for x in d]
+            return d
+        return axis(gt[0], gt[2], win[0], win[2]), axis(gt[1], gt[3], win[1], win[3])
+
+    def dat_window(image, win, box, logits, px, gh, gw, ratio=None, alpha=None, gt=None):
         """Analytic DAT (= _where_dat_image, on this window's gh x gw grid) -> (merged tokens
-        (gh*gw, C), cell centres (gh, gw, 2) in the crop window's [-1, 1] coords)."""
+        (gh*gw, C), cell centres (gh, gw, 2) in the crop window's [-1, 1] coords).
+        ratio / alpha override --dat_ratio / --dat_alpha; gt (normalised box): oracle density, same window."""
+        ratio = args.dat_ratio if ratio is None else ratio
+        alpha = args.dat_alpha if alpha is None else alpha
         p = dat_mod._wdat_softmax(logits.float().tolist())
         if args.dat_k > 0:
             win = dat_mod._wdat_adaptive_window(p, box, win, args.dat_k)[0]
@@ -422,7 +441,9 @@ def main():
         x1 = min(max(int(math.ceil(win[2] * W)), x0 + 1), W)
         y1 = min(max(int(math.ceil(win[3] * H)), y0 + 1), H)
         cw, ch = x1 - x0, y1 - y0
-        dx, dy = dat_mod._wdat_marginals(p, (x0 / W, y0 / H, x1 / W, y1 / H), args.dat_alpha, args.dat_ratio)
+        nwin = (x0 / W, y0 / H, x1 / W, y1 / H)
+        dx, dy = box_marginals(gt, nwin, alpha, ratio) if gt is not None else \
+            dat_mod._wdat_marginals(p, nwin, alpha, ratio)
         xe = [x0 + e * cw for e in dat_mod._wdat_inv_cdf_edges(dx, gw)]
         ye = [y0 + e * ch for e in dat_mod._wdat_inv_cdf_edges(dy, gh)]
         out = Image.new("RGB", (gw * 32, gh * 32))
@@ -636,6 +657,15 @@ def main():
                 ext["half"] = vit_image(half).reshape(gh * gw, -1)
             if "dat" in cfgs:
                 ext["dat"], ext["dat_pts"] = dat_window(image, win, box, logits, (px0, py0, px1, py1), gh, gw)
+            for c in cfgs:
+                m = DAT_VARIANT.fullmatch(c)
+                if not m:
+                    continue
+                if m[1] == "ob" and row_box is None:
+                    return None
+                ext[c], ext[c + "_pts"] = dat_window(image, win, box, logits, (px0, py0, px1, py1), gh, gw,
+                                                     ratio=float(m[2]), alpha=float(m[3]) if m[3] else None,
+                                                     gt=row_box if m[1] == "ob" else None)
             if "pwarp" in cfgs or "ldat" in cfgs:
                 lpx, lcrop = (px0, py0, px1, py1), crop
                 if "ldat" in cfgs and args.ldat_win == "dat":
@@ -735,7 +765,7 @@ def main():
             return [w["dat"] for w in pr["wins"]], [w["dat_pts"] for w in pr["wins"]], 0.0
         if cfg == "half":
             return [w["half"] for w in pr["wins"]], [ref_grid(w["gh"], w["gw"], dev) for w in pr["wins"]], 0.0
-        if re.fullmatch(r"z[0-9.]+", cfg):
+        if re.fullmatch(r"z[0-9.]+", cfg) or DAT_VARIANT.fullmatch(cfg):
             return [w[cfg] for w in pr["wins"]], [w[cfg + "_pts"] for w in pr["wins"]], 0.0
         zs, ps_, mo = [], [], 0.0
         if cfg == "ldat":
@@ -862,6 +892,7 @@ def main():
         head.eval()
         # n, loss per cfg, (key better, key worse) vs each other cfg, inbox(key), |off|(key)
         acc = torch.zeros(1 + len(cfgs) + 2 * len(others) + 2, device=dev)
+        ibs = torch.zeros(len(cfgs), device=dev)                 # inbox per cfg
         for hi, row in enumerate(mine_held):
             try:
                 pr = prepare(row)
@@ -869,25 +900,28 @@ def main():
                 pr = None
             if pr is None:
                 continue
-            L, ib, mo = {}, 0.0, 0.0
+            L, IB, mo = {}, {}, 0.0
             with torch.no_grad():
                 for c in cfgs:
                     if (hi, c) in cache:
-                        L[c] = cache[(hi, c)]
+                        L[c], IB[c] = cache[(hi, c)]
                         continue
                     f, P, m = feats_for(pr, c)
-                    L[c] = float(answer_loss(pr, f, P))
+                    L[c], IB[c] = float(answer_loss(pr, f, P)), inbox(pr, P)
                     if c == key:
-                        ib, mo = inbox(pr, P), m
+                        mo = m
                     if not loras and c != learned:
-                        cache[(hi, c)] = L[c]
+                        cache[(hi, c)] = (L[c], IB[c])
             v = [1.0] + [L[c] for c in cfgs]
             for c in others:
                 v += [float(L[key] < L[c] - 1e-4), float(L[key] > L[c] + 1e-4)]
-            acc += torch.tensor(v + [ib, mo], device=dev)
+            acc += torch.tensor(v + [IB[key], mo], device=dev)
+            ibs += torch.tensor([IB[c] for c in cfgs], device=dev)
         if ddp:
             dist.all_reduce(acc)
+            dist.all_reduce(ibs)
         n = max(float(acc[0]), 1.0)
+        say("[oft] inbox per cfg: " + "  ".join(f"{c} {float(ibs[i]) / n:.3f}" for i, c in enumerate(cfgs)))
         msg = "  ".join(f"{c} {acc[1 + i] / n:.4f}" for i, c in enumerate(cfgs))
         cmp = "  ".join(f"{key} vs {c} {int(acc[1 + len(cfgs) + 2 * j])}/{int(acc[2 + len(cfgs) + 2 * j])} "
                         f"p={sign_p(int(acc[1 + len(cfgs) + 2 * j]), int(acc[2 + len(cfgs) + 2 * j])):.3f}"
