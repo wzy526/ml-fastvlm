@@ -323,6 +323,8 @@ def main():
     ap.add_argument("--lr_tok", type=int, default=640)
     ap.add_argument("--max_ans_tok", type=int, default=32)
     ap.add_argument("--eval_every", type=int, default=100)
+    ap.add_argument("--dump_pts", action="store_true",
+                    help="accuracy mode: also store each config's sample points (normalised image xy per window)")
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", default=None)
@@ -819,6 +821,13 @@ def main():
             tot += P[..., 0].numel()
         return torch.cat([h.flatten() for h in hs]).sum() / tot, torch.cat([c.flatten() for c in cs]).sum() / tot
 
+    def points_norm(w, P, W, H):
+        """Sample points -> normalised image coordinates [[x, y] ...] (the warp's real output)."""
+        px0, py0, px1, py1 = w["px"]
+        u = px0 + (P[..., 0] + 1) / 2 * (px1 - px0)
+        v = py0 + (P[..., 1] + 1) / 2 * (py1 - py0)
+        return [[round(float(x) / W, 5), round(float(y) / H, 5)] for x, y in zip(u.flatten(), v.flatten())]
+
     def inbox(pr, pts):
         if pr["box"] is None or pts is None:
             return 0.0
@@ -884,9 +893,12 @@ def main():
                     lg = run_lm(pr, feats, pts, prompt_only=True)[0, -1].float()
                     pred = letters[int(lg[lid].argmax())]
                     ok = pred == s["gt"]
-                    out[c].append({"i": gi, "pred": pred, "gt": s["gt"], "ok": bool(ok), "cat": s["category"],
-                                   "prompt": s["prompt"], "window": [list(w["px"]) for w in pr["wins"]],
-                                   "n_tokens": int(pr["P"]), "stats": {"off": mo}})
+                    rec = {"i": gi, "pred": pred, "gt": s["gt"], "ok": bool(ok), "cat": s["category"],
+                           "prompt": s["prompt"], "window": [list(w["px"]) for w in pr["wins"]],
+                           "n_tokens": int(pr["P"]), "stats": {"off": mo}}
+                    if args.dump_pts and pts is not None:
+                        rec["pts"] = [points_norm(w, P, pr["W"], pr["H"]) for w, P in zip(pr["wins"], pts)]
+                    out[c].append(rec)
                     line.append(f"{c}={pred}{'+' if ok else '-'}")
             print(f"[oft-eval] {gi} gt={s['gt']} " + " ".join(line), flush=True)
         if args.out:
