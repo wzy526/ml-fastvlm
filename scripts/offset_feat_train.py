@@ -119,6 +119,37 @@ class LDatHead(nn.Module):
         return self.out(self.conv(x))[0, 0]
 
 
+class WinScaleHead(nn.Module):
+    """Learned window scale on top of the analytic DAT window. Reads the where-head's log
+    probability map and outputs one multiplier in [0.6, 1.8] around the rule's window.
+    Zero-init, so step 0 reproduces the analytic window exactly."""
+
+    def __init__(self, d=64):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(2, d), nn.GELU(), nn.Linear(d, 1))
+        nn.init.uniform_(self.net[-1].weight, -1e-3, 1e-3)   # small, not zero: tanh at exactly 0 has no gradient
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, logits):
+        p = torch.softmax(logits.float().flatten(), 0)
+        g = -torch.sum(p * p.clamp_min(1e-12).log())                 # entropy: how spread the mass is
+        x = torch.stack([g, p.max()])
+        x = (x - x.mean()) / x.std().clamp_min(1e-6)
+        return 1.2 + 0.6 * torch.tanh(self.net(x)[0])                # (0.6, 1.8), 1.2 at init
+
+
+def scale_window(box, win, sigma):
+    """`win` resized by `sigma` about the head's top box centre, clamped to the image."""
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    w2, h2 = (win[2] - win[0]) / 2 * sigma, (win[3] - win[1]) / 2 * sigma
+    w2, h2 = torch.clamp(w2, max=0.5), torch.clamp(h2, max=0.5)
+    x0 = torch.clamp(cx - w2, min=0.0)
+    y0 = torch.clamp(cy - h2, min=0.0)
+    x0 = torch.where(x0 + 2 * w2 > 1, 1 - 2 * w2, x0)
+    y0 = torch.where(y0 + 2 * h2 > 1, 1 - 2 * h2, y0)
+    return x0, y0, x0 + 2 * w2, y0 + 2 * h2
+
+
 def inv_cdf(d, u):
     """d (G,) positive bin densities on [0, 1], u (N,) in [0, 1] -> F^-1(u) in [0, 1],
     piecewise linear, differentiable in d."""
@@ -283,6 +314,12 @@ def main():
                     help="ldat window: analytic DAT's adaptive window (--dat_k; zero residual ~= dat) / the crop's")
     ap.add_argument("--ldat_n", type=int, default=16, help="ldat --ldat_in lr: window cells per side")
     ap.add_argument("--ldat_d", type=int, default=256)
+    ap.add_argument("--win_scale", action="store_true",
+                    help="ldat: learn the window's scale factor (0.6-1.8 around the analytic window); "
+                         "zero-init, so step 0 is the analytic window")
+    ap.add_argument("--win_w", type=float, default=0.0,
+                    help="weight of the window hinge: 0 when the window covers the GT box, "
+                         "L1 shortfall outside it")
     ap.add_argument("--box_w", type=float, default=1.0, help="ldat: weight of the box KL on the density map")
     ap.add_argument("--tr_w", type=float, default=0.0,
                     help="ldat: weight of KL(learned density || analytic where-head density) on the window cells "
@@ -380,6 +417,7 @@ def main():
     else:
         head = OffsetHead(C, k=args.k, max_off=args.max_off, d=args.d, pool=args.pool, norm=args.norm,
                           in_ln=args.in_ln, conv_bias=not args.no_conv_bias, pw_std=args.pw_std).to(dev)
+    win_head = WinScaleHead().to(dev) if args.win_scale else None
     loras = add_lora(model, args.lora_r, args.lora_alpha) if args.lora_r > 0 else {}
     lora_params = [p for m in loras.values() for p in (m.lora_A, m.lora_B)]
 
@@ -390,10 +428,12 @@ def main():
     groups = [{"params": lora_params, "lr": args.lora_lr}] if lora_params else []
     if args.train_cfg in ("net", "pwarp", "ldat"):
         groups.append({"params": list(head.parameters()), "lr": args.lr})
+    if win_head is not None and args.train_cfg == "ldat":
+        groups.append({"params": list(win_head.parameters()), "lr": args.lr})
     trainable = [p for g in groups for p in g["params"]]
     if ddp:
         with torch.no_grad():
-            for p in list(head.parameters()) + lora_params:
+            for p in list(head.parameters()) + lora_params + (list(win_head.parameters()) if win_head is not None else []):
                 dist.broadcast(p.data, 0)
     torch.manual_seed(args.seed + rank)
     opt = torch.optim.AdamW(groups, weight_decay=0.0) if groups else None
@@ -679,6 +719,15 @@ def main():
                     if args.dat_k > 0:
                         lw = dat_mod._wdat_adaptive_window(dat_mod._wdat_softmax(logits.float().tolist()),
                                                            box, win, args.dat_k)[0]
+                    if win_head is not None:
+                        sg = win_head(logits)
+                        sx0, sy0, sx1, sy1 = scale_window(box, lw, sg / sg.detach() * float(sg))
+                        lw = (float(sx0), float(sy0), float(sx1), float(sy1))
+                        aux["sigma"] = float(sg.detach())
+                        if row_box is not None:
+                            bx = row_box
+                            aux["win_h"] = (F.relu(torch.as_tensor(bx[0]) - sx0) + F.relu(sx1 - bx[2])
+                                            + F.relu(torch.as_tensor(bx[1]) - sy0) + F.relu(sy1 - bx[3]))
                     lx0, ly0 = int(lw[0] * W), int(lw[1] * H)
                     lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * W)), lx0 + 1), W),
                            min(max(int(math.ceil(lw[3] * H)), ly0 + 1), H))
@@ -757,7 +806,7 @@ def main():
         lg = run_lm(pr, feats, pts)[0, pr["P"] - 1:-1].float()
         return F.cross_entropy(lg, pr["ids"][0, pr["P"]:])
 
-    aux = {"kl": None, "tr": 0.0, "tr_last": 0.0}   # ldat's box KL / trust-region KL, last feats_for(.., "ldat")
+    aux = {"kl": None, "tr": 0.0, "tr_last": 0.0, "win_h": None, "sigma": 0.0}   # ldat's box KL / trust-region KL / window hinge
 
     def feats_for(pr, cfg):
         """-> (list of (gh*gw, C) token blocks, list of window-local points, mean |off|).
@@ -843,11 +892,13 @@ def main():
         return hit / max(tot, 1.0)
 
     def save_ckpt(path):
-        if not loras:
+        extra = {"win_head": win_head.state_dict()} if win_head is not None else {}
+        if not loras and not extra:
             torch.save(head.state_dict(), path)
             return
         torch.save({"head": head.state_dict(), "train_cfg": args.train_cfg,
-                    "lora": {n: (m.lora_A.detach().cpu(), m.lora_B.detach().cpu()) for n, m in loras.items()}}, path)
+                    "lora": {n: (m.lora_A.detach().cpu(), m.lora_B.detach().cpu()) for n, m in loras.items()},
+                    **extra}, path)
 
     def load_ckpt(path):
         sd = torch.load(path, map_location="cpu")
@@ -855,6 +906,8 @@ def main():
             head.load_state_dict(sd)
             return
         head.load_state_dict(sd["head"])
+        if sd.get("win_head") and win_head is not None:
+            win_head.load_state_dict(sd["win_head"])
         if sd.get("lora"):
             if set(sd["lora"]) != set(loras):
                 raise SystemExit(f"--load has LoRA on {len(sd['lora'])} modules, this run {len(loras)}: pass --lora_r")
@@ -974,8 +1027,9 @@ def main():
         save_ckpt(os.path.expanduser(args.save))
     rng = random.Random(args.seed + 17 * rank)
     t0 = time.time()
-    run = torch.zeros(9, device=dev)      # n, loss, ref loss, box KL sum, n with a box, trust-region KL sum,
-                                          # hinge sum, centre-L2 sum, n with a point-box loss
+    run = torch.zeros(12, device=dev)     # n, loss, ref loss, box KL sum, n with a box, trust-region KL sum,
+                                          # hinge sum, centre-L2 sum, n with a point-box loss,
+                                          # window-hinge sum, n with a window hinge, scale sum
     head_gn = 0.0
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
@@ -1008,7 +1062,10 @@ def main():
             tr = aux["tr"] if args.train_cfg == "ldat" else 0.0
             run[5] += float(tr)
             hinge, ctr = point_box(pr, pz) if args.train_cfg == "ldat" and (args.hinge_w or args.ctr_w) else (None, None)
-            pt = (args.hinge_w * hinge if hinge is not None else 0.0) + (args.ctr_w * ctr if ctr is not None else 0.0)
+            wh = aux["win_h"] if args.train_cfg == "ldat" else None
+            pt = ((args.hinge_w * hinge if hinge is not None else 0.0)
+                  + (args.ctr_w * ctr if ctr is not None else 0.0)
+                  + (args.win_w * wh if wh is not None else 0.0))
             if args.ans_w > 0:
                 loss = answer_loss(pr, fz, pz)
                 total = args.ans_w * loss + (args.box_w * kl if kl is not None else 0.0) + args.tr_w * tr + pt
@@ -1024,6 +1081,10 @@ def main():
                 run[6] += float(hinge.detach())
                 run[7] += float(ctr.detach())
                 run[8] += 1.0
+            if wh is not None:
+                run[9] += float(wh.detach())
+                run[10] += 1.0
+                run[11] += aux["sigma"]
             with torch.no_grad():
                 if loras:                                  # reference: the same input on the stock LM
                     set_lora(False)
@@ -1058,6 +1119,7 @@ def main():
                 f"(delta {(r[1] - r[2]) / n:+.4f})" + (f"  box KL {r[3] / max(float(r[4]), 1.0):.4f}" if r[4] > 0 else "") +
                 (f"  TR KL {r[5] / n:.4f}" if args.train_cfg == "ldat" else "") +
                 (f"  hinge {r[6] / max(float(r[8]), 1.0):.4f}  ctrL2 {r[7] / max(float(r[8]), 1.0):.4f}" if r[8] > 0 else "") +
+                (f"  winH {r[9] / max(float(r[10]), 1.0):.4f}  scale {r[11] / max(float(r[10]), 1.0):.3f}" if r[10] > 0 else "") +
                 f"  head grad {head_gn:.2e}  {(time.time() - t0) / step:.2f} s/step  "
                 f"skipped small-window {skips['small']} (rank 0)")
             run.zero_()
