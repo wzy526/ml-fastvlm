@@ -318,8 +318,8 @@ def main():
                     help="ldat: learn the window's scale factor (0.6-1.8 around the analytic window); "
                          "zero-init, so step 0 is the analytic window")
     ap.add_argument("--win_w", type=float, default=0.0,
-                    help="weight of the window hinge: 0 when the window covers the GT box, "
-                         "L1 shortfall outside it")
+                    help="weight of the window loss: L1 between each window edge and the GT-box edge, "
+                         "so the scale is pulled toward the box size from both sides")
     ap.add_argument("--box_w", type=float, default=1.0, help="ldat: weight of the box KL on the density map")
     ap.add_argument("--tr_w", type=float, default=0.0,
                     help="ldat: weight of KL(learned density || analytic where-head density) on the window cells "
@@ -725,9 +725,9 @@ def main():
                         lw = (float(sx0), float(sy0), float(sx1), float(sy1))
                         aux["sigma"] = float(sg.detach())
                         if row_box is not None:
-                            bx = row_box
-                            aux["win_h"] = (F.relu(torch.as_tensor(bx[0]) - sx0) + F.relu(sx1 - bx[2])
-                                            + F.relu(torch.as_tensor(bx[1]) - sy0) + F.relu(sy1 - bx[3]))
+                            bx = [torch.as_tensor(v, dtype=sx0.dtype, device=sx0.device) for v in row_box]
+                            aux["win_h"] = ((sx0 - bx[0]).abs() + (sx1 - bx[2]).abs()
+                                            + (sy0 - bx[1]).abs() + (sy1 - bx[3]).abs())
                     lx0, ly0 = int(lw[0] * W), int(lw[1] * H)
                     lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * W)), lx0 + 1), W),
                            min(max(int(math.ceil(lw[3] * H)), ly0 + 1), H))
