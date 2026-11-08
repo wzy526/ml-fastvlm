@@ -120,22 +120,25 @@ class LDatHead(nn.Module):
 
 
 class WinScaleHead(nn.Module):
-    """Learned window scale on top of the analytic DAT window. Reads the where-head's log
-    probability map and outputs one multiplier in [0.6, 1.8] around the rule's window.
-    Zero-init, so step 0 reproduces the analytic window exactly."""
+    """Learned window scale on top of the analytic DAT window. Reads the whole where-head
+    probability map (resized to n x n, two conv layers), so a tight peak and a spread-out
+    map are distinguishable, and outputs one multiplier in [0.6, 1.8]. The last layer is
+    near-zero init, so step 0 stays at 1.2, i.e. the analytic window."""
 
-    def __init__(self, d=64):
+    def __init__(self, n=8, d=16):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(2, d), nn.GELU(), nn.Linear(d, 1))
-        nn.init.uniform_(self.net[-1].weight, -1e-3, 1e-3)   # small, not zero: tanh at exactly 0 has no gradient
-        nn.init.zeros_(self.net[-1].bias)
+        self.n = n
+        self.conv = nn.Sequential(nn.Conv2d(1, d, 3, padding=1), nn.GELU(),
+                                  nn.Conv2d(d, d, 3, padding=1), nn.GELU())
+        self.out = nn.Linear(d, 1)
+        nn.init.uniform_(self.out.weight, -1e-3, 1e-3)   # small, not zero: tanh at exactly 0 has no gradient
+        nn.init.zeros_(self.out.bias)
 
     def forward(self, logits):
-        p = torch.softmax(logits.float().flatten(), 0)
-        g = -torch.sum(p * p.clamp_min(1e-12).log())                 # entropy: how spread the mass is
-        x = torch.stack([g, p.max()])
-        x = (x - x.mean()) / x.std().clamp_min(1e-6)
-        return 1.2 + 0.6 * torch.tanh(self.net(x)[0])                # (0.6, 1.8), 1.2 at init
+        p = torch.softmax(logits.float().flatten(), 0).reshape(1, 1, *logits.shape[-2:])
+        x = F.interpolate(p, size=(self.n, self.n), mode="bilinear", align_corners=False)
+        h = self.conv(x).mean(dim=(-2, -1))
+        return 1.2 + 0.6 * torch.tanh(self.out(h)[0, 0])             # (0.6, 1.8), 1.2 at init
 
 
 def scale_window(box, win, sigma):
@@ -907,7 +910,11 @@ def main():
             return
         head.load_state_dict(sd["head"])
         if sd.get("win_head") and win_head is not None:
-            win_head.load_state_dict(sd["win_head"])
+            try:
+                win_head.load_state_dict(sd["win_head"])
+            except RuntimeError:
+                print("[oft] checkpoint's window head is the old 2-number one, training it from scratch",
+                      flush=True)
         if sd.get("lora"):
             if set(sd["lora"]) != set(loras):
                 raise SystemExit(f"--load has LoRA on {len(sd['lora'])} modules, this run {len(loras)}: pass --lora_r")
