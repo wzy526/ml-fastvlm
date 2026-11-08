@@ -1,0 +1,288 @@
+"""Answer one image with the finalized learnable sampler.
+
+Same path as scripts/offset_feat_train.py accuracy mode for ``ldat``:
+layer-8 where-head, analytic adaptive window, LDatHead on the window's
+native ViT map, inverse-CDF mosaic, global M-RoPE. No window-scale head.
+"""
+
+import math
+import os
+import sys
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+
+_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+
+import llava.model.language_model.modeling_qwen3_5_dat as dat_mod
+from offset_feat_train import LDatHead, global_positions, inv_cdf, nms_peaks
+from patch_sample_probe import crop_geometry
+
+
+class LDatRunner:
+    def __init__(
+        self,
+        model_path,
+        where_head_pt,
+        ldat_pt,
+        device,
+        crop_tok=640,
+        lr_tok=640,
+        dat_alpha=0.8,
+        dat_ratio=0.0,
+        dat_k=0.6,
+        src_scale=4.0,
+        supersample=2,
+        ldat_d=256,
+        hr_cap=4096,
+        where_layer=8,
+        attn="sdpa",
+    ):
+        self.crop_tok = int(crop_tok)
+        self.lr_tok = int(lr_tok)
+        self.dat_alpha = float(dat_alpha)
+        self.dat_ratio = float(dat_ratio)
+        self.dat_k = float(dat_k)
+        self.src_scale = float(src_scale)
+        self.supersample = int(supersample)
+        self.hr_cap = int(hr_cap)
+        self.where_layer = int(where_layer)
+        self.dev = device
+
+        from transformers import AutoProcessor
+
+        self.model = dat_mod.Qwen3_5DATForConditionalGeneration.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, device_map={"": device}, attn_implementation=attn
+        ).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self._load_where_head(os.path.expanduser(where_head_pt))
+
+        self.processor = AutoProcessor.from_pretrained(model_path, min_pixels=1024, max_pixels=self.lr_tok * 1024)
+        self.hr_processor = AutoProcessor.from_pretrained(model_path, min_pixels=1024, max_pixels=100_000_000)
+        self.tok = self.hr_processor.tokenizer
+        ip = self.hr_processor.image_processor
+        self.ps, self.tps, self.ms = ip.patch_size, ip.temporal_patch_size, ip.merge_size
+        self.mean = torch.tensor(ip.image_mean, device=device).view(3, 1, 1)
+        self.std = torch.tensor(ip.image_std, device=device).view(3, 1, 1)
+        self.image_id = self.model.config.image_token_id
+        c = self.model.config.text_config.hidden_size
+        self.embed = self.model.get_input_embeddings()
+        self.head = LDatHead(c, d=int(ldat_d)).to(device).eval()
+        self._load_ldat(os.path.expanduser(ldat_pt))
+        eos = set()
+        for v in (self.model.generation_config.eos_token_id, self.tok.eos_token_id,
+                  self.tok.convert_tokens_to_ids("<|im_end|>")):
+            if isinstance(v, (list, tuple)):
+                eos.update(int(x) for x in v if x is not None)
+            elif v is not None:
+                eos.add(int(v))
+        self.eos = eos
+        self.last_n_tokens = 0
+        w = float(self.head.out.weight.detach().abs().mean())
+        print(f"[ldat] crop_tok {self.crop_tok}  lr_tok {self.lr_tok}  alpha {self.dat_alpha}  "
+              f"ratio {self.dat_ratio}  head |w| {w:.3e}", flush=True)
+
+    def _load_where_head(self, path):
+        sd = torch.load(path, map_location="cpu")
+        sd = {k[len("where_head."):] if k.startswith("where_head.") else k: v for k, v in sd.items()}
+        if not hasattr(self.model, "where_head"):
+            hidden = self.model.config.text_config.hidden_size
+            self.model.where_head = dat_mod._WhereXAttnHead(hidden, hidden, d=384, layers=2, heads=6, max_hw=512)
+        self.model.where_head.load_state_dict(sd)
+        self.model.where_head.float().to(self.dev).eval()
+
+    def _load_ldat(self, path):
+        sd = torch.load(path, map_location="cpu")
+        state = sd["head"] if isinstance(sd, dict) and "head" in sd else sd
+        self.head.load_state_dict(state)
+        if isinstance(sd, dict) and sd.get("win_head"):
+            print("[ldat] checkpoint has a window head; this eval does not use it", flush=True)
+
+    def _patchify(self, x):
+        _, h, w = x.shape
+        x = ((x - self.mean) / self.std)[None].repeat(self.tps, 1, 1, 1)
+        gh, gw = h // self.ps, w // self.ps
+        x = x.reshape(1, self.tps, 3, gh // self.ms, self.ms, self.ps, gw // self.ms, self.ms, self.ps)
+        x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+        return x.reshape(gh * gw, 3 * self.tps * self.ps * self.ps)
+
+    def _vit(self, pv, thw):
+        e = self.model.model.visual(pv.to(torch.bfloat16), grid_thw=thw, return_dict=True).pooler_output
+        return torch.cat(list(e), 0) if isinstance(e, (list, tuple)) else e
+
+    def _vit_image(self, pil):
+        x = torch.from_numpy(np.asarray(pil, dtype=np.float32) / 255.0).permute(2, 0, 1).to(self.dev)
+        h, w = x.shape[1] // self.ps, x.shape[2] // self.ps
+        e = self._vit(self._patchify(x), torch.tensor([[1, h, w]], device=self.dev))
+        return e.reshape(h // self.ms, w // self.ms, -1)
+
+    def _axis_density(self, m, g=64):
+        m = F.interpolate(m[None, None], size=g, mode="linear", align_corners=False)[0, 0].clamp_min(0)
+        d = (1 - self.dat_alpha) / g + self.dat_alpha * m / m.sum().clamp_min(1e-8)
+        if self.dat_ratio > 1:
+            d = torch.maximum(d, d.max() / self.dat_ratio)
+        return d / d.sum()
+
+    def _ldat_tokens(self, w):
+        """Window features + where-head log p -> mosaic tokens and global-PE points."""
+        x0, y0, x1, y1 = w["lnbox"]
+        gh, gw, s = w["gh"], w["gw"], max(self.supersample, 1)
+        nh, nw = w["lmap"].shape[-2:]
+        uh = (torch.arange(nh, device=self.dev) + 0.5) / nh
+        uw = (torch.arange(nw, device=self.dev) + 0.5) / nw
+        gy, gx = torch.meshgrid((y0 + uh * (y1 - y0)) * 2 - 1, (x0 + uw * (x1 - x0)) * 2 - 1, indexing="ij")
+        gc = torch.stack([gx, gy], -1)[None]
+        f = w["lmap"]
+        pw = F.grid_sample(w["head_p"][None, None], gc, mode="bilinear", padding_mode="border",
+                           align_corners=False)[0, 0].clamp_min(1e-8)
+        lp = pw.log()
+        q = torch.softmax((lp + self.head(f, lp)).flatten(), 0).reshape(nh, nw)
+        dx, dy = self._axis_density(q.sum(0)), self._axis_density(q.sum(1))
+        ux = (torch.arange(gw * 32 * s, device=self.dev) + 0.5) / (gw * 32 * s)
+        uy = (torch.arange(gh * 32 * s, device=self.dev) + 0.5) / (gh * 32 * s)
+        sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
+        img = F.grid_sample(w["psrc"][None], torch.stack([sx, sy], -1)[None], mode="bilinear",
+                            padding_mode="border", align_corners=False)
+        if img.shape[-2:] != (gh * 32, gw * 32):
+            img = F.interpolate(img, size=(gh * 32, gw * 32), mode="bicubic", antialias=True, align_corners=False)
+        img = img[0].clamp(0, 1)
+        z = self._vit(self._patchify(img), torch.tensor([[1, gh * 32 // self.ps, gw * 32 // self.ps]], device=self.dev))
+        z = z.reshape(gh * gw, -1)
+        lx0, ly0, lx1, ly1 = w["lpx"]
+        cx0, cy0, cx1, cy1 = w["px"]
+        cy = (ly0 + inv_cdf(dy, (torch.arange(gh, device=self.dev) + 0.5) / gh) * (ly1 - ly0) - cy0) / (cy1 - cy0) * 2 - 1
+        cx = (lx0 + inv_cdf(dx, (torch.arange(gw, device=self.dev) + 0.5) / gw) * (lx1 - lx0) - cx0) / (cx1 - cx0) * 2 - 1
+        py, px_ = torch.meshgrid(cy, cx, indexing="ij")
+        return z, torch.stack([px_, py], -1).float()
+
+    @torch.inference_mode()
+    def prepare(self, image, question):
+        image = image.convert("RGB")
+        w_img, h_img = image.size
+        dev = self.dev
+        thw = self.processor.image_processor(images=[image], return_tensors="pt")["image_grid_thw"][0]
+        lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
+        msgs = [{"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": [{"type": "image", "image": lr_img},
+                                             {"type": "text", "text": question},
+                                             {"type": "text", "text": dat_mod.WHERE_HINT}]}]
+        text = self.processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False)
+        text = text.rstrip()
+        if text.endswith("<|im_end|>"):
+            text = text[:-len("<|im_end|>")]
+        inp = self.processor(text=[text], images=[lr_img], return_tensors="pt")
+        inp = {k: v.to(dev) for k, v in inp.items() if torch.is_tensor(v)}
+        inp["pixel_values"] = inp["pixel_values"].to(torch.bfloat16)
+        out = self.model(**inp, output_hidden_states=True, return_dict=True, use_cache=False)
+        ids = inp["input_ids"][0]
+        is_img = ids == self.image_id
+        gh_l, gw_l = int(thw[1]) // 2, int(thw[2]) // 2
+        hs = out.hidden_states[self.where_layer][0]
+        cells = hs[is_img]
+        if cells.shape[0] != gh_l * gw_l:
+            print(f"[ldat] where-head grid {cells.shape[0]} != {gh_l}x{gw_l}", flush=True)
+            return None
+        logits = self.model.where_head(cells.reshape(gh_l, gw_l, -1), hs[int(torch.nonzero(is_img)[-1]) + 1:])
+        head_p = torch.softmax(logits.float().flatten(), 0).reshape(logits.shape)
+        hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600)
+        peaks = nms_peaks(logits, 1, 4, 0.0)
+        if not peaks:
+            return None
+        cy, cx = peaks[0]
+        box = ((cx + 0.5 - 2) / gw_l, (cy + 0.5 - 2) / gh_l, (cx + 0.5 + 2) / gw_l, (cy + 0.5 + 2) / gh_l)
+        win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h)
+        px0, py0, px1, py1, gh, gw = crop_geometry(image, win, self.crop_tok)
+        p = dat_mod._wdat_softmax(logits.float().tolist())
+        lw = win
+        if self.dat_k > 0:
+            lw = dat_mod._wdat_adaptive_window(p, box, win, self.dat_k)[0]
+        lx0, ly0 = int(lw[0] * w_img), int(lw[1] * h_img)
+        lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * w_img)), lx0 + 1), w_img),
+               min(max(int(math.ceil(lw[3] * h_img)), ly0 + 1), h_img))
+        lcrop = image.crop(lpx)
+        lcw, lch = lcrop.size
+        sc = math.sqrt(min(self.hr_cap * 1024, lcw * lch) / float(lcw * lch))
+        nw, nh = max(32, int(lcw * sc) // 32 * 32), max(32, int(lch * sc) // 32 * 32)
+        lmap = self._vit_image(lcrop.resize((nw, nh), Image.BICUBIC)).permute(2, 0, 1)[None].float()
+        sw = min(lcw, round(self.src_scale * gw * 32))
+        sh = min(lch, round(self.src_scale * gh * 32))
+        psrc = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32) / 255.0)
+        psrc = psrc.permute(2, 0, 1).to(dev)
+        win_rec = dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, lpx=lpx,
+                       lnbox=(lpx[0] / w_img, lpx[1] / h_img, lpx[2] / w_img, lpx[3] / h_img),
+                       lmap=lmap, psrc=psrc, head_p=head_p)
+        feats, pts = self._ldat_tokens(win_rec)
+
+        dummy = Image.new("RGB", (gw * 32, gh * 32))
+        qd = {"type": "text", "text": question}
+        content = [{"type": "image", "image": lr_img}, qd, {"type": "text", "text": dat_mod.WHERE_HINT},
+                   {"type": "image", "image": dummy}, dict(qd)]
+        amsgs = [{"role": "system", "content": "You are a helpful assistant."},
+                 {"role": "user", "content": content}]
+        atext = self.hr_processor.apply_chat_template(
+            amsgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        enc = self.hr_processor(text=[atext], images=[lr_img, dummy], return_tensors="pt")
+        thw2 = enc["image_grid_thw"].to(dev)
+        if tuple(thw2[1].tolist()) != (1, 2 * gh, 2 * gw):
+            print(f"[ldat] mosaic grid {tuple(thw2[1].tolist())} != {(1, 2 * gh, 2 * gw)}", flush=True)
+            return None
+        ids = enc["input_ids"][0].to(dev)
+        mm = torch.zeros_like(ids)
+        mm[ids == self.image_id] = 1
+        pos3d, rope_deltas = self.model.model.get_rope_index(ids[None], mm[None], image_grid_thw=thw2)
+        pos3d = pos3d.to(dev)
+        n_lr = int(torch.prod(thw2[0]))
+        lr_emb = self._vit(enc["pixel_values"][:n_lr].to(dev).to(torch.bfloat16), thw2[:1])
+        img_pos = torch.nonzero(ids == self.image_id).flatten()
+        if img_pos.numel() != lr_emb.shape[0] + gh * gw:
+            print(f"[ldat] image tokens {img_pos.numel()} != {lr_emb.shape[0]}+{gh * gw}", flush=True)
+            return None
+        blocks = dat_mod._where_token_runs(ids, self.image_id)[1:]
+        if len(blocks) != 1 or blocks[0][1] - blocks[0][0] != gh * gw:
+            print("[ldat] window token run does not match the mosaic", flush=True)
+            return None
+        emb = self.embed(ids[None])
+        return dict(ids=ids, mm=mm[None], pos3d=pos3d, rope_deltas=rope_deltas, emb=emb,
+                    lr_emb=lr_emb, img_pos=img_pos, blocks=blocks, wins=[win_rec],
+                    feats=feats, pts=pts, n_tokens=int(ids.shape[0]))
+
+    @torch.inference_mode()
+    def generate(self, image, question, max_new_tokens):
+        pr = self.prepare(image, question)
+        if pr is None:
+            return ""
+        self.last_n_tokens = int(pr["n_tokens"])
+        dev = self.dev
+        e = pr["emb"].clone()
+        e[0, pr["img_pos"]] = torch.cat([pr["lr_emb"], pr["feats"]], 0).to(e.dtype)
+        pos = global_positions(pr["pos3d"], pr["blocks"], pr["wins"], [pr["pts"]])
+        self.model.model.rope_deltas = pr["rope_deltas"]
+        n = e.shape[1]
+        o = self.model(inputs_embeds=e, position_ids=pos, mm_token_type_ids=pr["mm"],
+                       cache_position=torch.arange(n, device=dev),
+                       use_cache=True, return_dict=True, logits_to_keep=1)
+        cache = o.past_key_values
+        next_pos = int(math.floor(float(pos.max()))) + 1
+        tok = int(o.logits[0, -1].argmax())
+        toks = []
+        limit = max(int(max_new_tokens), 1)
+        for k in range(limit):
+            if tok in self.eos:
+                break
+            toks.append(tok)
+            if k == limit - 1:
+                break
+            o = self.model(input_ids=torch.tensor([[tok]], device=dev),
+                           position_ids=torch.full((3, 1, 1), next_pos + k, device=dev, dtype=torch.long),
+                           past_key_values=cache,
+                           cache_position=torch.tensor([n + k], device=dev),
+                           use_cache=True, return_dict=True)
+            cache = o.past_key_values
+            tok = int(o.logits[0, -1].argmax())
+        return self.tok.decode(toks, skip_special_tokens=True).strip()
