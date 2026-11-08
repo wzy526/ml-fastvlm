@@ -1041,6 +1041,7 @@ def main():
     for step in range(1, args.steps + 1):
         opt.zero_grad(set_to_none=True)
         n_ok = 0
+        sc = torch.zeros(2, device=dev)                  # scale sum, count, this step only
         for _ in range(args.accum):
             pr = None
             for _try in range(40):
@@ -1092,6 +1093,8 @@ def main():
                 run[9] += float(wh.detach())
                 run[10] += 1.0
                 run[11] += aux["sigma"]
+                sc[0] += aux["sigma"]
+                sc[1] += 1.0
             with torch.no_grad():
                 if loras:                                  # reference: the same input on the stock LM
                     set_lora(False)
@@ -1116,6 +1119,11 @@ def main():
             head_gn = float(torch.norm(torch.stack([g.norm() for g in hg]))) if hg else 0.0
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt.step()
+        if win_head is not None:
+            if ddp:
+                dist.all_reduce(sc)
+            if float(sc[1]) > 0:
+                say(f"[oft] step {step}: scale {float(sc[0]) / float(sc[1]):.4f}")
         if step % 10 == 0:
             r = run.clone()
             if ddp:
