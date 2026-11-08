@@ -734,14 +734,15 @@ def main():
                         lw = dat_mod._wdat_adaptive_window(dat_mod._wdat_softmax(logits.float().tolist()),
                                                            box, win, args.dat_k)[0]
                     if win_head is not None:
-                        sg = win_head(logits)
-                        sx0, sy0, sx1, sy1 = scale_window(box, lw, sg / sg.detach() * float(sg))
+                        with torch.enable_grad():       # prepare() is no_grad; the scale head still needs a graph
+                            sg = win_head(logits.detach())
+                            sx0, sy0, sx1, sy1 = scale_window(box, lw, sg / sg.detach() * float(sg))
+                            if row_box is not None:
+                                bx = [torch.as_tensor(float(v), dtype=sx0.dtype, device=sx0.device) for v in row_box]
+                                aux["win_h"] = ((sx0 - bx[0]).abs() + (sx1 - bx[2]).abs()
+                                                + (sy0 - bx[1]).abs() + (sy1 - bx[3]).abs())
                         lw = (float(sx0), float(sy0), float(sx1), float(sy1))
                         aux["sigma"] = float(sg.detach())
-                        if row_box is not None:
-                            bx = [torch.as_tensor(v, dtype=sx0.dtype, device=sx0.device) for v in row_box]
-                            aux["win_h"] = ((sx0 - bx[0]).abs() + (sx1 - bx[2]).abs()
-                                            + (sy0 - bx[1]).abs() + (sy1 - bx[3]).abs())
                     lx0, ly0 = int(lw[0] * W), int(lw[1] * H)
                     lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * W)), lx0 + 1), W),
                            min(max(int(math.ceil(lw[3] * H)), ly0 + 1), H))
@@ -941,6 +942,8 @@ def main():
         if args.load:
             load_ckpt(os.path.expanduser(args.load))
         head.eval()
+        if win_head is not None:
+            win_head.eval()
         samples = load_samples(argparse.Namespace(dataset=args.eval_dataset, vstar_root=args.vstar_root,
                                                   hrbench_parquet=args.hrbench_parquet, image_folder=None,
                                                   max_samples=args.max_samples))
@@ -996,6 +999,8 @@ def main():
 
     def evaluate(step):
         head.eval()
+        if win_head is not None:
+            win_head.eval()
         # n, loss per cfg, (key better, key worse) vs each other cfg, inbox(key), |off|(key)
         acc = torch.zeros(1 + len(cfgs) + 2 * len(others) + 2, device=dev)
         ibs = torch.zeros(len(cfgs), device=dev)                 # inbox per cfg
@@ -1036,6 +1041,8 @@ def main():
         say(f"[oft] EVAL step {step}: n={int(acc[0])}  loss {msg}  |  {cmp}  inbox {key} {acc[-2] / n:.3f}  "
             f"{last} {acc[-1] / n:.3f}")
         head.train()
+        if win_head is not None:
+            win_head.train()
         return float(acc[1 + cfgs.index(key)] / n) if key in cfgs else 0.0
 
     if args.load:
