@@ -141,13 +141,24 @@ class WinScaleHead(nn.Module):
         return 1.2 + 0.6 * torch.tanh(self.out(h)[0, 0])             # (0.6, 1.8), 1.2 at init
 
 
+def _ste_clamp(v, lo=None, hi=None):
+    """Clamp in the forward pass, but pass the gradient through unchanged: a window already
+    sitting on the image border would otherwise get zero gradient and the scale could not move."""
+    c = v
+    if lo is not None:
+        c = torch.clamp(c, min=lo)
+    if hi is not None:
+        c = torch.clamp(c, max=hi)
+    return v + (c - v).detach()
+
+
 def scale_window(box, win, sigma):
     """`win` resized by `sigma` about the head's top box centre, clamped to the image."""
     cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
     w2, h2 = (win[2] - win[0]) / 2 * sigma, (win[3] - win[1]) / 2 * sigma
-    w2, h2 = torch.clamp(w2, max=0.5), torch.clamp(h2, max=0.5)
-    x0 = torch.clamp(cx - w2, min=0.0)
-    y0 = torch.clamp(cy - h2, min=0.0)
+    w2, h2 = _ste_clamp(w2, hi=0.5), _ste_clamp(h2, hi=0.5)
+    x0 = _ste_clamp(cx - w2, lo=0.0)
+    y0 = _ste_clamp(cy - h2, lo=0.0)
     x0 = torch.where(x0 + 2 * w2 > 1, 1 - 2 * w2, x0)
     y0 = torch.where(y0 + 2 * h2 > 1, 1 - 2 * h2, y0)
     return x0, y0, x0 + 2 * w2, y0 + 2 * h2
