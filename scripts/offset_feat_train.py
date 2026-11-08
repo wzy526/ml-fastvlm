@@ -1117,13 +1117,17 @@ def main():
                     p.grad /= max(float(cnt) / args.accum, 1.0)
             hg = [p.grad for p in head.parameters() if p.grad is not None]
             head_gn = float(torch.norm(torch.stack([g.norm() for g in hg]))) if hg else 0.0
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            win_params = list(win_head.parameters()) if win_head is not None else []
+            win_ids = {id(p) for p in win_params}
+            torch.nn.utils.clip_grad_norm_([p for p in trainable if id(p) not in win_ids], 1.0)
+            if win_params:
+                torch.nn.utils.clip_grad_norm_(win_params, 1.0)
             opt.step()
         if win_head is not None:
             if ddp:
                 dist.all_reduce(sc)
             if float(sc[1]) > 0:
-                say(f"[oft] step {step}: scale {float(sc[0]) / float(sc[1]):.4f}")
+                say(f"[oft] step {step}: scale {float(sc[0]) / float(sc[1]):.6f}")
         if step % 10 == 0:
             r = run.clone()
             if ddp:
