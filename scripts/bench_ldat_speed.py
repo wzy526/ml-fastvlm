@@ -1,14 +1,14 @@
 #!/usr/bin/env python
-"""Speed of the finalized learnable sampler. One GPU.
+"""Speed of the finalized sampler, and of native Qwen3.5-2B. One GPU.
 
-LR tokens follow the accuracy sweep: 640 1280 2560 6400. The window budget
-stays at 400. Prefill is everything through the first token (where-head,
-window mosaic, LR ViT, LM prefill). Decode is the next fixed number of
-tokens; end-of-sequence does not stop the loop, so every sample has the
-same decode length.
+Token budgets follow the accuracy sweep: 640 1280 2560 6400. The sampler
+keeps its window at 400. The base model has no window: the same numbers are
+the single image's visual-token budget. Prefill is everything through the
+first token. Decode is the next fixed number of tokens; end-of-sequence
+does not stop the loop, so every sample has the same decode length.
 
-Each LR size is warmed up before it is timed. The warmup runs are not
-recorded. Shapes change with the LR size, so the warmup is per size.
+Each budget is warmed up before it is timed. The warmup runs are not
+recorded. Shapes change with the budget, so the warmup is per budget.
 
     python -u scripts/bench_ldat_speed.py \
         --model_path $E/checkpoint-1000 \
@@ -172,19 +172,74 @@ def _stat(xs):
     return float(a.mean()), float(np.median(a))
 
 
-def run_point(runner, samples, lr_tok, args):
-    set_lr_tok(runner, args.model_path, lr_tok)
+@torch.inference_mode()
+def time_base(model, processor, image, question, decode_len, device):
+    """Processor plus the first forward, then exactly decode_len more forwards.
+
+    ViT runs inside the first forward. Decode goes through the model's own
+    prepare_inputs_for_generation so the RoPE cache matches generate().
+    """
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    messages = [{"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": [{"type": "image", "image": image},
+                                             {"type": "text", "text": question}]}]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    enc = processor(text=[text], images=[image], return_tensors="pt")
+    moved = {}
+    for k, v in enc.items():
+        if not torch.is_tensor(v):
+            continue
+        moved[k] = v.to(device=device, dtype=torch.bfloat16) if k == "pixel_values" else v.to(device)
+    torch.cuda.synchronize()
+    t_prep = time.perf_counter()
+    out = model(**moved, use_cache=True, return_dict=True, logits_to_keep=1)
+    torch.cuda.synchronize()
+    t_pre = time.perf_counter()
+    cache = out.past_key_values
+    tok = int(out.logits[0, -1].argmax())
+    input_ids = moved["input_ids"]
+    attention = moved.get("attention_mask")
+    for _ in range(int(decode_len)):
+        input_ids = torch.cat([input_ids, input_ids.new_tensor([[tok]])], dim=1)
+        if attention is not None:
+            attention = torch.cat([attention, attention.new_ones((attention.shape[0], 1))], dim=1)
+        cache_position = torch.tensor([input_ids.shape[1] - 1], device=device)
+        step = model.prepare_inputs_for_generation(
+            input_ids, past_key_values=cache, attention_mask=attention,
+            cache_position=cache_position, use_cache=True, is_first_iteration=False)
+        out = model(**step, return_dict=True, logits_to_keep=1)
+        cache = out.past_key_values
+        tok = int(out.logits[0, -1].argmax())
+    torch.cuda.synchronize()
+    t_dec = time.perf_counter()
+    thw = moved["image_grid_thw"][0]
+    merge = int(getattr(processor.image_processor, "merge_size", 2))
+    vis = int(thw[1]) // merge * (int(thw[2]) // merge)
+    return {
+        "prepare_ms": (t_prep - t0) * 1000.0,
+        "lm_prefill_ms": (t_pre - t_prep) * 1000.0,
+        "prefill_ms": (t_pre - t0) * 1000.0,
+        "decode_ms": (t_dec - t_pre) * 1000.0,
+        "prompt_tokens": int(input_ids.shape[1] - decode_len),
+        "lr_tokens": vis,
+        "win_tokens": 0,
+    }
+
+
+def run_point(step, samples, lr_tok, args):
     warm = samples[:max(args.warmup, 1)]
     print(f"[speed] lr={lr_tok} warmup x{len(warm)}", flush=True)
     for s in warm:
-        time_one(runner, s["image"], s["question"], args.decode_len)
+        step(s)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
     rows = []
     for i, s in enumerate(samples):
-        rec = time_one(runner, s["image"], s["question"], args.decode_len)
+        rec = step(s)
         if rec is None:
             print(f"[speed] lr={lr_tok} sample {i} prepare failed", flush=True)
             continue
@@ -228,7 +283,8 @@ def main():
     e = os.environ.get("E", os.path.expanduser("~/vldat_experiments/0924_miniE1_2k"))
     x = os.environ.get("X", "/data/oss_bucket_0/wangziyi/vldat_experiments/sa1b_ldat")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_path", default=os.path.join(e, "checkpoint-1000"))
+    ap.add_argument("--model", choices=["ldat", "base"], default="ldat")
+    ap.add_argument("--model_path", default=None)
     ap.add_argument("--where_head_pt", default=os.path.join(e, "loc", "where_lm8_ce20.pt"))
     ap.add_argument("--ldat_pt", default=os.path.join(x, "hinge_noratio_ldat.pt"))
     ap.add_argument("--tokens", type=int, nargs="+", default=[640, 1280, 2560, 6400])
@@ -241,22 +297,51 @@ def main():
     ap.add_argument("--image_folder", default=None)
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--out", default=os.path.join(x, "speed_ldat", "speed.json"))
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    if args.model == "base":
+        args.model_path = args.model_path or "/data/oss_bucket_0/wangziyi/official_ckpt/Qwen3.5-2B"
+        args.out = args.out or os.path.join(x, "speed_ldat", "speed_base.json")
+        args.crop_tok = 0
+    else:
+        args.model_path = args.model_path or os.path.join(e, "checkpoint-1000")
+        args.out = args.out or os.path.join(x, "speed_ldat", "speed.json")
 
     samples = load_samples(args)
-    print(f"[speed] {len(samples)} images  window={args.crop_tok}  "
+    print(f"[speed] model={args.model}  {len(samples)} images  window={args.crop_tok}  "
           f"decode_len={args.decode_len}  warmup={args.warmup}  tokens={args.tokens}", flush=True)
     print(f"[speed] loading {args.model_path}", flush=True)
-    runner = LDatRunner(
-        args.model_path, args.where_head_pt, args.ldat_pt, args.device,
-        crop_tok=args.crop_tok, lr_tok=args.tokens[0],
-        dat_alpha=0.8, dat_ratio=0.0, src_scale=4.0, ldat_d=256,
-        n_win=1, grid=0, attn=args.attn)
+    if args.model == "base":
+        from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+        base = Qwen3_5ForConditionalGeneration.from_pretrained(
+            args.model_path, torch_dtype=torch.bfloat16, device_map={"": args.device},
+            attn_implementation=args.attn).eval()
+        holder = {"processor": None}
+
+        def use_tok(tok):
+            holder["processor"] = AutoProcessor.from_pretrained(
+                args.model_path, min_pixels=1024, max_pixels=int(tok) * 1024)
+
+        def step(s):
+            return time_base(base, holder["processor"], s["image"], s["question"],
+                             args.decode_len, args.device)
+    else:
+        runner = LDatRunner(
+            args.model_path, args.where_head_pt, args.ldat_pt, args.device,
+            crop_tok=args.crop_tok, lr_tok=args.tokens[0],
+            dat_alpha=0.8, dat_ratio=0.0, src_scale=4.0, ldat_d=256,
+            n_win=1, grid=0, attn=args.attn)
+
+        def use_tok(tok):
+            set_lr_tok(runner, args.model_path, tok)
+
+        def step(s):
+            return time_one(runner, s["image"], s["question"], args.decode_len)
 
     points = []
     for tok in args.tokens:
-        pt = run_point(runner, samples, tok, args)
+        use_tok(tok)
+        pt = run_point(step, samples, tok, args)
         points.append(pt)
         print(f"[speed] lr={tok}  prefill avg {pt['avg_prefill_ms']:.0f} ms "
               f"(p50 {pt['median_prefill_ms']:.0f}, prepare {pt['avg_prepare_ms']:.0f} + "
@@ -266,6 +351,7 @@ def main():
               f"vram {pt['peak_vram_gb']:.1f}G", flush=True)
 
     result = {
+        "model": args.model,
         "model_path": args.model_path,
         "where_head_pt": args.where_head_pt,
         "ldat_pt": args.ldat_pt,
