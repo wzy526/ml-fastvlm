@@ -34,6 +34,8 @@ class Qwen3_5_LDAT(lmms):
         src_scale: float = 4.0,
         ldat_d: int = 256,
         hr_cap: int = 4096,
+        n_win: int = 1,
+        grid: int = 0,
         batch_size: int = 1,
         attn_implementation: Optional[str] = "sdpa",
         **kwargs,
@@ -58,7 +60,7 @@ class Qwen3_5_LDAT(lmms):
             pretrained, where_head_pt, ldat_pt, device,
             crop_tok=crop_tok, lr_tok=lr_tok, dat_alpha=dat_alpha, dat_ratio=dat_ratio,
             dat_k=dat_k, src_scale=src_scale, ldat_d=ldat_d, hr_cap=hr_cap,
-            attn=attn_implementation or "sdpa",
+            n_win=n_win, grid=grid, attn=attn_implementation or "sdpa",
         )
         self._tokenizer = self.runner.tok
         self.pretrained = pretrained
@@ -141,8 +143,10 @@ class Qwen3_5_LDAT(lmms):
                 else:
                     ans = self.runner.generate(image, context, max_new)
                     if not self._printed_tok and self.runner.last_n_tokens:
+                        side = self.runner._mosaic_side()
+                        wtxt = f"{self.runner.n_win}x{side}x{side}" if side else str(self.runner.crop_tok)
                         print(f"[ldat] prompt tokens {self.runner.last_n_tokens} "
-                              f"(LR {self.runner.lr_tok} + window {self.runner.crop_tok} + text)", flush=True)
+                              f"(LR {self.runner.lr_tok} + window {wtxt} + text)", flush=True)
                         self._printed_tok = True
                 res.append(self._clean(ans, until))
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), res[-1])

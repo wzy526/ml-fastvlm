@@ -40,10 +40,16 @@ class LDatRunner:
         ldat_d=256,
         hr_cap=4096,
         where_layer=8,
+        n_win=1,
+        grid=0,
         attn="sdpa",
     ):
         self.crop_tok = int(crop_tok)
         self.lr_tok = int(lr_tok)
+        self.n_win = max(int(n_win), 1)
+        # grid>0 forces each window to N x N. Several windows with grid left at 0
+        # use 20 x 20 each, so the extra windows add tokens instead of splitting 400.
+        self.grid = int(grid)
         self.dat_alpha = float(dat_alpha)
         self.dat_ratio = float(dat_ratio)
         self.dat_k = float(dat_k)
@@ -84,8 +90,17 @@ class LDatRunner:
         self.eos = eos
         self.last_n_tokens = 0
         w = float(self.head.out.weight.detach().abs().mean())
-        print(f"[ldat] crop_tok {self.crop_tok}  lr_tok {self.lr_tok}  alpha {self.dat_alpha}  "
+        side = self._mosaic_side()
+        geom = f"{self.n_win} x {side}x{side}" if side else f"1 x crop_tok {self.crop_tok}"
+        print(f"[ldat] windows {geom}  lr_tok {self.lr_tok}  alpha {self.dat_alpha}  "
               f"ratio {self.dat_ratio}  head |w| {w:.3e}", flush=True)
+
+    def _mosaic_side(self):
+        if self.grid > 0:
+            return self.grid
+        if self.n_win > 1:
+            return 20
+        return 0
 
     def _load_where_head(self, path):
         sd = torch.load(path, map_location="cpu")
@@ -191,47 +206,59 @@ class LDatRunner:
         logits = self.model.where_head(cells.reshape(gh_l, gw_l, -1), hs[int(torch.nonzero(is_img)[-1]) + 1:])
         head_p = torch.softmax(logits.float().flatten(), 0).reshape(logits.shape)
         hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600)
-        peaks = nms_peaks(logits, 1, 4, 0.0)
+        side = self._mosaic_side()
+        peaks = nms_peaks(logits, self.n_win, 4, 0.0)
         if not peaks:
             return None
-        cy, cx = peaks[0]
-        box = ((cx + 0.5 - 2) / gw_l, (cy + 0.5 - 2) / gh_l, (cx + 0.5 + 2) / gw_l, (cy + 0.5 + 2) / gh_l)
-        win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h)
-        px0, py0, px1, py1, gh, gw = crop_geometry(image, win, self.crop_tok)
         p = dat_mod._wdat_softmax(logits.float().tolist())
-        lw = win
-        if self.dat_k > 0:
-            lw = dat_mod._wdat_adaptive_window(p, box, win, self.dat_k)[0]
-        lx0, ly0 = int(lw[0] * w_img), int(lw[1] * h_img)
-        lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * w_img)), lx0 + 1), w_img),
-               min(max(int(math.ceil(lw[3] * h_img)), ly0 + 1), h_img))
-        lcrop = image.crop(lpx)
-        lcw, lch = lcrop.size
-        sc = math.sqrt(min(self.hr_cap * 1024, lcw * lch) / float(lcw * lch))
-        nw, nh = max(32, int(lcw * sc) // 32 * 32), max(32, int(lch * sc) // 32 * 32)
-        lmap = self._vit_image(lcrop.resize((nw, nh), Image.BICUBIC)).permute(2, 0, 1)[None].float()
-        sw = min(lcw, round(self.src_scale * gw * 32))
-        sh = min(lch, round(self.src_scale * gh * 32))
-        psrc = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32) / 255.0)
-        psrc = psrc.permute(2, 0, 1).to(dev)
-        win_rec = dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, lpx=lpx,
-                       lnbox=(lpx[0] / w_img, lpx[1] / h_img, lpx[2] / w_img, lpx[3] / h_img),
-                       lmap=lmap, psrc=psrc, head_p=head_p)
-        feats, pts = self._ldat_tokens(win_rec)
+        wins, feats, pts = [], [], []
+        for cy, cx in peaks:
+            box = ((cx + 0.5 - 2) / gw_l, (cy + 0.5 - 2) / gh_l,
+                   (cx + 0.5 + 2) / gw_l, (cy + 0.5 + 2) / gh_l)
+            win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h)
+            tok_budget = side * side if side else self.crop_tok
+            px0, py0, px1, py1, gh, gw = crop_geometry(image, win, tok_budget)
+            if side:
+                gh = gw = side
+            lw = win
+            if self.dat_k > 0:
+                lw = dat_mod._wdat_adaptive_window(p, box, win, self.dat_k)[0]
+            lx0, ly0 = int(lw[0] * w_img), int(lw[1] * h_img)
+            lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * w_img)), lx0 + 1), w_img),
+                   min(max(int(math.ceil(lw[3] * h_img)), ly0 + 1), h_img))
+            lcrop = image.crop(lpx)
+            lcw, lch = lcrop.size
+            sc = math.sqrt(min(self.hr_cap * 1024, lcw * lch) / float(lcw * lch))
+            nw, nh = max(32, int(lcw * sc) // 32 * 32), max(32, int(lch * sc) // 32 * 32)
+            lmap = self._vit_image(lcrop.resize((nw, nh), Image.BICUBIC)).permute(2, 0, 1)[None].float()
+            sw = min(lcw, round(self.src_scale * gw * 32))
+            sh = min(lch, round(self.src_scale * gh * 32))
+            psrc = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32) / 255.0)
+            psrc = psrc.permute(2, 0, 1).to(dev)
+            win_rec = dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, lpx=lpx,
+                           lnbox=(lpx[0] / w_img, lpx[1] / h_img, lpx[2] / w_img, lpx[3] / h_img),
+                           lmap=lmap, psrc=psrc, head_p=head_p)
+            z, pt = self._ldat_tokens(win_rec)
+            wins.append(win_rec)
+            feats.append(z)
+            pts.append(pt)
 
-        dummy = Image.new("RGB", (gw * 32, gh * 32))
+        dummies = [Image.new("RGB", (w["gw"] * 32, w["gh"] * 32)) for w in wins]
         qd = {"type": "text", "text": question}
-        content = [{"type": "image", "image": lr_img}, qd, {"type": "text", "text": dat_mod.WHERE_HINT},
-                   {"type": "image", "image": dummy}, dict(qd)]
+        content = [{"type": "image", "image": lr_img}, qd, {"type": "text", "text": dat_mod.WHERE_HINT}]
+        content += [{"type": "image", "image": d} for d in dummies]
+        content.append(dict(qd))
         amsgs = [{"role": "system", "content": "You are a helpful assistant."},
                  {"role": "user", "content": content}]
         atext = self.hr_processor.apply_chat_template(
             amsgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        enc = self.hr_processor(text=[atext], images=[lr_img, dummy], return_tensors="pt")
+        enc = self.hr_processor(text=[atext], images=[lr_img] + dummies, return_tensors="pt")
         thw2 = enc["image_grid_thw"].to(dev)
-        if tuple(thw2[1].tolist()) != (1, 2 * gh, 2 * gw):
-            print(f"[ldat] mosaic grid {tuple(thw2[1].tolist())} != {(1, 2 * gh, 2 * gw)}", flush=True)
-            return None
+        for k, w in enumerate(wins):
+            if tuple(thw2[1 + k].tolist()) != (1, 2 * w["gh"], 2 * w["gw"]):
+                print(f"[ldat] mosaic {k} grid {tuple(thw2[1 + k].tolist())} != "
+                      f"{(1, 2 * w['gh'], 2 * w['gw'])}", flush=True)
+                return None
         ids = enc["input_ids"][0].to(dev)
         mm = torch.zeros_like(ids)
         mm[ids == self.image_id] = 1
@@ -240,16 +267,17 @@ class LDatRunner:
         n_lr = int(torch.prod(thw2[0]))
         lr_emb = self._vit(enc["pixel_values"][:n_lr].to(dev).to(torch.bfloat16), thw2[:1])
         img_pos = torch.nonzero(ids == self.image_id).flatten()
-        if img_pos.numel() != lr_emb.shape[0] + gh * gw:
-            print(f"[ldat] image tokens {img_pos.numel()} != {lr_emb.shape[0]}+{gh * gw}", flush=True)
+        n_win_tok = sum(w["gh"] * w["gw"] for w in wins)
+        if img_pos.numel() != lr_emb.shape[0] + n_win_tok:
+            print(f"[ldat] image tokens {img_pos.numel()} != {lr_emb.shape[0]}+{n_win_tok}", flush=True)
             return None
         blocks = dat_mod._where_token_runs(ids, self.image_id)[1:]
-        if len(blocks) != 1 or blocks[0][1] - blocks[0][0] != gh * gw:
-            print("[ldat] window token run does not match the mosaic", flush=True)
+        if len(blocks) != len(wins) or any(b - a != w["gh"] * w["gw"] for (a, b), w in zip(blocks, wins)):
+            print("[ldat] window token runs do not match the mosaics", flush=True)
             return None
         emb = self.embed(ids[None])
         return dict(ids=ids, mm=mm[None], pos3d=pos3d, rope_deltas=rope_deltas, emb=emb,
-                    lr_emb=lr_emb, img_pos=img_pos, blocks=blocks, wins=[win_rec],
+                    lr_emb=lr_emb, img_pos=img_pos, blocks=blocks, wins=wins,
                     feats=feats, pts=pts, n_tokens=int(ids.shape[0]))
 
     @torch.inference_mode()
@@ -260,8 +288,8 @@ class LDatRunner:
         self.last_n_tokens = int(pr["n_tokens"])
         dev = self.dev
         e = pr["emb"].clone()
-        e[0, pr["img_pos"]] = torch.cat([pr["lr_emb"], pr["feats"]], 0).to(e.dtype)
-        pos = global_positions(pr["pos3d"], pr["blocks"], pr["wins"], [pr["pts"]])
+        e[0, pr["img_pos"]] = torch.cat([pr["lr_emb"]] + pr["feats"], 0).to(e.dtype)
+        pos = global_positions(pr["pos3d"], pr["blocks"], pr["wins"], pr["pts"])
         self.model.model.rope_deltas = pr["rope_deltas"]
         n = e.shape[1]
         o = self.model(inputs_embeds=e, position_ids=pos, mm_token_type_ids=pr["mm"],

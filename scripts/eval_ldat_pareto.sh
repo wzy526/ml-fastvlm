@@ -2,6 +2,8 @@
 # Pareto of the finalized learnable sampler (hinge_noratio, no window head).
 #
 # LR tokens: 640 1280 2560 6400. The window stays at 400 tokens.
+# N_WIN=1 (default) is one aspect-preserving window of CROP_TOK.
+# N_WIN>1 keeps each window at GRID x GRID (default 20) and writes a separate OUT.
 # One lmms-eval launch per task per budget, 8 GPUs. A finished point
 # (a *_results.json under the output dir) is skipped, so the script resumes.
 #
@@ -20,8 +22,19 @@ source "${CONDA_SH:-$HOME/miniconda3/bin/activate}" "${CONDA_ENV:-$HOME/.conda/e
 E="${E:-$HOME/vldat_experiments/0924_miniE1_2k}"
 X="${X:-/data/oss_bucket_0/wangziyi/vldat_experiments/sa1b_ldat}"
 LMMS_EVAL_DIR="${LMMS_EVAL_DIR:-$HOME/lmms-eval}"
-OUT="${OUT:-$X/pareto_ldat_lr}"
 CROP_TOK="${CROP_TOK:-400}"
+N_WIN="${N_WIN:-1}"
+GRID="${GRID:-0}"
+if [[ "$N_WIN" != 1 && "$GRID" == 0 ]]; then
+    GRID=20
+fi
+if [[ -z "${OUT+x}" ]]; then
+    if [[ "$N_WIN" == 1 && "$GRID" == 0 ]]; then
+        OUT="$X/pareto_ldat_lr"
+    else
+        OUT="$X/pareto_ldat_lr_w${N_WIN}g${GRID}"
+    fi
+fi
 MODEL_PATH="${MODEL_PATH:-$E/checkpoint-1000}"
 WHERE_PT="${WHERE_PT:-$E/loc/where_lm8_ce20.pt}"
 LDAT_PT="${LDAT_PT:-$X/hinge_noratio_ldat.pt}"
@@ -50,7 +63,7 @@ fi
 cd "$LMMS_EVAL_DIR"
 
 echo "[pareto] tasks: $TASKS"
-echo "[pareto] lr tokens: $TOKS   window=$CROP_TOK   out=$OUT"
+echo "[pareto] lr tokens: $TOKS   window=$CROP_TOK   n_win=$N_WIN grid=$GRID   out=$OUT"
 echo "[pareto] head=$LDAT_PT"
 
 for tok in $TOKS; do
@@ -66,11 +79,11 @@ for tok in $TOKS; do
             extra=(--limit "$LIMIT")
         fi
         echo "------------------------------------------------------------------"
-        echo "[$(date '+%F %T')] $task  lr_tok=$tok  window=$CROP_TOK"
+        echo "[$(date '+%F %T')] $task  lr_tok=$tok  window=$CROP_TOK  n_win=$N_WIN grid=$GRID"
         echo "------------------------------------------------------------------"
         if accelerate launch --num_processes "$NPROC" --main_process_port "$PORT" -m lmms_eval \
             --model qwen3_5_ldat \
-            --model_args "pretrained=${MODEL_PATH},where_head_pt=${WHERE_PT},ldat_pt=${LDAT_PT},crop_tok=${CROP_TOK},lr_tok=${tok},dat_alpha=0.8,dat_ratio=0,src_scale=4,ldat_d=256,attn_implementation=sdpa" \
+            --model_args "pretrained=${MODEL_PATH},where_head_pt=${WHERE_PT},ldat_pt=${LDAT_PT},crop_tok=${CROP_TOK},lr_tok=${tok},n_win=${N_WIN},grid=${GRID},dat_alpha=0.8,dat_ratio=0,src_scale=4,ldat_d=256,attn_implementation=sdpa" \
             --tasks "$task" \
             --batch_size 1 \
             --log_samples \
