@@ -172,7 +172,6 @@ def _stat(xs):
     return float(a.mean()), float(np.median(a))
 
 
-@torch.inference_mode()
 def _text_position(cache_position, rope_deltas, device):
     """3 x batch x 1 mRoPE for one new text token.
 
@@ -293,7 +292,17 @@ def run_point(step, samples, lr_tok, args):
         "avg_prompt_tokens": prompt_m,
         "peak_vram_gb": torch.cuda.max_memory_allocated() / 1024**3,
     }
-    if lr_m < 0.9 * lr_tok:
+    if args.native:
+        expect = float(np.mean([s["image"].width * s["image"].height / 1024.0 for s in samples]))
+        point["avg_image_side"] = [
+            float(np.mean([s["image"].width for s in samples])),
+            float(np.mean([s["image"].height for s in samples])),
+        ]
+        point["native_token_expect"] = expect
+        if lr_m < 0.9 * expect:
+            print(f"[speed] native images would be ~{expect:.0f} tokens but the processor "
+                  f"produced {lr_m:.0f}", flush=True)
+    elif lr_m < 0.9 * lr_tok:
         print(f"[speed] lr budget {lr_tok} but images averaged {lr_m:.0f} LR tokens", flush=True)
     return point
 
@@ -313,15 +322,22 @@ def main():
     ap.add_argument("--max_samples", type=int, default=8)
     ap.add_argument("--dataset", choices=["4k", "8k"], default="4k",
                     help="HR-Bench parquet already in the HF cache")
+    ap.add_argument("--native", action="store_true",
+                    help="baseline only: no visual-token cap, so a 4K/8K image keeps its own resolution")
     ap.add_argument("--image_folder", default=None)
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    if args.native and args.model != "base":
+        raise SystemExit("[speed] --native is the baseline path")
     if args.model == "base":
         args.model_path = args.model_path or "/data/oss_bucket_0/wangziyi/official_ckpt/Qwen3.5-2B"
-        args.out = args.out or os.path.join(x, "speed_ldat", "speed_base.json")
+        name = f"speed_base_native_{args.dataset}.json" if args.native else "speed_base.json"
+        args.out = args.out or os.path.join(x, "speed_ldat", name)
         args.crop_tok = 0
+        if args.native:
+            args.tokens = [0]
     else:
         args.model_path = args.model_path or os.path.join(e, "checkpoint-1000")
         args.out = args.out or os.path.join(x, "speed_ldat", "speed.json")
@@ -338,8 +354,11 @@ def main():
         holder = {"processor": None}
 
         def use_tok(tok):
+            # 1e8 px covers an 8K frame (~3.3e7). The processor then only snaps
+            # each side to a multiple of 32; it does not shrink to a token budget.
+            cap = 100_000_000 if args.native else int(tok) * 1024
             holder["processor"] = AutoProcessor.from_pretrained(
-                args.model_path, min_pixels=1024, max_pixels=int(tok) * 1024)
+                args.model_path, min_pixels=1024, max_pixels=cap)
 
         def step(s):
             return time_base(base, holder["processor"], s["image"], s["question"],
@@ -362,7 +381,8 @@ def main():
         use_tok(tok)
         pt = run_point(step, samples, tok, args)
         points.append(pt)
-        print(f"[speed] lr={tok}  prefill avg {pt['avg_prefill_ms']:.0f} ms "
+        label = f"native {args.dataset}" if args.native else f"lr={tok}"
+        print(f"[speed] {label}  prefill avg {pt['avg_prefill_ms']:.0f} ms "
               f"(p50 {pt['median_prefill_ms']:.0f}, prepare {pt['avg_prepare_ms']:.0f} + "
               f"lm {pt['avg_lm_prefill_ms']:.0f})  "
               f"decode {pt['avg_decode_ms']:.0f} ms  {pt['ms_per_decode_tok']:.1f} ms/tok  "
@@ -378,6 +398,8 @@ def main():
         "decode_len": args.decode_len,
         "warmup": args.warmup,
         "dataset": args.image_folder or f"hrbench{args.dataset}",
+        "native": bool(args.native),
+        "max_pixels": 100_000_000 if args.native else None,
         "attn": args.attn,
         "gpu": torch.cuda.get_device_name(0),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
