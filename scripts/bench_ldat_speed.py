@@ -173,11 +173,29 @@ def _stat(xs):
 
 
 @torch.inference_mode()
-def time_base(model, processor, image, question, decode_len, device):
-    """Processor plus the first forward, then exactly decode_len more forwards.
+def _text_position(cache_position, rope_deltas, device):
+    """3 x batch x 1 mRoPE for one new text token.
 
-    ViT runs inside the first forward. Decode goes through the model's own
-    prepare_inputs_for_generation so the RoPE cache matches generate().
+    Qwen3.5 stores rope_deltas so that cache_position[0] + rope_deltas is the
+    absolute text position. A missing delta falls back to the token index.
+    """
+    if rope_deltas is None:
+        return cache_position.view(1, 1, 1).expand(3, 1, 1).to(dtype=torch.long)
+    delta = rope_deltas.to(device)
+    if delta.ndim == 0:
+        delta = delta.view(1, 1)
+    elif delta.ndim == 1:
+        delta = delta.view(-1, 1)
+    pos = (cache_position[0] + delta).view(1, -1, 1)
+    return pos.expand(3, pos.shape[1], 1).to(dtype=torch.long)
+
+
+@torch.inference_mode()
+def time_base(model, processor, image, question, decode_len, device):
+    """Processor plus the first forward, then exactly decode_len single-token steps.
+
+    ViT runs inside the first forward. Each decode step feeds one new token and
+    the KV cache, same as the sampler path.
     """
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -199,17 +217,18 @@ def time_base(model, processor, image, question, decode_len, device):
     t_pre = time.perf_counter()
     cache = out.past_key_values
     tok = int(out.logits[0, -1].argmax())
-    input_ids = moved["input_ids"]
-    attention = moved.get("attention_mask")
-    for _ in range(int(decode_len)):
-        input_ids = torch.cat([input_ids, input_ids.new_tensor([[tok]])], dim=1)
-        if attention is not None:
-            attention = torch.cat([attention, attention.new_ones((attention.shape[0], 1))], dim=1)
-        cache_position = torch.tensor([input_ids.shape[1] - 1], device=device)
-        step = model.prepare_inputs_for_generation(
-            input_ids, past_key_values=cache, attention_mask=attention,
-            cache_position=cache_position, use_cache=True, is_first_iteration=False)
-        out = model(**step, return_dict=True, logits_to_keep=1)
+    n = int(moved["input_ids"].shape[1])
+    rope_deltas = getattr(getattr(model, "model", None), "rope_deltas", None)
+    if rope_deltas is None:
+        rope_deltas = getattr(model, "rope_deltas", None)
+    for k in range(int(decode_len)):
+        cache_position = torch.tensor([n + k], device=device)
+        out = model(
+            input_ids=torch.tensor([[tok]], device=device),
+            position_ids=_text_position(cache_position, rope_deltas, device),
+            past_key_values=cache,
+            cache_position=cache_position,
+            use_cache=True, return_dict=True, logits_to_keep=1)
         cache = out.past_key_values
         tok = int(out.logits[0, -1].argmax())
     torch.cuda.synchronize()
@@ -222,7 +241,7 @@ def time_base(model, processor, image, question, decode_len, device):
         "lm_prefill_ms": (t_pre - t_prep) * 1000.0,
         "prefill_ms": (t_pre - t0) * 1000.0,
         "decode_ms": (t_dec - t_pre) * 1000.0,
-        "prompt_tokens": int(input_ids.shape[1] - decode_len),
+        "prompt_tokens": n,
         "lr_tokens": vis,
         "win_tokens": 0,
     }
