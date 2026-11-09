@@ -87,7 +87,9 @@ def pair_sep(ba, bb):
 
 
 def load_pairs(path, image_root, n_try):
+    print(f"[vis] reading {path}", flush=True)
     data = json.load(open(os.path.expanduser(path)))
+    print(f"[vis] {len(data)} rows, grouping by image", flush=True)
     groups = defaultdict(list)
     for s in data:
         im = s.get("image")
@@ -109,17 +111,34 @@ def load_pairs(path, image_root, n_try):
                 continue
             seen.add(r["q"])
             uniq.append(r)
-        path = im if os.path.isabs(im) else os.path.join(image_root, im)
-        if not os.path.isfile(path):
-            continue
         for i in range(len(uniq)):
             for j in range(i + 1, len(uniq)):
                 sep = pair_sep(uniq[i]["boxes"], uniq[j]["boxes"])
                 if sep is None:
                     continue
-                cands.append((sep, path, uniq[i], uniq[j]))
+                cands.append((sep, im, uniq[i], uniq[j]))
     cands.sort(key=lambda t: -t[0])
-    return cands[:n_try], len(groups), len(cands)
+    print(f"[vis] {len(groups)} images, {len(cands)} separated pairs; checking files for the farthest",
+          flush=True)
+    # Stat only the pairs we might draw. A full pass over the symlink farm
+    # blocks for a long time and prints nothing.
+    kept, missing, checked = [], 0, 0
+    limit = max(n_try * 30, 400)
+    for sep, im, a, b in cands:
+        checked += 1
+        fpath = im if os.path.isabs(im) else os.path.join(image_root, im)
+        if os.path.isfile(fpath):
+            kept.append((sep, fpath, a, b))
+        else:
+            missing += 1
+            if missing <= 3:
+                print(f"[vis] missing {fpath}", flush=True)
+        if len(kept) >= n_try or checked >= limit:
+            break
+        if checked % 50 == 0:
+            print(f"[vis] checked {checked}  found {len(kept)}  missing {missing}", flush=True)
+    print(f"[vis] file check done: kept {len(kept)}  missing {missing}  checked {checked}", flush=True)
+    return kept, len(groups), len(cands)
 
 
 class WhereMap:
