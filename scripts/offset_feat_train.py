@@ -414,7 +414,15 @@ def main():
         p.requires_grad_(False)
     sd = torch.load(os.path.expanduser(args.where_head_pt), map_location="cpu")
     sd = {k[len("where_head."):] if k.startswith("where_head.") else k: v for k, v in sd.items()}
+    if not hasattr(model, "where_head"):
+        hidden = model.config.text_config.hidden_size
+        model.where_head = dat_mod._WhereXAttnHead(
+            hidden, hidden, d=384, layers=2, heads=6, max_hw=512).to(dev)
+        say("[oft] checkpoint has no where-head module; attached one")
     model.where_head.load_state_dict(sd)
+    model.where_head.float().eval()
+    for p in model.where_head.parameters():
+        p.requires_grad_(False)
     processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=args.lr_tok * 1024)
     hr_processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=100_000_000)
     tok = hr_processor.tokenizer
