@@ -255,14 +255,11 @@ class LDatRunner:
 
         dummies = [Image.new("RGB", (w["gw"] * 32, w["gh"] * 32)) for w in wins]
         qd = {"type": "text", "text": question}
-        # Where-head still sees question + WHERE_HINT only. The answer turn
-        # matches the 2B layout: the question is asked again after the mosaic,
-        # so the image in front of the question is the window. The last line
-        # keeps the frozen official LM on a single letter.
+        # Where-head still sees question + WHERE_HINT only. The answer turn is
+        # the 2B layout: the question is asked again after the mosaic.
         content = [{"type": "image", "image": lr_img}, qd, {"type": "text", "text": dat_mod.WHERE_HINT}]
         content += [{"type": "image", "image": d} for d in dummies]
         content.append(dict(qd))
-        content.append({"type": "text", "text": "Reply with only the letter of the correct option."})
         amsgs = [{"role": "system", "content": "You are a helpful assistant."},
                  {"role": "user", "content": content}]
         atext = self.hr_processor.apply_chat_template(

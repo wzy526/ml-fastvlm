@@ -4030,7 +4030,7 @@ def train():
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
 
-        if model_args.use_dat:
+        if model_args.use_dat or training_args.lora_target_layers != "all":
             target_modules = get_lora_target_modules(
                 model_args.dat_layers,
                 target_layers=training_args.lora_target_layers,
