@@ -93,6 +93,10 @@ echo "[1110-4b] data=$DATA_JSON rows=$N_ALL boxed=$N_BOX"
 echo "[1110-4b] lora steps=$MAX_STEPS effective_batch=$EFF -> $CKPT_ROOT/$EXP_NAME"
 echo "[1110-4b] merged -> $MERGED_DIR"
 
+if [[ -f "$MERGED_DIR/config.json" && "${FORCE:-0}" != 1 ]]; then
+    echo "[1110-4b] merged checkpoint already present, skipping LoRA"
+else
+
 torchrun --nproc_per_node="${NPROC:-8}" --master_port "${MASTER_PORT:-40997}" llava/train/train_qwen_dat.py \
     --deepspeed ./scripts/zero_configs/zero2.json \
     --model_name_or_path "$MODEL_PATH" \
@@ -183,6 +187,8 @@ if isinstance(chat, str):
         json.dump({"chat_template": chat}, f, ensure_ascii=False, indent=2)
 print("[merge]", out_path)
 PY
+
+fi
 
 echo "[1110-4b] where-head on $MERGED_DIR"
 torchrun --nproc_per_node="${NPROC:-8}" --master_port "${WHERE_PORT:-40998}" scripts/where_head.py \
