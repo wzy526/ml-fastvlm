@@ -1928,16 +1928,12 @@ class Qwen2VLDataCollator:
             "attention_mask": attention_mask,
         }
 
-        if any("mm_token_type_ids" in inst for inst in instances):
-            mm_list = []
-            for inst in instances:
-                mm = inst.get("mm_token_type_ids")
-                if mm is None:
-                    mm = torch.zeros_like(inst["input_ids"])
-                mm_list.append(mm.long())
-            batch["mm_token_type_ids"] = torch.nn.utils.rnn.pad_sequence(
-                mm_list, batch_first=True, padding_value=0
-            )
+        # Qwen3.5 M-RoPE rejects image_grid_thw without this. The processor
+        # used here does not put it in the batch, so mark image-pad tokens
+        # (1) and leave text and padding at 0.
+        mm = torch.zeros_like(input_ids)
+        mm.masked_fill_(input_ids.eq(IMAGE_PAD_ID), 1)
+        batch["mm_token_type_ids"] = mm
 
         # Concatenate pixel_values and image_grid_thw across the batch
         pixel_values_list = [inst["pixel_values"] for inst in instances if "pixel_values" in inst]
