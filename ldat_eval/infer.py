@@ -43,6 +43,7 @@ class LDatRunner:
         n_win=1,
         grid=0,
         attn="sdpa",
+        enable_thinking=False,
     ):
         self.crop_tok = int(crop_tok)
         self.lr_tok = int(lr_tok)
@@ -57,6 +58,7 @@ class LDatRunner:
         self.supersample = int(supersample)
         self.hr_cap = int(hr_cap)
         self.where_layer = int(where_layer)
+        self.enable_thinking = bool(enable_thinking)
         self.dev = device
 
         from transformers import AutoProcessor
@@ -251,7 +253,8 @@ class LDatRunner:
         amsgs = [{"role": "system", "content": "You are a helpful assistant."},
                  {"role": "user", "content": content}]
         atext = self.hr_processor.apply_chat_template(
-            amsgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            amsgs, tokenize=False, add_generation_prompt=True,
+            enable_thinking=self.enable_thinking)
         enc = self.hr_processor(text=[atext], images=[lr_img] + dummies, return_tensors="pt")
         thw2 = enc["image_grid_thw"].to(dev)
         for k, w in enumerate(wins):
@@ -313,4 +316,10 @@ class LDatRunner:
                            use_cache=True, return_dict=True)
             cache = o.past_key_values
             tok = int(o.logits[0, -1].argmax())
-        return self.tok.decode(toks, skip_special_tokens=True).strip()
+        # Thinking mode emits a </think> token. skip_special_tokens drops it, and
+        # the letter extractor then sees the reasoning instead of the answer.
+        text = self.tok.decode(toks, skip_special_tokens=not self.enable_thinking)
+        if self.enable_thinking:
+            for tag in ("<|im_end|>", "<|im_start|>", "<|endoftext|>"):
+                text = text.replace(tag, "")
+        return text.strip()
