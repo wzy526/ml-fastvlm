@@ -1693,6 +1693,10 @@ class Qwen2VLCoupledDATDataset(Dataset):
             result["pixel_values"] = inputs["pixel_values"]
             result["image_grid_thw"] = inputs["image_grid_thw"]
 
+        mm_ids = _take_mm_token_type_ids(inputs, input_ids.size(1))
+        if mm_ids is not None:
+            result["mm_token_type_ids"] = mm_ids
+
         if where_target is not None:
             result["where_target"] = where_target
 
@@ -1848,6 +1852,10 @@ class Qwen2VLSupervisedDataset(Dataset):
             result["pixel_values"] = inputs["pixel_values"]
             result["image_grid_thw"] = inputs["image_grid_thw"]
 
+        mm_ids = _take_mm_token_type_ids(inputs, input_ids.size(1))
+        if mm_ids is not None:
+            result["mm_token_type_ids"] = mm_ids
+
         # ---- Optional KD teacher input (same text, possibly different image resolution) ----
         if self.kd_enabled:
             teacher_kwargs = {
@@ -1877,6 +1885,22 @@ class Qwen2VLSupervisedDataset(Dataset):
         return result
 
 
+def _take_mm_token_type_ids(inputs, seq_len):
+    """Slice the processor's M-RoPE type ids to the (possibly truncated) tokens.
+
+    Qwen3.5 refuses image_grid_thw unless this tensor is passed through.
+    0 = text, 1 = image, 2 = video.
+    """
+    mm = inputs.get("mm_token_type_ids") if isinstance(inputs, dict) else None
+    if mm is None:
+        return None
+    if mm.dim() == 2:
+        mm = mm[:, :seq_len].squeeze(0)
+    else:
+        mm = mm[:seq_len]
+    return mm.to(dtype=torch.long)
+
+
 # ---------------------------------------------------------------------------
 # Collator
 # ---------------------------------------------------------------------------
@@ -1903,6 +1927,17 @@ class Qwen2VLDataCollator:
             "labels": labels,
             "attention_mask": attention_mask,
         }
+
+        if any("mm_token_type_ids" in inst for inst in instances):
+            mm_list = []
+            for inst in instances:
+                mm = inst.get("mm_token_type_ids")
+                if mm is None:
+                    mm = torch.zeros_like(inst["input_ids"])
+                mm_list.append(mm.long())
+            batch["mm_token_type_ids"] = torch.nn.utils.rnn.pad_sequence(
+                mm_list, batch_first=True, padding_value=0
+            )
 
         # Concatenate pixel_values and image_grid_thw across the batch
         pixel_values_list = [inst["pixel_values"] for inst in instances if "pixel_values" in inst]
