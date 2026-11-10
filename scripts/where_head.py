@@ -613,7 +613,8 @@ def main():
             run_loss, run_mass, run_n = 0.0, 0.0, 0
         if step % args.eval_every == 0 or step == args.steps:
             if main_rank:
-                eval_heldout(frozen, head, held, args.min_cells, args.out_cells, f" [step {step}]")
+                if held:
+                    eval_heldout(frozen, head, held, args.min_cells, args.out_cells, f" [step {step}]")
                 eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells,
                            args.out_boxes if step == args.steps else None, f" [step {step}]")
                 if args.save:

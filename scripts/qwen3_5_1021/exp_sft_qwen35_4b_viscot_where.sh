@@ -196,7 +196,7 @@ torchrun --nproc_per_node="${NPROC:-8}" --master_port "${WHERE_PORT:-40998}" scr
     --train_json "$DATA_JSON" \
     --image_root "$IMAGE_ROOT/train_split" \
     --max_per_json 40000 \
-    --heldout 600 \
+    --heldout 0 \
     --steps "${WHERE_STEPS:-600}" \
     --accum 4 \
     --lr 1e-4 \
