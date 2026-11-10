@@ -255,9 +255,12 @@ class LDatRunner:
 
         dummies = [Image.new("RGB", (w["gw"] * 32, w["gh"] * 32)) for w in wins]
         qd = {"type": "text", "text": question}
+        # The where-head still sees question + WHERE_HINT only. After the mosaic,
+        # ask for the letter alone: repeating the question makes the frozen 4B
+        # open with "Based on the zoomed-in view".
         content = [{"type": "image", "image": lr_img}, qd, {"type": "text", "text": dat_mod.WHERE_HINT}]
         content += [{"type": "image", "image": d} for d in dummies]
-        content.append(dict(qd))
+        content.append({"type": "text", "text": "Reply with only the letter of the correct option."})
         amsgs = [{"role": "system", "content": "You are a helpful assistant."},
                  {"role": "user", "content": content}]
         atext = self.hr_processor.apply_chat_template(
