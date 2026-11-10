@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# 4B step 1, one job, two phases. Data is the boxed Visual-CoT set only.
-#   extra_0916/viscot_bbox.train.json
-# Phase A: LoRA on official Qwen3.5-4B, one image + question + short answer.
-#          q/k/v/o, r=8, alpha=16, lr=2e-5. Projector lr=5e-6. No DAT layers.
-# Phase B: freeze that model, train the where-head 600 steps on layer 8.
+# 4B, one job, two phases in series. Phase B starts only after the merge.
+# Phase A: LoRA on official Qwen3.5-4B. Data is the boxed Visual-CoT set only
+#          (extra_0916/viscot_bbox.train.json). One image + question + short
+#          answer. q/k/v/o, r=8, alpha=16, lr=2e-5. Projector lr=5e-6. No DAT layers.
+# Phase B: freeze that model, train the where-head on layer 8. Data is Visual-CoT
+#          plus RefCOCO plus COCO-small. Same mix that took the 2B head from
+#          66.5% to 79.1% window hit.
 #
 #   bash scripts/qwen3_5_1021/exp_sft_qwen35_4b_viscot_where.sh
 #
@@ -52,9 +54,15 @@ export DEEPSPEED_TIMEOUT="${DEEPSPEED_TIMEOUT:-7200}"
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-7200}"
 mkdir -p "$TRITON_CACHE_DIR" "$CKPT_ROOT/$EXP_NAME"
 
+REF_JSON="${REF_JSON:-$OSS_DATA/extra_1018/refcoco_bbox.json}"
+COCO_JSON="${COCO_JSON:-$OSS_DATA/extra_1018/coco_small_bbox.json}"
 if [[ -z "$DATA_JSON" || ! -f "$DATA_JSON" ]]; then
     echo "[ERROR] boxed Visual-CoT json not found." >&2
     echo "        looked for extra_0916/viscot_bbox.train.json and viscot_bbox.json under $OSS_DATA" >&2
+    exit 1
+fi
+if [[ ! -f "$REF_JSON" || ! -f "$COCO_JSON" ]]; then
+    echo "[ERROR] where-head json missing: $REF_JSON or $COCO_JSON" >&2
     exit 1
 fi
 if [[ ! -f "$MODEL_PATH/config.json" ]]; then
@@ -191,13 +199,14 @@ PY
 fi
 
 echo "[1110-4b] where-head on $MERGED_DIR"
+echo "[1110-4b] where data: $DATA_JSON + $REF_JSON + $COCO_JSON"
 torchrun --nproc_per_node="${NPROC:-8}" --master_port "${WHERE_PORT:-40998}" scripts/where_head.py \
     --model_path "$MERGED_DIR" \
-    --train_json "$DATA_JSON" \
+    --train_json "$DATA_JSON" "$REF_JSON" "$COCO_JSON" \
     --image_root "$IMAGE_ROOT/train_split" \
-    --max_per_json 40000 \
+    --max_per_json 40000 40000 60000 \
     --heldout 0 \
-    --steps "${WHERE_STEPS:-600}" \
+    --steps "${WHERE_STEPS:-1500}" \
     --accum 4 \
     --lr 1e-4 \
     --d 384 \
