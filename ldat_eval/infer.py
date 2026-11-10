@@ -90,6 +90,14 @@ class LDatRunner:
             elif v is not None:
                 eos.add(int(v))
         self.eos = eos
+        self.think_end = None
+        if self.enable_thinking:
+            tid = self.tok.convert_tokens_to_ids("</think>")
+            unk = self.tok.unk_token_id
+            if isinstance(tid, int) and tid >= 0 and (unk is None or tid != int(unk)):
+                self.think_end = int(tid)
+        self.n_think_closed = 0
+        self.n_think_capped = 0
         self.last_n_tokens = 0
         w = float(self.head.out.weight.detach().abs().mean())
         side = self._mosaic_side()
@@ -300,22 +308,56 @@ class LDatRunner:
                        use_cache=True, return_dict=True, logits_to_keep=1)
         cache = o.past_key_values
         next_pos = int(math.floor(float(pos.max()))) + 1
-        tok = int(o.logits[0, -1].argmax())
+        logits = o.logits[0, -1]
+        tok = int(logits.argmax())
         toks = []
-        limit = max(int(max_new_tokens), 1)
-        for k in range(limit):
+        # A finished think is </think> and then a short answer. The 1024 cap was
+        # cutting 42/64 unfinished traces mid-sentence, and <|im_end|> was ending
+        # the other 22 before the tag. Keep going until the tag, then 48 answer
+        # tokens. An end token in the first 16 tokens still stops, so a bare
+        # letter is unchanged.
+        think_limit = max(int(max_new_tokens), 4096 if self.think_end is not None else 1)
+        answer_limit = 48
+        closed = False
+        answer_left = answer_limit
+        while True:
+            if tok in self.eos and (self.think_end is None or closed or len(toks) < 16):
+                break
             if tok in self.eos:
+                masked = logits.float().clone()
+                for eid in self.eos:
+                    if 0 <= eid < masked.shape[-1]:
+                        masked[eid] = torch.finfo(masked.dtype).min
+                tok = int(masked.argmax())
+                if tok in self.eos:
+                    break
+            if self.think_end is not None and not closed and len(toks) >= think_limit:
+                break
+            if self.think_end is None and len(toks) >= think_limit:
                 break
             toks.append(tok)
-            if k == limit - 1:
-                break
+            just_closed = self.think_end is not None and tok == self.think_end and not closed
+            if just_closed:
+                closed = True
+                answer_left = answer_limit
+            elif closed:
+                answer_left -= 1
+                if answer_left <= 0:
+                    break
+            k = len(toks) - 1
             o = self.model(input_ids=torch.tensor([[tok]], device=dev),
                            position_ids=torch.full((3, 1, 1), next_pos + k, device=dev, dtype=torch.long),
                            past_key_values=cache,
                            cache_position=torch.tensor([n + k], device=dev),
                            use_cache=True, return_dict=True)
             cache = o.past_key_values
-            tok = int(o.logits[0, -1].argmax())
+            logits = o.logits[0, -1]
+            tok = int(logits.argmax())
+        if self.think_end is not None:
+            if closed:
+                self.n_think_closed += 1
+            else:
+                self.n_think_capped += 1
         # Thinking mode emits a </think> token. skip_special_tokens drops it, and
         # the letter extractor then sees the reasoning instead of the answer.
         text = self.tok.decode(toks, skip_special_tokens=not self.enable_thinking)

@@ -158,6 +158,9 @@ class Qwen3_5_LDAT(lmms):
                 pbar.update(1)
         res = re_ords.get_original(res)
         pbar.close()
+        if self.runner.think_end is not None:
+            print(f"[ldat] rank {self.rank} think_closed={self.runner.n_think_closed} "
+                  f"capped={self.runner.n_think_capped}", flush=True)
         return res
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
