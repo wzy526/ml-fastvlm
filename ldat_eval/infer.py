@@ -52,6 +52,7 @@ class LDatRunner:
         attn="sdpa",
         enable_thinking=False,
         prefix_cache=False,
+        fast_prefix=False,
     ):
         self.crop_tok = int(crop_tok)
         self.lr_tok = int(lr_tok)
@@ -68,6 +69,10 @@ class LDatRunner:
         self.where_layer = int(where_layer)
         self.enable_thinking = bool(enable_thinking)
         self.prefix_cache = bool(prefix_cache)
+        # The first forward only feeds the where-head. With fast_prefix it stops
+        # after the where-head layer, and the answer turn reuses its LR ViT rows.
+        # The answer forward itself is unchanged.
+        self.fast_prefix = bool(fast_prefix)
         self.dev = device
 
         from transformers import AutoProcessor
@@ -118,6 +123,18 @@ class LDatRunner:
         self.recurrent_fp32 = "off"
         print(f"[ldat] linear-attention continuation {self.gdn_multitoken}", flush=True)
         self._ensure_recurrent_fp32()
+        if not hasattr(self.model, "_dat_attn_modules"):
+            # The model caches this list on its first forward. A first pass that
+            # runs only the lower layers must not shorten it.
+            self.model._dat_attn_modules = [m for m in self.model.modules() if hasattr(m, "_dat_force_batch")]
+        self.lr_vit_reuse = True
+        self._lr_vit_checks = 4
+        self._lr_pixels_warned = False
+        self.n_lr_reuse = 0
+        if self.fast_prefix:
+            note = " (prefix_cache is on, so the full first pass runs)" if self.prefix_cache else ""
+            print(f"[ldat] fast_prefix: first pass stops after layer {self.where_layer}, "
+                  f"LR ViT reused{note}", flush=True)
         w = float(self.head.out.weight.detach().abs().mean())
         side = self._mosaic_side()
         geom = f"{self.n_win} x {side}x{side}" if side else f"1 x crop_tok {self.crop_tok}"
@@ -167,6 +184,66 @@ class LDatRunner:
     def _vit(self, pv, thw):
         e = self.model.model.visual(pv.to(torch.bfloat16), grid_thw=thw, return_dict=True).pooler_output
         return torch.cat(list(e), 0) if isinstance(e, (list, tuple)) else e
+
+    def _short_first_pass(self):
+        return self.fast_prefix and not self.prefix_cache
+
+    def _where_states(self, inp):
+        """Where-head states of the prefix and the LR ViT rows of that forward.
+
+        Only the decoder layers below the where-head run. They get the same
+        input, length and kernels as in the full first forward, so the states
+        are the same bits as ``hidden_states[where_layer]``.
+        """
+        lm = self.model.model.language_model
+        layers = lm.layers
+        got = {}
+
+        def keep_vit(module, args, output):
+            e = output.pooler_output
+            got["vit"] = torch.cat(list(e), 0) if isinstance(e, (list, tuple)) else e
+
+        def keep_h(module, args, output):
+            got["h"] = output[0] if isinstance(output, (tuple, list)) else output
+
+        hv = self.model.model.visual.register_forward_hook(keep_vit)
+        hl = layers[self.where_layer - 1].register_forward_hook(keep_h)
+        lm.layers = torch.nn.ModuleList(list(layers)[: self.where_layer])
+        try:
+            self.model(**inp, use_cache=False, return_dict=True, logits_to_keep=1)
+        finally:
+            lm.layers = layers
+            hv.remove()
+            hl.remove()
+        return got["h"][0], got.get("vit")
+
+    def _reuse_lr_vit(self, lr_vit, prefix_pv, prefix_thw, lr_pv, lr_thw):
+        """First-pass LR ViT rows for the answer turn, or ``None`` to run the ViT again."""
+        if lr_vit is None or not self.lr_vit_reuse:
+            return None
+        pv = lr_pv.to(device=prefix_pv.device, dtype=prefix_pv.dtype)
+        same = (
+            torch.equal(lr_thw, prefix_thw.to(device=lr_thw.device, dtype=lr_thw.dtype))
+            and pv.shape == prefix_pv.shape
+            and torch.equal(pv, prefix_pv)
+        )
+        if not same:
+            if not self._lr_pixels_warned:
+                print("[ldat] LR pixels differ between the two turns; ViT runs again", flush=True)
+                self._lr_pixels_warned = True
+            return None
+        if self._lr_vit_checks > 0:
+            self._lr_vit_checks -= 1
+            fresh = self._vit(lr_pv.to(self.dev), lr_thw)
+            if not torch.equal(fresh, lr_vit):
+                self.lr_vit_reuse = False
+                diff = (fresh.float() - lr_vit.float()).abs().max().item()
+                print(f"[ldat] LR ViT reuse off: first-pass rows differ by {diff:.4g}", flush=True)
+                return fresh
+            if self._lr_vit_checks == 0:
+                print("[ldat] LR ViT reuse matched a fresh ViT bit for bit on 4 images", flush=True)
+        self.n_lr_reuse += 1
+        return lr_vit
 
     def _vit_image(self, pil):
         x = torch.from_numpy(np.asarray(pil, dtype=np.float32) / 255.0).permute(2, 0, 1).to(self.dev)
@@ -237,16 +314,24 @@ class LDatRunner:
         # tokens are recomputed with the mosaic, which is the same tiling as
         # one forward of the whole answer.
         boundary = None
-        if self.prefix_cache and self.gdn_multitoken == "patched":
-            boundary = arm_chunk_rewind(int(inp["input_ids"].shape[1]))
-        try:
-            out = self.model(**inp, output_hidden_states=True, return_dict=True,
-                             use_cache=self.prefix_cache)
-        finally:
-            failed = rewind_failed()
-            disarm_chunk_rewind()
+        failed = False
+        lr_vit = None
+        if self._short_first_pass():
+            hs, lr_vit = self._where_states(inp)
+            prefix_cache = None
+        else:
+            if self.prefix_cache and self.gdn_multitoken == "patched":
+                boundary = arm_chunk_rewind(int(inp["input_ids"].shape[1]))
+            try:
+                out = self.model(**inp, output_hidden_states=True, return_dict=True,
+                                 use_cache=self.prefix_cache)
+            finally:
+                failed = rewind_failed()
+                disarm_chunk_rewind()
+            prefix_cache = out.past_key_values if self.prefix_cache else None
+            hs = out.hidden_states[self.where_layer][0]
+            del out
         prefix_ids = inp["input_ids"][0]
-        prefix_cache = out.past_key_values if self.prefix_cache else None
         if boundary and failed:
             print("[ldat] gdn chunk rewind failed; keeping the prefix end", flush=True)
             boundary = None
@@ -273,7 +358,6 @@ class LDatRunner:
         ids = prefix_ids
         is_img = ids == self.image_id
         gh_l, gw_l = int(thw[1]) // 2, int(thw[2]) // 2
-        hs = out.hidden_states[self.where_layer][0]
         cells = hs[is_img]
         if cells.shape[0] != gh_l * gw_l:
             print(f"[ldat] where-head grid {cells.shape[0]} != {gh_l}x{gw_l}", flush=True)
@@ -401,7 +485,9 @@ class LDatRunner:
                   flush=True)
         lr_emb = None
         if cache is None:
-            lr_emb = self._vit(lr_pv.to(dev).to(torch.bfloat16), lr_thw)
+            lr_emb = self._reuse_lr_vit(lr_vit, inp["pixel_values"], prefix_thw, lr_pv, lr_thw)
+            if lr_emb is None:
+                lr_emb = self._vit(lr_pv.to(dev).to(torch.bfloat16), lr_thw)
         return dict(ids=ids, mm=mm[None], pos3d=pos3d, rope_deltas=rope_deltas, emb=emb,
                     lr_emb=lr_emb, lr_pv=lr_pv, lr_thw=lr_thw, img_pos=img_pos, blocks=blocks,
                     wins=wins, feats=feats, pts=pts, n_tokens=int(ids.shape[0]),

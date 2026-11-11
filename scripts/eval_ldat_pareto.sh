@@ -68,7 +68,10 @@ pc_arg=""
 if [[ "${PREFIX_CACHE:-0}" == "1" ]]; then
     pc_arg=",prefix_cache=True"
 fi
-echo "[pareto] head=$LDAT_PT  prefix_cache=${PREFIX_CACHE:-0}"
+if [[ "${FAST_PREFIX:-0}" == "1" ]]; then
+    pc_arg="${pc_arg},fast_prefix=True"
+fi
+echo "[pareto] head=$LDAT_PT  prefix_cache=${PREFIX_CACHE:-0}  fast_prefix=${FAST_PREFIX:-0}"
 
 for tok in $TOKS; do
     for task in $TASKS; do

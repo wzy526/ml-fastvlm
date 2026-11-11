@@ -46,6 +46,7 @@ class Qwen3_5_LDAT(lmms):
         attn_implementation: Optional[str] = "sdpa",
         enable_thinking: bool = False,
         prefix_cache: bool = False,
+        fast_prefix: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -71,6 +72,7 @@ class Qwen3_5_LDAT(lmms):
             n_win=n_win, grid=grid, attn=attn_implementation or "sdpa",
             enable_thinking=_flag(enable_thinking),
             prefix_cache=_flag(prefix_cache),
+            fast_prefix=_flag(fast_prefix),
         )
         self._tokenizer = self.runner.tok
         self.pretrained = pretrained
@@ -146,7 +148,8 @@ class Qwen3_5_LDAT(lmms):
             max_new = int(gen_kwargs.get("max_new_tokens", 32))
             if not self._printed_tok:
                 print(f"[ldat] enable_thinking={self.runner.enable_thinking} "
-                      f"prefix_cache={self.runner.prefix_cache} max_new_tokens={max_new}",
+                      f"prefix_cache={self.runner.prefix_cache} fast_prefix={self.runner.fast_prefix} "
+                      f"max_new_tokens={max_new}",
                       flush=True)
             for context, visual in zip(contexts, visuals):
                 if isinstance(context, str) and "<image>" in context:
