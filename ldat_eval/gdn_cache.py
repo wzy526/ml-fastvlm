@@ -18,6 +18,7 @@ _CHUNK = 64
 # together with the mosaic, so the chunks line up with one full forward.
 _rewind_boundary = None
 _rewind_failed = False
+_snap_kernel_noted = False
 
 
 def enable_multitoken_gdn():
@@ -210,14 +211,16 @@ def _prefill_at_chunk(self, hidden_states, cache_params, attention_mask, boundar
     the conv tail are the values from token ``boundary``.
     """
     global _rewind_failed
-    from transformers.models.qwen3_5.modeling_qwen3_5 import (
-        apply_mask_to_padding_states,
-        torch_chunk_gated_delta_rule,
-    )
+    from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
-    if self.chunk_gated_delta_rule is not torch_chunk_gated_delta_rule:
-        _rewind_failed = True
-        return orig(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
+    global _snap_kernel_noted
+    fn = self.chunk_gated_delta_rule
+    if not _snap_kernel_noted:
+        print(
+            f"[ldat] gdn snapshot uses the torch chunk loop; model kernel is {getattr(fn, '__name__', type(fn).__name__)}",
+            flush=True,
+        )
+        _snap_kernel_noted = True
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
     batch_size, seq_len, _ = hidden_states.shape
     mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
