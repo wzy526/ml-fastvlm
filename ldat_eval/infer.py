@@ -19,7 +19,13 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 import llava.model.language_model.modeling_qwen3_5_dat as dat_mod
-from ldat_eval.gdn_cache import enable_multitoken_gdn, keep_recurrent_state_fp32
+from ldat_eval.gdn_cache import (
+    arm_chunk_rewind,
+    disarm_chunk_rewind,
+    enable_multitoken_gdn,
+    keep_recurrent_state_fp32,
+    rewind_failed,
+)
 from offset_feat_train import LDatHead, global_positions, inv_cdf, nms_peaks
 from patch_sample_probe import crop_geometry
 
@@ -108,6 +114,7 @@ class LDatRunner:
         self.gdn_multitoken = enable_multitoken_gdn()
         self._gdn_warned = False
         self._fp32_seen = False
+        self._rewind_logged = False
         self.recurrent_fp32 = "off"
         print(f"[ldat] linear-attention continuation {self.gdn_multitoken}", flush=True)
         self._ensure_recurrent_fp32()
@@ -226,10 +233,34 @@ class LDatRunner:
         inp = self.processor(text=[text], images=[lr_img], return_tensors="pt")
         inp = {k: v.to(dev) for k, v in inp.items() if torch.is_tensor(v)}
         inp["pixel_values"] = inp["pixel_values"].to(torch.bfloat16)
-        out = self.model(**inp, output_hidden_states=True, return_dict=True,
-                         use_cache=self.prefix_cache)
+        # Stop the linear cache on a 64-token boundary. The leftover prefix
+        # tokens are recomputed with the mosaic, which is the same tiling as
+        # one forward of the whole answer.
+        boundary = None
+        if self.prefix_cache and self.gdn_multitoken == "patched":
+            boundary = arm_chunk_rewind(int(inp["input_ids"].shape[1]))
+        try:
+            out = self.model(**inp, output_hidden_states=True, return_dict=True,
+                             use_cache=self.prefix_cache)
+        finally:
+            failed = rewind_failed()
+            disarm_chunk_rewind()
         prefix_ids = inp["input_ids"][0]
         prefix_cache = out.past_key_values if self.prefix_cache else None
+        if boundary and failed:
+            print("[ldat] gdn chunk rewind failed; keeping the prefix end", flush=True)
+            boundary = None
+        if prefix_cache is not None and boundary:
+            prefix_cache.crop(boundary)
+            seen = prefix_cache.get_seq_length()
+            if seen != boundary:
+                print(f"[ldat] gdn chunk rewind left the cache at {seen}; prefix cache off", flush=True)
+                prefix_cache = None
+                boundary = None
+            elif not self._rewind_logged:
+                n_prefix = int(prefix_ids.shape[0])
+                print(f"[ldat] gdn state kept at {boundary} of {n_prefix}", flush=True)
+                self._rewind_logged = True
         if prefix_cache is not None and not self._fp32_seen:
             kinds = sorted({
                 str(layer.recurrent_states.dtype).replace("torch.", "")
@@ -352,7 +383,7 @@ class LDatRunner:
                     pos3d[:, :, :npre].long(), pos_pre.long())
                 same_pixels = prefix_pv.shape == ans_pv.shape and torch.equal(prefix_pv, ans_pv)
                 if same_pos and same_pixels:
-                    cache, cache_len = prefix_cache, npre
+                    cache, cache_len = prefix_cache, boundary if boundary else npre
                 elif not same_pos:
                     print("[ldat] prefix cache off: positions differ", flush=True)
                 else:
@@ -376,6 +407,35 @@ class LDatRunner:
                     wins=wins, feats=feats, pts=pts, n_tokens=int(ids.shape[0]),
                     cache=cache, cache_len=cache_len, split=split)
 
+    def _place_tail_visual(self, pr, emb, cut):
+        """Write image rows in the recomputed tail.
+
+        The tail can contain the end of the low-resolution image when the
+        64-token boundary falls inside it. Mosaic rows stay the sampled features.
+        """
+        img_pos = pr["img_pos"]
+        split = pr["split"]
+        if img_pos.numel() == 0:
+            return
+        lr_pos = img_pos[img_pos < split]
+        mosaic_pos = img_pos[img_pos >= split]
+        lr_keep = lr_pos[lr_pos >= cut]
+        if lr_keep.numel():
+            lr = self._lr_emb(pr)
+            if lr.shape[0] != lr_pos.shape[0]:
+                raise RuntimeError(f"LR embeddings {tuple(lr.shape)} != {int(lr_pos.shape[0])} image tokens")
+            emb[0, lr_keep - cut] = lr[lr_pos >= cut].to(dtype=emb.dtype)
+        mosaic_keep = mosaic_pos[mosaic_pos >= cut]
+        if mosaic_keep.numel():
+            feats = torch.cat(pr["feats"], 0)
+            skipped = int((mosaic_pos < cut).sum())
+            feats = feats[skipped:]
+            if feats.shape[0] != mosaic_keep.shape[0]:
+                raise RuntimeError(
+                    f"mosaic features {int(feats.shape[0])} != {int(mosaic_keep.shape[0])} tail image tokens"
+                )
+            emb[0, mosaic_keep - cut] = feats.to(dtype=emb.dtype)
+
     def _lr_emb(self, pr):
         if pr["lr_emb"] is None:
             pr["lr_emb"] = self._vit(pr["lr_pv"].to(self.dev).to(torch.bfloat16), pr["lr_thw"])
@@ -389,9 +449,7 @@ class LDatRunner:
         cut = pr["cache_len"]
         if pr["cache"] is not None:
             e = pr["emb"][:, cut:].clone()
-            rel = pr["img_pos"]
-            rel = rel[rel >= cut] - cut
-            e[0, rel] = torch.cat(pr["feats"], 0).to(e.dtype)
+            self._place_tail_visual(pr, e, cut)
             o = self.model(inputs_embeds=e, position_ids=pos[:, :, cut:],
                            mm_token_type_ids=pr["mm"][:, cut:],
                            past_key_values=pr["cache"],

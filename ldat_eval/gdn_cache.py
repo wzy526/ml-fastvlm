@@ -12,6 +12,12 @@ import torch
 import torch.nn.functional as F
 
 _NEEDLE = "has_previous_state(self.layer_idx) and seq_len == 1"
+_CHUNK = 64
+# While this is set, a fresh prefill longer than the boundary keeps the linear
+# state at that boundary (a multiple of 64). The caller recomputes the tail
+# together with the mosaic, so the chunks line up with one full forward.
+_rewind_boundary = None
+_rewind_failed = False
 
 
 def enable_multitoken_gdn():
@@ -45,6 +51,16 @@ def enable_multitoken_gdn():
             and cache_params.has_previous_state(self.layer_idx)
         )
         if not continue_chunk:
+            boundary = _rewind_boundary
+            if (
+                boundary is not None
+                and cache_params is not None
+                and seq_len > boundary
+                and not cache_params.has_previous_state(self.layer_idx)
+            ):
+                return _prefill_at_chunk(
+                    self, hidden_states, cache_params, attention_mask, boundary, orig
+                )
             return orig(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
         return _continue(self, hidden_states, cache_params, attention_mask)
 
@@ -90,6 +106,63 @@ def keep_recurrent_state_fp32():
     update_recurrent_state._ldat_fp32 = True
     LinearAttentionLayer.update_recurrent_state = update_recurrent_state
     return "patched"
+
+
+def arm_chunk_rewind(n_tokens):
+    """Keep the linear state at the last multiple of 64 in the next fresh prefill.
+
+    Returns that boundary, or ``None`` when ``n_tokens`` is already aligned.
+    The prefill still returns hidden states for every token. Only the cached
+    summary and conv tail are rewound, so the next forward can recompute the
+    leftover tokens together with the mosaic.
+    """
+    global _rewind_boundary, _rewind_failed
+    n_tokens = int(n_tokens)
+    boundary = (n_tokens // _CHUNK) * _CHUNK
+    _rewind_failed = False
+    _rewind_boundary = boundary if 0 < boundary < n_tokens else None
+    return _rewind_boundary
+
+
+def disarm_chunk_rewind():
+    global _rewind_boundary
+    _rewind_boundary = None
+
+
+def rewind_failed():
+    return _rewind_failed
+
+
+def _split_mask(mask, boundary, seq_len):
+    if mask is None:
+        return None, None
+    if mask.dim() == 2 and mask.shape[-1] == seq_len:
+        return mask[..., :boundary], mask[..., boundary:]
+    return None
+
+
+def _prefill_at_chunk(self, hidden_states, cache_params, attention_mask, boundary, orig):
+    """Run one prefill, then put the linear cache back at ``boundary``."""
+    global _rewind_failed
+    split = _split_mask(attention_mask, boundary, hidden_states.shape[1])
+    if attention_mask is not None and split is None:
+        _rewind_failed = True
+        return orig(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
+    mask_head, mask_tail = (None, None) if split is None else split
+    head = orig(
+        self, hidden_states[:, :boundary], cache_params=cache_params, attention_mask=mask_head
+    )
+    layer = cache_params.layers[self.layer_idx]
+    recurrent = layer.recurrent_states.clone()
+    conv = layer.conv_states.clone()
+    tail_h = hidden_states[:, boundary:]
+    if tail_h.shape[1] == 1:
+        tail = orig(self, tail_h, cache_params=cache_params, attention_mask=mask_tail)
+    else:
+        tail = _continue(self, tail_h, cache_params, mask_tail)
+    layer.recurrent_states.copy_(recurrent)
+    layer.conv_states.copy_(conv)
+    return torch.cat([head, tail], dim=1)
 
 
 def _continue(self, hidden_states, cache_params, attention_mask):
