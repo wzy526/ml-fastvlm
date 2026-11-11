@@ -259,7 +259,7 @@ class LDatRunner:
                 boundary = None
             elif not self._rewind_logged:
                 n_prefix = int(prefix_ids.shape[0])
-                print(f"[ldat] gdn state kept at {boundary} of {n_prefix}", flush=True)
+                print(f"[ldat] gdn state copied at {boundary} of {n_prefix}", flush=True)
                 self._rewind_logged = True
         if prefix_cache is not None and not self._fp32_seen:
             kinds = sorted({

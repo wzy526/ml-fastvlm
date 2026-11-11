@@ -133,36 +133,135 @@ def rewind_failed():
     return _rewind_failed
 
 
-def _split_mask(mask, boundary, seq_len):
-    if mask is None:
-        return None, None
-    if mask.dim() == 2 and mask.shape[-1] == seq_len:
-        return mask[..., :boundary], mask[..., boundary:]
-    return None
+def _l2norm(x, dim=-1, eps=1e-6):
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
+
+
+def _chunk_copy_state(
+    query, key, value, g, beta, keep_tokens, chunk_size=64, use_qk_l2norm_in_kernel=False,
+):
+    """One chunked prefill. Also return the fp32 summary after ``keep_tokens``.
+
+    Same math as ``torch_chunk_gated_delta_rule``. The summary is the value the
+    loop holds at that chunk boundary, before the tail of this call is applied.
+    """
+    initial_dtype = query.dtype
+    if use_qk_l2norm_in_kernel:
+        query = _l2norm(query, dim=-1, eps=1e-6)
+        key = _l2norm(key, dim=-1, eps=1e-6)
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    query = query * (1 / (query.shape[-1] ** 0.5))
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    last_recurrent_state = torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=value.dtype)
+    core_attn_out = torch.zeros_like(value)
+    saved = None
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn_i = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
+        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn_i @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+        if keep_tokens is not None and (i + 1) * chunk_size == keep_tokens:
+            saved = last_recurrent_state.clone()
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, saved
 
 
 def _prefill_at_chunk(self, hidden_states, cache_params, attention_mask, boundary, orig):
-    """Run one prefill, then put the linear cache back at ``boundary``."""
+    """Run the whole prefix in one forward, and keep the linear cache at ``boundary``.
+
+    The hidden states are the single-call result. Only the stored summary and
+    the conv tail are the values from token ``boundary``.
+    """
     global _rewind_failed
-    split = _split_mask(attention_mask, boundary, hidden_states.shape[1])
-    if attention_mask is not None and split is None:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        apply_mask_to_padding_states,
+        torch_chunk_gated_delta_rule,
+    )
+
+    if self.chunk_gated_delta_rule is not torch_chunk_gated_delta_rule:
         _rewind_failed = True
         return orig(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
-    mask_head, mask_tail = (None, None) if split is None else split
-    head = orig(
-        self, hidden_states[:, :boundary], cache_params=cache_params, attention_mask=mask_head
-    )
-    layer = cache_params.layers[self.layer_idx]
-    recurrent = layer.recurrent_states.clone()
-    conv = layer.conv_states.clone()
-    tail_h = hidden_states[:, boundary:]
-    if tail_h.shape[1] == 1:
-        tail = orig(self, tail_h, cache_params=cache_params, attention_mask=mask_tail)
+    hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+    batch_size, seq_len, _ = hidden_states.shape
+    mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+    kernel = self.conv_kernel_size
+    if boundary < kernel or boundary >= seq_len:
+        _rewind_failed = True
+        return orig(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
+    conv_at = mixed_qkv[:, :, boundary - kernel:boundary].contiguous()
+    cache_params.update_conv_state(conv_at, self.layer_idx)
+    if self.causal_conv1d_fn is not None:
+        mixed_qkv = self.causal_conv1d_fn(
+            x=mixed_qkv,
+            weight=self.conv1d.weight.squeeze(1),
+            bias=self.conv1d.bias,
+            activation=self.activation,
+            seq_idx=None,
+        )
     else:
-        tail = _continue(self, tail_h, cache_params, mask_tail)
-    layer.recurrent_states.copy_(recurrent)
-    layer.conv_states.copy_(conv)
-    return torch.cat([head, tail], dim=1)
+        mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+    mixed_qkv = mixed_qkv.transpose(1, 2)
+    query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+    query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+    key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+    value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+    z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
+    b = self.in_proj_b(hidden_states)
+    a = self.in_proj_a(hidden_states)
+    beta = b.sigmoid()
+    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    if self.num_v_heads // self.num_k_heads > 1:
+        repeat = self.num_v_heads // self.num_k_heads
+        query = query.repeat_interleave(repeat, dim=2)
+        key = key.repeat_interleave(repeat, dim=2)
+    core_attn_out, saved = _chunk_copy_state(
+        query, key, value, g=g, beta=beta, keep_tokens=boundary, use_qk_l2norm_in_kernel=True,
+    )
+    if saved is None:
+        raise RuntimeError(f"gdn summary was not copied at token {boundary}")
+    cache_params.update_recurrent_state(saved, self.layer_idx)
+    core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+    z = z.reshape(-1, self.head_v_dim)
+    core_attn_out = self.norm(core_attn_out, z)
+    core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+    return self.out_proj(core_attn_out)
 
 
 def _continue(self, hidden_states, cache_params, attention_mask):
