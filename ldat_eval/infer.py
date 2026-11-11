@@ -19,6 +19,7 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 import llava.model.language_model.modeling_qwen3_5_dat as dat_mod
+from ldat_eval.gdn_cache import enable_multitoken_gdn
 from offset_feat_train import LDatHead, global_positions, inv_cdf, nms_peaks
 from patch_sample_probe import crop_geometry
 
@@ -103,6 +104,10 @@ class LDatRunner:
         self.n_cache = 0
         self.n_cache_fallback = 0
         self.last_n_tokens = 0
+        self.last_prefill_logits = None
+        self.gdn_multitoken = enable_multitoken_gdn()
+        self._gdn_warned = False
+        print(f"[ldat] linear-attention continuation {self.gdn_multitoken}", flush=True)
         w = float(self.head.out.weight.detach().abs().mean())
         side = self._mosaic_side()
         geom = f"{self.n_win} x {side}x{side}" if side else f"1 x crop_tok {self.crop_tok}"
@@ -200,13 +205,12 @@ class LDatRunner:
                 {"role": "user", "content": [{"type": "image", "image": lr_img},
                                              {"type": "text", "text": question},
                                              {"type": "text", "text": dat_mod.WHERE_HINT}]}]
-        proc = self.hr_processor if self.prefix_cache else self.processor
-        text = proc.apply_chat_template(
+        text = self.processor.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False)
         text = text.rstrip()
         if text.endswith("<|im_end|>"):
             text = text[:-len("<|im_end|>")]
-        inp = proc(text=[text], images=[lr_img], return_tensors="pt")
+        inp = self.processor(text=[text], images=[lr_img], return_tensors="pt")
         inp = {k: v.to(dev) for k, v in inp.items() if torch.is_tensor(v)}
         inp["pixel_values"] = inp["pixel_values"].to(torch.bfloat16)
         out = self.model(**inp, output_hidden_states=True, return_dict=True,
@@ -308,6 +312,11 @@ class LDatRunner:
         # and that token is prefilled with the mosaic.
         npre = int(prefix_ids.shape[0]) if prefix_cache is not None else 0
         cache, cache_len = None, 0
+        if prefix_cache is not None and self.gdn_multitoken == "broken":
+            if not self._gdn_warned:
+                print("[ldat] prefix cache off: linear attention would drop the prefix state", flush=True)
+                self._gdn_warned = True
+            prefix_cache = None
         if (prefix_cache is not None and lr_end <= npre < int(ids.shape[0])
                 and torch.equal(ids[:npre], prefix_ids)):
             same_grid = torch.equal(lr_thw, prefix_thw.to(device=lr_thw.device, dtype=lr_thw.dtype))
@@ -315,11 +324,18 @@ class LDatRunner:
                 pos_pre, _ = self.model.model.get_rope_index(
                     ids[:npre][None], mm[:npre][None], image_grid_thw=lr_thw)
                 pos_pre = pos_pre.to(pos3d.device)
-                if pos_pre.shape == pos3d[:, :, :npre].shape and torch.equal(
-                        pos3d[:, :, :npre].long(), pos_pre.long()):
+                prefix_pv = inp["pixel_values"]
+                ans_pv = lr_pv.to(device=prefix_pv.device, dtype=prefix_pv.dtype)
+                same_pos = pos_pre.shape == pos3d[:, :, :npre].shape and torch.equal(
+                    pos3d[:, :, :npre].long(), pos_pre.long())
+                same_pixels = prefix_pv.shape == ans_pv.shape and torch.equal(prefix_pv, ans_pv)
+                if same_pos and same_pixels:
                     cache, cache_len = prefix_cache, npre
-                else:
+                elif not same_pos:
                     print("[ldat] prefix cache off: positions differ", flush=True)
+                else:
+                    print(f"[ldat] prefix cache off: LR pixels {tuple(prefix_pv.shape)} vs {tuple(ans_pv.shape)}",
+                          flush=True)
             else:
                 print("[ldat] prefix cache off: LR grid differs", flush=True)
         elif prefix_cache is not None:
@@ -370,6 +386,7 @@ class LDatRunner:
             o = self.model(inputs_embeds=e, position_ids=pos, mm_token_type_ids=pr["mm"],
                            cache_position=torch.arange(n, device=dev),
                            use_cache=True, return_dict=True, logits_to_keep=1)
+        self.last_prefill_logits = o.logits.detach()
         return o, pos, n
 
     @torch.inference_mode()
@@ -378,7 +395,6 @@ class LDatRunner:
         if pr is None:
             return ""
         self.last_n_tokens = int(pr["n_tokens"])
-        dev = self.dev
         try:
             o, pos, n = self._prefill(pr)
         except Exception as exc:
@@ -386,6 +402,15 @@ class LDatRunner:
             print(f"[ldat] prefix cache failed ({type(exc).__name__}: {exc}); full prefill", flush=True)
             pr["cache"] = None
             o, pos, n = self._prefill(pr)
+        return self._decode(o, pos, n, max_new_tokens)
+
+    @torch.inference_mode()
+    def finish(self, pr, max_new_tokens):
+        o, pos, n = self._prefill(pr)
+        return self._decode(o, pos, n, max_new_tokens)
+
+    def _decode(self, o, pos, n, max_new_tokens):
+        dev = self.dev
         cache = o.past_key_values
         next_pos = int(math.floor(float(pos.max()))) + 1
         logits = o.logits[0, -1]

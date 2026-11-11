@@ -20,18 +20,37 @@ from gdino_probe import load_vstar
 from ldat_eval.infer import LDatRunner
 
 
+def sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def run(runner, samples, n_tok, flag):
     runner.prefix_cache = flag
     times, answers = [], []
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    sync()
     for sample in samples:
         t0 = time.perf_counter()
         answers.append(runner.generate(sample["image"], sample["prompt"], n_tok))
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        sync()
         times.append(time.perf_counter() - t0)
     return times, answers
+
+
+def same_window(runner, sample, n_tok):
+    """One window, then the full prefill and the cache continuation on those embeddings."""
+    runner.prefix_cache = True
+    pr = runner.prepare(sample["image"], sample["prompt"])
+    if pr is None or pr["cache"] is None:
+        return None
+    held = pr["cache"]
+    pr["cache"] = None
+    full = runner.finish(pr, n_tok)
+    full_logits = runner.last_prefill_logits
+    pr["cache"] = held
+    cached = runner.finish(pr, n_tok)
+    delta = (full_logits.float() - runner.last_prefill_logits.float()).abs().max().item()
+    return full, cached, delta
 
 
 def main():
@@ -64,6 +83,17 @@ def main():
     for i, (a, b) in enumerate(zip(full_a, cache_a)):
         if a != b:
             print(f"[bench] differ {i}: {a!r} | {b!r}")
+    for i, sample in enumerate(samples[1:]):
+        try:
+            got = same_window(runner, sample, args.max_new_tokens)
+        except Exception as exc:
+            print(f"[bench] same_window {i} failed: {type(exc).__name__}: {exc}")
+            continue
+        if got is None:
+            print(f"[bench] same_window {i} cache not used")
+            continue
+        full, cached, delta = got
+        print(f"[bench] same_window {i} match {full == cached}  logit_max_abs {delta:.4g}  {full!r} | {cached!r}")
 
 
 if __name__ == "__main__":
