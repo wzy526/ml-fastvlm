@@ -19,7 +19,7 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 import llava.model.language_model.modeling_qwen3_5_dat as dat_mod
-from ldat_eval.gdn_cache import enable_multitoken_gdn
+from ldat_eval.gdn_cache import enable_multitoken_gdn, keep_recurrent_state_fp32
 from offset_feat_train import LDatHead, global_positions, inv_cdf, nms_peaks
 from patch_sample_probe import crop_geometry
 
@@ -107,12 +107,24 @@ class LDatRunner:
         self.last_prefill_logits = None
         self.gdn_multitoken = enable_multitoken_gdn()
         self._gdn_warned = False
+        self._fp32_seen = False
+        self.recurrent_fp32 = "off"
         print(f"[ldat] linear-attention continuation {self.gdn_multitoken}", flush=True)
+        self._ensure_recurrent_fp32()
         w = float(self.head.out.weight.detach().abs().mean())
         side = self._mosaic_side()
         geom = f"{self.n_win} x {side}x{side}" if side else f"1 x crop_tok {self.crop_tok}"
         print(f"[ldat] windows {geom}  lr_tok {self.lr_tok}  alpha {self.dat_alpha}  "
               f"ratio {self.dat_ratio}  head |w| {w:.3e}", flush=True)
+
+    def _ensure_recurrent_fp32(self):
+        if not self.prefix_cache or self.recurrent_fp32 in ("patched", "broken"):
+            return
+        self.recurrent_fp32 = keep_recurrent_state_fp32()
+        if self.recurrent_fp32 == "patched":
+            print("[ldat] linear-attention state kept in fp32", flush=True)
+        else:
+            print("[ldat] linear-attention state fp32 patch failed", flush=True)
 
     def _mosaic_side(self):
         if self.grid > 0:
@@ -196,6 +208,7 @@ class LDatRunner:
 
     @torch.inference_mode()
     def prepare(self, image, question):
+        self._ensure_recurrent_fp32()
         image = image.convert("RGB")
         w_img, h_img = image.size
         dev = self.dev
@@ -217,6 +230,14 @@ class LDatRunner:
                          use_cache=self.prefix_cache)
         prefix_ids = inp["input_ids"][0]
         prefix_cache = out.past_key_values if self.prefix_cache else None
+        if prefix_cache is not None and not self._fp32_seen:
+            kinds = sorted({
+                str(layer.recurrent_states.dtype).replace("torch.", "")
+                for layer in (getattr(prefix_cache, "layers", None) or [])
+                if getattr(layer, "recurrent_states", None) is not None
+            })
+            print(f"[ldat] linear-attention state dtype {' '.join(kinds) if kinds else 'missing'}", flush=True)
+            self._fp32_seen = True
         prefix_thw = inp["image_grid_thw"]
         ids = prefix_ids
         is_img = ids == self.image_id
@@ -312,9 +333,10 @@ class LDatRunner:
         # and that token is prefilled with the mosaic.
         npre = int(prefix_ids.shape[0]) if prefix_cache is not None else 0
         cache, cache_len = None, 0
-        if prefix_cache is not None and self.gdn_multitoken == "broken":
+        if prefix_cache is not None and (self.gdn_multitoken == "broken" or self.recurrent_fp32 == "broken"):
             if not self._gdn_warned:
-                print("[ldat] prefix cache off: linear attention would drop the prefix state", flush=True)
+                why = "drop the prefix state" if self.gdn_multitoken == "broken" else "round the summary to bfloat16"
+                print(f"[ldat] prefix cache off: linear attention would {why}", flush=True)
                 self._gdn_warned = True
             prefix_cache = None
         if (prefix_cache is not None and lr_end <= npre < int(ids.shape[0])

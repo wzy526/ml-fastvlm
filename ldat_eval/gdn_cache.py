@@ -53,6 +53,45 @@ def enable_multitoken_gdn():
     return "patched"
 
 
+def keep_recurrent_state_fp32():
+    """Keep the linear-attention summary in fp32 when it is written to the cache.
+
+    The torch chunk kernel already returns that summary in fp32. The cache
+    buffer is created in the conv state's dtype, bfloat16, and ``copy_`` rounds
+    it. The mosaic then reads the rounded value. Full-attention keys and the
+    conv tail stay in bfloat16. Returns ``patched`` or ``broken``.
+    """
+    try:
+        from transformers.cache_utils import LinearAttentionLayer
+    except Exception as exc:
+        print(f"[ldat] fp32 linear-attention state unavailable ({type(exc).__name__}: {exc})", flush=True)
+        return "broken"
+    current = LinearAttentionLayer.update_recurrent_state
+    if getattr(current, "_ldat_fp32", False):
+        return "patched"
+
+    def update_recurrent_state(self, recurrent_states, **kwargs):
+        recurrent_states = recurrent_states.float()
+        buf = self.recurrent_states
+        if (
+            not self.is_recurrent_states_initialized
+            or buf is None
+            or buf.dtype != torch.float32
+            or buf.shape != recurrent_states.shape
+            or buf.device != recurrent_states.device
+        ):
+            self.recurrent_states = torch.empty(
+                recurrent_states.shape, dtype=torch.float32, device=recurrent_states.device
+            )
+            self.is_recurrent_states_initialized = True
+        self.recurrent_states.copy_(recurrent_states)
+        return self.recurrent_states
+
+    update_recurrent_state._ldat_fp32 = True
+    LinearAttentionLayer.update_recurrent_state = update_recurrent_state
+    return "patched"
+
+
 def _continue(self, hidden_states, cache_params, attention_mask):
     from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 

@@ -87,7 +87,7 @@ for tok in $TOKS; do
         echo "------------------------------------------------------------------"
         if accelerate launch --num_processes "$NPROC" --main_process_port "$PORT" -m lmms_eval \
             --model qwen3_5_ldat \
-            --model_args "pretrained=${MODEL_PATH},where_head_pt=${WHERE_PT},ldat_pt=${LDAT_PT},crop_tok=${CROP_TOK},lr_tok=${tok},n_win=${N_WIN},grid=${GRID},dat_alpha=0.8,dat_ratio=0,src_scale=4,ldat_d=256,attn_implementation=sdpa${PREFIX_CACHE:+,prefix_cache=True}" \
+            --model_args "pretrained=${MODEL_PATH},where_head_pt=${WHERE_PT},ldat_pt=${LDAT_PT},crop_tok=${CROP_TOK},lr_tok=${tok},n_win=${N_WIN},grid=${GRID},dat_alpha=0.8,dat_ratio=0,src_scale=4,ldat_d=256,attn_implementation=sdpa${pc_arg}" \
             --tasks "$task" \
             --batch_size 1 \
             --log_samples \
