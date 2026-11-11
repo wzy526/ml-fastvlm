@@ -64,7 +64,11 @@ cd "$LMMS_EVAL_DIR"
 
 echo "[pareto] tasks: $TASKS"
 echo "[pareto] lr tokens: $TOKS   window=$CROP_TOK   n_win=$N_WIN grid=$GRID   out=$OUT"
-echo "[pareto] head=$LDAT_PT"
+pc_arg=""
+if [[ "${PREFIX_CACHE:-0}" == "1" ]]; then
+    pc_arg=",prefix_cache=True"
+fi
+echo "[pareto] head=$LDAT_PT  prefix_cache=${PREFIX_CACHE:-0}"
 
 for tok in $TOKS; do
     for task in $TASKS; do
@@ -83,7 +87,7 @@ for tok in $TOKS; do
         echo "------------------------------------------------------------------"
         if accelerate launch --num_processes "$NPROC" --main_process_port "$PORT" -m lmms_eval \
             --model qwen3_5_ldat \
-            --model_args "pretrained=${MODEL_PATH},where_head_pt=${WHERE_PT},ldat_pt=${LDAT_PT},crop_tok=${CROP_TOK},lr_tok=${tok},n_win=${N_WIN},grid=${GRID},dat_alpha=0.8,dat_ratio=0,src_scale=4,ldat_d=256,attn_implementation=sdpa" \
+            --model_args "pretrained=${MODEL_PATH},where_head_pt=${WHERE_PT},ldat_pt=${LDAT_PT},crop_tok=${CROP_TOK},lr_tok=${tok},n_win=${N_WIN},grid=${GRID},dat_alpha=0.8,dat_ratio=0,src_scale=4,ldat_d=256,attn_implementation=sdpa${PREFIX_CACHE:+,prefix_cache=True}" \
             --tasks "$task" \
             --batch_size 1 \
             --log_samples \

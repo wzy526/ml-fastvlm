@@ -20,6 +20,12 @@ from lmms_eval.api.model import lmms
 from ldat_eval.infer import LDatRunner
 
 
+def _flag(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in {"1", "true", "yes"}
+
+
 class Qwen3_5_LDAT(lmms):
     def __init__(
         self,
@@ -39,6 +45,7 @@ class Qwen3_5_LDAT(lmms):
         batch_size: int = 1,
         attn_implementation: Optional[str] = "sdpa",
         enable_thinking: bool = False,
+        prefix_cache: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -62,7 +69,8 @@ class Qwen3_5_LDAT(lmms):
             crop_tok=crop_tok, lr_tok=lr_tok, dat_alpha=dat_alpha, dat_ratio=dat_ratio,
             dat_k=dat_k, src_scale=src_scale, ldat_d=ldat_d, hr_cap=hr_cap,
             n_win=n_win, grid=grid, attn=attn_implementation or "sdpa",
-            enable_thinking=enable_thinking,
+            enable_thinking=_flag(enable_thinking),
+            prefix_cache=_flag(prefix_cache),
         )
         self._tokenizer = self.runner.tok
         self.pretrained = pretrained
@@ -137,7 +145,8 @@ class Qwen3_5_LDAT(lmms):
             until = [item for item in until if item != "\n\n"]
             max_new = int(gen_kwargs.get("max_new_tokens", 32))
             if not self._printed_tok:
-                print(f"[ldat] enable_thinking={self.runner.enable_thinking} max_new_tokens={max_new}",
+                print(f"[ldat] enable_thinking={self.runner.enable_thinking} "
+                      f"prefix_cache={self.runner.prefix_cache} max_new_tokens={max_new}",
                       flush=True)
             for context, visual in zip(contexts, visuals):
                 if isinstance(context, str) and "<image>" in context:
