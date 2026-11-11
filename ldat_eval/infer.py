@@ -44,6 +44,7 @@ class LDatRunner:
         grid=0,
         attn="sdpa",
         enable_thinking=False,
+        prefix_cache=False,
     ):
         self.crop_tok = int(crop_tok)
         self.lr_tok = int(lr_tok)
@@ -59,6 +60,7 @@ class LDatRunner:
         self.hr_cap = int(hr_cap)
         self.where_layer = int(where_layer)
         self.enable_thinking = bool(enable_thinking)
+        self.prefix_cache = bool(prefix_cache)
         self.dev = device
 
         from transformers import AutoProcessor
@@ -98,6 +100,8 @@ class LDatRunner:
                 self.think_end = int(tid)
         self.n_think_closed = 0
         self.n_think_capped = 0
+        self.n_cache = 0
+        self.n_cache_fallback = 0
         self.last_n_tokens = 0
         w = float(self.head.out.weight.detach().abs().mean())
         side = self._mosaic_side()
@@ -196,16 +200,21 @@ class LDatRunner:
                 {"role": "user", "content": [{"type": "image", "image": lr_img},
                                              {"type": "text", "text": question},
                                              {"type": "text", "text": dat_mod.WHERE_HINT}]}]
-        text = self.processor.apply_chat_template(
+        proc = self.hr_processor if self.prefix_cache else self.processor
+        text = proc.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False)
         text = text.rstrip()
         if text.endswith("<|im_end|>"):
             text = text[:-len("<|im_end|>")]
-        inp = self.processor(text=[text], images=[lr_img], return_tensors="pt")
+        inp = proc(text=[text], images=[lr_img], return_tensors="pt")
         inp = {k: v.to(dev) for k, v in inp.items() if torch.is_tensor(v)}
         inp["pixel_values"] = inp["pixel_values"].to(torch.bfloat16)
-        out = self.model(**inp, output_hidden_states=True, return_dict=True, use_cache=False)
-        ids = inp["input_ids"][0]
+        out = self.model(**inp, output_hidden_states=True, return_dict=True,
+                         use_cache=self.prefix_cache)
+        prefix_ids = inp["input_ids"][0]
+        prefix_cache = out.past_key_values if self.prefix_cache else None
+        prefix_thw = inp["image_grid_thw"]
+        ids = prefix_ids
         is_img = ids == self.image_id
         gh_l, gw_l = int(thw[1]) // 2, int(thw[2]) // 2
         hs = out.hidden_states[self.where_layer][0]
@@ -278,20 +287,78 @@ class LDatRunner:
         pos3d, rope_deltas = self.model.model.get_rope_index(ids[None], mm[None], image_grid_thw=thw2)
         pos3d = pos3d.to(dev)
         n_lr = int(torch.prod(thw2[0]))
-        lr_emb = self._vit(enc["pixel_values"][:n_lr].to(dev).to(torch.bfloat16), thw2[:1])
+        lr_pv = enc["pixel_values"][:n_lr]
+        lr_thw = thw2[:1]
         img_pos = torch.nonzero(ids == self.image_id).flatten()
         n_win_tok = sum(w["gh"] * w["gw"] for w in wins)
-        if img_pos.numel() != lr_emb.shape[0] + n_win_tok:
-            print(f"[ldat] image tokens {img_pos.numel()} != {lr_emb.shape[0]}+{n_win_tok}", flush=True)
+        n_lr_tok = int(torch.prod(thw2[0]).item()) // (self.ms * self.ms)
+        if img_pos.numel() != n_lr_tok + n_win_tok:
+            print(f"[ldat] image tokens {img_pos.numel()} != {n_lr_tok}+{n_win_tok}", flush=True)
             return None
         blocks = dat_mod._where_token_runs(ids, self.image_id)[1:]
         if len(blocks) != len(wins) or any(b - a != w["gh"] * w["gw"] for (a, b), w in zip(blocks, wins)):
             print("[ldat] window token runs do not match the mosaics", flush=True)
             return None
         emb = self.embed(ids[None])
+        split = int(blocks[0][0])
+        cache = None
+        if prefix_cache is not None and int(prefix_ids.shape[0]) == split and torch.equal(ids[:split], prefix_ids):
+            if torch.equal(lr_thw, prefix_thw):
+                pos_pre, _ = self.model.model.get_rope_index(
+                    ids[:split][None], mm[:split][None], image_grid_thw=lr_thw)
+                if torch.equal(pos3d[:, :, :split], pos_pre.to(pos3d.device)):
+                    cache = prefix_cache
+                else:
+                    print("[ldat] prefix cache off: positions differ", flush=True)
+            else:
+                print("[ldat] prefix cache off: LR grid differs", flush=True)
+        elif prefix_cache is not None:
+            npre = int(prefix_ids.shape[0])
+            ncmp = min(npre, split, int(ids.shape[0]))
+            bad = -1
+            if ncmp and not torch.equal(ids[:ncmp], prefix_ids[:ncmp]):
+                bad = int((ids[:ncmp] != prefix_ids[:ncmp]).nonzero(as_tuple=False)[0])
+            print(f"[ldat] prefix cache off: prefix {npre} tokens, mosaic starts at {split}, first mismatch {bad}",
+                  flush=True)
+        lr_emb = None
+        if cache is None:
+            lr_emb = self._vit(lr_pv.to(dev).to(torch.bfloat16), lr_thw)
         return dict(ids=ids, mm=mm[None], pos3d=pos3d, rope_deltas=rope_deltas, emb=emb,
-                    lr_emb=lr_emb, img_pos=img_pos, blocks=blocks, wins=wins,
-                    feats=feats, pts=pts, n_tokens=int(ids.shape[0]))
+                    lr_emb=lr_emb, lr_pv=lr_pv, lr_thw=lr_thw, img_pos=img_pos, blocks=blocks,
+                    wins=wins, feats=feats, pts=pts, n_tokens=int(ids.shape[0]),
+                    cache=cache, split=split)
+
+    def _lr_emb(self, pr):
+        if pr["lr_emb"] is None:
+            pr["lr_emb"] = self._vit(pr["lr_pv"].to(self.dev).to(torch.bfloat16), pr["lr_thw"])
+        return pr["lr_emb"]
+
+    def _prefill(self, pr):
+        dev = self.dev
+        pos = global_positions(pr["pos3d"], pr["blocks"], pr["wins"], pr["pts"])
+        self.model.model.rope_deltas = pr["rope_deltas"]
+        n = pr["emb"].shape[1]
+        split = pr["split"]
+        if pr["cache"] is not None:
+            e = pr["emb"][:, split:].clone()
+            rel = pr["img_pos"]
+            rel = rel[rel >= split] - split
+            e[0, rel] = torch.cat(pr["feats"], 0).to(e.dtype)
+            o = self.model(inputs_embeds=e, position_ids=pos[:, :, split:],
+                           mm_token_type_ids=pr["mm"][:, split:],
+                           past_key_values=pr["cache"],
+                           cache_position=torch.arange(split, n, device=dev),
+                           use_cache=True, return_dict=True, logits_to_keep=1)
+            self.n_cache += 1
+            if self.n_cache == 1:
+                print(f"[ldat] prefix cache reused {split} tokens, new {n - split}", flush=True)
+        else:
+            e = pr["emb"].clone()
+            e[0, pr["img_pos"]] = torch.cat([self._lr_emb(pr)] + pr["feats"], 0).to(e.dtype)
+            o = self.model(inputs_embeds=e, position_ids=pos, mm_token_type_ids=pr["mm"],
+                           cache_position=torch.arange(n, device=dev),
+                           use_cache=True, return_dict=True, logits_to_keep=1)
+        return o, pos, n
 
     @torch.inference_mode()
     def generate(self, image, question, max_new_tokens):
@@ -300,14 +367,13 @@ class LDatRunner:
             return ""
         self.last_n_tokens = int(pr["n_tokens"])
         dev = self.dev
-        e = pr["emb"].clone()
-        e[0, pr["img_pos"]] = torch.cat([pr["lr_emb"]] + pr["feats"], 0).to(e.dtype)
-        pos = global_positions(pr["pos3d"], pr["blocks"], pr["wins"], pr["pts"])
-        self.model.model.rope_deltas = pr["rope_deltas"]
-        n = e.shape[1]
-        o = self.model(inputs_embeds=e, position_ids=pos, mm_token_type_ids=pr["mm"],
-                       cache_position=torch.arange(n, device=dev),
-                       use_cache=True, return_dict=True, logits_to_keep=1)
+        try:
+            o, pos, n = self._prefill(pr)
+        except Exception as exc:
+            self.n_cache_fallback += 1
+            print(f"[ldat] prefix cache failed ({type(exc).__name__}: {exc}); full prefill", flush=True)
+            pr["cache"] = None
+            o, pos, n = self._prefill(pr)
         cache = o.past_key_values
         next_pos = int(math.floor(float(pos.max()))) + 1
         logits = o.logits[0, -1]
