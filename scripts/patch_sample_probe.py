@@ -103,7 +103,7 @@ def grid_shape(aspect, n):
     return gh, gw
 
 
-def crop_geometry(image, win, crop_tok):
+def crop_geometry(image, win, crop_tok, *, factor=BLOCK):
     """modeling._where_crop_image's pixel box and its resized grid (gh, gw)."""
     W, H = image.size
     x0, y0, x1, y1 = win
@@ -111,10 +111,10 @@ def crop_geometry(image, win, crop_tok):
     px1 = min(max(int(math.ceil(x1 * W)), px0 + 1), W)
     py1 = min(max(int(math.ceil(y1 * H)), py0 + 1), H)
     cw, ch = px1 - px0, py1 - py0
-    sc = math.sqrt(min(crop_tok * 1024, cw * ch) / float(cw * ch))
-    nw = max(BLOCK, int(cw * sc) // BLOCK * BLOCK)
-    nh = max(BLOCK, int(ch * sc) // BLOCK * BLOCK)
-    return px0, py0, px1, py1, nh // BLOCK, nw // BLOCK
+    sc = math.sqrt(min(crop_tok * (factor * factor), cw * ch) / float(cw * ch))
+    nw = max(factor, int(cw * sc) // factor * factor)
+    nh = max(factor, int(ch * sc) // factor * factor)
+    return px0, py0, px1, py1, nh // factor, nw // factor
 
 
 def linspace(a, b, n):

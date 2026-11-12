@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gdino_probe import load_vstar, gt_box_frac, gt_window, box_hits, hd_size, FACTOR  # noqa: E402
 
@@ -89,20 +90,22 @@ def load_train(jsons, image_root, max_per_json, say=print):
 # ───────────────────────── frozen model features ─────────────────────────
 
 class Frozen:
-    def __init__(self, model_path, txt_layer, hd_cap, attn, device, local_rank=0):
+    def __init__(self, model_path, txt_layer, hd_cap, attn, device, local_rank=0,
+                 model_family="auto", head_prefix="legacy"):
         from transformers import AutoProcessor
-        from llava.model.language_model.modeling_qwen3_5_dat import Qwen3_5DATForConditionalGeneration
-        self.model = Qwen3_5DATForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map={"": local_rank},
-            attn_implementation=attn).eval()
+        from ldat_eval.backbone import load_backbone
+        self.dtype = torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
+        self.backbone = load_backbone(model_path, model_family, device=device, dtype=self.dtype, attn=attn)
+        self.model = self.backbone.model
+        self.factor = self.backbone.factor
+        self.head_prefix = head_prefix
         for p in self.model.parameters():
             p.requires_grad_(False)
-        self.proc = AutoProcessor.from_pretrained(model_path, min_pixels=FACTOR * FACTOR, max_pixels=100_000_000)
+        self.proc = AutoProcessor.from_pretrained(model_path, min_pixels=self.factor * self.factor, max_pixels=100_000_000)
         self.tok = self.proc.tokenizer
         self.txt_layer = txt_layer
         self.hd_cap = hd_cap
         self.device = device
-        self.dtype = torch.bfloat16
         self.feat_cap = None        # --feat lr: tok x 1024 px (the LM's LR view), else the HD cap
         self.lm_layer = None        # --feat lm:L: cells = LM layer-L states of the LR image tokens
         self.lr_proc = None
@@ -111,9 +114,10 @@ class Frozen:
 
     def set_lm_view(self, model_path, lm_layer, lr_tok):
         from transformers import AutoProcessor
+        self.backbone.validate_layer(lm_layer)
         self.lm_layer = lm_layer
-        self.lr_proc = AutoProcessor.from_pretrained(model_path, min_pixels=FACTOR * FACTOR,
-                                                     max_pixels=lr_tok * FACTOR * FACTOR)
+        self.lr_proc = AutoProcessor.from_pretrained(model_path, min_pixels=self.factor * self.factor,
+                                                     max_pixels=lr_tok * self.factor * self.factor)
 
     def feats(self, img):
         return self.hd_features(img, self.feat_cap)
@@ -132,22 +136,23 @@ class Frozen:
         (question + template tail). These cells have attended to the question
         for L layers -- the representation the LM's own text grounding (77 %)
         and SD-RPN's RPN read from; the frozen ViT cells (48 %) have not."""
-        messages = [{"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": [{"type": "image", "image": img},
-                                                 {"type": "text", "text": q}]}]
-        text = self.lr_proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
-                                                enable_thinking=False)
+        from ldat_eval.backbone import where_prefix
+        if self.head_prefix == "train":
+            thw = self.lr_proc.image_processor(images=[img], return_tensors="pt")["image_grid_thw"][0]
+            img = img.resize((int(thw[2]) * self.backbone.patch_size,
+                              int(thw[1]) * self.backbone.patch_size), Image.BICUBIC)
+        text = where_prefix(self.lr_proc, img, q, self.head_prefix)
         inp = self.lr_proc(text=[text], images=[img], return_tensors="pt")
         ids = inp["input_ids"].to(self.device)
         kw = {}                                   # everything the processor made (mm_token_type_ids too)
         for k, v in inp.items():
             if isinstance(v, torch.Tensor):
                 kw[k] = v.to(device=self.device, dtype=self.dtype) if k == "pixel_values" else v.to(self.device)
-        out = self.model(**kw, output_hidden_states=True, return_dict=True)
+        out = self.backbone.forward(**kw, output_hidden_states=True, return_dict=True)
         hs = out.hidden_states[self.lm_layer][0]              # (S, C)
         is_img = ids[0] == self.image_token_id
         thw = inp["image_grid_thw"][0]
-        gh, gw = int(thw[1]) // 2, int(thw[2]) // 2
+        gh, gw = int(thw[1]) // self.backbone.merge_size, int(thw[2]) // self.backbone.merge_size
         cells = hs[is_img]
         assert cells.shape[0] == gh * gw, (cells.shape, gh, gw)
         last_img = int(torch.nonzero(is_img)[-1])
@@ -164,18 +169,21 @@ class Frozen:
         aspect = img.width / img.height
         h = int(math.sqrt(total / aspect))
         w = int(h * aspect)
-        hd_w, hd_h = max(FACTOR, w // FACTOR * FACTOR), max(FACTOR, h // FACTOR * FACTOR)
+        hd_w, hd_h = max(self.factor, w // self.factor * self.factor), max(self.factor, h // self.factor * self.factor)
         hd_img = img.resize((hd_w, hd_h), Image.BICUBIC)
         hr = self.proc.image_processor(images=[hd_img], return_tensors="pt")
-        feat = self.model._generate_hd_features(
-            hr["pixel_values"].to(device=self.device, dtype=self.dtype),
-            hr["image_grid_thw"].to(self.device))[0]
-        return feat                                           # (H, W, C) bf16
+        thw = hr["image_grid_thw"].to(self.device)
+        if self.backbone.family == "qwen3_5":
+            return self.model._generate_hd_features(
+                hr["pixel_values"].to(device=self.device, dtype=self.dtype), thw)[0]
+        feat = self.backbone.visual_tokens(hr["pixel_values"].to(self.device), thw)
+        return feat.reshape(int(thw[0, 1]) // self.backbone.merge_size,
+                            int(thw[0, 2]) // self.backbone.merge_size, -1)
 
     @torch.no_grad()
     def text_states(self, q):
         ids = self.tok(q, return_tensors="pt", truncation=True, max_length=96).to(self.device)
-        out = self.model(input_ids=ids["input_ids"], attention_mask=ids["attention_mask"],
+        out = self.backbone.forward(input_ids=ids["input_ids"], attention_mask=ids["attention_mask"],
                          output_hidden_states=True, return_dict=True)
         return out.hidden_states[self.txt_layer][0]           # (T, C) bf16
 
@@ -377,6 +385,8 @@ def vstar_query(s, mode):
 
 @torch.no_grad()
 def eval_vstar(frozen, head, samples, min_cells, out_cells, out_path=None, tag="", query="question"):
+    if not samples:
+        return 0.0
     head.eval()
     n = n_win = n_box = n_win3 = n_box3 = 0
     mass_sum = 0.0
@@ -463,6 +473,9 @@ def eval_heldout(frozen, head, rows, min_cells, out_cells, tag=""):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
+    ap.add_argument("--model_family", choices=["auto", "qwen2_5_vl", "qwen3_5"], default="auto")
+    ap.add_argument("--head_prefix", choices=["legacy", "train"], default="legacy")
+    ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     ap.add_argument("--train_json", nargs="*", default=[])
     ap.add_argument("--image_root", default="~/sft_data/train_split")
     ap.add_argument("--max_per_json", type=int, nargs="+", default=[20000],
@@ -511,8 +524,11 @@ def main():
     # model on its own shard of the rows, DDP averages the (tiny) head gradients
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    device = f"cuda:{local_rank}"
+    if args.device == "cuda":
+        torch.cuda.set_device(local_rank)
+    elif world > 1:
+        raise ValueError("CPU smoke mode supports one process")
+    device = f"cuda:{local_rank}" if args.device == "cuda" else "cpu"
     if world > 1:
         import torch.distributed as dist
         dist.init_process_group("nccl")
@@ -530,16 +546,18 @@ def main():
         os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_root, f"rank{local_rank}")
         os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
 
-    frozen = Frozen(args.model_path, args.txt_layer, args.hd_cap, args.attn, device, local_rank)
+    frozen = Frozen(args.model_path, args.txt_layer, args.hd_cap, args.attn, device, local_rank,
+                    args.model_family, args.head_prefix)
     time.sleep(args.stagger * local_rank)
     if args.feat == "lr":
-        frozen.feat_cap = args.lr_tok * FACTOR * FACTOR
+        frozen.feat_cap = args.lr_tok * frozen.factor * frozen.factor
     elif args.feat.startswith("lm:"):
         frozen.set_lm_view(args.model_path, int(args.feat.split(":")[1]), args.lr_tok)
     elif args.feat != "hd":
         raise SystemExit(f"--feat {args.feat}: expected hd | lr | lm:L")
-    vstar = load_vstar(args.vstar_root, args.vstar_n)
-    f0, t0_ = frozen.pair(vstar[0]["image"], "what colour is the cup?")
+    vstar = load_vstar(args.vstar_root, args.vstar_n) if args.vstar_n > 0 else []
+    sample_image = vstar[0]["image"] if vstar else Image.new("RGB", (224, 224))
+    f0, t0_ = frozen.pair(sample_image, "what colour is the cup?")
     c_img, c_txt = f0.shape[-1], t0_.shape[-1]
     if args.head == "xattn":
         head = XAttnHead(c_img, c_txt, args.d, args.xlayers, args.xheads).to(device)
@@ -550,7 +568,9 @@ def main():
         f"{world} GPU(s) -> {args.steps} steps x {args.accum} x {world} = {args.steps * args.accum * world} samples")
 
     if args.load:
-        head.load_state_dict(torch.load(os.path.expanduser(args.load), map_location=device))
+        from ldat_eval.checkpoints import load_head
+        state, _ = load_head(args.load, frozen.backbone, kind="where", where_layer=frozen.lm_layer)
+        head.load_state_dict(state)
         say(f"[where] loaded head weights from {args.load}")
         if not args.train_json:                                # eval-only
             if main_rank:
@@ -562,6 +582,8 @@ def main():
     rows = load_train(args.train_json, os.path.expanduser(args.image_root), args.max_per_json, say)
     held, rows = rows[: args.heldout], rows[args.heldout:]
     rows = rows[rank::world]                                   # same shuffle on every rank (seeded)
+    if not rows and args.steps > 0:
+        raise ValueError("No training rows left on this rank after heldout split")
     say(f"[where] {len(rows)} train rows per rank, {len(held)} held-out")
     if args.steps == 0:                                        # eval-only on the same held-out split
         if main_rank:
@@ -618,7 +640,13 @@ def main():
                 eval_vstar(frozen, head, vstar, args.min_cells, args.out_cells,
                            args.out_boxes if step == args.steps else None, f" [step {step}]")
                 if args.save:
-                    torch.save(head.state_dict(), os.path.expanduser(args.save))
+                    from ldat_eval.checkpoints import save_head
+                    save_head(args.save, head.state_dict(), metadata=dict(
+                        kind="where", model_family=frozen.backbone.family,
+                        hidden_size=frozen.backbone.hidden_size, factor=frozen.factor,
+                        where_layer=frozen.lm_layer, head_prefix=args.head_prefix,
+                        head_type=args.head, d=args.d, layers=args.xlayers, heads=args.xheads,
+                        lr_tok=args.lr_tok))
             barrier()
 
 

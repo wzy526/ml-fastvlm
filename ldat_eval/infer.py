@@ -18,7 +18,8 @@ _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
-import llava.model.language_model.modeling_qwen3_5_dat as dat_mod
+import llava.model.where_dat as dat_mod
+from ldat_eval.backbone import load_backbone, where_prefix
 from ldat_eval.gdn_cache import (
     arm_chunk_rewind,
     disarm_chunk_rewind,
@@ -53,6 +54,8 @@ class LDatRunner:
         enable_thinking=False,
         prefix_cache=False,
         fast_prefix=False,
+        model_family="qwen3_5",
+        dtype=None,
     ):
         self.crop_tok = int(crop_tok)
         self.lr_tok = int(lr_tok)
@@ -74,25 +77,28 @@ class LDatRunner:
         # The answer forward itself is unchanged.
         self.fast_prefix = bool(fast_prefix)
         self.dev = device
+        self.dtype = dtype or (torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32)
 
         from transformers import AutoProcessor
 
-        self.model = dat_mod.Qwen3_5DATForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map={"": device}, attn_implementation=attn
-        ).eval()
+        self.backbone = load_backbone(model_path, model_family, device=device, dtype=self.dtype, attn=attn)
+        self.model = self.backbone.model
+        self.model_family = self.backbone.family
+        self.backbone.validate_layer(self.where_layer)
+        self.factor = self.backbone.factor
         for p in self.model.parameters():
             p.requires_grad_(False)
         self._load_where_head(os.path.expanduser(where_head_pt))
 
-        self.processor = AutoProcessor.from_pretrained(model_path, min_pixels=1024, max_pixels=self.lr_tok * 1024)
-        self.hr_processor = AutoProcessor.from_pretrained(model_path, min_pixels=1024, max_pixels=100_000_000)
+        self.processor = AutoProcessor.from_pretrained(model_path, min_pixels=self.factor ** 2, max_pixels=self.lr_tok * self.factor ** 2)
+        self.hr_processor = AutoProcessor.from_pretrained(model_path, min_pixels=self.factor ** 2, max_pixels=100_000_000)
         self.tok = self.hr_processor.tokenizer
         ip = self.hr_processor.image_processor
         self.ps, self.tps, self.ms = ip.patch_size, ip.temporal_patch_size, ip.merge_size
         self.mean = torch.tensor(ip.image_mean, device=device).view(3, 1, 1)
         self.std = torch.tensor(ip.image_std, device=device).view(3, 1, 1)
         self.image_id = self.model.config.image_token_id
-        c = self.model.config.text_config.hidden_size
+        c = self.backbone.hidden_size
         self.embed = self.model.get_input_embeddings()
         self.head = LDatHead(c, d=int(ldat_d)).to(device).eval()
         self._load_ldat(os.path.expanduser(ldat_pt))
@@ -116,12 +122,13 @@ class LDatRunner:
         self.n_cache_fallback = 0
         self.last_n_tokens = 0
         self.last_prefill_logits = None
-        self.gdn_multitoken = enable_multitoken_gdn()
+        self.gdn_multitoken = enable_multitoken_gdn() if self.model_family == "qwen3_5" else "not_applicable"
         self._gdn_warned = False
         self._fp32_seen = False
         self._rewind_logged = False
         self.recurrent_fp32 = "off"
-        print(f"[ldat] linear-attention continuation {self.gdn_multitoken}", flush=True)
+        if self.model_family == "qwen3_5":
+            print(f"[ldat] linear-attention continuation {self.gdn_multitoken}", flush=True)
         self._ensure_recurrent_fp32()
         if not hasattr(self.model, "_dat_attn_modules"):
             # The model caches this list on its first forward. A first pass that
@@ -142,6 +149,8 @@ class LDatRunner:
               f"ratio {self.dat_ratio}  head |w| {w:.3e}", flush=True)
 
     def _ensure_recurrent_fp32(self):
+        if self.model_family != "qwen3_5":
+            return
         if not self.prefix_cache or self.recurrent_fp32 in ("patched", "broken"):
             return
         self.recurrent_fp32 = keep_recurrent_state_fp32()
@@ -158,20 +167,26 @@ class LDatRunner:
         return 0
 
     def _load_where_head(self, path):
-        sd = torch.load(path, map_location="cpu")
-        sd = {k[len("where_head."):] if k.startswith("where_head.") else k: v for k, v in sd.items()}
+        from ldat_eval.checkpoints import load_head
+        sd, meta = load_head(path, self.backbone, kind="where", where_layer=self.where_layer,
+                             head_prefix="train" if self.model_family == "qwen2_5_vl" else None)
         if not hasattr(self.model, "where_head"):
-            hidden = self.model.config.text_config.hidden_size
-            self.model.where_head = dat_mod._WhereXAttnHead(hidden, hidden, d=384, layers=2, heads=6, max_hw=512)
+            hidden = self.backbone.hidden_size
+            self.model.where_head = dat_mod._WhereXAttnHead(
+                hidden, hidden, d=meta.get("d", 384), layers=meta.get("layers", 2),
+                heads=meta.get("heads", 6), max_hw=512)
         self.model.where_head.load_state_dict(sd)
         self.model.where_head.float().to(self.dev).eval()
+        self.model.where_head.requires_grad_(False)
 
     def _load_ldat(self, path):
-        sd = torch.load(path, map_location="cpu")
-        state = sd["head"] if isinstance(sd, dict) and "head" in sd else sd
+        from ldat_eval.checkpoints import load_head
+        state, meta = load_head(path, self.backbone, kind="ldat", where_layer=self.where_layer,
+                               inference=True)
         self.head.load_state_dict(state)
-        if isinstance(sd, dict) and sd.get("win_head"):
-            print("[ldat] checkpoint has a window head; this eval does not use it", flush=True)
+        for key in ("dat_alpha", "dat_ratio", "dat_k", "src_scale", "supersample", "hr_cap"):
+            if key in meta and meta[key] != getattr(self, key):
+                print(f"[ldat] evaluation override {key}={getattr(self, key)} (trained {meta[key]})", flush=True)
 
     def _patchify(self, x):
         _, h, w = x.shape
@@ -182,8 +197,7 @@ class LDatRunner:
         return x.reshape(gh * gw, 3 * self.tps * self.ps * self.ps)
 
     def _vit(self, pv, thw):
-        e = self.model.model.visual(pv.to(torch.bfloat16), grid_thw=thw, return_dict=True).pooler_output
-        return torch.cat(list(e), 0) if isinstance(e, (list, tuple)) else e
+        return self.backbone.visual_tokens(pv, thw)
 
     def _short_first_pass(self):
         return self.fast_prefix and not self.prefix_cache
@@ -200,8 +214,7 @@ class LDatRunner:
         got = {}
 
         def keep_vit(module, args, output):
-            e = output.pooler_output
-            got["vit"] = torch.cat(list(e), 0) if isinstance(e, (list, tuple)) else e
+            got["vit"] = self.backbone.merged_visual(output)
 
         def keep_h(module, args, output):
             got["h"] = output[0] if isinstance(output, (tuple, list)) else output
@@ -210,7 +223,7 @@ class LDatRunner:
         hl = layers[self.where_layer - 1].register_forward_hook(keep_h)
         lm.layers = torch.nn.ModuleList(list(layers)[: self.where_layer])
         try:
-            self.model(**inp, use_cache=False, return_dict=True, logits_to_keep=1)
+            self.backbone.forward(**inp, use_cache=False, return_dict=True, logits_to_keep=1)
         finally:
             lm.layers = layers
             hv.remove()
@@ -273,15 +286,15 @@ class LDatRunner:
         lp = pw.log()
         q = torch.softmax((lp + self.head(f, lp)).flatten(), 0).reshape(nh, nw)
         dx, dy = self._axis_density(q.sum(0)), self._axis_density(q.sum(1))
-        ux = (torch.arange(gw * 32 * s, device=self.dev) + 0.5) / (gw * 32 * s)
-        uy = (torch.arange(gh * 32 * s, device=self.dev) + 0.5) / (gh * 32 * s)
+        ux = (torch.arange(gw * self.factor * s, device=self.dev) + 0.5) / (gw * self.factor * s)
+        uy = (torch.arange(gh * self.factor * s, device=self.dev) + 0.5) / (gh * self.factor * s)
         sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
         img = F.grid_sample(w["psrc"][None], torch.stack([sx, sy], -1)[None], mode="bilinear",
                             padding_mode="border", align_corners=False)
-        if img.shape[-2:] != (gh * 32, gw * 32):
-            img = F.interpolate(img, size=(gh * 32, gw * 32), mode="bicubic", antialias=True, align_corners=False)
+        if img.shape[-2:] != (gh * self.factor, gw * self.factor):
+            img = F.interpolate(img, size=(gh * self.factor, gw * self.factor), mode="bicubic", antialias=True, align_corners=False)
         img = img[0].clamp(0, 1)
-        z = self._vit(self._patchify(img), torch.tensor([[1, gh * 32 // self.ps, gw * 32 // self.ps]], device=self.dev))
+        z = self._vit(self._patchify(img), torch.tensor([[1, gh * self.factor // self.ps, gw * self.factor // self.ps]], device=self.dev))
         z = z.reshape(gh * gw, -1)
         lx0, ly0, lx1, ly1 = w["lpx"]
         cx0, cy0, cx1, cy1 = w["px"]
@@ -297,19 +310,11 @@ class LDatRunner:
         w_img, h_img = image.size
         dev = self.dev
         thw = self.processor.image_processor(images=[image], return_tensors="pt")["image_grid_thw"][0]
-        lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
-        msgs = [{"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": [{"type": "image", "image": lr_img},
-                                             {"type": "text", "text": question},
-                                             {"type": "text", "text": dat_mod.WHERE_HINT}]}]
-        text = self.processor.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False)
-        text = text.rstrip()
-        if text.endswith("<|im_end|>"):
-            text = text[:-len("<|im_end|>")]
+        lr_img = image.resize((int(thw[2]) * self.ps, int(thw[1]) * self.ps), Image.BICUBIC)
+        text = where_prefix(self.processor, lr_img, question, "train")
         inp = self.processor(text=[text], images=[lr_img], return_tensors="pt")
         inp = {k: v.to(dev) for k, v in inp.items() if torch.is_tensor(v)}
-        inp["pixel_values"] = inp["pixel_values"].to(torch.bfloat16)
+        inp["pixel_values"] = inp["pixel_values"].to(self.dtype)
         # Stop the linear cache on a 64-token boundary. The leftover prefix
         # tokens are recomputed with the mosaic, which is the same tiling as
         # one forward of the whole answer.
@@ -323,7 +328,7 @@ class LDatRunner:
             if self.prefix_cache and self.gdn_multitoken == "patched":
                 boundary = arm_chunk_rewind(int(inp["input_ids"].shape[1]))
             try:
-                out = self.model(**inp, output_hidden_states=True, return_dict=True,
+                out = self.backbone.forward(**inp, output_hidden_states=True, return_dict=True,
                                  use_cache=self.prefix_cache)
             finally:
                 failed = rewind_failed()
@@ -346,7 +351,7 @@ class LDatRunner:
                 n_prefix = int(prefix_ids.shape[0])
                 print(f"[ldat] gdn state copied at {boundary} of {n_prefix}", flush=True)
                 self._rewind_logged = True
-        if prefix_cache is not None and not self._fp32_seen:
+        if self.model_family == "qwen3_5" and prefix_cache is not None and not self._fp32_seen:
             kinds = sorted({
                 str(layer.recurrent_states.dtype).replace("torch.", "")
                 for layer in (getattr(prefix_cache, "layers", None) or [])
@@ -357,14 +362,14 @@ class LDatRunner:
         prefix_thw = inp["image_grid_thw"]
         ids = prefix_ids
         is_img = ids == self.image_id
-        gh_l, gw_l = int(thw[1]) // 2, int(thw[2]) // 2
+        gh_l, gw_l = int(thw[1]) // self.ms, int(thw[2]) // self.ms
         cells = hs[is_img]
         if cells.shape[0] != gh_l * gw_l:
             print(f"[ldat] where-head grid {cells.shape[0]} != {gh_l}x{gw_l}", flush=True)
             return None
         logits = self.model.where_head(cells.reshape(gh_l, gw_l, -1), hs[int(torch.nonzero(is_img)[-1]) + 1:])
         head_p = torch.softmax(logits.float().flatten(), 0).reshape(logits.shape)
-        hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600)
+        hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600, patch_size=self.ps, merge_size=self.ms)
         side = self._mosaic_side()
         peaks = nms_peaks(logits, self.n_win, 4, 0.0)
         if not peaks:
@@ -374,9 +379,9 @@ class LDatRunner:
         for cy, cx in peaks:
             box = ((cx + 0.5 - 2) / gw_l, (cy + 0.5 - 2) / gh_l,
                    (cx + 0.5 + 2) / gw_l, (cy + 0.5 + 2) / gh_l)
-            win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h)
+            win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h, factor=self.factor)
             tok_budget = side * side if side else self.crop_tok
-            px0, py0, px1, py1, gh, gw = crop_geometry(image, win, tok_budget)
+            px0, py0, px1, py1, gh, gw = crop_geometry(image, win, tok_budget, factor=self.factor)
             if side:
                 gh = gw = side
             lw = win
@@ -387,11 +392,11 @@ class LDatRunner:
                    min(max(int(math.ceil(lw[3] * h_img)), ly0 + 1), h_img))
             lcrop = image.crop(lpx)
             lcw, lch = lcrop.size
-            sc = math.sqrt(min(self.hr_cap * 1024, lcw * lch) / float(lcw * lch))
-            nw, nh = max(32, int(lcw * sc) // 32 * 32), max(32, int(lch * sc) // 32 * 32)
+            sc = math.sqrt(min(self.hr_cap * self.factor ** 2, lcw * lch) / float(lcw * lch))
+            nw, nh = max(self.factor, int(lcw * sc) // self.factor * self.factor), max(self.factor, int(lch * sc) // self.factor * self.factor)
             lmap = self._vit_image(lcrop.resize((nw, nh), Image.BICUBIC)).permute(2, 0, 1)[None].float()
-            sw = min(lcw, round(self.src_scale * gw * 32))
-            sh = min(lch, round(self.src_scale * gh * 32))
+            sw = min(lcw, round(self.src_scale * gw * self.factor))
+            sh = min(lch, round(self.src_scale * gh * self.factor))
             psrc = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32) / 255.0)
             psrc = psrc.permute(2, 0, 1).to(dev)
             win_rec = dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, lpx=lpx,
@@ -402,7 +407,7 @@ class LDatRunner:
             feats.append(z)
             pts.append(pt)
 
-        dummies = [Image.new("RGB", (w["gw"] * 32, w["gh"] * 32)) for w in wins]
+        dummies = [Image.new("RGB", (w["gw"] * self.factor, w["gh"] * self.factor)) for w in wins]
         qd = {"type": "text", "text": question}
         # Where-head still sees question + WHERE_HINT only. The answer turn is
         # the 2B layout: the question is asked again after the mosaic.
@@ -417,14 +422,14 @@ class LDatRunner:
         enc = self.hr_processor(text=[atext], images=[lr_img] + dummies, return_tensors="pt")
         thw2 = enc["image_grid_thw"].to(dev)
         for k, w in enumerate(wins):
-            if tuple(thw2[1 + k].tolist()) != (1, 2 * w["gh"], 2 * w["gw"]):
+            if tuple(thw2[1 + k].tolist()) != (1, self.ms * w["gh"], self.ms * w["gw"]):
                 print(f"[ldat] mosaic {k} grid {tuple(thw2[1 + k].tolist())} != "
-                      f"{(1, 2 * w['gh'], 2 * w['gw'])}", flush=True)
+                      f"{(1, self.ms * w['gh'], self.ms * w['gw'])}", flush=True)
                 return None
         ids = enc["input_ids"][0].to(dev)
         mm = torch.zeros_like(ids)
         mm[ids == self.image_id] = 1
-        pos3d, rope_deltas = self.model.model.get_rope_index(ids[None], mm[None], image_grid_thw=thw2)
+        pos3d, rope_deltas = self.backbone.rope_index(ids[None], mm[None], thw2)
         pos3d = pos3d.to(dev)
         n_lr = int(torch.prod(thw2[0]))
         lr_pv = enc["pixel_values"][:n_lr]
@@ -458,8 +463,7 @@ class LDatRunner:
                 and torch.equal(ids[:npre], prefix_ids)):
             same_grid = torch.equal(lr_thw, prefix_thw.to(device=lr_thw.device, dtype=lr_thw.dtype))
             if same_grid:
-                pos_pre, _ = self.model.model.get_rope_index(
-                    ids[:npre][None], mm[:npre][None], image_grid_thw=lr_thw)
+                pos_pre, _ = self.backbone.rope_index(ids[:npre][None], mm[:npre][None], lr_thw)
                 pos_pre = pos_pre.to(pos3d.device)
                 prefix_pv = inp["pixel_values"]
                 ans_pv = lr_pv.to(device=prefix_pv.device, dtype=prefix_pv.dtype)
@@ -487,7 +491,7 @@ class LDatRunner:
         if cache is None:
             lr_emb = self._reuse_lr_vit(lr_vit, inp["pixel_values"], prefix_thw, lr_pv, lr_thw)
             if lr_emb is None:
-                lr_emb = self._vit(lr_pv.to(dev).to(torch.bfloat16), lr_thw)
+                lr_emb = self._vit(lr_pv.to(dev).to(self.dtype), lr_thw)
         return dict(ids=ids, mm=mm[None], pos3d=pos3d, rope_deltas=rope_deltas, emb=emb,
                     lr_emb=lr_emb, lr_pv=lr_pv, lr_thw=lr_thw, img_pos=img_pos, blocks=blocks,
                     wins=wins, feats=feats, pts=pts, n_tokens=int(ids.shape[0]),
@@ -524,7 +528,7 @@ class LDatRunner:
 
     def _lr_emb(self, pr):
         if pr["lr_emb"] is None:
-            pr["lr_emb"] = self._vit(pr["lr_pv"].to(self.dev).to(torch.bfloat16), pr["lr_thw"])
+            pr["lr_emb"] = self._vit(pr["lr_pv"].to(self.dev).to(self.dtype), pr["lr_thw"])
         return pr["lr_emb"]
 
     def _prefill(self, pr):
@@ -536,7 +540,7 @@ class LDatRunner:
         if pr["cache"] is not None:
             e = pr["emb"][:, cut:].clone()
             self._place_tail_visual(pr, e, cut)
-            o = self.model(inputs_embeds=e, position_ids=pos[:, :, cut:],
+            o = self.backbone.forward(inputs_embeds=e, position_ids=pos[:, :, cut:],
                            mm_token_type_ids=pr["mm"][:, cut:],
                            past_key_values=pr["cache"],
                            cache_position=torch.arange(cut, n, device=dev),
@@ -549,7 +553,7 @@ class LDatRunner:
         else:
             e = pr["emb"].clone()
             e[0, pr["img_pos"]] = torch.cat([self._lr_emb(pr)] + pr["feats"], 0).to(e.dtype)
-            o = self.model(inputs_embeds=e, position_ids=pos, mm_token_type_ids=pr["mm"],
+            o = self.backbone.forward(inputs_embeds=e, position_ids=pos, mm_token_type_ids=pr["mm"],
                            cache_position=torch.arange(n, device=dev),
                            use_cache=True, return_dict=True, logits_to_keep=1)
         self.last_prefill_logits = o.logits.detach()
@@ -616,7 +620,7 @@ class LDatRunner:
                 if answer_left <= 0:
                     break
             k = len(toks) - 1
-            o = self.model(input_ids=torch.tensor([[tok]], device=dev),
+            o = self.backbone.forward(input_ids=torch.tensor([[tok]], device=dev),
                            position_ids=torch.full((3, 1, 1), next_pos + k, device=dev, dtype=torch.long),
                            past_key_values=cache,
                            cache_position=torch.tensor([n + k], device=dev),

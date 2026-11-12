@@ -27,6 +27,8 @@ def _flag(v):
 
 
 class Qwen3_5_LDAT(lmms):
+    model_family = "qwen3_5"
+
     def __init__(
         self,
         pretrained: str,
@@ -42,6 +44,8 @@ class Qwen3_5_LDAT(lmms):
         hr_cap: int = 4096,
         n_win: int = 1,
         grid: int = 0,
+        where_layer: int = 8,
+        supersample: int = 2,
         batch_size: int = 1,
         attn_implementation: Optional[str] = "sdpa",
         enable_thinking: bool = False,
@@ -70,6 +74,7 @@ class Qwen3_5_LDAT(lmms):
             crop_tok=crop_tok, lr_tok=lr_tok, dat_alpha=dat_alpha, dat_ratio=dat_ratio,
             dat_k=dat_k, src_scale=src_scale, ldat_d=ldat_d, hr_cap=hr_cap,
             n_win=n_win, grid=grid, attn=attn_implementation or "sdpa",
+            where_layer=int(where_layer), supersample=int(supersample), model_family=self.model_family,
             enable_thinking=_flag(enable_thinking),
             prefix_cache=_flag(prefix_cache),
             fast_prefix=_flag(fast_prefix),

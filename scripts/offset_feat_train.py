@@ -47,6 +47,7 @@ import re
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
@@ -268,6 +269,9 @@ def nms_peaks(logits, k, dist_cells, tau):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
+    ap.add_argument("--model_family", choices=["auto", "qwen2_5_vl", "qwen3_5"], default="auto")
+    ap.add_argument("--where_layer", type=int, default=8)
+    ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     ap.add_argument("--where_head_pt", required=True)
     ap.add_argument("--train_json", default=None)
     ap.add_argument("--held_from_train", type=int, default=3000)
@@ -380,6 +384,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", default=None)
     args = ap.parse_args()
+    if args.save_best and args.held_from_train <= 0 and not args.eval_dataset:
+        raise ValueError("--save_best requires --held_from_train > 0")
     if not args.eval_dataset and not args.train_json:
         raise SystemExit("training needs --train_json (or --eval_dataset)")
     cfgs = [c for c in args.cfgs.split(",") if c]
@@ -396,8 +402,12 @@ def main():
     rank = dist.get_rank() if ddp else 0
     world = dist.get_world_size() if ddp else 1
     local = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local)
-    dev = torch.device("cuda", local)
+    if args.device == "cuda":
+        torch.cuda.set_device(local)
+    elif ddp:
+        raise ValueError("CPU smoke mode supports one process")
+    dev = torch.device("cuda", local) if args.device == "cuda" else torch.device("cpu")
+    dtype = torch.bfloat16 if args.device == "cuda" else torch.float32
     torch.manual_seed(args.seed)          # same head / LoRA init on every rank; per-rank seed set after
 
     def say(*a):
@@ -405,33 +415,39 @@ def main():
             print(*a, flush=True)
 
     from transformers import AutoProcessor
-    import llava.model.language_model.modeling_qwen3_5_dat as dat_mod
+    import llava.model.where_dat as dat_mod
+    from ldat_eval.backbone import load_backbone, where_prefix
     from patch_sample_probe import crop_geometry
 
-    model = dat_mod.Qwen3_5DATForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, device_map={"": local}, attn_implementation=args.attn).eval()
+    backbone = load_backbone(args.model_path, args.model_family, device=dev, dtype=dtype, attn=args.attn)
+    backbone.validate_layer(args.where_layer)
+    model = backbone.model
+    factor = backbone.factor
     for p in model.parameters():
         p.requires_grad_(False)
-    sd = torch.load(os.path.expanduser(args.where_head_pt), map_location="cpu")
+    from ldat_eval.checkpoints import load_head, save_head
+    sd, where_meta = load_head(args.where_head_pt, backbone, kind="where", where_layer=args.where_layer,
+                              head_prefix="train" if backbone.family == "qwen2_5_vl" else None)
     sd = {k[len("where_head."):] if k.startswith("where_head.") else k: v for k, v in sd.items()}
     if not hasattr(model, "where_head"):
-        hidden = model.config.text_config.hidden_size
+        hidden = backbone.hidden_size
         model.where_head = dat_mod._WhereXAttnHead(
-            hidden, hidden, d=384, layers=2, heads=6, max_hw=512).to(dev)
+            hidden, hidden, d=where_meta.get("d", 384), layers=where_meta.get("layers", 2),
+            heads=where_meta.get("heads", 6), max_hw=512).to(dev)
         say("[oft] checkpoint has no where-head module; attached one")
     model.where_head.load_state_dict(sd)
     model.where_head.float().eval()
     for p in model.where_head.parameters():
         p.requires_grad_(False)
-    processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=args.lr_tok * 1024)
-    hr_processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=1024, max_pixels=100_000_000)
+    processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=factor ** 2, max_pixels=args.lr_tok * factor ** 2)
+    hr_processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=factor ** 2, max_pixels=100_000_000)
     tok = hr_processor.tokenizer
     ip = hr_processor.image_processor
     ps, tps, ms = ip.patch_size, ip.temporal_patch_size, ip.merge_size
     mean = torch.tensor(ip.image_mean, device=dev).view(3, 1, 1)
     std = torch.tensor(ip.image_std, device=dev).view(3, 1, 1)
     image_id = model.config.image_token_id
-    C = model.config.text_config.hidden_size
+    C = backbone.hidden_size
     embed = model.get_input_embeddings()
 
     if learned == "ldat":
@@ -472,8 +488,7 @@ def main():
         return x.reshape(gh * gw, 3 * tps * ps * ps)
 
     def vit_pv(pv, thw):
-        e = model.model.visual(pv.to(torch.bfloat16), grid_thw=thw, return_dict=True).pooler_output
-        return torch.cat(list(e), 0) if isinstance(e, (list, tuple)) else e
+        return backbone.visual_tokens(pv, thw)
 
     def vit_image(pil):
         """PIL (sides multiples of 32) -> merged tokens (h, w, C)."""
@@ -514,13 +529,13 @@ def main():
             dat_mod._wdat_marginals(p, nwin, alpha, ratio)
         xe = [x0 + e * cw for e in dat_mod._wdat_inv_cdf_edges(dx, gw)]
         ye = [y0 + e * ch for e in dat_mod._wdat_inv_cdf_edges(dy, gh)]
-        out = Image.new("RGB", (gw * 32, gh * 32))
+        out = Image.new("RGB", (gw * factor, gh * factor))
         for i in range(gh):
             for j in range(gw):
                 bx0, by0 = int(math.floor(xe[j])), int(math.floor(ye[i]))
                 bx1 = max(int(math.ceil(min(xe[j + 1], W))), bx0 + 1)
                 by1 = max(int(math.ceil(min(ye[i + 1], H))), by0 + 1)
-                out.paste(image.crop((bx0, by0, bx1, by1)).resize((32, 32), Image.BICUBIC), (j * 32, i * 32))
+                out.paste(image.crop((bx0, by0, bx1, by1)).resize((factor, factor), Image.BICUBIC), (j * factor, i * factor))
         cx = torch.tensor([(xe[j] + xe[j + 1]) / 2 for j in range(gw)], device=dev)
         cy = torch.tensor([(ye[i] + ye[i + 1]) / 2 for i in range(gh)], device=dev)
         gy, gx = torch.meshgrid((cy - px[1]) / (px[3] - px[1]) * 2 - 1, (cx - px[0]) / (px[2] - px[0]) * 2 - 1,
@@ -539,7 +554,7 @@ def main():
         the window source image, ViT (frozen, differentiable) -> tokens, sample points, mean |off|."""
         gh, gw = w["gh"], w["gw"]
         off = head(w["crop"].t().reshape(1, -1, gh, gw).float(), gh, gw)
-        Ho, Wo, s = gh * 32, gw * 32, max(args.supersample, 1)
+        Ho, Wo, s = gh * factor, gw * factor, max(args.supersample, 1)
         offp = F.interpolate(off, size=(Ho * s, Wo * s), mode="bilinear", align_corners=False)[0]
         g = ref_grid(Ho * s, Wo * s, dev)
         G = torch.stack([g[..., 0] + 2 * offp[0] / gw, g[..., 1] + 2 * offp[1] / gh], -1).clamp(-1, 1)
@@ -599,13 +614,13 @@ def main():
         if kl_only:
             return None, None, kl
         dx, dy = axis_density(q.sum(0)), axis_density(q.sum(1))
-        ux = (torch.arange(gw * 32 * s, device=dev) + 0.5) / (gw * 32 * s)
-        uy = (torch.arange(gh * 32 * s, device=dev) + 0.5) / (gh * 32 * s)
+        ux = (torch.arange(gw * factor * s, device=dev) + 0.5) / (gw * factor * s)
+        uy = (torch.arange(gh * factor * s, device=dev) + 0.5) / (gh * factor * s)
         sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
         img = F.grid_sample(w["psrc"][None], torch.stack([sx, sy], -1)[None], mode="bilinear",
                             padding_mode="border", align_corners=False)
-        img = aa_down(img, gh * 32, gw * 32)
-        z = vit_pv(patchify(img), torch.tensor([[1, gh * 32 // ps, gw * 32 // ps]], device=dev)).reshape(gh * gw, -1)
+        img = aa_down(img, gh * factor, gw * factor)
+        z = vit_pv(patchify(img), torch.tensor([[1, gh * factor // ps, gw * factor // ps]], device=dev)).reshape(gh * gw, -1)
         (lx0, ly0, lx1, ly1), (cx0, cy0, cx1, cy1) = w["lpx"], w["px"]   # ldat window -> crop-window coords
         cy = (ly0 + inv_cdf(dy, (torch.arange(gh, device=dev) + 0.5) / gh) * (ly1 - ly0) - cy0) / (cy1 - cy0) * 2 - 1
         cx = (lx0 + inv_cdf(dx, (torch.arange(gw, device=dev) + 0.5) / gw) * (lx1 - lx0) - cx0) / (cx1 - cx0) * 2 - 1
@@ -633,7 +648,7 @@ def main():
                     d.draft("RGB", (tw, th))
                     d = d.convert("RGB")
                     if args.comp_bg == "blur":
-                        d = d.resize((max(1, tw // 32), max(1, th // 32)), Image.BILINEAR)
+                        d = d.resize((max(1, tw // factor), max(1, th // factor)), Image.BILINEAR)
                     canvas.paste(d.resize((tw, th), Image.BILINEAR), (j * tw, i * th))
                 except Exception:
                     pass
@@ -648,7 +663,7 @@ def main():
         image = row["image"] if row.get("image") is not None else Image.open(row["path"])
         W, H = image.size
         per_win = args.grid * args.grid if args.grid else args.crop_tok // args.n_win
-        if args.min_win_ratio and W * H * 0.25 / 1024 < args.min_win_ratio * per_win:
+        if args.min_win_ratio and W * H * 0.25 / (factor ** 2) < args.min_win_ratio * per_win:
             skips["small"] += 1
             return None
         image = image.convert("RGB")
@@ -657,50 +672,44 @@ def main():
             image, row_box = composite(row, image)
             W, H = image.size
         thw = processor.image_processor(images=[image], return_tensors="pt")["image_grid_thw"][0]
-        lr_img = image.resize((int(thw[2]) * 16, int(thw[1]) * 16), Image.BICUBIC)
+        lr_img = image.resize((int(thw[2]) * ps, int(thw[1]) * ps), Image.BICUBIC)
         q = row["q"]
-        msgs = [{"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": [{"type": "image", "image": lr_img}, {"type": "text", "text": q},
-                                             {"type": "text", "text": dat_mod.WHERE_HINT}]}]
-        text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False)
-        text = text.rstrip()
-        if text.endswith("<|im_end|>"):
-            text = text[:-len("<|im_end|>")]
+        text = where_prefix(processor, lr_img, q, "train")
         inp = processor(text=[text], images=[lr_img], return_tensors="pt")
         inp = {k: v.to(dev) for k, v in inp.items() if torch.is_tensor(v)}
-        inp["pixel_values"] = inp["pixel_values"].to(torch.bfloat16)
+        inp["pixel_values"] = inp["pixel_values"].to(dtype)
         set_lora(False)                       # the where-head was trained on the stock LM's layer 8
         try:
-            out = model(**inp, output_hidden_states=True, return_dict=True, use_cache=False)
+            out = backbone.forward(**inp, output_hidden_states=True, return_dict=True, use_cache=False)
         finally:
             set_lora(True)
         ids = inp["input_ids"][0]
         is_img = ids == image_id
-        gh_l, gw_l = int(thw[1]) // 2, int(thw[2]) // 2
-        hs = out.hidden_states[8][0]
+        gh_l, gw_l = int(thw[1]) // ms, int(thw[2]) // ms
+        hs = out.hidden_states[args.where_layer][0]
         cells = hs[is_img]
         if cells.shape[0] != gh_l * gw_l:
             return None
         logits = model.where_head(cells.reshape(gh_l, gw_l, -1), hs[int(torch.nonzero(is_img)[-1]) + 1:])
-        hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600)
+        hd_w, hd_h = dat_mod._where_hd_size(image, thw, 3, 5017600, patch_size=ps, merge_size=ms)
         full = None
         if need_hr and args.hr_source == "full":
-            sc = math.sqrt(min(args.hr_full_cap * 1024, W * H) / float(W * H))
-            Wf, Hf = max(32, int(W * sc) // 32 * 32), max(32, int(H * sc) // 32 * 32)
+            sc = math.sqrt(min(args.hr_full_cap * (factor ** 2), W * H) / float(W * H))
+            Wf, Hf = max(factor, int(W * sc) // factor * factor), max(factor, int(H * sc) // factor * factor)
             full = vit_image(image.resize((Wf, Hf), Image.BICUBIC)).permute(2, 0, 1)[None].float()
 
         wins = []
         for cy, cx in nms_peaks(logits, args.n_win, args.peak_dist, args.peak_tau):
             box = ((cx + 0.5 - 2) / gw_l, (cy + 0.5 - 2) / gh_l, (cx + 0.5 + 2) / gw_l, (cy + 0.5 + 2) / gh_l)
-            win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h)
-            px0, py0, px1, py1, gh, gw = crop_geometry(image, win, per_win)
+            win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h, factor=factor)
+            px0, py0, px1, py1, gh, gw = crop_geometry(image, win, per_win, factor=factor)
             if args.tok_ratio > 0:
-                n_tok = round(args.tok_ratio * (px1 - px0) * (py1 - py0) / 1024)
-                px0, py0, px1, py1, gh, gw = crop_geometry(image, win, min(max(n_tok, args.tok_min), args.tok_max))
+                n_tok = round(args.tok_ratio * (px1 - px0) * (py1 - py0) / (factor ** 2))
+                px0, py0, px1, py1, gh, gw = crop_geometry(image, win, min(max(n_tok, args.tok_min), args.tok_max), factor=factor)
             if args.grid:
                 gh = gw = args.grid
             cw, ch = px1 - px0, py1 - py0
-            if args.min_win_ratio and cw * ch / 1024 < args.min_win_ratio * gh * gw:
+            if args.min_win_ratio and cw * ch / (factor ** 2) < args.min_win_ratio * gh * gw:
                 skips["small"] += 1
                 return None
             crop = image.crop((px0, py0, px1, py1))
@@ -715,13 +724,13 @@ def main():
                 zx1, zy1 = zx0 + 2 * hw_, zy0 + 2 * hh_
                 zc = image.crop((int(zx0), int(zy0), max(int(math.ceil(zx1)), int(zx0) + 1),
                                  max(int(math.ceil(zy1)), int(zy0) + 1)))
-                ext[c] = vit_image(zc.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
+                ext[c] = vit_image(zc.resize((gw * factor, gh * factor), Image.BICUBIC)).reshape(gh * gw, -1)
                 ux = zx0 + (torch.arange(gw, device=dev) + 0.5) / gw * (zx1 - zx0)
                 uy = zy0 + (torch.arange(gh, device=dev) + 0.5) / gh * (zy1 - zy0)
                 gy, gx = torch.meshgrid((uy - py0) / ch * 2 - 1, (ux - px0) / cw * 2 - 1, indexing="ij")
                 ext[c + "_pts"] = torch.stack([gx, gy], -1).float()
             if "half" in cfgs:
-                half = crop.resize((gw * 16, gh * 16), Image.BICUBIC).resize((gw * 32, gh * 32), Image.BICUBIC)
+                half = crop.resize((gw * factor // 2, gh * factor // 2), Image.BICUBIC).resize((gw * factor, gh * factor), Image.BICUBIC)
                 ext["half"] = vit_image(half).reshape(gh * gw, -1)
             if "dat" in cfgs:
                 ext["dat"], ext["dat_pts"] = dat_window(image, win, box, logits, (px0, py0, px1, py1), gh, gw)
@@ -755,13 +764,13 @@ def main():
                     lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * W)), lx0 + 1), W),
                            min(max(int(math.ceil(lw[3] * H)), ly0 + 1), H))
                     lcrop = image.crop(lpx)
-                    ext["lfeat"] = vit_image(lcrop.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
+                    ext["lfeat"] = vit_image(lcrop.resize((gw * factor, gh * factor), Image.BICUBIC)).reshape(gh * gw, -1)
                 lcw, lch = lcrop.size
                 if "ldat" in cfgs and args.ldat_in == "native":
-                    sc = math.sqrt(min(args.hr_cap * 1024, lcw * lch) / float(lcw * lch))
-                    nW, nH = max(32, int(lcw * sc) // 32 * 32), max(32, int(lch * sc) // 32 * 32)
+                    sc = math.sqrt(min(args.hr_cap * (factor ** 2), lcw * lch) / float(lcw * lch))
+                    nW, nH = max(factor, int(lcw * sc) // factor * factor), max(factor, int(lch * sc) // factor * factor)
                     ext["lmap"] = vit_image(lcrop.resize((nW, nH), Image.BICUBIC)).permute(2, 0, 1)[None].float()
-                sw, sh = min(lcw, round(args.src_scale * gw * 32)), min(lch, round(args.src_scale * gh * 32))
+                sw, sh = min(lcw, round(args.src_scale * gw * factor)), min(lch, round(args.src_scale * gh * factor))
                 ext["psrc"] = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32)
                                                / 255.0).permute(2, 0, 1).to(dev)
                 ext["lpx"], ext["lnbox"] = lpx, (lpx[0] / W, lpx[1] / H, lpx[2] / W, lpx[3] / H)
@@ -773,16 +782,16 @@ def main():
                 ty1, tx1 = max(ty0 + 1, math.ceil(py1 / H * Hg)), max(tx0 + 1, math.ceil(px1 / W * Wg))
                 hr, src, sbox = full[..., ty0:ty1, tx0:tx1], full, (px0 / W, py0 / H, px1 / W, py1 / H)
             else:
-                sc = math.sqrt(min(args.hr_cap * 1024, cw * ch) / float(cw * ch))
-                hw_, hh_ = max(32, int(cw * sc) // 32 * 32), max(32, int(ch * sc) // 32 * 32)
+                sc = math.sqrt(min(args.hr_cap * (factor ** 2), cw * ch) / float(cw * ch))
+                hw_, hh_ = max(factor, int(cw * sc) // factor * factor), max(factor, int(ch * sc) // factor * factor)
                 hr = vit_image(crop.resize((hw_, hh_), Image.BICUBIC)).permute(2, 0, 1)[None].float()
                 src, sbox = hr, (0.0, 0.0, 1.0, 1.0)
-            lo = vit_image(crop.resize((gw * 32, gh * 32), Image.BICUBIC)).reshape(gh * gw, -1)
+            lo = vit_image(crop.resize((gw * factor, gh * factor), Image.BICUBIC)).reshape(gh * gw, -1)
             ext.setdefault("lfeat", lo)
             wins.append(dict(px=(px0, py0, px1, py1), nbox=(px0 / W, py0 / H, px1 / W, py1 / H), gh=gh, gw=gw,
                              hr=hr, src=src, sbox=sbox, crop=lo, **ext))
 
-        dummies = [Image.new("RGB", (w["gw"] * 32, w["gh"] * 32)) for w in wins]
+        dummies = [Image.new("RGB", (w["gw"] * factor, w["gh"] * factor)) for w in wins]
         qd = {"type": "text", "text": q}
         content = [{"type": "image", "image": lr_img}, qd, {"type": "text", "text": dat_mod.WHERE_HINT}] + \
             [{"type": "image", "image": d} for d in dummies] + [dict(qd)]
@@ -791,7 +800,7 @@ def main():
         enc = hr_processor(text=[text], images=[lr_img] + dummies, return_tensors="pt")
         thw2 = enc["image_grid_thw"].to(dev)
         for k, w in enumerate(wins):
-            if tuple(thw2[1 + k].tolist()) != (1, 2 * w["gh"], 2 * w["gw"]):
+            if tuple(thw2[1 + k].tolist()) != (1, ms * w["gh"], ms * w["gw"]):
                 return None
         a_ids = tok.encode(row["a"], add_special_tokens=False)[: args.max_ans_tok] + \
             tok.encode("<|im_end|>", add_special_tokens=False) if row["a"] else []
@@ -799,7 +808,7 @@ def main():
         ids = torch.cat([enc["input_ids"][0], torch.tensor(a_ids, dtype=torch.long)]).to(dev)[None]
         mm = torch.zeros_like(ids)
         mm[ids == image_id] = 1
-        pos3d, rope_deltas = model.model.get_rope_index(ids, mm, image_grid_thw=thw2)
+        pos3d, rope_deltas = backbone.rope_index(ids, mm, thw2)
         n_lr = int(torch.prod(thw2[0]))
         lr_emb = vit_pv(enc["pixel_values"][:n_lr].to(dev), thw2[:1])
         img_pos = torch.nonzero(ids[0] == image_id).flatten()
@@ -821,7 +830,7 @@ def main():
         n = pr["P"] if prompt_only else e.shape[1]
         pos = global_positions(pr["pos3d"], pr["blocks"], pr["wins"], pts) if args.pe == "global" else pr["pos3d"]
         model.model.rope_deltas = pr["rope_deltas"]
-        o = model(inputs_embeds=e[:, :n], position_ids=pos[..., :n], mm_token_type_ids=pr["mm"][:, :n],
+        o = backbone.forward(inputs_embeds=e[:, :n], position_ids=pos[..., :n], mm_token_type_ids=pr["mm"][:, :n],
                   use_cache=False, return_dict=True, logits_to_keep=1 if prompt_only else 0)
         return o.logits
 
@@ -916,12 +925,15 @@ def main():
 
     def save_ckpt(path):
         extra = {"win_head": win_head.state_dict()} if win_head is not None else {}
-        if not loras and not extra:
-            torch.save(head.state_dict(), path)
-            return
-        torch.save({"head": head.state_dict(), "train_cfg": args.train_cfg,
-                    "lora": {n: (m.lora_A.detach().cpu(), m.lora_B.detach().cpu()) for n, m in loras.items()},
-                    **extra}, path)
+        save_head(path, head.state_dict(), metadata=dict(
+            kind="ldat", model_family=backbone.family, hidden_size=C, factor=factor,
+            where_layer=args.where_layer, ldat_in=args.ldat_in, ldat_win=args.ldat_win,
+            pe=args.pe, ldat_d=args.ldat_d, dat_alpha=args.dat_alpha, dat_ratio=args.dat_ratio,
+            dat_k=args.dat_k, src_scale=args.src_scale, supersample=args.supersample,
+            hr_cap=args.hr_cap, lr_tok=args.lr_tok, crop_tok=args.crop_tok,
+            n_win=args.n_win, grid=args.grid),
+            train_cfg=args.train_cfg,
+            lora={n: (m.lora_A.detach().cpu(), m.lora_B.detach().cpu()) for n, m in loras.items()}, **extra)
 
     def load_ckpt(path):
         sd = torch.load(path, map_location="cpu")
@@ -992,7 +1004,9 @@ def main():
 
     # ───────────────────────── training ─────────────────────────
     rows = load_rows(args.train_json, args.image_root, args.max_train + args.held_from_train, args.seed)
-    train, held = rows[:-args.held_from_train], rows[-args.held_from_train:]
+    train, held = (rows[:-args.held_from_train], rows[-args.held_from_train:]) if args.held_from_train else (rows, [])
+    if not train:
+        raise ValueError("No training rows remain after --held_from_train")
     if opt is None and args.steps > 0:
         raise SystemExit("nothing to train: --train_cfg fzero / crop / dat needs --lora_r > 0 (or --steps 0)")
     if args.held_eval_n > 0:
@@ -1015,8 +1029,8 @@ def main():
         for hi, row in enumerate(mine_held):
             try:
                 pr = prepare(row)
-            except Exception:
-                pr = None
+            except Exception as exc:
+                raise RuntimeError(f"Failed to prepare held-out image {row.get('path')}") from exc
             if pr is None:
                 continue
             L, IB, mo = {}, {}, 0.0
@@ -1074,8 +1088,9 @@ def main():
                 row = train[rng.randrange(len(train))]
                 try:
                     pr = prepare(row)
-                except Exception:
+                except (FileNotFoundError, OSError) as exc:
                     skips["other"] += 1
+                    say(f"[oft] unreadable image {row.get('path')}: {exc}")
                     pr = None
                 if pr is not None:
                     break
