@@ -20,6 +20,7 @@ if _SCRIPTS not in sys.path:
 
 import llava.model.where_dat as dat_mod
 from ldat_eval.backbone import load_backbone, where_prefix
+from ldat_eval.decoding import DecodeOptions
 from ldat_eval.gdn_cache import (
     arm_chunk_rewind,
     disarm_chunk_rewind,
@@ -560,7 +561,11 @@ class LDatRunner:
         return o, pos, n
 
     @torch.inference_mode()
-    def generate(self, image, question, max_new_tokens):
+    def generate(self, image, question, max_new_tokens, generation_kwargs=None):
+        DecodeOptions.from_kwargs(generation_kwargs)
+        self.last_n_tokens = 0
+        self.last_generation = dict(input_tokens=0, output_tokens=0, generated_token_ids=[],
+                                    finish_reason="no_window", raw_response="")
         pr = self.prepare(image, question)
         if pr is None:
             return ""
@@ -572,20 +577,24 @@ class LDatRunner:
             print(f"[ldat] prefix cache failed ({type(exc).__name__}: {exc}); full prefill", flush=True)
             pr["cache"] = None
             o, pos, n = self._prefill(pr)
-        return self._decode(o, pos, n, max_new_tokens)
+        return self._decode(o, pos, n, max_new_tokens, generation_kwargs, pr["ids"].tolist())
 
     @torch.inference_mode()
-    def finish(self, pr, max_new_tokens):
+    def finish(self, pr, max_new_tokens, generation_kwargs=None):
         o, pos, n = self._prefill(pr)
-        return self._decode(o, pos, n, max_new_tokens)
+        return self._decode(o, pos, n, max_new_tokens, generation_kwargs, pr["ids"].tolist())
 
-    def _decode(self, o, pos, n, max_new_tokens):
+    def _decode(self, o, pos, n, max_new_tokens, generation_kwargs=None, prompt_ids=()):
+        options = DecodeOptions.from_kwargs(generation_kwargs)
+        if int(max_new_tokens) != max_new_tokens or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer")
         dev = self.dev
         cache = o.past_key_values
         next_pos = int(math.floor(float(pos.max()))) + 1
         logits = o.logits[0, -1]
-        tok = int(logits.argmax())
         toks = []
+        eos_token = None
+        finish_reason = "length"
         # A finished think is </think> and then a short answer. The 1024 cap was
         # cutting 42/64 unfinished traces mid-sentence, and <|im_end|> was ending
         # the other 22 before the tag. Keep going until the tag, then 48 answer
@@ -596,20 +605,21 @@ class LDatRunner:
         closed = False
         answer_left = answer_limit
         while True:
+            if not closed and len(toks) >= think_limit:
+                break
+            tok = options.choose(logits, toks, prompt_ids)
             if tok in self.eos and (self.think_end is None or closed or len(toks) < 16):
+                eos_token = tok
+                finish_reason = "eos"
                 break
             if tok in self.eos:
                 masked = logits.float().clone()
                 for eid in self.eos:
                     if 0 <= eid < masked.shape[-1]:
                         masked[eid] = torch.finfo(masked.dtype).min
-                tok = int(masked.argmax())
+                tok = options.choose(masked, toks, prompt_ids)
                 if tok in self.eos:
                     break
-            if self.think_end is not None and not closed and len(toks) >= think_limit:
-                break
-            if self.think_end is None and len(toks) >= think_limit:
-                break
             toks.append(tok)
             just_closed = self.think_end is not None and tok == self.think_end and not closed
             if just_closed:
@@ -618,7 +628,10 @@ class LDatRunner:
             elif closed:
                 answer_left -= 1
                 if answer_left <= 0:
+                    finish_reason = "answer_length"
                     break
+            if not closed and len(toks) >= think_limit:
+                break
             k = len(toks) - 1
             o = self.backbone.forward(input_ids=torch.tensor([[tok]], device=dev),
                            position_ids=torch.full((3, 1, 1), next_pos + k, device=dev, dtype=torch.long),
@@ -627,7 +640,6 @@ class LDatRunner:
                            use_cache=True, return_dict=True)
             cache = o.past_key_values
             logits = o.logits[0, -1]
-            tok = int(logits.argmax())
         if self.think_end is not None:
             if closed:
                 self.n_think_closed += 1
@@ -639,4 +651,10 @@ class LDatRunner:
         if self.enable_thinking:
             for tag in ("<|im_end|>", "<|im_start|>", "<|endoftext|>"):
                 text = text.replace(tag, "")
-        return text.strip()
+        generated = toks + ([eos_token] if eos_token is not None else [])
+        text = text.strip()
+        self.last_generation = dict(input_tokens=int(n), output_tokens=len(generated),
+                                    generated_token_ids=generated, finish_reason=finish_reason,
+                                    raw_response=text,
+                                    generation_kwargs={**options.to_dict(), "max_new_tokens": int(max_new_tokens)})
+        return text

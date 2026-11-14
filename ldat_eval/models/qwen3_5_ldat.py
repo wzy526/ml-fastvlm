@@ -2,9 +2,12 @@
 
 Registered as ``qwen3_5_ldat`` through LMMS_EVAL_PLUGINS=ldat_eval.
 The prompt the task builds is the question; this wrapper adds the LR image,
-the where-head hint, and the learned mosaic, then generates greedily.
+the where-head hint, and the learned mosaic, then decodes greedily or samples.
 """
 
+import json
+import os
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
@@ -14,10 +17,11 @@ from PIL import Image
 from tqdm import tqdm
 
 from lmms_eval import utils
-from lmms_eval.api.instance import Instance
+from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.api.model import lmms
 
 from ldat_eval.infer import LDatRunner
+from ldat_eval.decoding import DecodeOptions
 
 
 def _flag(v):
@@ -132,20 +136,22 @@ class Qwen3_5_LDAT(lmms):
                 ans = ans.split(term)[0]
         return ans.strip()
 
-    def generate_until(self, requests: List[Instance]) -> List[str]:
+    def generate_until(self, requests: List[Instance]) -> List[GenerationResult]:
         res = []
 
         def _collate(x):
             return -len(self.tokenizer.encode(x[0])), x[0]
 
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
-        re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
+        entries = [(*reg.args, bool((reg.metadata or {}).get("__padding_only__", False))) for reg in requests]
+        re_ords = utils.Collator(entries, _collate, grouping=True)
         chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
         for chunk in chunks:
-            contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
+            contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split, padding = zip(*chunk)
             task, split = task[0], split[0]
             visuals = [doc_to_visual[i](self.task_dict[task][split][ids]) for i, ids in enumerate(doc_id)]
             gen_kwargs = all_gen_kwargs[0]
+            options = DecodeOptions.from_kwargs(gen_kwargs)
             until = gen_kwargs.get("until", [self.tokenizer.decode(self.eot_token_id)])
             if isinstance(until, str):
                 until = [until]
@@ -156,22 +162,38 @@ class Qwen3_5_LDAT(lmms):
                       f"prefix_cache={self.runner.prefix_cache} fast_prefix={self.runner.fast_prefix} "
                       f"max_new_tokens={max_new}",
                       flush=True)
-            for context, visual in zip(contexts, visuals):
+                print(f"[ldat] decoding={options.to_dict()}", flush=True)
+            for context, visual, ident, padding_only in zip(contexts, visuals, doc_id, padding):
                 if isinstance(context, str) and "<image>" in context:
                     context = context.replace("<image>", "")
                 image = self._image_of(visual)
                 if image is None:
                     ans = ""
+                    meta = dict(input_tokens=0, output_tokens=0, generated_token_ids=[],
+                                finish_reason="missing_image", raw_response="")
                 else:
-                    ans = self.runner.generate(image, context, max_new)
+                    ans = self.runner.generate(image, context, max_new, generation_kwargs=gen_kwargs)
+                    meta = dict(self.runner.last_generation)
                     if not self._printed_tok and self.runner.last_n_tokens:
                         side = self.runner._mosaic_side()
                         wtxt = f"{self.runner.n_win}x{side}x{side}" if side else str(self.runner.crop_tok)
                         print(f"[ldat] prompt tokens {self.runner.last_n_tokens} "
                               f"(LR {self.runner.lr_tok} + window {wtxt} + text)", flush=True)
                         self._printed_tok = True
-                res.append(self._clean(ans, until))
-                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), res[-1])
+                answer = self._clean(ans, until)
+                res.append(GenerationResult(text=answer, token_counts=TokenCounts(
+                    input_tokens=meta["input_tokens"], output_tokens=meta["output_tokens"])))
+                trace_dir = os.environ.get("LDAT_DECODE_TRACE_DIR")
+                if trace_dir:
+                    path = Path(trace_dir)
+                    path.mkdir(parents=True, exist_ok=True)
+                    rank = self.accelerator.process_index if hasattr(self, "accelerator") else self.rank
+                    meta.setdefault("generation_kwargs", {**options.to_dict(), "max_new_tokens": max_new})
+                    record = dict(meta, task=task, doc_id=int(ident), input=context, response=answer,
+                                  padding_only=padding_only)
+                    with (path / f"rank{rank}.jsonl").open("a") as handle:
+                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), answer)
                 pbar.update(1)
         res = re_ords.get_original(res)
         pbar.close()
