@@ -28,7 +28,7 @@ from ldat_eval.gdn_cache import (
     keep_recurrent_state_fp32,
     rewind_failed,
 )
-from offset_feat_train import LDatHead, global_positions, inv_cdf, nms_peaks
+from offset_feat_train import LDatHead, global_positions, inv_cdf, nms_peaks, sample_feat_map
 from patch_sample_probe import crop_geometry
 
 
@@ -55,6 +55,7 @@ class LDatRunner:
         enable_thinking=False,
         prefix_cache=False,
         fast_prefix=False,
+        sample_feat=False,
         model_family="qwen3_5",
         dtype=None,
     ):
@@ -77,6 +78,9 @@ class LDatRunner:
         # after the where-head layer, and the answer turn reuses its LR ViT rows.
         # The answer forward itself is unchanged.
         self.fast_prefix = bool(fast_prefix)
+        # Mosaic tokens read from the window's native ViT map at the sample
+        # points instead of warping the pixels and running the ViT again.
+        self.sample_feat = bool(sample_feat)
         self.dev = device
         self.dtype = dtype or (torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32)
 
@@ -147,7 +151,8 @@ class LDatRunner:
         side = self._mosaic_side()
         geom = f"{self.n_win} x {side}x{side}" if side else f"1 x crop_tok {self.crop_tok}"
         print(f"[ldat] windows {geom}  lr_tok {self.lr_tok}  alpha {self.dat_alpha}  "
-              f"ratio {self.dat_ratio}  head |w| {w:.3e}", flush=True)
+              f"ratio {self.dat_ratio}  sample {'feat' if self.sample_feat else 'pixel'}  head |w| {w:.3e}",
+              flush=True)
 
     def _ensure_recurrent_fp32(self):
         if self.model_family != "qwen3_5":
@@ -188,6 +193,10 @@ class LDatRunner:
         for key in ("dat_alpha", "dat_ratio", "dat_k", "src_scale", "supersample", "hr_cap"):
             if key in meta and meta[key] != getattr(self, key):
                 print(f"[ldat] evaluation override {key}={getattr(self, key)} (trained {meta[key]})", flush=True)
+        mode = "feat" if self.sample_feat else "pixel"
+        if meta.get("ldat_sample", "pixel") != mode:
+            print(f"[ldat] evaluation override ldat_sample={mode} (trained {meta.get('ldat_sample', 'pixel')})",
+                  flush=True)
 
     def _patchify(self, x):
         _, h, w = x.shape
@@ -287,16 +296,19 @@ class LDatRunner:
         lp = pw.log()
         q = torch.softmax((lp + self.head(f, lp)).flatten(), 0).reshape(nh, nw)
         dx, dy = self._axis_density(q.sum(0)), self._axis_density(q.sum(1))
-        ux = (torch.arange(gw * self.factor * s, device=self.dev) + 0.5) / (gw * self.factor * s)
-        uy = (torch.arange(gh * self.factor * s, device=self.dev) + 0.5) / (gh * self.factor * s)
-        sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
-        img = F.grid_sample(w["psrc"][None], torch.stack([sx, sy], -1)[None], mode="bilinear",
-                            padding_mode="border", align_corners=False)
-        if img.shape[-2:] != (gh * self.factor, gw * self.factor):
-            img = F.interpolate(img, size=(gh * self.factor, gw * self.factor), mode="bicubic", antialias=True, align_corners=False)
-        img = img[0].clamp(0, 1)
-        z = self._vit(self._patchify(img), torch.tensor([[1, gh * self.factor // self.ps, gw * self.factor // self.ps]], device=self.dev))
-        z = z.reshape(gh * gw, -1)
+        if self.sample_feat:
+            z = sample_feat_map(f, dx, dy, gh, gw, s).to(self.dtype)
+        else:
+            ux = (torch.arange(gw * self.factor * s, device=self.dev) + 0.5) / (gw * self.factor * s)
+            uy = (torch.arange(gh * self.factor * s, device=self.dev) + 0.5) / (gh * self.factor * s)
+            sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
+            img = F.grid_sample(w["psrc"][None], torch.stack([sx, sy], -1)[None], mode="bilinear",
+                                padding_mode="border", align_corners=False)
+            if img.shape[-2:] != (gh * self.factor, gw * self.factor):
+                img = F.interpolate(img, size=(gh * self.factor, gw * self.factor), mode="bicubic", antialias=True, align_corners=False)
+            img = img[0].clamp(0, 1)
+            z = self._vit(self._patchify(img), torch.tensor([[1, gh * self.factor // self.ps, gw * self.factor // self.ps]], device=self.dev))
+            z = z.reshape(gh * gw, -1)
         lx0, ly0, lx1, ly1 = w["lpx"]
         cx0, cy0, cx1, cy1 = w["px"]
         cy = (ly0 + inv_cdf(dy, (torch.arange(gh, device=self.dev) + 0.5) / gh) * (ly1 - ly0) - cy0) / (cy1 - cy0) * 2 - 1
@@ -396,10 +408,12 @@ class LDatRunner:
             sc = math.sqrt(min(self.hr_cap * self.factor ** 2, lcw * lch) / float(lcw * lch))
             nw, nh = max(self.factor, int(lcw * sc) // self.factor * self.factor), max(self.factor, int(lch * sc) // self.factor * self.factor)
             lmap = self._vit_image(lcrop.resize((nw, nh), Image.BICUBIC)).permute(2, 0, 1)[None].float()
-            sw = min(lcw, round(self.src_scale * gw * self.factor))
-            sh = min(lch, round(self.src_scale * gh * self.factor))
-            psrc = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32) / 255.0)
-            psrc = psrc.permute(2, 0, 1).to(dev)
+            psrc = None
+            if not self.sample_feat:
+                sw = min(lcw, round(self.src_scale * gw * self.factor))
+                sh = min(lch, round(self.src_scale * gh * self.factor))
+                psrc = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32) / 255.0)
+                psrc = psrc.permute(2, 0, 1).to(dev)
             win_rec = dict(px=(px0, py0, px1, py1), gh=gh, gw=gw, lpx=lpx,
                            lnbox=(lpx[0] / w_img, lpx[1] / h_img, lpx[2] / w_img, lpx[3] / h_img),
                            lmap=lmap, psrc=psrc, head_p=head_p)

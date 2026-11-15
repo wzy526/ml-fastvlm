@@ -55,6 +55,7 @@ class Qwen3_5_LDAT(lmms):
         enable_thinking: bool = False,
         prefix_cache: bool = False,
         fast_prefix: bool = False,
+        sample_feat: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -82,6 +83,7 @@ class Qwen3_5_LDAT(lmms):
             enable_thinking=_flag(enable_thinking),
             prefix_cache=_flag(prefix_cache),
             fast_prefix=_flag(fast_prefix),
+            sample_feat=_flag(sample_feat),
         )
         self._tokenizer = self.runner.tok
         self.pretrained = pretrained

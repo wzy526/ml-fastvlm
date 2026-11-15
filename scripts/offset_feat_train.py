@@ -30,6 +30,7 @@ Pixel-space configs (--cfgs crop,dat,pwarp; no HR feature map is computed then):
          log p)); its x / y marginals -> the analytic DAT's inverse-CDF warp (differentiable) of the
          window pixels -> ViT. Window = analytic DAT's adaptive one (--ldat_win dat), so step 0 ~= dat;
          trained with answer CE + --box_w x KL(box target || density) when the row has a box.
+         --ldat_sample feat: the same points read from the window's native ViT map, no second ViT.
 Accuracy uses option-letter scoring (argmax over the option letters' logits at the first
 answer position), the same for all four.
 
@@ -174,6 +175,20 @@ def inv_cdf(d, u):
     idx = (torch.searchsorted(c.detach(), u.contiguous(), right=True) - 1).clamp(0, G - 1)
     c0, c1 = c[idx], c[idx + 1]
     return (idx.to(d.dtype) + ((u - c0) / (c1 - c0).clamp_min(1e-8)).clamp(0, 1)) / G
+
+
+def sample_feat_map(fmap, dx, dy, gh, gw, s=1):
+    """fmap (1, C, h, w) ViT tokens of the window, dx / dy its axis densities -> (gh*gw, C)
+    tokens bilinearly read at the inverse-CDF grid; s > 1 reads s x s points per cell and
+    averages them, so a stretched cell still covers its area. Differentiable in dx / dy."""
+    ux = (torch.arange(gw * s, device=fmap.device, dtype=dx.dtype) + 0.5) / (gw * s)
+    uy = (torch.arange(gh * s, device=fmap.device, dtype=dy.dtype) + 0.5) / (gh * s)
+    sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
+    z = F.grid_sample(fmap, torch.stack([sx, sy], -1)[None].to(fmap.dtype), mode="bilinear",
+                      padding_mode="border", align_corners=False)
+    if s > 1:
+        z = F.avg_pool2d(z, s)
+    return z[0].flatten(1).t()
 
 
 LORA_TARGETS = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
@@ -328,6 +343,9 @@ def main():
                     help="ldat density-head input: the window resized to the gh x gw output grid -> ViT / the "
                          "window at native resolution -> ViT (<= --hr_cap tokens; density on that grid) / "
                          "LM layer-8 LR cells")
+    ap.add_argument("--ldat_sample", choices=["pixel", "feat"], default="pixel",
+                    help="ldat tokens: pixel = inverse-CDF warp of the window pixels -> ViT; feat = the same "
+                         "points read from the window's native ViT map (needs --ldat_in native, no 2nd ViT)")
     ap.add_argument("--ldat_win", choices=["dat", "crop"], default="dat",
                     help="ldat window: analytic DAT's adaptive window (--dat_k; zero residual ~= dat) / the crop's")
     ap.add_argument("--ldat_n", type=int, default=16, help="ldat --ldat_in lr: window cells per side")
@@ -388,6 +406,8 @@ def main():
         raise ValueError("--save_best requires --held_from_train > 0")
     if not args.eval_dataset and not args.train_json:
         raise SystemExit("training needs --train_json (or --eval_dataset)")
+    if args.ldat_sample == "feat" and args.ldat_in != "native":
+        raise SystemExit("--ldat_sample feat reads the native window map: pass --ldat_in native")
     cfgs = [c for c in args.cfgs.split(",") if c]
     if not args.eval_dataset and args.train_cfg not in cfgs:
         raise SystemExit(f"--train_cfg {args.train_cfg} must be one of --cfgs {cfgs}")
@@ -614,13 +634,16 @@ def main():
         if kl_only:
             return None, None, kl
         dx, dy = axis_density(q.sum(0)), axis_density(q.sum(1))
-        ux = (torch.arange(gw * factor * s, device=dev) + 0.5) / (gw * factor * s)
-        uy = (torch.arange(gh * factor * s, device=dev) + 0.5) / (gh * factor * s)
-        sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
-        img = F.grid_sample(w["psrc"][None], torch.stack([sx, sy], -1)[None], mode="bilinear",
-                            padding_mode="border", align_corners=False)
-        img = aa_down(img, gh * factor, gw * factor)
-        z = vit_pv(patchify(img), torch.tensor([[1, gh * factor // ps, gw * factor // ps]], device=dev)).reshape(gh * gw, -1)
+        if args.ldat_sample == "feat":
+            z = sample_feat_map(w["lmap"], dx, dy, gh, gw, s)
+        else:
+            ux = (torch.arange(gw * factor * s, device=dev) + 0.5) / (gw * factor * s)
+            uy = (torch.arange(gh * factor * s, device=dev) + 0.5) / (gh * factor * s)
+            sy, sx = torch.meshgrid(inv_cdf(dy, uy) * 2 - 1, inv_cdf(dx, ux) * 2 - 1, indexing="ij")
+            img = F.grid_sample(w["psrc"][None], torch.stack([sx, sy], -1)[None], mode="bilinear",
+                                padding_mode="border", align_corners=False)
+            img = aa_down(img, gh * factor, gw * factor)
+            z = vit_pv(patchify(img), torch.tensor([[1, gh * factor // ps, gw * factor // ps]], device=dev)).reshape(gh * gw, -1)
         (lx0, ly0, lx1, ly1), (cx0, cy0, cx1, cy1) = w["lpx"], w["px"]   # ldat window -> crop-window coords
         cy = (ly0 + inv_cdf(dy, (torch.arange(gh, device=dev) + 0.5) / gh) * (ly1 - ly0) - cy0) / (cy1 - cy0) * 2 - 1
         cx = (lx0 + inv_cdf(dx, (torch.arange(gw, device=dev) + 0.5) / gw) * (lx1 - lx0) - cx0) / (cx1 - cx0) * 2 - 1
@@ -770,9 +793,10 @@ def main():
                     sc = math.sqrt(min(args.hr_cap * (factor ** 2), lcw * lch) / float(lcw * lch))
                     nW, nH = max(factor, int(lcw * sc) // factor * factor), max(factor, int(lch * sc) // factor * factor)
                     ext["lmap"] = vit_image(lcrop.resize((nW, nH), Image.BICUBIC)).permute(2, 0, 1)[None].float()
-                sw, sh = min(lcw, round(args.src_scale * gw * factor)), min(lch, round(args.src_scale * gh * factor))
-                ext["psrc"] = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32)
-                                               / 255.0).permute(2, 0, 1).to(dev)
+                if "pwarp" in cfgs or args.ldat_sample == "pixel":
+                    sw, sh = min(lcw, round(args.src_scale * gw * factor)), min(lch, round(args.src_scale * gh * factor))
+                    ext["psrc"] = torch.from_numpy(np.asarray(lcrop.resize((sw, sh), Image.BICUBIC), dtype=np.float32)
+                                                   / 255.0).permute(2, 0, 1).to(dev)
                 ext["lpx"], ext["lnbox"] = lpx, (lpx[0] / W, lpx[1] / H, lpx[2] / W, lpx[3] / H)
             if not need_hr:
                 hr = src = sbox = None
@@ -928,6 +952,7 @@ def main():
         save_head(path, head.state_dict(), metadata=dict(
             kind="ldat", model_family=backbone.family, hidden_size=C, factor=factor,
             where_layer=args.where_layer, ldat_in=args.ldat_in, ldat_win=args.ldat_win,
+            ldat_sample=args.ldat_sample,
             pe=args.pe, ldat_d=args.ldat_d, dat_alpha=args.dat_alpha, dat_ratio=args.dat_ratio,
             dat_k=args.dat_k, src_scale=args.src_scale, supersample=args.supersample,
             hr_cap=args.hr_cap, lr_tok=args.lr_tok, crop_tok=args.crop_tok,
