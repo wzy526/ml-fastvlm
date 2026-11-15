@@ -21,7 +21,6 @@ import base64
 import glob
 import io
 import json
-import math
 import os
 import sys
 import time
@@ -143,12 +142,12 @@ def time_one(runner, image, question, decode_len):
     torch.cuda.synchronize()
     t_pre = time.perf_counter()
     cache = o.past_key_values
-    next_pos = int(math.floor(float(pos.max()))) + 1
+    next_pos = float(pos.max()) + 1
     tok = int(o.logits[0, -1].argmax())
     for k in range(int(decode_len)):
         o = runner.model(
             input_ids=torch.tensor([[tok]], device=dev),
-            position_ids=torch.full((3, 1, 1), next_pos + k, device=dev, dtype=torch.long),
+            position_ids=torch.full((3, 1, 1), next_pos + k, device=dev, dtype=pos.dtype),
             past_key_values=cache,
             cache_position=torch.tensor([n + k], device=dev),
             use_cache=True, return_dict=True)

@@ -604,7 +604,9 @@ class LDatRunner:
             raise ValueError("max_new_tokens must be a positive integer")
         dev = self.dev
         cache = o.past_key_values
-        next_pos = int(math.floor(float(pos.max()))) + 1
+        # The mosaic shifts every later position by a fraction; training scores the
+        # answer at those fractional positions, so generated tokens keep the offset.
+        next_pos = float(pos.max()) + 1
         logits = o.logits[0, -1]
         toks = []
         eos_token = None
@@ -648,7 +650,7 @@ class LDatRunner:
                 break
             k = len(toks) - 1
             o = self.backbone.forward(input_ids=torch.tensor([[tok]], device=dev),
-                           position_ids=torch.full((3, 1, 1), next_pos + k, device=dev, dtype=torch.long),
+                           position_ids=torch.full((3, 1, 1), next_pos + k, device=dev, dtype=pos.dtype),
                            past_key_values=cache,
                            cache_position=torch.tensor([n + k], device=dev),
                            use_cache=True, return_dict=True)

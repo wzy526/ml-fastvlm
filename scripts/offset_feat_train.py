@@ -1121,7 +1121,8 @@ def main():
                     break
             if pr is None:
                 continue
-            if args.train_cfg == "ldat" and args.ans_w == 0:
+            if (args.train_cfg == "ldat" and args.ans_w == 0
+                    and not (args.tr_w or args.hinge_w or args.ctr_w or args.win_w)):
                 kls = [k for k in (ldat_tokens(pr, w, kl_only=True)[2] for w in pr["wins"]) if k is not None]
                 kl = torch.stack(kls).mean() if kls else None
                 if kl is not None:
@@ -1146,8 +1147,8 @@ def main():
             else:
                 with torch.no_grad():
                     loss = answer_loss(pr, [z.detach() for z in fz], pz)
-                total = (args.box_w * kl if kl is not None else 0.0) + pt or None
-            if total is not None and total.requires_grad:
+                total = (args.box_w * kl if kl is not None else 0.0) + args.tr_w * tr + pt
+            if torch.is_tensor(total) and total.requires_grad:
                 (total / args.accum).backward()
             run[3] += float(kl) if kl is not None else 0.0
             run[4] += float(kl is not None)
