@@ -6,17 +6,18 @@
 # layer 8, trained density head, unless the row says otherwise. Finished rows and
 # heads are skipped, so a group can be relaunched after a failure.
 #
-#   bash scripts/run_ablations.sh component native tokens density4b loss layer
+#   bash scripts/run_ablations.sh component      # one group per launch
 #
 # Groups:
 #   component  crop (fixed / adaptive window), + analytic warp, + learned warp (Q-LAS),
 #              whole-image uniform / analytic / learned warp            eval only
-#   native     SFT checkpoint without window at 640..4096 LR tokens     eval only
-#   tokens     Q-LAS at LR 320 / 1280 / 2560 and window 100 / 196 / 900 eval only
-#   density4b  density head for 4B (2B recipe), eval at LR 640 and 1280 ~4 h train
+#   win        Q-LAS with a 100 / 196 / 900-token window                eval only
+#   lr         Q-LAS at LR 320 / 640 / 1280 / 2560, and the SFT checkpoint
+#              without window at matched total tokens                   eval only
 #   loss       density head without hinge / box KL / trust region / answer CE  4 x ~2.5 h
 #   layer      where-head at layers 4 / 8 / 12 / 16 / last, analytic warp,
 #              plus first-pass latency per layer                         5 x ~4 h
+#   density4b  density head for 4B (2B recipe), eval at LR 640 and 1280 ~4 h train
 #
 # Rows: $A/<row>/<task>_lr<N>/   heads: $A/heads/   logs: $L/   chain: $L/chain.log
 set -uo pipefail
@@ -112,7 +113,8 @@ component() {
     ev comp_full_qlas WIN_FULL=1
 }
 
-native() {
+lr() {
+    ev tok_lr TOKS="320 640 1280 2560"
     local px="" t
     for t in ${NATIVE_TOKS:-640 720 1040 1680 2960 4096}; do
         px+="$((t * 1024)) "
@@ -124,8 +126,7 @@ native() {
     PORT=$((PORT + 10))
 }
 
-tokens() {
-    ev tok_lr TOKS="320 1280 2560"
+win() {
     local c
     for c in 100 196 900; do
         ev "tok_win$c" CROP_TOK=$c
@@ -178,10 +179,10 @@ layer() {
     done
 }
 
-[ $# -gt 0 ] || { echo "usage: $0 component|native|tokens|density4b|loss|layer ..."; exit 1; }
+[ $# -gt 0 ] || { echo "usage: $0 component|win|lr|loss|layer|density4b ..."; exit 1; }
 for g in "$@"; do
     case "$g" in
-        component|native|tokens|density4b|loss|layer) say "== $g"; "$g" ;;
+        component|win|lr|loss|layer|density4b) say "== $g"; "$g" ;;
         *) say "unknown group $g"; exit 1 ;;
     esac
 done
