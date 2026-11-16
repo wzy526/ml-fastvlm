@@ -81,7 +81,10 @@ fi
 if [[ "${WIN_FULL:-0}" == "1" ]]; then
     pc_arg="${pc_arg},win_full=True"
 fi
-echo "[pareto] head=$LDAT_PT  prefix_cache=${PREFIX_CACHE:-0}  fast_prefix=${FAST_PREFIX:-0}  sample_feat=${SAMPLE_FEAT:-0}"
+if [[ "${EDGE_FIX:-0}" == "1" ]]; then
+    pc_arg="${pc_arg},edge_fix=True"
+fi
+echo "[pareto] head=$LDAT_PT  prefix_cache=${PREFIX_CACHE:-0}  fast_prefix=${FAST_PREFIX:-0}  sample_feat=${SAMPLE_FEAT:-0}  edge_fix=${EDGE_FIX:-0}"
 echo "[pareto] alpha=$DAT_ALPHA  ratio=$DAT_RATIO  k=$DAT_K  win_full=${WIN_FULL:-0}  where_layer=$WHERE_LAYER  where=$WHERE_PT"
 
 for tok in $TOKS; do

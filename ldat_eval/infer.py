@@ -57,6 +57,7 @@ class LDatRunner:
         fast_prefix=False,
         sample_feat=False,
         win_full=False,
+        edge_fix=False,
         model_family="qwen3_5",
         dtype=None,
     ):
@@ -85,6 +86,10 @@ class LDatRunner:
         # One window covering the whole image: the density is warped over the
         # full frame and the adaptive window is skipped.
         self.win_full = bool(win_full)
+        # The head's zero-padded convs lift its residual on the window border
+        # (left column ~8x the mean on HR-Bench 8K). edge_fix copies the next
+        # inner row / column of the residual onto the outer ring.
+        self.edge_fix = bool(edge_fix)
         self.dev = device
         self.dtype = dtype or (torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32)
 
@@ -158,7 +163,8 @@ class LDatRunner:
             geom = f"full image x {f'{side}x{side}' if side else f'crop_tok {self.crop_tok}'}"
         print(f"[ldat] windows {geom}  lr_tok {self.lr_tok}  alpha {self.dat_alpha}  "
               f"ratio {self.dat_ratio}  k {self.dat_k}  where_layer {self.where_layer}  "
-              f"sample {'feat' if self.sample_feat else 'pixel'}  head |w| {w:.3e}",
+              f"sample {'feat' if self.sample_feat else 'pixel'}  head |w| {w:.3e}"
+              f"{'  edge_fix' if self.edge_fix else ''}",
               flush=True)
 
     def _ensure_recurrent_fp32(self):
@@ -301,7 +307,12 @@ class LDatRunner:
         pw = F.grid_sample(w["head_p"][None, None], gc, mode="bilinear", padding_mode="border",
                            align_corners=False)[0, 0].clamp_min(1e-8)
         lp = pw.log()
-        q = torch.softmax((lp + self.head(f, lp)).flatten(), 0).reshape(nh, nw)
+        r = self.head(f, lp)
+        if self.edge_fix and nh >= 3 and nw >= 3:
+            r = r.clone()
+            r[:, 0], r[:, -1] = r[:, 1], r[:, -2]
+            r[0, :], r[-1, :] = r[1, :], r[-2, :]
+        q = torch.softmax((lp + r).flatten(), 0).reshape(nh, nw)
         dx, dy = self._axis_density(q.sum(0)), self._axis_density(q.sum(1))
         w["q"], w["dx"], w["dy"], w["lp"] = q, dx, dy, lp
         if self.sample_feat:

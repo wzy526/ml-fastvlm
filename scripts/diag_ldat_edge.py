@@ -59,6 +59,7 @@ def main():
     ap.add_argument("--split", default="hrbench_8k")
     ap.add_argument("--n", type=int, default=100)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--edge_fix", action="store_true", help="copy the inner ring of the residual onto the border")
     args = ap.parse_args()
 
     ds, prompt_of, visual = _dataset(args.split)
@@ -72,7 +73,7 @@ def main():
     idx = idx[:args.n]
     runner = LDatRunner(args.model_path, args.where_head_pt, args.ldat_pt, args.device,
                         crop_tok=400, lr_tok=640, dat_alpha=0.8, dat_ratio=0.0, dat_k=0.6,
-                        src_scale=4.0, where_layer=8, fast_prefix=True)
+                        src_scale=4.0, where_layer=8, fast_prefix=True, edge_fix=args.edge_fix)
     acc = {k: [] for k in ("prior", "final", "resid")}
     tok = []
     for k, i in enumerate(idx):
