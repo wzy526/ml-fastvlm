@@ -14,7 +14,8 @@
 #   win        Q-LAS with a 100 / 196 / 900-token window                eval only
 #   lr         Q-LAS at LR 320 / 640 / 1280 / 2560, and the SFT checkpoint
 #              without window at matched total tokens                   eval only
-#   loss       density head without hinge / box KL / trust region / answer CE  4 x ~2.5 h
+#   loss       earlier ratio-4 heads (hinge / centre L2 / both), eval only;
+#              density head without hinge / box KL / trust region       3 x ~2.5 h
 #   layer      where-head at layers 4 / 8 / 12 / 16 / last, analytic warp,
 #              plus first-pass latency per layer                         5 x ~4 h
 #   density4b  density head for 4B (2B recipe), eval at LR 640 and 1280 ~4 h train
@@ -59,7 +60,7 @@ ev() {
     shift
     say "eval $row $*"
     env MODEL_PATH="$M2" WHERE_PT="$W2" LDAT_PT="$H2" CROP_TOK=400 N_WIN=1 GRID=0 TOKS=640 \
-        DAT_ALPHA=0.8 DAT_K=0.6 WIN_FULL=0 WHERE_LAYER=8 FAST_PREFIX=1 PREFIX_CACHE=0 SAMPLE_FEAT=0 \
+        DAT_ALPHA=0.8 DAT_K=0.6 DAT_RATIO=0 WIN_FULL=0 WHERE_LAYER=8 FAST_PREFIX=1 PREFIX_CACHE=0 SAMPLE_FEAT=0 \
         TASKS="$TASKS3" PORT="$PORT" "$@" OUT="$A/$row" \
         bash scripts/eval_ldat_pareto.sh >> "$L/$row.log" 2>&1
     PORT=$((PORT + 10))
@@ -140,10 +141,21 @@ density4b() {
 
 loss() {
     local v n f
+    # Heads trained earlier with the same where-head, data and steps under a
+    # density-ratio cap of 4 (stage1_ldat.pt, the no-hinge cell, was scored
+    # by the training script: 145 / 543 / 471).
+    for v in "r4_hinge:hinge_ldat" "r4_ctr:ctrl2_ldat" "r4_hinge_ctr:both_ldat"; do
+        n=${v%%:*}
+        f=$X/${v#*:}.pt
+        if [ -s "$f" ]; then
+            ev "loss_$n" LDAT_PT="$f" DAT_RATIO=4
+        else
+            say "skip loss_$n: $f missing"
+        fi
+    done
     for v in "no_hinge:--ans_w 1 --box_w 0.1 --tr_w 0.1 --hinge_w 0" \
              "no_box:--ans_w 1 --box_w 0 --tr_w 0.1 --hinge_w 1" \
-             "no_tr:--ans_w 1 --box_w 0.1 --tr_w 0 --hinge_w 1" \
-             "no_ans:--ans_w 0 --box_w 0.1 --tr_w 0.1 --hinge_w 1"; do
+             "no_tr:--ans_w 1 --box_w 0.1 --tr_w 0 --hinge_w 1"; do
         n=${v%%:*}
         f=${v#*:}
         train_ldat "loss_$n" "$(train_base "$M2" "$W2")" "$f" && ev "loss_$n" LDAT_PT="$A/heads/loss_$n.pt"
