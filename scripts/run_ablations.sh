@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Q-LAS ablations on the 2B pipeline of the main table, plus the 4B density head.
 #
-# Every row is V* / HR-Bench 4K / 8K through lmms-eval with the old V* prompt
-# (LMMS_EVAL_DIR=~/lmms-eval-oldvstar): LR 640 + one 400-token window, where-head
+# Every ablation row is HR-Bench 8K through lmms-eval (ABL_TASKS to change it;
+# the 4B density head is a main-table row and keeps V* / HR 4K / 8K, V* with the
+# old prompt from LMMS_EVAL_DIR=~/lmms-eval-oldvstar): LR 640 + one 400-token window, where-head
 # layer 8, trained density head, unless the row says otherwise. Finished rows and
 # heads are skipped, so a group can be relaunched after a failure.
 #
@@ -46,7 +47,8 @@ W2=$E/loc/where_lm8_ce20.pt
 H2=$X/hinge_noratio_ldat.pt
 Z2=$A/heads/ldat_zero_2b.pt
 W4=$M4B/where_lm8_ce20.pt
-TASKS3="vstar_bench hrbench4k hrbench8k"
+ABL_TASKS=${ABL_TASKS:-hrbench8k}
+MAIN_TASKS="vstar_bench hrbench4k hrbench8k"
 mkdir -p "$A/heads" "$L"
 
 say() { echo "$(date '+%F %T') $*" | tee -a "$L/chain.log"; }
@@ -62,7 +64,7 @@ ev() {
     say "eval $row $*"
     env MODEL_PATH="$M2" WHERE_PT="$W2" LDAT_PT="$H2" CROP_TOK=400 N_WIN=1 GRID=0 TOKS=640 \
         DAT_ALPHA=0.8 DAT_K=0.6 DAT_RATIO=0 WIN_FULL=0 WHERE_LAYER=8 FAST_PREFIX=1 PREFIX_CACHE=0 SAMPLE_FEAT=0 \
-        TASKS="$TASKS3" PORT="$PORT" "$@" OUT="$A/$row" \
+        TASKS="$ABL_TASKS" PORT="$PORT" "$@" OUT="$A/$row" \
         bash scripts/eval_ldat_pareto.sh >> "$L/$row.log" 2>&1
     PORT=$((PORT + 10))
 }
@@ -127,7 +129,7 @@ lr() {
     done
     say "native SFT sweep: ${NATIVE_TOKS:-640 1040 1680 2960}"
     PIXELS="${px% }" OUT_ROOT="$A/native_sft" PORT="$PORT" \
-        bash scripts/eval_pixel_sweep.sh base35 "$M2" "vstar_bench,hrbench4k,hrbench8k" native_sft \
+        bash scripts/eval_pixel_sweep.sh base35 "$M2" "${ABL_TASKS// /,}" native_sft \
         >> "$L/native_sft.log" 2>&1
     PORT=$((PORT + 10))
 }
@@ -141,7 +143,8 @@ win() {
 
 density4b() {
     train_ldat ldat4b_hinge_noratio "$(train_base "$M4B" "$W4")" "$FULL_LOSS" || return 1
-    ev d4b_qlas MODEL_PATH="$M4B" WHERE_PT="$W4" LDAT_PT="$A/heads/ldat4b_hinge_noratio.pt" TOKS="640 1280"
+    ev d4b_qlas MODEL_PATH="$M4B" WHERE_PT="$W4" LDAT_PT="$A/heads/ldat4b_hinge_noratio.pt" TOKS="640 1280" \
+        TASKS="$MAIN_TASKS"
 }
 
 loss() {
