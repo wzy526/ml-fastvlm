@@ -87,33 +87,66 @@ def _row(d, prompt_of, visual):
 
 
 def load_pairs(split):
-    """One group per shared image, with the questions named by PAIRS."""
+    """One group per shared image, with the questions named by PAIRS.
+
+    Only the chosen rows are decoded. The scan keeps dataset indices, so several
+    processes can share the cache without each holding every 8K image.
+    """
     ds, prompt_of, visual = _dataset(split)
     groups = {}
-    for d in ds:
+    for i in range(len(ds)):
+        d = ds[i]
         if str(d["cycle_category"]) != "0":
             continue
-        groups.setdefault(hashlib.md5(d["image"].encode()).hexdigest(), []).append(d)
+        groups.setdefault(hashlib.md5(d["image"].encode()).hexdigest(), []).append(i)
     chosen = []
     for name, spec in PAIRS:
         hit = None
-        for docs in groups.values():
-            questions = [x["question"] for x in docs]
+        for idxs in groups.values():
+            questions = [ds[i]["question"] for i in idxs]
             if all(any(s.lower() in q.lower() for q in questions) for s in spec):
-                hit = docs
+                hit = idxs
                 break
         if hit is None:
             print(f"[vis] no image contains {spec}", flush=True)
             continue
         picked = []
         for s in spec:
-            for d in hit:
+            for i in hit:
+                d = ds[i]
                 if s.lower() in d["question"].lower() and all(d["question"] != r["question"] for r in picked):
                     picked.append(_row(d, prompt_of, visual))
                     break
         chosen.append((name, picked))
-        print(f"[vis] {name}: " + " || ".join(r["question"] for r in picked), flush=True)
     return chosen
+
+
+def merge_pairs(out):
+    """Stack the per-image sheets once every rank has written its pngs."""
+    blocks, meta = [], []
+    for name, _spec in PAIRS:
+        path = os.path.join(out, f"pair_{name}.png")
+        if not os.path.exists(path):
+            print(f"[vis] missing {path}", flush=True)
+            continue
+        blocks.append(Image.open(path).convert("RGB"))
+        jpath = os.path.join(out, f"pair_{name}.json")
+        if os.path.exists(jpath):
+            with open(jpath) as f:
+                meta.extend(json.load(f))
+    if not blocks:
+        raise SystemExit(f"no pair_*.png in {out}")
+    gap = 18
+    canvas = Image.new("RGB", (max(s.width for s in blocks), sum(s.height for s in blocks) + gap * (len(blocks) - 1)),
+                       (255, 255, 255))
+    y = 0
+    for s in blocks:
+        canvas.paste(s, (0, y))
+        y += s.height + gap
+    save_png(canvas, os.path.join(out, "hrbench_sampling.png"))
+    with open(os.path.join(out, "hrbench_sampling.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[vis] merged {len(blocks)} pairs -> {out}", flush=True)
 
 
 def load_rows(split, n_try, seed):
@@ -227,19 +260,31 @@ def draw_row(r, w, pw=520, ph=520, cap_h=150):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_path", required=True)
-    ap.add_argument("--where_head_pt", required=True)
-    ap.add_argument("--ldat_pt", required=True)
+    ap.add_argument("--model_path")
+    ap.add_argument("--where_head_pt")
+    ap.add_argument("--ldat_pt")
     ap.add_argument("--split", default="hrbench_8k")
     ap.add_argument("--out", default="/tmp/vis_hrbench")
     ap.add_argument("--mode", choices=("pairs", "random"), default="pairs")
+    ap.add_argument("--rank", type=int, default=0, help="this process's share of the pairs")
+    ap.add_argument("--world", type=int, default=1, help="how many processes split the pairs")
+    ap.add_argument("--merge", action="store_true", help="stack pair_*.png and exit")
     ap.add_argument("--n_try", type=int, default=12, help="random mode: questions per category")
     ap.add_argument("--n_show", type=int, default=4, help="random mode: rows per category, correct ones first")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
+    if args.merge:
+        merge_pairs(args.out)
+        return
+    if not (args.model_path and args.where_head_pt and args.ldat_pt):
+        ap.error("--model_path, --where_head_pt and --ldat_pt are required")
+    if args.world < 1 or not 0 <= args.rank < args.world:
+        ap.error("--rank must be in 0 .. --world-1")
 
     groups = load_pairs(args.split) if args.mode == "pairs" else [(None, load_rows(args.split, args.n_try, args.seed))]
+    groups = groups[args.rank::args.world]
+    print(f"[vis] rank {args.rank}/{args.world}: " + ", ".join(name or "random" for name, _rows in groups), flush=True)
     runner = LDatRunner(args.model_path, args.where_head_pt, args.ldat_pt, args.device,
                         crop_tok=400, lr_tok=640, dat_alpha=0.8, dat_ratio=0.0, dat_k=0.6,
                         src_scale=4.0, where_layer=8, fast_prefix=True)
@@ -274,6 +319,8 @@ def main():
                 block.paste(s, (0, y))
                 y += s.height + gap
             save_png(block, os.path.join(args.out, f"pair_{name}.png"))
+            with open(os.path.join(args.out, f"pair_{name}.json"), "w") as f:
+                json.dump([m for m in meta if m["group"] == name], f, indent=2)
             blocks.append(block)
         else:
             blocks.extend(sheets)
@@ -293,8 +340,10 @@ def main():
         for s in blocks:
             canvas.paste(s, (0, y))
             y += s.height + gap
-        save_png(canvas, os.path.join(args.out, "hrbench_sampling.png"))
-    with open(os.path.join(args.out, "hrbench_sampling.json"), "w") as f:
+        tag = "" if args.world == 1 else f".r{args.rank}"
+        save_png(canvas, os.path.join(args.out, f"hrbench_sampling{tag}.png"))
+    tag = "" if args.world == 1 else f".r{args.rank}"
+    with open(os.path.join(args.out, f"hrbench_sampling{tag}.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print(f"[vis] ran {n_ran}  correct {n_ok}  wrote {len(blocks)} blocks -> {args.out}", flush=True)
 
