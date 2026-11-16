@@ -12,7 +12,9 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 export CONDA_SH=${CONDA_SH:-$HOME/miniconda3/bin/activate}
-export CONDA_ENV=${CONDA_ENV:-fastvlm}
+CONDA_ENV=${CONDA_ENV:-fastvlm}
+[[ "$CONDA_ENV" == */* && ! -d "$CONDA_ENV" ]] && CONDA_ENV=fastvlm
+export CONDA_ENV
 # shellcheck disable=SC1090
 source "$CONDA_SH" "$CONDA_ENV"
 
@@ -27,6 +29,8 @@ TASKS_ABL=${TASKS_ABL:-hrbench4k}
 export LMMS_EVAL_DIR=${LMMS_EVAL_DIR:-$HOME/lmms-eval-oldvstar}
 export HRBENCH_SKIP_GPT_EVAL=1 PYTHONUNBUFFERED=1
 export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+# V* and HR-Bench are cached; eight ranks asking the mirror get HTTP 429 and back off.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} HF_DATASETS_OFFLINE=${HF_DATASETS_OFFLINE:-1}
 # eval_ldat_pareto.sh reads these; a value left in the shell would cut every row short.
 unset LIMIT NPROC
 

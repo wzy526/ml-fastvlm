@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # 8 HR-Bench 4K questions through the two new eval paths (whole-image window,
 # density-ratio cap 4) before the ablations. Writes to /tmp only; ~5 min.
+#   bash scripts/ablation/smoke.sh              # both
+#   bash scripts/ablation/smoke.sh win_full     # one
+WANT=${1:-all}
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 mkzero "$Z2" "$M2"
 
 smoke() {   # smoke NAME [VAR=value ...]
     local out=/tmp/abl_smoke_$1
+    [[ "$WANT" == all || "$WANT" == "$1" ]] || return 0
     shift
     say "smoke $*"
     rm -rf "$out"
