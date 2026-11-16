@@ -23,7 +23,9 @@ die() {
 # die_log REASON LOG
 die_log() {
     say "STOP $1 (see $2)"
-    tail -n 30 "$2" | while IFS= read -r line; do say "  $line"; done
+    grep -aE "image pixel cap|image visual type|Traceback|Error|bad cap" "$2" | tail -n 20 \
+        | while IFS= read -r line; do say "  $line"; done
+    tail -n 15 "$2" | while IFS= read -r line; do say "  $line"; done
     exit 1
 }
 
@@ -37,6 +39,7 @@ check_caps() {
 import re, sys
 text = open(sys.argv[1], errors="replace").read()
 want = [int(x) for x in sys.argv[2].split()]
+text = re.sub(r"\x1b\[[0-9;]*m", "", text)
 starts = [int(x) for x in re.findall(r"\[base35_tok(\d+)\]", text)]
 raw = re.findall(r"image pixel cap (\d+)\.\.(\d+) -> (\d+)x(\d+)", text)
 parsed = []
