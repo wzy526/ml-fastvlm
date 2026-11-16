@@ -6,6 +6,9 @@ inside the window, and the token centres of the 400-token mosaic. Everything
 comes from ldat_eval.infer.LDatRunner.prepare with the main-table settings,
 so the window and the points are the ones the answer was computed from.
 
+``--mode pairs`` (the default) keeps images that carry two questions about
+different places, and draws those questions one under the other.
+
     python scripts/vis_hrbench_sampling.py \
         --model_path $E/checkpoint-1000 \
         --where_head_pt $E/loc/where_lm8_ce20.pt \
@@ -13,6 +16,7 @@ so the window and the points are the ones the answer was computed from.
         --split hrbench_8k --out /tmp/vis_hrbench
 """
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -34,6 +38,27 @@ from vis_intent_where import fit, font, wrap  # noqa: E402
 
 CYAN, RED, DOT = (0, 190, 220), (210, 40, 40), (255, 230, 0)
 
+# Questions that name different objects in one photograph. Each entry is a
+# list of substrings, and each substring must hit a different question.
+PAIRS = [
+    ("signs_towns", ["Zaragoza", "Aloc"]),
+    ("two_signs", ["direction arrows", "rectangular white sign"]),
+    ("two_flags", ["color of the flag on the left", "flag on the right"]),
+    ("bench_table", ["bench on the left", "striped shirt"]),
+    ("dog_bin", ["color of the dog", "green trash bin"]),
+    ("bike_sign", ["color of the bike", "text written on the signboard"]),
+    ("two_devices", ["black rectangular device", "square white adapter"]),
+    ("sleeve_bin", ["jacket's sleeve", "recycle bin"]),
+    ("clock_river", ["time shown on the clock", "river flowing"]),
+    ("mailbox_entrance", ["color of the mailbox", "above the entrance"]),
+    ("door_backpack", ["signboard above the left door", "backpack"]),
+    ("flag_totem", ["below the American flag", "totem pole"]),
+    ("plate_bird", ["bird positioned", "license plate number of the car"]),
+    ("barge_building", ["name of the barge", "small white building"]),
+    ("camera_church", ["Surveillance camera", "main entrance of the church"]),
+    ("sign_structure", ["message written on the sign", "type of structure"]),
+]
+
 
 def save_png(im, path):
     # PIL opens files "w+b", which the OSS mount rejects; write the bytes once.
@@ -41,6 +66,54 @@ def save_png(im, path):
     im.save(buf, "PNG")
     with open(path, "wb") as f:
         f.write(buf.getvalue())
+
+
+def _dataset(split):
+    from datasets import load_dataset
+    from lmms_eval.tasks.hrbench.utils import hrbench_doc_to_text, hrbench_doc_to_visual
+
+    def prompt_of(d):
+        try:
+            return hrbench_doc_to_text(d, None)
+        except (TypeError, KeyError):
+            return hrbench_doc_to_text(d, {"pre_prompt": "", "post_prompt": ""})
+
+    return load_dataset("DreamMr/HR-Bench", "hrbench_version_split", split=split), prompt_of, hrbench_doc_to_visual
+
+
+def _row(d, prompt_of, visual):
+    return {"cat": d["category"], "question": d["question"].strip(), "answer": d["answer"],
+            "prompt": prompt_of(d), "image": visual(d)[0], "index": int(d["index"])}
+
+
+def load_pairs(split):
+    """One group per shared image, with the questions named by PAIRS."""
+    ds, prompt_of, visual = _dataset(split)
+    groups = {}
+    for d in ds:
+        if str(d["cycle_category"]) != "0":
+            continue
+        groups.setdefault(hashlib.md5(d["image"].encode()).hexdigest(), []).append(d)
+    chosen = []
+    for name, spec in PAIRS:
+        hit = None
+        for docs in groups.values():
+            questions = [x["question"] for x in docs]
+            if all(any(s.lower() in q.lower() for q in questions) for s in spec):
+                hit = docs
+                break
+        if hit is None:
+            print(f"[vis] no image contains {spec}", flush=True)
+            continue
+        picked = []
+        for s in spec:
+            for d in hit:
+                if s.lower() in d["question"].lower() and all(d["question"] != r["question"] for r in picked):
+                    picked.append(_row(d, prompt_of, visual))
+                    break
+        chosen.append((name, picked))
+        print(f"[vis] {name}: " + " || ".join(r["question"] for r in picked), flush=True)
+    return chosen
 
 
 def load_rows(split, n_try, seed):
@@ -94,9 +167,9 @@ def heat(crop, q):
     arr = q.detach().float().cpu().numpy()
     arr = np.sqrt(arr / max(float(arr.max()), 1e-12))
     W, H = crop.size
-    h = np.asarray(Image.fromarray((arr * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR), np.float32) / 255.0
+    h = np.asarray(Image.fromarray((arr * 255).astype(np.uint8)).resize((W, H), Image.BICUBIC), np.float32) / 255.0
     base = np.asarray(crop.convert("RGB"), np.float32)
-    a = np.clip((h - 0.15) / 0.85, 0, 1)[..., None] * 0.65
+    a = (h ** 1.4)[..., None] * 0.72
     return Image.fromarray((base * (1 - a) + np.array(RED, np.float32) * a).astype(np.uint8))
 
 
@@ -159,54 +232,71 @@ def main():
     ap.add_argument("--ldat_pt", required=True)
     ap.add_argument("--split", default="hrbench_8k")
     ap.add_argument("--out", default="/tmp/vis_hrbench")
-    ap.add_argument("--n_try", type=int, default=12, help="questions per category")
-    ap.add_argument("--n_show", type=int, default=4, help="rows per category, correct ones first")
+    ap.add_argument("--mode", choices=("pairs", "random"), default="pairs")
+    ap.add_argument("--n_try", type=int, default=12, help="random mode: questions per category")
+    ap.add_argument("--n_show", type=int, default=4, help="random mode: rows per category, correct ones first")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
-    rows = load_rows(args.split, args.n_try, args.seed)
+    groups = load_pairs(args.split) if args.mode == "pairs" else [(None, load_rows(args.split, args.n_try, args.seed))]
     runner = LDatRunner(args.model_path, args.where_head_pt, args.ldat_pt, args.device,
                         crop_tok=400, lr_tok=640, dat_alpha=0.8, dat_ratio=0.0, dat_k=0.6,
                         src_scale=4.0, where_layer=8, fast_prefix=True)
     os.makedirs(args.out, exist_ok=True)
-    done = []
-    for k, r in enumerate(rows):
-        with torch.inference_mode():
-            pr = runner.prepare(r["image"], r["prompt"])
-            if pr is None:
-                print(f"[vis] {k} no window", flush=True)
-                continue
-            r["pred"] = runner.finish(pr, 16).strip()
-        sheet, ok = draw_row(r, pr["wins"][0])
-        done.append((r, sheet, ok))
-        print(f"[vis] {k + 1}/{len(rows)} {r['cat']} ok={int(ok)} pred={r['pred'][:8]!r} gt={r['answer']} "
-              f"| {r['question'][:90]}", flush=True)
-
-    meta, picked = [], []
-    for cat in sorted({r["cat"] for r, _, _ in done}):
-        rs = [x for x in done if x[0]["cat"] == cat]
-        rs.sort(key=lambda x: not x[2])
-        picked += rs[:args.n_show]
-    for i, (r, sheet, ok) in enumerate(picked):
-        path = os.path.join(args.out, f"{r['cat']}_{i:02d}_{'ok' if ok else 'wrong'}.png")
-        save_png(sheet, path)
-        meta.append({"file": path, "category": r["cat"], "index": r["index"], "question": r["question"],
-                     "answer": r["answer"], "pred": r["pred"], "correct": ok})
-    if picked:
-        gap = 10
-        sheets = [s for _, s, _ in picked]
-        canvas = Image.new("RGB", (max(s.width for s in sheets), sum(s.height for s in sheets) + gap * (len(sheets) - 1)),
+    meta, blocks = [], []
+    n_ok = n_ran = 0
+    for name, rows in groups:
+        sheets = []
+        for r in rows:
+            with torch.inference_mode():
+                pr = runner.prepare(r["image"], r["prompt"])
+                if pr is None:
+                    print(f"[vis] no window | {r['question'][:90]}", flush=True)
+                    continue
+                r["pred"] = runner.finish(pr, 16).strip()
+            sheet, ok = draw_row(r, pr["wins"][0])
+            sheets.append(sheet)
+            n_ran += 1
+            n_ok += int(ok)
+            meta.append({"group": name, "category": r["cat"], "index": r["index"], "question": r["question"],
+                         "answer": r["answer"], "pred": r["pred"], "correct": ok})
+            print(f"[vis] {n_ran} {name or r['cat']} ok={int(ok)} pred={r['pred'][:8]!r} gt={r['answer']} "
+                  f"| {r['question'][:90]}", flush=True)
+        if not sheets:
+            continue
+        if args.mode == "pairs":
+            gap = 8
+            block = Image.new("RGB", (sheets[0].width, sum(s.height for s in sheets) + gap * (len(sheets) - 1)),
+                              (255, 255, 255))
+            y = 0
+            for s in sheets:
+                block.paste(s, (0, y))
+                y += s.height + gap
+            save_png(block, os.path.join(args.out, f"pair_{name}.png"))
+            blocks.append(block)
+        else:
+            blocks.extend(sheets)
+    if args.mode == "random":
+        kept = []
+        for cat in sorted({m["category"] for m in meta}):
+            rs = [b for b, m in zip(blocks, meta) if m["category"] == cat]
+            ms = [m for m in meta if m["category"] == cat]
+            order = sorted(range(len(ms)), key=lambda i: not ms[i]["correct"])
+            kept += [rs[i] for i in order[:args.n_show]]
+        blocks = kept
+    if blocks:
+        gap = 18
+        canvas = Image.new("RGB", (max(s.width for s in blocks), sum(s.height for s in blocks) + gap * (len(blocks) - 1)),
                            (255, 255, 255))
         y = 0
-        for s in sheets:
+        for s in blocks:
             canvas.paste(s, (0, y))
             y += s.height + gap
         save_png(canvas, os.path.join(args.out, "hrbench_sampling.png"))
     with open(os.path.join(args.out, "hrbench_sampling.json"), "w") as f:
         json.dump(meta, f, indent=2)
-    n_ok = sum(ok for _, _, ok in done)
-    print(f"[vis] ran {len(done)}  correct {n_ok}  wrote {len(picked)} rows -> {args.out}", flush=True)
+    print(f"[vis] ran {n_ran}  correct {n_ok}  wrote {len(blocks)} blocks -> {args.out}", flush=True)
 
 
 if __name__ == "__main__":
