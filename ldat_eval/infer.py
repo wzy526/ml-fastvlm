@@ -303,7 +303,7 @@ class LDatRunner:
         lp = pw.log()
         q = torch.softmax((lp + self.head(f, lp)).flatten(), 0).reshape(nh, nw)
         dx, dy = self._axis_density(q.sum(0)), self._axis_density(q.sum(1))
-        w["q"], w["dx"], w["dy"] = q, dx, dy
+        w["q"], w["dx"], w["dy"], w["lp"] = q, dx, dy, lp
         if self.sample_feat:
             z = sample_feat_map(f, dx, dy, gh, gw, s).to(self.dtype)
         else:
