@@ -12,8 +12,8 @@
 #   component  crop (fixed / adaptive window), + analytic warp, + learned warp (Q-LAS),
 #              whole-image uniform / analytic / learned warp            eval only
 #   win        Q-LAS with a 100 / 196 / 900-token window                eval only
-#   lr         Q-LAS at LR 320 / 640 / 1280 / 2560, and the SFT checkpoint
-#              without window at matched total tokens                   eval only
+#   lr         Q-LAS at LR 320 / 1280 / 2560, and the SFT checkpoint without
+#              window at 640 / 1040 / 1680 / 2960 tokens                eval only
 #   loss       earlier ratio-4 heads (hinge / centre L2 / both), eval only;
 #              density head without hinge / box KL / trust region       3 x ~2.5 h
 #   layer      where-head at layers 4 / 12 / 16 / last with the two stages of the
@@ -71,6 +71,7 @@ ev() {
 mkzero() {
     [ -f "$1" ] && return 0
     python - "$1" "$2" <<'PY'
+import os
 import sys
 sys.path.insert(0, "scripts")
 import torch
@@ -78,7 +79,9 @@ from transformers import AutoConfig
 from offset_feat_train import LDatHead
 cfg = AutoConfig.from_pretrained(sys.argv[2])
 hidden = getattr(cfg, "text_config", cfg).hidden_size
-torch.save(LDatHead(hidden, d=256).state_dict(), sys.argv[1])
+tmp = f"{sys.argv[1]}.{os.getpid()}.tmp"
+torch.save(LDatHead(hidden, d=256).state_dict(), tmp)
+os.replace(tmp, sys.argv[1])
 print("[zero]", sys.argv[1], "hidden", hidden)
 PY
 }
@@ -116,12 +119,13 @@ component() {
 }
 
 lr() {
-    ev tok_lr TOKS="320 640 1280 2560"
+    # LR 640 is the comp_qlas row of the component group.
+    ev tok_lr TOKS="320 1280 2560"
     local px="" t
-    for t in ${NATIVE_TOKS:-640 720 1040 1680 2960 4096}; do
+    for t in ${NATIVE_TOKS:-640 1040 1680 2960}; do
         px+="$((t * 1024)) "
     done
-    say "native SFT sweep: ${NATIVE_TOKS:-640 720 1040 1680 2960 4096}"
+    say "native SFT sweep: ${NATIVE_TOKS:-640 1040 1680 2960}"
     PIXELS="${px% }" OUT_ROOT="$A/native_sft" PORT="$PORT" \
         bash scripts/eval_pixel_sweep.sh base35 "$M2" "vstar_bench,hrbench4k,hrbench8k" native_sft \
         >> "$L/native_sft.log" 2>&1
