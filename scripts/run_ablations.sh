@@ -16,8 +16,9 @@
 #              without window at matched total tokens                   eval only
 #   loss       earlier ratio-4 heads (hinge / centre L2 / both), eval only;
 #              density head without hinge / box KL / trust region       3 x ~2.5 h
-#   layer      where-head at layers 4 / 8 / 12 / 16 / last, analytic warp,
-#              plus first-pass latency per layer                         5 x ~4 h
+#   layer      where-head at layers 4 / 12 / 16 / last with the two stages of the
+#              main head (layer 8 is the main head), analytic warp, plus
+#              first-pass latency per layer                              4 x ~5.5 h
 #   density4b  density head for 4B (2B recipe), eval at LR 640 and 1280 ~4 h train
 #
 # Rows: $A/<row>/<task>_lr<N>/   heads: $A/heads/   logs: $L/   chain: $L/chain.log
@@ -162,26 +163,44 @@ loss() {
     done
 }
 
+# The two stages of $E/loc/where_lm8_ce20.pt (where_lm8_mix.pt, then ce20),
+# so layer 8 is the main-table head and only the other layers are trained.
+where_train() {   # where_train LAYER OUT
+    local l=$1 out=$2 mix=$A/heads/where_lm$1_mix.pt
+    local data=("$OSS_DATA/extra_0916/viscot_bbox.train.json" "$OSS_DATA/extra_1018/refcoco_bbox.json"
+                "$OSS_DATA/extra_1018/coco_small_bbox.json")
+    if [ ! -f "$mix" ]; then
+        say "where-head layer $l, stage mix"
+        torchrun --nproc_per_node 8 --master_port "$PORT" scripts/where_head.py --model_path "$M2" \
+            --train_json "${data[@]}" --max_per_json 20000 40000 60000 --accum 4 --steps 1500 \
+            --eval_every 500 --head xattn --d 384 --lr 3e-4 --eval_query question --feat "lm:$l" \
+            --save "$mix" --out_boxes "$A/heads/where_lm${l}_mix.json" > "$L/where_lm${l}_mix.log" 2>&1
+        PORT=$((PORT + 10))
+        [ -f "$mix" ] || { say "where-head layer $l mix FAILED, see $L/where_lm${l}_mix.log"; return 1; }
+    fi
+    say "where-head layer $l, stage ce20"
+    torchrun --nproc_per_node 8 --master_port "$PORT" scripts/where_head.py --model_path "$M2" \
+        --load "$mix" --train_json "${data[@]}" --max_per_json 20000 40000 60000 --accum 4 --steps 600 \
+        --eval_every 200 --head xattn --d 384 --lr 1e-4 --ce_weight 20 --dilate 0 --eval_query question \
+        --feat "lm:$l" --save "$out" --out_boxes "$A/heads/where_lm${l}_ce20.json" \
+        > "$L/where_lm${l}_ce20.log" 2>&1
+    PORT=$((PORT + 10))
+    [ -f "$out" ] || { say "where-head layer $l ce20 FAILED, see $L/where_lm${l}_ce20.log"; return 1; }
+}
+
 layer() {
     mkzero "$Z2" "$M2"
     local last l w
     last=$(python -c "import json; c = json.load(open('$M2/config.json')); print(c.get('text_config', c)['num_hidden_layers'] - 1)")
     for l in ${LAYERS:-4 8 12 16 $last}; do
-        w=$A/heads/where_lm$l.pt
-        if [ ! -f "$w" ]; then
-            say "where-head layer $l"
-            torchrun --nproc_per_node 8 --master_port "$PORT" scripts/where_head.py --model_path "$M2" \
-                --train_json "$OSS_DATA/extra_0916/viscot_bbox.train.json" \
-                             "$OSS_DATA/extra_1018/refcoco_bbox.json" \
-                             "$OSS_DATA/extra_1018/coco_small_bbox.json" \
-                --max_per_json 40000 40000 60000 --accum 4 --steps 1500 --eval_every 500 \
-                --head xattn --d 384 --lr 1e-4 --ce_weight 20 --dilate 0 --eval_query question \
-                --feat "lm:$l" --save "$w" --out_boxes "$A/heads/where_lm${l}_vstar.json" \
-                > "$L/where_lm$l.log" 2>&1
-            PORT=$((PORT + 10))
-            [ -f "$w" ] || { say "where-head layer $l FAILED, see $L/where_lm$l.log"; continue; }
+        if [ "$l" = 8 ]; then
+            # The comp_dat_zero row of the component group is this layer's eval.
+            w=$W2
+        else
+            w=$A/heads/where_lm${l}_ce20.pt
+            [ -f "$w" ] || where_train "$l" "$w" || continue
+            ev "layer_$l" WHERE_PT="$w" WHERE_LAYER="$l" LDAT_PT="$Z2"
         fi
-        ev "layer_$l" WHERE_PT="$w" WHERE_LAYER="$l" LDAT_PT="$Z2"
         if ! grep -qs "\"name\": \"layer $l\"" "$A/layer_cost.jsonl"; then
             say "latency layer $l"
             CUDA_VISIBLE_DEVICES=0 python -u scripts/bench_cost.py --name "layer $l" --model ldat \
