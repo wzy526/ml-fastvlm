@@ -209,8 +209,10 @@ for px in $PIXELS; do
     fi
     # Qwen3.5's chat template can default to thinking mode; force it off so
     # numbers are deterministic and comparable to the DAT rows.
+    # qwen3_vl resolves to the chat wrapper, which drops max_pixels from the
+    # image unless apply_image_pixel_limits is on; a 4K image then runs at full res.
     if [[ "$MODEL_TYPE" == "base35" ]]; then
-        margs+=",enable_thinking=False"
+        margs+=",enable_thinking=False,apply_image_pixel_limits=True"
     fi
     if [[ -n "${EXTRA_MARGS:-}" ]]; then
         margs+=",${EXTRA_MARGS}"
