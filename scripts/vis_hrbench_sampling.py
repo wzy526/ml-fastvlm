@@ -86,7 +86,7 @@ def _row(d, prompt_of, visual):
             "prompt": prompt_of(d), "image": visual(d)[0], "index": int(d["index"])}
 
 
-def load_pairs(split):
+def load_pairs(split, only=None):
     """One group per shared image, with the questions named by PAIRS.
 
     Only the chosen rows are decoded. The scan keeps dataset indices, so several
@@ -101,6 +101,8 @@ def load_pairs(split):
         groups.setdefault(hashlib.md5(d["image"].encode()).hexdigest(), []).append(i)
     chosen = []
     for name, spec in PAIRS:
+        if only and name not in only:
+            continue
         hit = None
         for idxs in groups.values():
             questions = [ds[i]["question"] for i in idxs]
@@ -206,8 +208,16 @@ def heat(crop, q):
     return Image.fromarray((base * (1 - a) + np.array(RED, np.float32) * a).astype(np.uint8))
 
 
-def draw_row(r, w, pw=520, ph=520, cap_h=150):
-    image = r["image"].convert("RGB")
+def gamma_correct(image, g):
+    """Display only: out = in ** (1 / g), so g > 1 lifts the shadows."""
+    if g == 1.0:
+        return image
+    lut = [min(255, round(255 * (i / 255) ** (1.0 / g))) for i in range(256)]
+    return image.point(lut * 3)
+
+
+def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
+    image = gamma_correct(r["image"].convert("RGB"), gamma)
     lx0, ly0, lx1, ly1 = w["lpx"]
     crop = image.crop(w["lpx"])
 
@@ -273,6 +283,9 @@ def main():
     ap.add_argument("--n_show", type=int, default=4, help="random mode: rows per category, correct ones first")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--only", nargs="*", help="pairs mode: draw only these PAIRS names, e.g. plate_bird")
+    ap.add_argument("--gamma", type=float, default=1.0,
+                    help="gamma of the drawn image only (> 1 brightens); the model sees the original")
     args = ap.parse_args()
     if args.merge:
         merge_pairs(args.out)
@@ -282,7 +295,7 @@ def main():
     if args.world < 1 or not 0 <= args.rank < args.world:
         ap.error("--rank must be in 0 .. --world-1")
 
-    groups = load_pairs(args.split) if args.mode == "pairs" else [(None, load_rows(args.split, args.n_try, args.seed))]
+    groups = load_pairs(args.split, args.only) if args.mode == "pairs" else [(None, load_rows(args.split, args.n_try, args.seed))]
     groups = groups[args.rank::args.world]
     print(f"[vis] rank {args.rank}/{args.world}: " + ", ".join(name or "random" for name, _rows in groups), flush=True)
     runner = LDatRunner(args.model_path, args.where_head_pt, args.ldat_pt, args.device,
@@ -300,7 +313,7 @@ def main():
                     print(f"[vis] no window | {r['question'][:90]}", flush=True)
                     continue
                 r["pred"] = runner.finish(pr, 16).strip()
-            sheet, ok = draw_row(r, pr["wins"][0])
+            sheet, ok = draw_row(r, pr["wins"][0], gamma=args.gamma)
             sheets.append(sheet)
             n_ran += 1
             n_ok += int(ok)
