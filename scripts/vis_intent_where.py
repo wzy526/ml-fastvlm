@@ -20,6 +20,7 @@ pairs whose peaks land in different boxes.
 """
 import argparse
 import json
+import math
 import os
 import sys
 from collections import defaultdict
@@ -244,6 +245,44 @@ def cross(dr, pt, size, color, r=7):
     dr.line([x, y - r - 4, x, y + r + 4], fill=color, width=2)
 
 
+def sample_points(p, win, image_size, crop_tok=400, alpha=0.8, factor=32):
+    """Centres of the DAT cells inside the window, as fractions of the image.
+
+    Same geometry as llava.model.where_dat._where_dat_image: the cell count
+    matches the pixel crop at this token budget, and each cell centre is the
+    inverse-CDF warp of the where-head marginals (uniform floor `alpha`).
+    With a zero learned residual this is the prior-only sampler."""
+    W, H = image_size
+    px0, py0 = int(win[0] * W), int(win[1] * H)
+    px1 = min(max(int(math.ceil(win[2] * W)), px0 + 1), W)
+    py1 = min(max(int(math.ceil(win[3] * H)), py0 + 1), H)
+    cw, ch = px1 - px0, py1 - py0
+    sc = math.sqrt(min(crop_tok * factor * factor, cw * ch) / float(cw * ch))
+    gw = max(1, int(cw * sc) // factor)
+    gh = max(1, int(ch * sc) // factor)
+    box = (px0 / W, py0 / H, px1 / W, py1 / H)
+    dx, dy = dat_mod._wdat_marginals(p, box, alpha, 0)
+    xe = dat_mod._wdat_inv_cdf_edges(dx, gw)
+    ye = dat_mod._wdat_inv_cdf_edges(dy, gh)
+    pts = []
+    for i in range(gh):
+        cy = (py0 + (ye[i] + ye[i + 1]) / 2 * ch) / H
+        for j in range(gw):
+            cx = (px0 + (xe[j] + xe[j + 1]) / 2 * cw) / W
+            pts.append((cx, cy))
+    return pts
+
+
+def dots(image, pts, color, radius=3):
+    im = image.convert("RGB").copy()
+    d = ImageDraw.Draw(im)
+    W, H = im.size
+    for x, y in pts:
+        px, py = x * W, y * H
+        d.ellipse([px - radius, py - radius, px + radius, py + radius], fill=color)
+    return im
+
+
 def overlay(image, p, color):
     arr = np.asarray(p, np.float32)
     arr = arr / max(float(arr.max()), 1e-8)
@@ -289,27 +328,43 @@ def draw_example(image, a, b, hit):
     rect(d, b["map"]["win"], right.size, cyan, 4)
     cross(d, b["map"]["peak"], right.size, (255, 255, 255))
 
+    def samples(rec, color):
+        pts = sample_points(rec["map"]["p"], rec["map"]["win"], base.size)
+        im = dots(base, pts, color)
+        d = ImageDraw.Draw(im)
+        for box in rec["boxes"]:
+            rect(d, box, im.size, green if color == (210, 40, 40) else orange, 4)
+        rect(d, rec["map"]["win"], im.size, cyan, 4)
+        return im
+
+    samp_a = samples(a, (210, 40, 40))
+    samp_b = samples(b, (40, 90, 210))
+
     pw, ph, cap_h = 460, 360, 108
-    panels = [fit(left, pw, ph), fit(mid, pw, ph), fit(right, pw, ph)]
+    panels = [fit(left, pw, ph), fit(mid, pw, ph), fit(samp_a, pw, ph),
+              fit(right, pw, ph), fit(samp_b, pw, ph)]
     fnt = font(16)
     small = font(14)
     titles = [
         "image  ·  green = question A boxes, orange = question B",
         "question A  ·  red = where-head, cyan = window",
+        "question A  ·  red dots = prior-only samples",
         "question B  ·  blue = where-head, cyan = window",
+        "question B  ·  blue dots = prior-only samples",
     ]
-    bodies = ["", a["q"], b["q"]]
-    sheet = Image.new("RGB", (pw * 3 + 16, ph + cap_h + 8), (255, 255, 255))
+    bodies = ["", a["q"], "", b["q"], ""]
+    n = len(panels)
+    sheet = Image.new("RGB", (pw * n + 16, ph + cap_h + 8), (255, 255, 255))
     for i, panel in enumerate(panels):
         sheet.paste(panel, (8 + i * pw, 4))
     dr = ImageDraw.Draw(sheet)
-    for i in range(3):
+    qcolor = {1: green, 2: green, 3: orange, 4: orange}
+    for i in range(n):
         x = 8 + i * pw
         dr.text((x, ph + 8), titles[i], fill=(40, 40, 40), font=small)
-        color = (20, 20, 20) if i == 0 else (green if i == 1 else orange)
         y = ph + 30
         for line in wrap(bodies[i], fnt, pw - 12, 3):
-            dr.text((x, y), line, fill=color, font=fnt)
+            dr.text((x, y), line, fill=qcolor.get(i, (20, 20, 20)), font=fnt)
             y += 22
     tag = "both peaks in their own boxes" if hit else "peaks did not both land in their boxes"
     dr.text((8, ph + cap_h - 16), tag, fill=(20, 120, 40) if hit else (160, 40, 40), font=small)
