@@ -46,14 +46,14 @@ for j in jsons:
         if not im:
             continue
         p = im if os.path.isabs(im) else os.path.join(root, im)
-        if not os.path.exists(p):
-            missing += 1
-            continue
+        # paths outside home are on OSS: a stat there costs tens of ms, so skip it
         e = entry(p)
         if e is None:
             shared += 1
-        else:
+        elif os.path.lexists(os.path.join(home, e)):
             keep.add(e)
+        else:
+            missing += 1
 open(sys.argv[2], "w").write("".join(f"{k}\n" for k in sorted(keep)))
 print(f"images: {len(keep)} in home to copy, {shared} already outside home, {missing} missing on machine 1")
 PY
