@@ -74,6 +74,33 @@ if [[ "$CKPT" == /* && ! -d "$CKPT" ]]; then
     exit 1
 fi
 
+# BASE_AS_QWEN=1: score a qwen3_5_dat checkpoint as the plain Qwen3.5 it was
+# fine-tuned from (the no-window SFT control). The stock loader rejects the
+# `qwen3_5_dat` model type, so point it at a copy of the checkpoint whose
+# config.json is rewritten to `qwen3_5` with the DAT-only fields removed. The
+# original checkpoint is left untouched; the DAT modules in the weights are
+# ignored on load.
+if [[ "${BASE_AS_QWEN:-0}" == "1" ]]; then
+    CKPT_VIEW="${CKPT_VIEW:-$(dirname "$CKPT")/.qwen35_view}"
+    mkdir -p "$CKPT_VIEW"
+    find "$CKPT" -maxdepth 1 -type f -exec ln -sfn {} "$CKPT_VIEW/" \;
+    python3 - "$CKPT/config.json" "$CKPT_VIEW/config.json" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["model_type"] = "qwen3_5"
+for k in ("dat_extra_args", "auto_map"):
+    cfg.pop(k, None)
+for sub in (cfg, cfg.get("text_config"), cfg.get("vision_config")):
+    if isinstance(sub, dict) and sub.get("model_type") == "qwen3_5_dat":
+        sub["model_type"] = "qwen3_5"
+arch = cfg.get("architectures") or []
+cfg["architectures"] = ["Qwen3_5ForConditionalGeneration" if a.endswith("DATForConditionalGeneration") else a for a in arch]
+json.dump(cfg, open(sys.argv[2], "w"), indent=2)
+PY
+    echo "[base-as-qwen] scoring $CKPT through $CKPT_VIEW (config rewritten to qwen3_5)"
+    CKPT="$CKPT_VIEW"
+fi
+
 # Default grid = the token axis 256/640/1280/2560/6400/11520 from
 # scripts/archive/qwen2_5vl_adl_0528/_eval_pareto.sh, converted to pixels with the
 # family's TOK_PX so qwen2.5 (784) and qwen3.5 (1024) rows line up by tokens.
