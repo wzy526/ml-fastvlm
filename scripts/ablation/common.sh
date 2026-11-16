@@ -12,7 +12,7 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 export CONDA_SH=${CONDA_SH:-$HOME/miniconda3/bin/activate}
-export CONDA_ENV=${CONDA_ENV:-$HOME/miniconda3/envs/fastvlm}
+export CONDA_ENV=${CONDA_ENV:-fastvlm}
 # shellcheck disable=SC1090
 source "$CONDA_SH" "$CONDA_ENV"
 
@@ -68,20 +68,23 @@ ev() {
 # mkzero OUT MODEL: density head with a zero residual, so the density is the where-head's.
 mkzero() {
     [ -f "$1" ] && return 0
+    # config.json is read directly: the SFT checkpoint's model_type (qwen3_5_dat)
+    # is unknown to AutoConfig.
     python - "$1" "$2" <<'PY'
+import json
 import os
 import sys
 sys.path.insert(0, "scripts")
 import torch
-from transformers import AutoConfig
 from offset_feat_train import LDatHead
-cfg = AutoConfig.from_pretrained(sys.argv[2])
-hidden = getattr(cfg, "text_config", cfg).hidden_size
+cfg = json.load(open(os.path.join(sys.argv[2], "config.json")))
+hidden = cfg.get("text_config", cfg)["hidden_size"]
 tmp = f"{sys.argv[1]}.{os.getpid()}.tmp"
 torch.save(LDatHead(hidden, d=256).state_dict(), tmp)
 os.replace(tmp, sys.argv[1])
 print("[zero]", sys.argv[1], "hidden", hidden)
 PY
+    [ -f "$1" ] || { say "zero density head FAILED for $2"; exit 1; }
 }
 
 # The recipe of hinge_noratio_ldat.pt without its loss weights.
