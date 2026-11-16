@@ -87,7 +87,7 @@ def pair_sep(ba, bb):
     return max(l1(center(a), center(b)) for a in ba for b in bb)
 
 
-def load_pairs(path, image_root, n_try):
+def load_pairs(path, image_root, n_try, match=None):
     print(f"[vis] reading {path}", flush=True)
     data = json.load(open(os.path.expanduser(path)))
     print(f"[vis] {len(data)} rows, grouping by image", flush=True)
@@ -119,6 +119,10 @@ def load_pairs(path, image_root, n_try):
                     continue
                 cands.append((sep, im, uniq[i], uniq[j]))
     cands.sort(key=lambda t: -t[0])
+    if match:
+        keys = [m.lower() for m in match]
+        cands = [c for c in cands if all(k in (c[2]["q"] + " || " + c[3]["q"]).lower() for k in keys)]
+        print(f"[vis] {len(cands)} pairs contain {match}", flush=True)
     print(f"[vis] {len(groups)} images, {len(cands)} separated pairs; checking files for the farthest",
           flush=True)
     # Stat only the pairs we might draw. A full pass over the symlink farm
@@ -295,6 +299,14 @@ def overlay(image, p, color):
     return Image.fromarray((base * (1 - a) + col * a).astype(np.uint8))
 
 
+def gamma_correct(image, g):
+    """Display only: out = in ** (1 / g), so g > 1 lifts the shadows."""
+    if g == 1.0:
+        return image
+    lut = [min(255, round(255 * (i / 255) ** (1.0 / g))) for i in range(256)]
+    return image.convert("RGB").point(lut * 3)
+
+
 def fit(im, w, h):
     im = im.copy()
     im.thumbnail((w, h), Image.BICUBIC)
@@ -382,10 +394,14 @@ def main():
     ap.add_argument("--n_try", type=int, default=36, help="separated pairs to run, farthest first")
     ap.add_argument("--n_show", type=int, default=6)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--match", nargs="*",
+                    help="keep only pairs whose two questions contain all these substrings")
+    ap.add_argument("--gamma", type=float, default=1.0,
+                    help="gamma of the drawn image only (> 1 brightens); the where-head sees the original")
     args = ap.parse_args()
 
     image_root = os.path.expanduser(args.image_root)
-    pairs, n_img, n_sep = load_pairs(args.json, image_root, args.n_try)
+    pairs, n_img, n_sep = load_pairs(args.json, image_root, args.n_try, args.match)
     print(f"[vis] {n_img} images, {n_sep} question pairs with boxes >= 0.28 apart, running {len(pairs)}",
           flush=True)
     if not pairs:
@@ -426,7 +442,7 @@ def main():
         raise SystemExit("[vis] no forward succeeded")
 
     os.makedirs(args.out, exist_ok=True)
-    sheets = [draw_example(r["image"], r["a"], r["b"], r["hit"]) for r in show]
+    sheets = [draw_example(gamma_correct(r["image"], args.gamma), r["a"], r["b"], r["hit"]) for r in show]
     w = max(s.width for s in sheets)
     gap = 10
     canvas = Image.new("RGB", (w, sum(s.height for s in sheets) + gap * (len(sheets) - 1)), (255, 255, 255))
