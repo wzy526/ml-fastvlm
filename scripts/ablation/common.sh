@@ -52,10 +52,15 @@ need() {
 }
 need "$M2" "$W2" "$H2" "$LMMS_EVAL_DIR"
 
-exec 9>"$L/lock"
-say "waiting for the GPUs"
-flock 9
-say "start"
+# SKIP_LOCK=1: a parent script already holds $L/lock and is calling this one.
+if [[ "${SKIP_LOCK:-0}" == 1 ]]; then
+    say "start"
+else
+    exec 9>"$L/lock"
+    say "waiting for the GPUs"
+    flock 9
+    say "start"
+fi
 
 # ev ROW [VAR=value ...]: one eval_ldat_pareto.sh run of the main setting with the overrides.
 ev() {

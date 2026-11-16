@@ -217,15 +217,19 @@ for px in $PIXELS; do
     fi
 
     echo "------------------------------------------------------------------"
-    echo "[$tag] $TASK  px=$px  (~$tok LLM tokens)"
+    echo "[$tag] $TASK  px=$px  (~$tok LLM tokens)  limit=${LIMIT:-all}"
     echo "------------------------------------------------------------------"
+    # LIMIT is a smoke knob. Unset, the point is the full task.
+    extra=()
+    [[ -n "${LIMIT:-}" ]] && extra=(--limit "$LIMIT")
     if accelerate launch --num_processes "$NPROC" --main_process_port $((PORT++)) -m lmms_eval \
         --model "$MODEL" \
         --model_args "$margs" \
         --tasks "$TASK" \
         --batch_size 1 \
         --log_samples \
-        --output_path "$out"; then
+        --output_path "$out" \
+        ${extra[@]+"${extra[@]}"}; then
         touch "$out/done"
     else
         echo "[FAIL] $tag (px=$px) exited non-zero — continuing to next point" >&2
