@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Q-LAS ablations on the 2B pipeline of the main table, plus the 4B density head.
 #
-# Every ablation row is HR-Bench 8K through lmms-eval (ABL_TASKS to change it;
+# Every ablation row is HR-Bench 4K through lmms-eval (ABL_TASKS to change it;
 # the 4B density head is a main-table row and keeps V* / HR 4K / 8K, V* with the
 # old prompt from LMMS_EVAL_DIR=~/lmms-eval-oldvstar): LR 640 + one 400-token window, where-head
 # layer 8, trained density head, unless the row says otherwise. Finished rows and
@@ -47,7 +47,7 @@ W2=$E/loc/where_lm8_ce20.pt
 H2=$X/hinge_noratio_ldat.pt
 Z2=$A/heads/ldat_zero_2b.pt
 W4=$M4B/where_lm8_ce20.pt
-ABL_TASKS=${ABL_TASKS:-hrbench8k}
+ABL_TASKS=${ABL_TASKS:-hrbench4k}
 MAIN_TASKS="vstar_bench hrbench4k hrbench8k"
 mkdir -p "$A/heads" "$L"
 
