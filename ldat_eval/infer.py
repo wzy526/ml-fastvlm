@@ -56,6 +56,7 @@ class LDatRunner:
         prefix_cache=False,
         fast_prefix=False,
         sample_feat=False,
+        win_full=False,
         model_family="qwen3_5",
         dtype=None,
     ):
@@ -81,6 +82,9 @@ class LDatRunner:
         # Mosaic tokens read from the window's native ViT map at the sample
         # points instead of warping the pixels and running the ViT again.
         self.sample_feat = bool(sample_feat)
+        # One window covering the whole image: the density is warped over the
+        # full frame and the adaptive window is skipped.
+        self.win_full = bool(win_full)
         self.dev = device
         self.dtype = dtype or (torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32)
 
@@ -150,8 +154,11 @@ class LDatRunner:
         w = float(self.head.out.weight.detach().abs().mean())
         side = self._mosaic_side()
         geom = f"{self.n_win} x {side}x{side}" if side else f"1 x crop_tok {self.crop_tok}"
+        if self.win_full:
+            geom = f"full image x {f'{side}x{side}' if side else f'crop_tok {self.crop_tok}'}"
         print(f"[ldat] windows {geom}  lr_tok {self.lr_tok}  alpha {self.dat_alpha}  "
-              f"ratio {self.dat_ratio}  sample {'feat' if self.sample_feat else 'pixel'}  head |w| {w:.3e}",
+              f"ratio {self.dat_ratio}  k {self.dat_k}  where_layer {self.where_layer}  "
+              f"sample {'feat' if self.sample_feat else 'pixel'}  head |w| {w:.3e}",
               flush=True)
 
     def _ensure_recurrent_fp32(self):
@@ -387,18 +394,23 @@ class LDatRunner:
         peaks = nms_peaks(logits, self.n_win, 4, 0.0)
         if not peaks:
             return None
+        if self.win_full:
+            peaks = peaks[:1]
         p = dat_mod._wdat_softmax(logits.float().tolist())
         wins, feats, pts = [], [], []
         for cy, cx in peaks:
             box = ((cx + 0.5 - 2) / gw_l, (cy + 0.5 - 2) / gh_l,
                    (cx + 0.5 + 2) / gw_l, (cy + 0.5 + 2) / gh_l)
-            win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h, factor=self.factor)
+            if self.win_full:
+                win = (0.0, 0.0, 1.0, 1.0)
+            else:
+                win = dat_mod._where_pad_window(box, 2.0, 20, hd_w, hd_h, factor=self.factor)
             tok_budget = side * side if side else self.crop_tok
             px0, py0, px1, py1, gh, gw = crop_geometry(image, win, tok_budget, factor=self.factor)
             if side:
                 gh = gw = side
             lw = win
-            if self.dat_k > 0:
+            if self.dat_k > 0 and not self.win_full:
                 lw = dat_mod._wdat_adaptive_window(p, box, win, self.dat_k)[0]
             lx0, ly0 = int(lw[0] * w_img), int(lw[1] * h_img)
             lpx = (lx0, ly0, min(max(int(math.ceil(lw[2] * w_img)), lx0 + 1), w_img),

@@ -38,6 +38,9 @@ fi
 MODEL_PATH="${MODEL_PATH:-$E/checkpoint-1000}"
 WHERE_PT="${WHERE_PT:-$E/loc/where_lm8_ce20.pt}"
 LDAT_PT="${LDAT_PT:-$X/hinge_noratio_ldat.pt}"
+DAT_ALPHA="${DAT_ALPHA:-0.8}"
+DAT_K="${DAT_K:-0.6}"
+WHERE_LAYER="${WHERE_LAYER:-8}"
 NPROC="${NPROC:-8}"
 PORT="${PORT:-29720}"
 LIMIT="${LIMIT:-}"
@@ -74,7 +77,11 @@ fi
 if [[ "${SAMPLE_FEAT:-0}" == "1" ]]; then
     pc_arg="${pc_arg},sample_feat=True"
 fi
+if [[ "${WIN_FULL:-0}" == "1" ]]; then
+    pc_arg="${pc_arg},win_full=True"
+fi
 echo "[pareto] head=$LDAT_PT  prefix_cache=${PREFIX_CACHE:-0}  fast_prefix=${FAST_PREFIX:-0}  sample_feat=${SAMPLE_FEAT:-0}"
+echo "[pareto] alpha=$DAT_ALPHA  k=$DAT_K  win_full=${WIN_FULL:-0}  where_layer=$WHERE_LAYER  where=$WHERE_PT"
 
 for tok in $TOKS; do
     for task in $TASKS; do
@@ -93,7 +100,7 @@ for tok in $TOKS; do
         echo "------------------------------------------------------------------"
         if accelerate launch --num_processes "$NPROC" --main_process_port "$PORT" -m lmms_eval \
             --model qwen3_5_ldat \
-            --model_args "pretrained=${MODEL_PATH},where_head_pt=${WHERE_PT},ldat_pt=${LDAT_PT},crop_tok=${CROP_TOK},lr_tok=${tok},n_win=${N_WIN},grid=${GRID},dat_alpha=0.8,dat_ratio=0,src_scale=4,ldat_d=256,attn_implementation=sdpa${pc_arg}" \
+            --model_args "pretrained=${MODEL_PATH},where_head_pt=${WHERE_PT},ldat_pt=${LDAT_PT},crop_tok=${CROP_TOK},lr_tok=${tok},n_win=${N_WIN},grid=${GRID},dat_alpha=${DAT_ALPHA},dat_k=${DAT_K},where_layer=${WHERE_LAYER},dat_ratio=0,src_scale=4,ldat_d=256,attn_implementation=sdpa${pc_arg}" \
             --tasks "$task" \
             --batch_size 1 \
             --log_samples \

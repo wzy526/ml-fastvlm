@@ -172,7 +172,8 @@ def main():
     for i, k in enumerate(order, 1):
         row = runs[k]
         ma = row["args"]
-        flags = [f"{n}={ma[n]}" for n in ("crop_tok", "n_win", "grid", "fast_prefix", "sample_feat",
+        flags = [f"{n}={ma[n]}" for n in ("crop_tok", "n_win", "grid", "dat_alpha", "dat_k", "win_full",
+                                           "where_layer", "fast_prefix", "sample_feat",
                                            "prefix_cache", "enable_thinking") if n in ma]
         first = min(t["mtime"] for t in row["tasks"].values())
         vs = row["tasks"].get("vstar_bench", {}).get("prompt", "")

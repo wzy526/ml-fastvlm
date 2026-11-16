@@ -118,7 +118,7 @@ class LDat:
     DEFAULTS = dict(lr_tok=640, crop_tok=400, n_win=1, grid=0, dat_alpha=0.8, dat_ratio=0.0,
                     dat_k=0.6, src_scale=4.0, supersample=2, ldat_d=256, hr_cap=4096,
                     where_layer=8, fast_prefix=False, sample_feat=False, prefix_cache=False,
-                    enable_thinking=False)
+                    enable_thinking=False, win_full=False)
 
     def __init__(self, pretrained, where_head_pt, ldat_pt, family="auto", device="cuda",
                  attn="sdpa", **kw):
@@ -128,7 +128,7 @@ class LDat:
         if unknown:
             raise ValueError(f"ldat: unknown model_args {sorted(unknown)}")
         params = {**self.DEFAULTS, **kw}
-        for key in ("fast_prefix", "sample_feat", "prefix_cache", "enable_thinking"):
+        for key in ("fast_prefix", "sample_feat", "prefix_cache", "enable_thinking", "win_full"):
             params[key] = _as_bool(params[key])
         self.params = params
         self.runner = LDatRunner(pretrained, where_head_pt, ldat_pt, device,
