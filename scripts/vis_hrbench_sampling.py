@@ -9,6 +9,10 @@ so the window and the points are the ones the answer was computed from.
 ``--mode pairs`` (the default) keeps images that carry two questions about
 different places, and draws those questions one under the other.
 
+``--n_win 4`` runs the multi-window setting (four 20x20 windows) and draws
+(a) the image, (b) the where-head relevance map with the numbered windows,
+(c) each window's learned density and token centres.
+
     python scripts/vis_hrbench_sampling.py \
         --model_path $E/checkpoint-1000 \
         --where_head_pt $E/loc/where_lm8_ce20.pt \
@@ -37,6 +41,7 @@ from offset_feat_train import inv_cdf  # noqa: E402
 from vis_intent_where import fit, font, wrap  # noqa: E402
 
 CYAN, RED, DOT = (0, 190, 220), (210, 40, 40), (255, 230, 0)
+WIN_COLORS = [CYAN, (255, 140, 0), (60, 200, 60), (230, 60, 200), (120, 120, 255), (255, 255, 255)]
 
 # Questions that name different objects in one photograph. Each entry is a
 # list of substrings, and each substring must hit a different question.
@@ -268,6 +273,77 @@ def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
     return sheet, ok
 
 
+def window_tile(image, w, color):
+    """One window: learned density under its token centres."""
+    crop = image.crop(w["lpx"])
+    tile = heat(crop, w["q"])
+    tile.thumbnail((1200, 1200), Image.BICUBIC)
+    k = tile.width / crop.width
+    _ex, _ey, cx, cy = token_grid(w)
+    d = ImageDraw.Draw(tile)
+    rad = max(2, tile.width // 220)
+    for y in cy:
+        for x in cx:
+            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=DOT, outline=(0, 0, 0))
+    d.rectangle([0, 0, tile.width - 1, tile.height - 1], outline=color, width=8)
+    return tile
+
+
+def draw_multi(r, wins, pw=520, ph=520, cap_h=150, gamma=1.0):
+    """(a) image, (b) relevance map with the numbered windows, (c) each window's density and samples."""
+    image = gamma_correct(r["image"].convert("RGB"), gamma)
+    full = image.copy()
+    full.thumbnail((2400, 2400), Image.BICUBIC)
+    s = full.width / image.width
+
+    rel = heat(full, wins[0]["head_p"])
+    d = ImageDraw.Draw(rel)
+    lw = max(4, full.width // 160)
+    lab = font(max(20, full.width // 30))
+    for i, w in enumerate(wins):
+        c = WIN_COLORS[i % len(WIN_COLORS)]
+        x0, y0, x1, y1 = (v * s for v in w["lpx"])
+        d.rectangle([x0, y0, x1, y1], outline=c, width=lw)
+        t = str(i + 1)
+        tw, th = lab.getlength(t), lab.size
+        d.rectangle([x0, y0, x0 + tw + 12, y0 + th + 10], fill=c)
+        d.text((x0 + 6, y0 + 3), t, fill=(0, 0, 0), font=lab)
+
+    cols = 2 if len(wins) > 1 else 1
+    rows = (len(wins) + cols - 1) // cols
+    tw, th = (pw - 4 * (cols - 1)) // cols, (ph - 4 * (rows - 1)) // rows
+    grid = Image.new("RGB", (pw, ph), (248, 248, 248))
+    gd = ImageDraw.Draw(grid)
+    small = font(14)
+    for i, w in enumerate(wins):
+        c = WIN_COLORS[i % len(WIN_COLORS)]
+        x, y = (i % cols) * (tw + 4), (i // cols) * (th + 4)
+        grid.paste(fit(window_tile(image, w, c), tw, th), (x, y))
+        gd.rectangle([x, y, x + 22, y + 20], fill=c)
+        gd.text((x + 6, y + 2), str(i + 1), fill=(0, 0, 0), font=small)
+
+    panels = [fit(full, pw, ph), fit(rel, pw, ph), grid]
+    sheet = Image.new("RGB", (pw * 3 + 16, ph + cap_h + 8), (255, 255, 255))
+    for i, p in enumerate(panels):
+        sheet.paste(p, (8 + i * pw, 4))
+    dr = ImageDraw.Draw(sheet)
+    fnt = font(16)
+    side = f"{wins[0]['gw']}x{wins[0]['gh']}"
+    titles = [f"(a) {r['cat']}  ·  {image.width}x{image.height}",
+              f"(b) relevance map  ·  {len(wins)} windows",
+              f"(c) learned density + {side} samples per window"]
+    for i, t in enumerate(titles):
+        dr.text((8 + i * pw, ph + 8), t, fill=(40, 40, 40), font=small)
+    y = ph + 32
+    for line in wrap(r["question"], fnt, pw * 3 - 16, 3):
+        dr.text((8, y), line, fill=(20, 20, 20), font=fnt)
+        y += 22
+    ok = r["pred"][:1].upper() == str(r["answer"]).strip()[:1].upper()
+    dr.text((8, y + 4), f"answer {r['answer']}  ·  Q-LAS {r['pred'][:8]!r}  ·  {'correct' if ok else 'wrong'}",
+            fill=(20, 120, 40) if ok else (160, 40, 40), font=small)
+    return sheet, ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path")
@@ -286,6 +362,8 @@ def main():
     ap.add_argument("--only", nargs="*", help="pairs mode: draw only these PAIRS names, e.g. plate_bird")
     ap.add_argument("--gamma", type=float, default=1.0,
                     help="gamma of the drawn image only (> 1 brightens); the model sees the original")
+    ap.add_argument("--n_win", type=int, default=1,
+                    help="> 1: that many 20x20 windows (the multi-window eval setting), drawn as (a)/(b)/(c)")
     args = ap.parse_args()
     if args.merge:
         merge_pairs(args.out)
@@ -300,7 +378,7 @@ def main():
     print(f"[vis] rank {args.rank}/{args.world}: " + ", ".join(name or "random" for name, _rows in groups), flush=True)
     runner = LDatRunner(args.model_path, args.where_head_pt, args.ldat_pt, args.device,
                         crop_tok=400, lr_tok=640, dat_alpha=0.8, dat_ratio=0.0, dat_k=0.6,
-                        src_scale=4.0, where_layer=8, fast_prefix=True)
+                        src_scale=4.0, where_layer=8, fast_prefix=True, n_win=args.n_win)
     os.makedirs(args.out, exist_ok=True)
     meta, blocks = [], []
     n_ok = n_ran = 0
@@ -313,12 +391,16 @@ def main():
                     print(f"[vis] no window | {r['question'][:90]}", flush=True)
                     continue
                 r["pred"] = runner.finish(pr, 16).strip()
-            sheet, ok = draw_row(r, pr["wins"][0], gamma=args.gamma)
+            if args.n_win > 1:
+                sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma)
+            else:
+                sheet, ok = draw_row(r, pr["wins"][0], gamma=args.gamma)
             sheets.append(sheet)
             n_ran += 1
             n_ok += int(ok)
             meta.append({"group": name, "category": r["cat"], "index": r["index"], "question": r["question"],
-                         "answer": r["answer"], "pred": r["pred"], "correct": ok})
+                         "answer": r["answer"], "pred": r["pred"], "correct": ok,
+                         "windows": [list(w["lpx"]) for w in pr["wins"]]})
             print(f"[vis] {n_ran} {name or r['cat']} ok={int(ok)} pred={r['pred'][:8]!r} gt={r['answer']} "
                   f"| {r['question'][:90]}", flush=True)
         if not sheets:
