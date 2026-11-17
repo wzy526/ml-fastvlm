@@ -42,7 +42,6 @@ from vis_intent_where import fit, font, wrap  # noqa: E402
 
 CYAN, RED, DOT = (0, 190, 220), (210, 40, 40), (255, 230, 0)
 WIN_COLORS = [(70, 185, 205), (205, 120, 52), (55, 142, 66), (140, 90, 185), (90, 90, 90), (190, 190, 190)]
-SAMPLE_DOT = (45, 90, 195)
 
 # Questions that name different objects in one photograph. Each entry is a
 # list of substrings, and each substring must hit a different question.
@@ -275,7 +274,7 @@ def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
     return sheet, ok
 
 
-def window_tile(image, w, color, tw, th, dot=4.5, ss=2, dot_color=SAMPLE_DOT, stride=2):
+def window_tile(image, w, color, tw, th, dot=4.5, ss=2, dot_color=None, stride=2):
     """One window at tw x th: learned density under its token centres (dot = radius in output px).
 
     stride > 1 draws every stride-th centre along each axis; the drawn points are real
@@ -291,7 +290,7 @@ def window_tile(image, w, color, tw, th, dot=4.5, ss=2, dot_color=SAMPLE_DOT, st
     off = stride // 2
     for y in cy[off::stride]:
         for x in cx[off::stride]:
-            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=dot_color)
+            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=dot_color or color)
     d.rectangle([0, 0, tile.width - 1, tile.height - 1], outline=color, width=4 * ss)
     return fit(tile, tw, th)
 
@@ -320,7 +319,7 @@ def caption(dr, r, x, y, width):
     return ok
 
 
-def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=4.5, dot_color=SAMPLE_DOT, stride=2):
+def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=4.5, dot_color=None, stride=2):
     """(a) image, (b) relevance map with the numbered windows, (c) each window's density and samples."""
     image = gamma_correct(r["image"].convert("RGB"), gamma)
     full = image.copy()
@@ -392,7 +391,7 @@ def main():
     ap.add_argument("--dot", type=float, default=4.5, help="n_win > 1: sample dot radius in output pixels")
     ap.add_argument("--dot_stride", type=int, default=2,
                     help="n_win > 1: draw every k-th sample along each axis (1 = all 20x20)")
-    ap.add_argument("--dot_color", default="2d5ac3", help="n_win > 1: sample dot colour, hex RGB")
+    ap.add_argument("--dot_color", default="", help="n_win > 1: one sample dot colour, hex RGB (default: the window's colour)")
     ap.add_argument("--keep", nargs="*", help="pairs mode: draw only questions containing one of these substrings")
     args = ap.parse_args()
     if args.merge:
@@ -427,7 +426,8 @@ def main():
                 r["pred"] = runner.finish(pr, 16).strip()
             if args.n_win > 1:
                 sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma, dot=args.dot, stride=max(1, args.dot_stride),
-                                       dot_color=tuple(int(args.dot_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)))
+                                       dot_color=tuple(int(args.dot_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+                                       if args.dot_color else None)
             else:
                 sheet, ok = draw_row(r, pr["wins"][0], gamma=args.gamma)
             sheets.append(sheet)
