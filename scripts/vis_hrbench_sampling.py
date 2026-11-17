@@ -274,7 +274,7 @@ def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
     return sheet, ok
 
 
-def window_tile(image, w, color, tw, th, dot=2.2, ss=2):
+def window_tile(image, w, color, tw, th, dot=3.2, ss=2, dot_color=(226, 190, 104)):
     """One window at tw x th: learned density under its token centres (dot = radius in output px)."""
     crop = image.crop(w["lpx"])
     tile = heat(crop, w["q"])
@@ -285,8 +285,7 @@ def window_tile(image, w, color, tw, th, dot=2.2, ss=2):
     rad = dot * ss
     for y in cy:
         for x in cx:
-            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=DOT, outline=(0, 0, 0),
-                      width=max(1, ss // 2))
+            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=dot_color)
     d.rectangle([0, 0, tile.width - 1, tile.height - 1], outline=color, width=4 * ss)
     return fit(tile, tw, th)
 
@@ -315,7 +314,7 @@ def caption(dr, r, x, y, width):
     return ok
 
 
-def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.2):
+def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=3.2, dot_color=(226, 190, 104)):
     """(a) image, (b) relevance map with the numbered windows, (c) each window's density and samples."""
     image = gamma_correct(r["image"].convert("RGB"), gamma)
     full = image.copy()
@@ -344,7 +343,7 @@ def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.2):
     for i, w in enumerate(wins):
         c = WIN_COLORS[i % len(WIN_COLORS)]
         x, y = (i % cols) * (tw + 4), (i // cols) * (th + 4)
-        grid.paste(window_tile(image, w, c, tw, th, dot=dot), (x, y))
+        grid.paste(window_tile(image, w, c, tw, th, dot=dot, dot_color=dot_color), (x, y))
         gd.rectangle([x, y, x + 26, y + 24], fill=c)
         gd.text((x + 7, y + 2), str(i + 1), fill=(0, 0, 0), font=small)
 
@@ -383,7 +382,8 @@ def main():
                     help="gamma of the drawn image only (> 1 brightens); the model sees the original")
     ap.add_argument("--n_win", type=int, default=1,
                     help="> 1: that many 20x20 windows (the multi-window eval setting), drawn as (a)/(b)/(c)")
-    ap.add_argument("--dot", type=float, default=2.2, help="n_win > 1: sample dot radius in output pixels")
+    ap.add_argument("--dot", type=float, default=3.2, help="n_win > 1: sample dot radius in output pixels")
+    ap.add_argument("--dot_color", default="e2be68", help="n_win > 1: sample dot colour, hex RGB")
     ap.add_argument("--keep", nargs="*", help="pairs mode: draw only questions containing one of these substrings")
     args = ap.parse_args()
     if args.merge:
@@ -417,7 +417,8 @@ def main():
                     continue
                 r["pred"] = runner.finish(pr, 16).strip()
             if args.n_win > 1:
-                sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma, dot=args.dot)
+                sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma, dot=args.dot,
+                                       dot_color=tuple(int(args.dot_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)))
             else:
                 sheet, ok = draw_row(r, pr["wins"][0], gamma=args.gamma)
             sheets.append(sheet)
