@@ -41,8 +41,8 @@ from offset_feat_train import inv_cdf  # noqa: E402
 from vis_intent_where import fit, font, wrap  # noqa: E402
 
 CYAN, RED, DOT = (0, 190, 220), (210, 40, 40), (255, 230, 0)
-WIN_COLORS = [(110, 160, 175), (205, 155, 105), (130, 170, 120), (170, 125, 160), (135, 140, 185), (190, 190, 190)]
-SAMPLE_DOT = (28, 52, 110)
+WIN_COLORS = [(70, 185, 205), (205, 120, 52), (55, 142, 66), (140, 90, 185), (90, 90, 90), (190, 190, 190)]
+SAMPLE_DOT = (45, 90, 195)
 
 # Questions that name different objects in one photograph. Each entry is a
 # list of substrings, and each substring must hit a different question.
@@ -392,7 +392,7 @@ def main():
     ap.add_argument("--dot", type=float, default=4.5, help="n_win > 1: sample dot radius in output pixels")
     ap.add_argument("--dot_stride", type=int, default=2,
                     help="n_win > 1: draw every k-th sample along each axis (1 = all 20x20)")
-    ap.add_argument("--dot_color", default="1c346e", help="n_win > 1: sample dot colour, hex RGB")
+    ap.add_argument("--dot_color", default="2d5ac3", help="n_win > 1: sample dot colour, hex RGB")
     ap.add_argument("--keep", nargs="*", help="pairs mode: draw only questions containing one of these substrings")
     args = ap.parse_args()
     if args.merge:
