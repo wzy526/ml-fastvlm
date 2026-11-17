@@ -222,6 +222,21 @@ def gamma_correct(image, g):
     return image.point(lut * 3)
 
 
+def pixelate(image, boxes, blocks=8):
+    """Display only: mosaic each (x0, y0, x1, y1) box, given as fractions of the image."""
+    if not boxes:
+        return image
+    image = image.copy()
+    W, H = image.size
+    for fx0, fy0, fx1, fy1 in boxes:
+        box = (int(fx0 * W), int(fy0 * H), int(round(fx1 * W)), int(round(fy1 * H)))
+        reg = image.crop(box)
+        n = max(1, min(reg.size) // blocks)
+        small = reg.resize((max(1, reg.width // n), max(1, reg.height // n)), Image.BILINEAR)
+        image.paste(small.resize(reg.size, Image.NEAREST), box[:2])
+    return image
+
+
 def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
     image = gamma_correct(r["image"].convert("RGB"), gamma)
     lx0, ly0, lx1, ly1 = w["lpx"]
@@ -322,7 +337,7 @@ def caption(dr, r, x, y, width):
 
 def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.8, dot_color=None, stride=2):
     """(a) image, (b) relevance map with the numbered windows, (c) each window's density and samples."""
-    image = gamma_correct(r["image"].convert("RGB"), gamma)
+    image = gamma_correct(pixelate(r["image"].convert("RGB"), r.get("mosaic")), gamma)
     full = image.copy()
     full.thumbnail((2400, 2400), Image.BICUBIC)
     s = full.width / image.width
@@ -393,6 +408,9 @@ def main():
     ap.add_argument("--dot_stride", type=int, default=2,
                     help="n_win > 1: draw every k-th sample along each axis (1 = all 20x20)")
     ap.add_argument("--dot_color", default="", help="n_win > 1: one sample dot colour, hex RGB (default: the window's colour)")
+    ap.add_argument("--mosaic", nargs="*", default=[],
+                    help="display only: NAME=x0,y0,x1,y1 (fractions of the image) pixelates that box in "
+                         "pair NAME, e.g. faces; repeat for more boxes")
     ap.add_argument("--keep", nargs="*", help="pairs mode: draw only questions containing one of these substrings")
     args = ap.parse_args()
     if args.merge:
@@ -404,6 +422,10 @@ def main():
         ap.error("--rank must be in 0 .. --world-1")
 
     groups = load_pairs(args.split, args.only) if args.mode == "pairs" else [(None, load_rows(args.split, args.n_try, args.seed))]
+    mosaic = {}
+    for spec in args.mosaic:
+        name, box = spec.split("=", 1)
+        mosaic.setdefault(name, []).append(tuple(float(v) for v in box.split(",")))
     if args.keep:
         groups = [(name, [r for r in rows if any(s.lower() in r["question"].lower() for s in args.keep)])
                   for name, rows in groups]
@@ -425,6 +447,7 @@ def main():
                     print(f"[vis] no window | {r['question'][:90]}", flush=True)
                     continue
                 r["pred"] = runner.finish(pr, 16).strip()
+            r["mosaic"] = mosaic.get(name, [])
             if args.n_win > 1:
                 sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma, dot=args.dot, stride=max(1, args.dot_stride),
                                        dot_color=tuple(int(args.dot_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
