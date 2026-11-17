@@ -41,7 +41,8 @@ from offset_feat_train import inv_cdf  # noqa: E402
 from vis_intent_where import fit, font, wrap  # noqa: E402
 
 CYAN, RED, DOT = (0, 190, 220), (210, 40, 40), (255, 230, 0)
-WIN_COLORS = [CYAN, (255, 140, 0), (60, 200, 60), (230, 60, 200), (120, 120, 255), (255, 255, 255)]
+WIN_COLORS = [(110, 160, 175), (205, 155, 105), (130, 170, 120), (170, 125, 160), (135, 140, 185), (190, 190, 190)]
+SAMPLE_DOT = (28, 52, 110)
 
 # Questions that name different objects in one photograph. Each entry is a
 # list of substrings, and each substring must hit a different question.
@@ -274,7 +275,7 @@ def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
     return sheet, ok
 
 
-def window_tile(image, w, color, tw, th, dot=4.5, ss=2, dot_color=(226, 190, 104), stride=2):
+def window_tile(image, w, color, tw, th, dot=4.5, ss=2, dot_color=SAMPLE_DOT, stride=2):
     """One window at tw x th: learned density under its token centres (dot = radius in output px).
 
     stride > 1 draws every stride-th centre along each axis; the drawn points are real
@@ -319,7 +320,7 @@ def caption(dr, r, x, y, width):
     return ok
 
 
-def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=4.5, dot_color=(226, 190, 104), stride=2):
+def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=4.5, dot_color=SAMPLE_DOT, stride=2):
     """(a) image, (b) relevance map with the numbered windows, (c) each window's density and samples."""
     image = gamma_correct(r["image"].convert("RGB"), gamma)
     full = image.copy()
@@ -391,7 +392,7 @@ def main():
     ap.add_argument("--dot", type=float, default=4.5, help="n_win > 1: sample dot radius in output pixels")
     ap.add_argument("--dot_stride", type=int, default=2,
                     help="n_win > 1: draw every k-th sample along each axis (1 = all 20x20)")
-    ap.add_argument("--dot_color", default="e2be68", help="n_win > 1: sample dot colour, hex RGB")
+    ap.add_argument("--dot_color", default="1c346e", help="n_win > 1: sample dot colour, hex RGB")
     ap.add_argument("--keep", nargs="*", help="pairs mode: draw only questions containing one of these substrings")
     args = ap.parse_args()
     if args.merge:
