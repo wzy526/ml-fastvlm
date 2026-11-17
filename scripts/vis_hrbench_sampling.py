@@ -68,7 +68,10 @@ PAIRS = [
 def save_png(im, path):
     # PIL opens files "w+b", which the OSS mount rejects; write the bytes once.
     buf = io.BytesIO()
-    im.save(buf, "PNG")
+    if path.endswith(".jpg"):
+        im.save(buf, "JPEG", quality=95)
+    else:
+        im.save(buf, "PNG")
     with open(path, "wb") as f:
         f.write(buf.getvalue())
 
@@ -289,7 +292,7 @@ def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
     return sheet, ok
 
 
-def window_tile(image, w, color, tw, th, dot=2.8, ss=2, dot_color=None, stride=2):
+def window_tile(image, w, color, tw, th, dot=2.8, ss=2, dot_color=None, stride=2, final=True):
     """One window at tw x th: learned density under its token centres (dot = radius in output px).
 
     stride > 1 draws every stride-th centre along each axis; the drawn points are real
@@ -308,7 +311,29 @@ def window_tile(image, w, color, tw, th, dot=2.8, ss=2, dot_color=None, stride=2
             d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=dot_color or color,
                       outline=(255, 255, 255), width=ss)
     d.rectangle([0, 0, tile.width - 1, tile.height - 1], outline=color, width=4 * ss)
-    return fit(tile, tw, th)
+    return fit(tile, tw, th) if final else tile
+
+
+def save_crops(r, wins, out, gamma=1.0, dot=2.8, stride=2, dot_color=None, tile_w=258):
+    """The full image and every window at the original resolution.
+
+    winK.png is the plain crop; winK_samples.png adds the density and dots,
+    scaled so they look as in the figure tile (tile_w px wide).
+    """
+    os.makedirs(out, exist_ok=True)
+    image = gamma_correct(pixelate(r["image"].convert("RGB"), r.get("mosaic")), gamma)
+    save_png(image, os.path.join(out, "orig.jpg"))
+    for i, w in enumerate(wins):
+        c = WIN_COLORS[i % len(WIN_COLORS)]
+        crop = image.crop(w["lpx"])
+        save_png(crop, os.path.join(out, f"win{i + 1}.png"))
+        ss = max(1, round(crop.width / tile_w))
+        tile = window_tile(image, w, c, crop.width // ss, crop.height // ss, dot=dot, ss=ss,
+                           dot_color=dot_color, stride=stride, final=False)
+        save_png(tile, os.path.join(out, f"win{i + 1}_samples.png"))
+    print(f"[vis] crops {image.width}x{image.height} -> {out}: "
+          + ", ".join(f"win{i + 1} {w['lpx'][2] - w['lpx'][0]}x{w['lpx'][3] - w['lpx'][1]}" for i, w in enumerate(wins)),
+          flush=True)
 
 
 def caption(dr, r, x, y, width, size=20):
@@ -437,6 +462,9 @@ def main():
     ap.add_argument("--dot_stride", type=int, default=2,
                     help="n_win > 1: draw every k-th sample along each axis (1 = all 20x20)")
     ap.add_argument("--dot_color", default="", help="n_win > 1: one sample dot colour, hex RGB (default: the window's colour)")
+    ap.add_argument("--save_crops", action="store_true",
+                    help="also write crops_<pair>_<index>/: orig.jpg and each window at the original resolution "
+                         "(winK.png plain, winK_samples.png with density and dots)")
     ap.add_argument("--no_text", action="store_true",
                     help="n_win > 1: leave the space under (a)/(b) blank instead of writing question / options / answers")
     ap.add_argument("--mosaic", nargs="*", default=[],
@@ -479,10 +507,13 @@ def main():
                     continue
                 r["pred"] = runner.finish(pr, 16).strip()
             r["mosaic"] = mosaic.get(name, [])
+            dot_color = tuple(int(args.dot_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)) if args.dot_color else None
+            if args.save_crops:
+                save_crops(r, pr["wins"], os.path.join(args.out, f"crops_{name or 'row'}_{r['index']}"),
+                           gamma=args.gamma, dot=args.dot, stride=max(1, args.dot_stride), dot_color=dot_color)
             if args.n_win > 1:
                 sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma, dot=args.dot, stride=max(1, args.dot_stride),
-                                       dot_color=tuple(int(args.dot_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
-                                       if args.dot_color else None, text=not args.no_text)
+                                       dot_color=dot_color, text=not args.no_text)
             else:
                 sheet, ok = draw_row(r, pr["wins"][0], gamma=args.gamma)
             sheets.append(sheet)
