@@ -88,6 +88,7 @@ def _dataset(split):
 
 def _row(d, prompt_of, visual):
     return {"cat": d["category"], "question": d["question"].strip(), "answer": d["answer"],
+            "options": {k: str(d[k]).strip() for k in "ABCD" if d.get(k) not in (None, "")},
             "prompt": prompt_of(d), "image": visual(d)[0], "index": int(d["index"])}
 
 
@@ -273,23 +274,48 @@ def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
     return sheet, ok
 
 
-def window_tile(image, w, color):
-    """One window: learned density under its token centres."""
+def window_tile(image, w, color, tw, th, dot=2.2, ss=2):
+    """One window at tw x th: learned density under its token centres (dot = radius in output px)."""
     crop = image.crop(w["lpx"])
     tile = heat(crop, w["q"])
-    tile.thumbnail((1200, 1200), Image.BICUBIC)
+    tile.thumbnail((tw * ss, th * ss), Image.BICUBIC)
     k = tile.width / crop.width
     _ex, _ey, cx, cy = token_grid(w)
     d = ImageDraw.Draw(tile)
-    rad = max(2, tile.width // 220)
+    rad = dot * ss
     for y in cy:
         for x in cx:
-            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=DOT, outline=(0, 0, 0))
-    d.rectangle([0, 0, tile.width - 1, tile.height - 1], outline=color, width=8)
-    return tile
+            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=DOT, outline=(0, 0, 0),
+                      width=max(1, ss // 2))
+    d.rectangle([0, 0, tile.width - 1, tile.height - 1], outline=color, width=4 * ss)
+    return fit(tile, tw, th)
 
 
-def draw_multi(r, wins, pw=520, ph=520, cap_h=150, gamma=1.0):
+def caption(dr, r, x, y, width):
+    """Question, options, ground truth and the Q-LAS answer; returns whether Q-LAS is right."""
+    opts = r.get("options") or {}
+
+    def opt(v):
+        k = str(v).strip()[:1].upper()
+        return f"{k}. {opts[k]}" if k in opts else str(v).strip()
+
+    fnt = font(22)
+    for line in wrap("Question: " + r["question"], fnt, width, 2):
+        dr.text((x, y), line, fill=(20, 20, 20), font=fnt)
+        y += 28
+    if opts:
+        for line in wrap("Options: " + "  ·  ".join(f"{k}. {v}" for k, v in opts.items()), fnt, width, 2):
+            dr.text((x, y), line, fill=(60, 60, 60), font=fnt)
+            y += 28
+    ok = r["pred"][:1].upper() == str(r["answer"]).strip()[:1].upper()
+    dr.text((x, y + 4), f"GT: {opt(r['answer'])}", fill=(20, 20, 20), font=fnt)
+    gx = x + max(fnt.getlength(f"GT: {opt(r['answer'])}") + 60, width // 3)
+    dr.text((gx, y + 4), f"Q-LAS: {opt(r['pred'])}  ({'correct' if ok else 'wrong'})",
+            fill=(20, 120, 40) if ok else (170, 40, 40), font=fnt)
+    return ok
+
+
+def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.2):
     """(a) image, (b) relevance map with the numbered windows, (c) each window's density and samples."""
     image = gamma_correct(r["image"].convert("RGB"), gamma)
     full = image.copy()
@@ -314,33 +340,26 @@ def draw_multi(r, wins, pw=520, ph=520, cap_h=150, gamma=1.0):
     tw, th = (pw - 4 * (cols - 1)) // cols, (ph - 4 * (rows - 1)) // rows
     grid = Image.new("RGB", (pw, ph), (248, 248, 248))
     gd = ImageDraw.Draw(grid)
-    small = font(14)
+    small = font(18)
     for i, w in enumerate(wins):
         c = WIN_COLORS[i % len(WIN_COLORS)]
         x, y = (i % cols) * (tw + 4), (i // cols) * (th + 4)
-        grid.paste(fit(window_tile(image, w, c), tw, th), (x, y))
-        gd.rectangle([x, y, x + 22, y + 20], fill=c)
-        gd.text((x + 6, y + 2), str(i + 1), fill=(0, 0, 0), font=small)
+        grid.paste(window_tile(image, w, c, tw, th, dot=dot), (x, y))
+        gd.rectangle([x, y, x + 26, y + 24], fill=c)
+        gd.text((x + 7, y + 2), str(i + 1), fill=(0, 0, 0), font=small)
 
     panels = [fit(full, pw, ph), fit(rel, pw, ph), grid]
     sheet = Image.new("RGB", (pw * 3 + 16, ph + cap_h + 8), (255, 255, 255))
     for i, p in enumerate(panels):
         sheet.paste(p, (8 + i * pw, 4))
     dr = ImageDraw.Draw(sheet)
-    fnt = font(16)
     side = f"{wins[0]['gw']}x{wins[0]['gh']}"
     titles = [f"(a) {r['cat']}  ·  {image.width}x{image.height}",
               f"(b) relevance map  ·  {len(wins)} windows",
               f"(c) learned density + {side} samples per window"]
     for i, t in enumerate(titles):
         dr.text((8 + i * pw, ph + 8), t, fill=(40, 40, 40), font=small)
-    y = ph + 32
-    for line in wrap(r["question"], fnt, pw * 3 - 16, 3):
-        dr.text((8, y), line, fill=(20, 20, 20), font=fnt)
-        y += 22
-    ok = r["pred"][:1].upper() == str(r["answer"]).strip()[:1].upper()
-    dr.text((8, y + 4), f"answer {r['answer']}  ·  Q-LAS {r['pred'][:8]!r}  ·  {'correct' if ok else 'wrong'}",
-            fill=(20, 120, 40) if ok else (160, 40, 40), font=small)
+    ok = caption(dr, r, 8, ph + 40, pw * 3 - 16)
     return sheet, ok
 
 
@@ -364,6 +383,8 @@ def main():
                     help="gamma of the drawn image only (> 1 brightens); the model sees the original")
     ap.add_argument("--n_win", type=int, default=1,
                     help="> 1: that many 20x20 windows (the multi-window eval setting), drawn as (a)/(b)/(c)")
+    ap.add_argument("--dot", type=float, default=2.2, help="n_win > 1: sample dot radius in output pixels")
+    ap.add_argument("--keep", nargs="*", help="pairs mode: draw only questions containing one of these substrings")
     args = ap.parse_args()
     if args.merge:
         merge_pairs(args.out)
@@ -374,6 +395,10 @@ def main():
         ap.error("--rank must be in 0 .. --world-1")
 
     groups = load_pairs(args.split, args.only) if args.mode == "pairs" else [(None, load_rows(args.split, args.n_try, args.seed))]
+    if args.keep:
+        groups = [(name, [r for r in rows if any(s.lower() in r["question"].lower() for s in args.keep)])
+                  for name, rows in groups]
+        groups = [g for g in groups if g[1]]
     groups = groups[args.rank::args.world]
     print(f"[vis] rank {args.rank}/{args.world}: " + ", ".join(name or "random" for name, _rows in groups), flush=True)
     runner = LDatRunner(args.model_path, args.where_head_pt, args.ldat_pt, args.device,
@@ -392,14 +417,14 @@ def main():
                     continue
                 r["pred"] = runner.finish(pr, 16).strip()
             if args.n_win > 1:
-                sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma)
+                sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma, dot=args.dot)
             else:
                 sheet, ok = draw_row(r, pr["wins"][0], gamma=args.gamma)
             sheets.append(sheet)
             n_ran += 1
             n_ok += int(ok)
             meta.append({"group": name, "category": r["cat"], "index": r["index"], "question": r["question"],
-                         "answer": r["answer"], "pred": r["pred"], "correct": ok,
+                         "options": r.get("options"), "answer": r["answer"], "pred": r["pred"], "correct": ok,
                          "windows": [list(w["lpx"]) for w in pr["wins"]]})
             print(f"[vis] {n_ran} {name or r['cat']} ok={int(ok)} pred={r['pred'][:8]!r} gt={r['answer']} "
                   f"| {r['question'][:90]}", flush=True)
