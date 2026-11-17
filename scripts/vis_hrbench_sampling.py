@@ -274,7 +274,7 @@ def draw_row(r, w, pw=520, ph=520, cap_h=150, gamma=1.0):
     return sheet, ok
 
 
-def window_tile(image, w, color, tw, th, dot=4.5, ss=2, dot_color=None, stride=2):
+def window_tile(image, w, color, tw, th, dot=2.8, ss=2, dot_color=None, stride=2):
     """One window at tw x th: learned density under its token centres (dot = radius in output px).
 
     stride > 1 draws every stride-th centre along each axis; the drawn points are real
@@ -290,7 +290,8 @@ def window_tile(image, w, color, tw, th, dot=4.5, ss=2, dot_color=None, stride=2
     off = stride // 2
     for y in cy[off::stride]:
         for x in cx[off::stride]:
-            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=dot_color or color)
+            d.ellipse([x * k - rad, y * k - rad, x * k + rad, y * k + rad], fill=dot_color or color,
+                      outline=(255, 255, 255), width=ss)
     d.rectangle([0, 0, tile.width - 1, tile.height - 1], outline=color, width=4 * ss)
     return fit(tile, tw, th)
 
@@ -319,7 +320,7 @@ def caption(dr, r, x, y, width):
     return ok
 
 
-def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=4.5, dot_color=None, stride=2):
+def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.8, dot_color=None, stride=2):
     """(a) image, (b) relevance map with the numbered windows, (c) each window's density and samples."""
     image = gamma_correct(r["image"].convert("RGB"), gamma)
     full = image.copy()
@@ -388,7 +389,7 @@ def main():
                     help="gamma of the drawn image only (> 1 brightens); the model sees the original")
     ap.add_argument("--n_win", type=int, default=1,
                     help="> 1: that many 20x20 windows (the multi-window eval setting), drawn as (a)/(b)/(c)")
-    ap.add_argument("--dot", type=float, default=4.5, help="n_win > 1: sample dot radius in output pixels")
+    ap.add_argument("--dot", type=float, default=2.8, help="n_win > 1: sample dot radius in output pixels")
     ap.add_argument("--dot_stride", type=int, default=2,
                     help="n_win > 1: draw every k-th sample along each axis (1 = all 20x20)")
     ap.add_argument("--dot_color", default="", help="n_win > 1: one sample dot colour, hex RGB (default: the window's colour)")
