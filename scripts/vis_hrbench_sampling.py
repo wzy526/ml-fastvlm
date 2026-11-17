@@ -358,7 +358,7 @@ def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.8, dot_color
     cols = 2 if len(wins) > 1 else 1
     rows = (len(wins) + cols - 1) // cols
     tw, th = (pw - 4 * (cols - 1)) // cols, (ph - 4 * (rows - 1)) // rows
-    grid = Image.new("RGB", (pw, ph), (248, 248, 248))
+    grid = Image.new("RGB", (pw, ph), (255, 255, 255))
     gd = ImageDraw.Draw(grid)
     small = font(18)
     for i, w in enumerate(wins):
@@ -368,19 +368,28 @@ def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.8, dot_color
         gd.rectangle([x, y, x + 26, y + 24], fill=c)
         gd.text((x + 7, y + 2), str(i + 1), fill=(0, 0, 0), font=small)
 
-    panels = [fit(full, pw, ph), fit(rel, pw, ph), grid]
-    sheet = Image.new("RGB", (pw * 3 + 16, ph + cap_h + 8), (255, 255, 255))
-    for i, p in enumerate(panels):
-        sheet.paste(p, (8 + i * pw, 4))
+    # (a) and (b) keep their own width and sit flush with the top of (c).
+    a, b = full.copy(), rel
+    a.thumbnail((pw, ph), Image.BICUBIC)
+    b = b.resize(a.size, Image.BICUBIC)
+    panels = [a, b, grid]
+    gap, top = 12, 30
+    xs = [8]
+    for p in panels[:-1]:
+        xs.append(xs[-1] + p.width + gap)
+    width = xs[-1] + grid.width + 8
+    sheet = Image.new("RGB", (width, top + ph + cap_h), (255, 255, 255))
+    for x, p in zip(xs, panels):
+        sheet.paste(p, (x, top))
     dr = ImageDraw.Draw(sheet)
     side = f"{wins[0]['gw']}x{wins[0]['gh']}"
     titles = [f"(a) {r['cat']}  ·  {image.width}x{image.height}",
               f"(b) relevance map  ·  {len(wins)} windows",
               f"(c) learned density + {side} samples per window" if stride == 1 else
               f"(c) learned density + samples (every {({2: '2nd', 3: '3rd'}).get(stride, f'{stride}th')} of {side})"]
-    for i, t in enumerate(titles):
-        dr.text((8 + i * pw, ph + 8), t, fill=(40, 40, 40), font=small)
-    ok = caption(dr, r, 8, ph + 40, pw * 3 - 16)
+    for x, t in zip(xs, titles):
+        dr.text((x, 6), t, fill=(40, 40, 40), font=small)
+    ok = caption(dr, r, 8, top + ph + 12, width - 16)
     return sheet, ok
 
 
