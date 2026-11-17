@@ -311,31 +311,35 @@ def window_tile(image, w, color, tw, th, dot=2.8, ss=2, dot_color=None, stride=2
     return fit(tile, tw, th)
 
 
-def caption(dr, r, x, y, width):
-    """Question, options, ground truth and the Q-LAS answer; returns whether Q-LAS is right."""
+def caption(dr, r, x, y, width, size=20):
+    """Question, options, ground truth and the Q-LAS answer.
+
+    Returns (Q-LAS is right, y below the last line).
+    """
     opts = r.get("options") or {}
 
     def opt(v):
         k = str(v).strip()[:1].upper()
         return f"{k}. {opts[k]}" if k in opts else str(v).strip()
 
-    fnt = font(22)
-    for line in wrap("Question: " + r["question"], fnt, width, 2):
+    fnt, step = font(size), size + 6
+    for line in wrap("Question: " + r["question"], fnt, width, 4):
         dr.text((x, y), line, fill=(20, 20, 20), font=fnt)
-        y += 28
+        y += step
     if opts:
-        for line in wrap("Options: " + "  ·  ".join(f"{k}. {v}" for k, v in opts.items()), fnt, width, 2):
+        for line in wrap("Options: " + "  ·  ".join(f"{k}. {v}" for k, v in opts.items()), fnt, width, 4):
             dr.text((x, y), line, fill=(60, 60, 60), font=fnt)
-            y += 28
+            y += step
     ok = r["pred"][:1].upper() == str(r["answer"]).strip()[:1].upper()
-    dr.text((x, y + 4), f"GT: {opt(r['answer'])}", fill=(20, 20, 20), font=fnt)
-    gx = x + max(fnt.getlength(f"GT: {opt(r['answer'])}") + 60, width // 3)
-    dr.text((gx, y + 4), f"Q-LAS: {opt(r['pred'])}  ({'correct' if ok else 'wrong'})",
+    y += 4
+    dr.text((x, y), f"GT: {opt(r['answer'])}", fill=(20, 20, 20), font=fnt)
+    y += step
+    dr.text((x, y), f"Q-LAS: {opt(r['pred'])}  ({'correct' if ok else 'wrong'})",
             fill=(20, 120, 40) if ok else (170, 40, 40), font=fnt)
-    return ok
+    return ok, y + step
 
 
-def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.8, dot_color=None, stride=2):
+def draw_multi(r, wins, pw=520, ph=520, gamma=1.0, dot=2.8, dot_color=None, stride=2, text=True):
     """(a) image, (b) relevance map with the numbered windows, (c) each window's density and samples."""
     image = gamma_correct(pixelate(r["image"].convert("RGB"), r.get("mosaic")), gamma)
     full = image.copy()
@@ -345,15 +349,9 @@ def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.8, dot_color
     rel = heat(full, wins[0]["head_p"])
     d = ImageDraw.Draw(rel)
     lw = max(4, full.width // 160)
-    lab = font(max(20, full.width // 30))
     for i, w in enumerate(wins):
-        c = WIN_COLORS[i % len(WIN_COLORS)]
         x0, y0, x1, y1 = (v * s for v in w["lpx"])
-        d.rectangle([x0, y0, x1, y1], outline=c, width=lw)
-        t = str(i + 1)
-        tw, th = lab.getlength(t), lab.size
-        d.rectangle([x0, y0, x0 + tw + 12, y0 + th + 10], fill=c)
-        d.text((x0 + 6, y0 + 3), t, fill=(0, 0, 0), font=lab)
+        d.rectangle([x0, y0, x1, y1], outline=WIN_COLORS[i % len(WIN_COLORS)], width=lw)
 
     cols = 2 if len(wins) > 1 else 1
     rows = (len(wins) + cols - 1) // cols
@@ -368,28 +366,50 @@ def draw_multi(r, wins, pw=520, ph=520, cap_h=190, gamma=1.0, dot=2.8, dot_color
         gd.rectangle([x, y, x + 26, y + 24], fill=c)
         gd.text((x + 7, y + 2), str(i + 1), fill=(0, 0, 0), font=small)
 
-    # (a) and (b) keep their own width and sit flush with the top of (c).
-    a, b = full.copy(), rel
-    a.thumbnail((pw, ph), Image.BICUBIC)
-    b = b.resize(a.size, Image.BICUBIC)
+    # (a) and (b) sit flush with the top of (c) and shrink until the caption
+    # fits in the space under them, beside (c).
+    gap, top, pad = 12, 30, 14
+    scratch = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    hmax = ph
+    for _ in range(8):
+        a = full.copy()
+        a.thumbnail((pw, hmax), Image.BICUBIC)
+        cap_w = 2 * a.width + gap
+        cap_need = caption(scratch, r, 0, 0, cap_w)[1] if text else 0
+        if a.height + pad + cap_need <= ph or hmax <= 160:
+            break
+        hmax = max(160, ph - pad - cap_need)
+    b = rel.resize(a.size, Image.BICUBIC)
+    bd, lab, sb = ImageDraw.Draw(b), font(16), a.width / image.width
+    for i, w in enumerate(wins):
+        x0, y0 = w["lpx"][0] * sb, w["lpx"][1] * sb
+        bd.rectangle([x0, y0, x0 + 20, y0 + 20], fill=WIN_COLORS[i % len(WIN_COLORS)])
+        bd.text((x0 + 5, y0 + 1), str(i + 1), fill=(0, 0, 0), font=lab)
     panels = [a, b, grid]
-    gap, top = 12, 30
     xs = [8]
     for p in panels[:-1]:
         xs.append(xs[-1] + p.width + gap)
     width = xs[-1] + grid.width + 8
-    sheet = Image.new("RGB", (width, top + ph + cap_h), (255, 255, 255))
+    height = top + max(ph, a.height + pad + cap_need) + 8
+    sheet = Image.new("RGB", (width, height), (255, 255, 255))
     for x, p in zip(xs, panels):
         sheet.paste(p, (x, top))
     dr = ImageDraw.Draw(sheet)
     side = f"{wins[0]['gw']}x{wins[0]['gh']}"
-    titles = [f"(a) {r['cat']}  ·  {image.width}x{image.height}",
-              f"(b) relevance map  ·  {len(wins)} windows",
-              f"(c) learned density + {side} samples per window" if stride == 1 else
-              f"(c) learned density + samples (every {({2: '2nd', 3: '3rd'}).get(stride, f'{stride}th')} of {side})"]
-    for x, t in zip(xs, titles):
-        dr.text((x, 6), t, fill=(40, 40, 40), font=small)
-    ok = caption(dr, r, 8, top + ph + 12, width - 16)
+    titles = [f"(a) {image.width}x{image.height}",
+              f"(b) relevance + {len(wins)} windows",
+              f"(c) density + {side} samples per window" if stride == 1 else
+              f"(c) density + samples (every {({2: '2nd', 3: '3rd'}).get(stride, f'{stride}th')} of {side})"]
+    for x, t, p in zip(xs, titles, panels):
+        f = small
+        for size in (18, 16, 14, 12):
+            f = font(size)
+            if f.getlength(t) <= p.width + gap - 4:
+                break
+        dr.text((x, 6), t, fill=(40, 40, 40), font=f)
+    ok = r["pred"][:1].upper() == str(r["answer"]).strip()[:1].upper()
+    if text:
+        caption(dr, r, 8, top + a.height + pad, cap_w)
     return sheet, ok
 
 
@@ -417,6 +437,8 @@ def main():
     ap.add_argument("--dot_stride", type=int, default=2,
                     help="n_win > 1: draw every k-th sample along each axis (1 = all 20x20)")
     ap.add_argument("--dot_color", default="", help="n_win > 1: one sample dot colour, hex RGB (default: the window's colour)")
+    ap.add_argument("--no_text", action="store_true",
+                    help="n_win > 1: leave the space under (a)/(b) blank instead of writing question / options / answers")
     ap.add_argument("--mosaic", nargs="*", default=[],
                     help="display only: NAME=x0,y0,x1,y1 (fractions of the image) pixelates that box in "
                          "pair NAME, e.g. faces; repeat for more boxes")
@@ -460,7 +482,7 @@ def main():
             if args.n_win > 1:
                 sheet, ok = draw_multi(r, pr["wins"], gamma=args.gamma, dot=args.dot, stride=max(1, args.dot_stride),
                                        dot_color=tuple(int(args.dot_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
-                                       if args.dot_color else None)
+                                       if args.dot_color else None, text=not args.no_text)
             else:
                 sheet, ok = draw_row(r, pr["wins"][0], gamma=args.gamma)
             sheets.append(sheet)
